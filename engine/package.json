@@ -1,0 +1,24 @@
+{
+  "name": "arb-engine",
+  "version": "1.0.0",
+  "description": "High-performance MEV arbitrage engine — TypeScript/Bun/Viem",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "fastify": "^5.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0",
+    "dotenv": "^16.4.0",
+    "yaml": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}

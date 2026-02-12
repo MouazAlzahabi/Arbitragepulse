@@ -1,0 +1,187 @@
+# ============================================================
+# ArbitragePulse — Token Allowlist
+# ============================================================
+#
+# HOW IT WORKS:
+#   1. Add tokens you trust to the list below
+#   2. The engine auto-generates ALL valid pair combinations
+#   3. Example: 5 tokens = 20 directional pairs, checked automatically
+#
+# ADDING A NEW TOKEN:
+#   Just add a block under the right chain. The engine handles the rest.
+#
+#   - symbol: "LINK"
+#     address: "0x350a791Bfc2C21F9Ed5d10980Dad2e2638ffa7f6"
+#     decimals: 18
+#     trusted: true
+#
+# FIELDS:
+#   symbol:     Human-readable ticker
+#   address:    Contract address (checksummed)
+#   decimals:   Token decimals (18 for most, 6 for USDC/USDT)
+#   trusted:    true = actively trade, false = monitor only (no execution)
+#   category:   "stable" | "blue_chip" | "defi" | "meme" | "other"
+#               Used for trade sizing — stables and blue chips get larger sizes
+#   max_trade:  (optional) Override max trade amount for this token
+#               If not set, uses defaults based on category
+#
+# ⚠️  SAFETY:
+#   - Only add tokens you've verified (check on block explorer)
+#   - Avoid rebasing tokens (OHM, AMPL) — they break V2 router math
+#   - Avoid fee-on-transfer tokens — they'll cause reverts
+#   - When in doubt, set trusted: false first and monitor
+# ============================================================
+
+# ── Trade sizing defaults per category ──
+defaults:
+  trade_sizes:
+    stable:     "150"      # $150 per arb
+    blue_chip:  "0.05"     # 0.05 ETH per arb (~$150)
+    defi:       "0.03"     # Smaller for mid-caps
+    meme:       "0.01"     # Smallest for volatile tokens
+    other:      "0.02"
+  min_swap_sizes:
+    stable:     "10"
+    blue_chip:  "0.005"
+    defi:       "0.005"
+    meme:       "0.002"
+    other:      "0.005"
+
+
+# ════════════════════════════════════════════════════════════
+# OPTIMISM (Chain ID: 10)
+# ════════════════════════════════════════════════════════════
+optimism:
+  # ── Stablecoins ──
+  - symbol: "USDC"
+    address: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
+    decimals: 6
+    trusted: true
+    category: "stable"
+
+  - symbol: "USDT"
+    address: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
+    decimals: 6
+    trusted: true
+    category: "stable"
+
+  - symbol: "DAI"
+    address: "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"
+    decimals: 18
+    trusted: true
+    category: "stable"
+
+  # ── Blue Chips ──
+  - symbol: "WETH"
+    address: "0x4200000000000000000000000000000000000006"
+    decimals: 18
+    trusted: true
+    category: "blue_chip"
+
+  - symbol: "OP"
+    address: "0x4200000000000000000000000000000000000042"
+    decimals: 18
+    trusted: true
+    category: "blue_chip"
+
+  - symbol: "WBTC"
+    address: "0x68f180fcCe6836688e9084f035309E29Bf0A2095"
+    decimals: 8
+    trusted: true
+    category: "blue_chip"
+
+  # ── DeFi Tokens ──
+  - symbol: "LINK"
+    address: "0x350a791Bfc2C21F9Ed5d10980Dad2e2638ffa7f6"
+    decimals: 18
+    trusted: true
+    category: "defi"
+
+  - symbol: "SNX"
+    address: "0x8700dAec35aF8Ff88c16BdF0418774CB3D7599B4"
+    decimals: 18
+    trusted: true
+    category: "defi"
+
+  - symbol: "AAVE"
+    address: "0x76FB31fb4af56892A25e32cFC43De717950c9278"
+    decimals: 18
+    trusted: false           # Monitor only for now — enable when ready
+    category: "defi"
+
+  - symbol: "CRV"
+    address: "0x0994206dfE8De6Ec6920FF4D779B0d950605Fb53"
+    decimals: 18
+    trusted: false
+    category: "defi"
+
+  # ── Example: how to add a meme token ──
+  # - symbol: "VELO"
+  #   address: "0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db"
+  #   decimals: 18
+  #   trusted: false          # Start with false, monitor first
+  #   category: "meme"
+
+
+# ════════════════════════════════════════════════════════════
+# GNOSIS (Chain ID: 100)
+# ════════════════════════════════════════════════════════════
+gnosis:
+  - symbol: "WXDAI"
+    address: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"
+    decimals: 18
+    trusted: true
+    category: "stable"
+
+  - symbol: "USDC"
+    address: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"
+    decimals: 6
+    trusted: true
+    category: "stable"
+
+  - symbol: "WETH"
+    address: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"
+    decimals: 18
+    trusted: true
+    category: "blue_chip"
+
+  - symbol: "GNO"
+    address: "0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb"
+    decimals: 18
+    trusted: true
+    category: "blue_chip"
+
+
+# ════════════════════════════════════════════════════════════
+# BASE (Chain ID: 8453)
+# ════════════════════════════════════════════════════════════
+base:
+  - symbol: "WETH"
+    address: "0x4200000000000000000000000000000000000006"
+    decimals: 18
+    trusted: true
+    category: "blue_chip"
+
+  - symbol: "USDC"
+    address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    decimals: 6
+    trusted: true
+    category: "stable"
+
+  - symbol: "USDbC"
+    address: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"
+    decimals: 6
+    trusted: true
+    category: "stable"
+
+  - symbol: "cbETH"
+    address: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"
+    decimals: 18
+    trusted: true
+    category: "blue_chip"
+
+  # - symbol: "DEGEN"
+  #   address: "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"
+  #   decimals: 18
+  #   trusted: false
+  #   category: "meme"

@@ -1,0 +1,244 @@
+# ============================================================
+# ArbitragePulse Engine — Configuration
+# ============================================================
+# This is the ONLY file you need to edit to:
+#   - Add new chains
+#   - Add new DEX routers
+#   - Add new trading pairs
+#
+# No code changes needed. Just edit this file and restart.
+# ============================================================
+
+
+# ─── CHAINS ────────────────────────────────────────────────
+# Add any EVM chain. You need:
+#   - Chain ID
+#   - WebSocket RPC (wss://) for event subscriptions
+#   - HTTP RPC (https://) for tx submission
+#   - Your deployed ArbitrageExecutor contract address on that chain
+#
+# Free RPCs:
+#   Optimism:  wss://opt-mainnet.g.alchemy.com/v2/YOUR_KEY
+#   Base:      wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY
+#   Arbitrum:  wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
+#   Gnosis:    wss://rpc.gnosischain.com/wss  (or use BlockPI)
+#   Polygon:   wss://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
+
+chains:
+  - id: 10
+    name: "Optimism"
+    enabled: true
+    ws_rpc: "wss://opt-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    http_rpc: "https://opt-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0x4200000000000000000000000000000000000006"  # WETH
+    block_time_ms: 2000
+    contract_address: "0xYOUR_CONTRACT_ON_OPTIMISM"
+    min_native_balance: 0.005   # Pause if ETH < this
+    min_profit_usd: 0.50        # Min profit after gas
+    deadline_seconds: 120       # Tx expiry
+
+  - id: 100
+    name: "Gnosis"
+    enabled: false               # Set to true when ready
+    ws_rpc: "wss://rpc.gnosischain.com/wss"
+    http_rpc: "https://rpc.gnosischain.com"
+    native_currency: "xDAI"
+    wrapped_native: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"  # WETH on Gnosis
+    block_time_ms: 5000
+    contract_address: "0xYOUR_CONTRACT_ON_GNOSIS"
+    min_native_balance: 1.0     # xDAI is cheap, keep some
+    min_profit_usd: 0.20
+    deadline_seconds: 180
+
+  - id: 8453
+    name: "Base"
+    enabled: false
+    ws_rpc: "wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    http_rpc: "https://base-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0x4200000000000000000000000000000000000006"
+    block_time_ms: 2000
+    contract_address: "0xYOUR_CONTRACT_ON_BASE"
+    min_native_balance: 0.005
+    min_profit_usd: 0.30
+    deadline_seconds: 120
+
+  # ── Add more chains easily ──
+  # - id: 42161
+  #   name: "Arbitrum"
+  #   enabled: false
+  #   ws_rpc: "wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY"
+  #   http_rpc: "https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY"
+  #   native_currency: "ETH"
+  #   wrapped_native: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+  #   block_time_ms: 250
+  #   contract_address: "0x..."
+  #   min_native_balance: 0.005
+  #   min_profit_usd: 0.30
+  #   deadline_seconds: 60
+
+
+# ─── ROUTERS ──────────────────────────────────────────────
+# Each DEX router the bot can trade on.
+# type: "v2" = Uniswap V2 compatible (most DEXs)
+#        "v3" = Uniswap V3 (used for LISTENING only — execution still via v2)
+# fee_bps: trading fee in basis points (30 = 0.3%)
+
+routers:
+  # ── Optimism ──
+  - id: "velodrome-v2"
+    name: "Velodrome V2"
+    chain_id: 10
+    address: "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858"
+    type: "v2"
+    fee_bps: 30
+    factory: "0xF1046053aa5682b4F9a81b5481394DA16BE5FF5a"
+
+  - id: "uniswap-v2-op"
+    name: "Uniswap V2 (OP)"
+    chain_id: 10
+    address: "0x4A7b5Da61326A6379179b40d00F57E5bbDC962c2"
+    type: "v2"
+    fee_bps: 30
+    factory: "0x0c3c1c532F1e39EdF36BE9Fe0bE1410313E074Bf"
+
+  - id: "sushiswap-op"
+    name: "SushiSwap (OP)"
+    chain_id: 10
+    address: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+    type: "v2"
+    fee_bps: 30
+
+  # V3 routers — used for PRICE MONITORING (listening to swap events)
+  # The bot detects V3 price moves and checks if V2 pools haven't caught up
+  - id: "uniswap-v3-op"
+    name: "Uniswap V3 (OP)"
+    chain_id: 10
+    address: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    type: "v3"
+    fee_bps: 30  # varies per pool
+
+  # ── Gnosis ──
+  - id: "sushiswap-gnosis"
+    name: "SushiSwap (Gnosis)"
+    chain_id: 100
+    address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+    type: "v2"
+    fee_bps: 30
+
+  - id: "honeyswap"
+    name: "Honeyswap"
+    chain_id: 100
+    address: "0x1C232F01118CB8B424793ae03F870aa7D0ac7f77"
+    type: "v2"
+    fee_bps: 30
+
+  # ── Base ──
+  - id: "aerodrome"
+    name: "Aerodrome"
+    chain_id: 8453
+    address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
+    type: "v2"
+    fee_bps: 30
+
+  - id: "uniswap-v2-base"
+    name: "Uniswap V2 (Base)"
+    chain_id: 8453
+    address: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"
+    type: "v2"
+    fee_bps: 30
+
+  # ── Add more routers easily ──
+  # - id: "my-dex"
+  #   name: "My DEX"
+  #   chain_id: 42161      # Arbitrum
+  #   address: "0x..."
+  #   type: "v2"
+  #   fee_bps: 25
+
+
+# ─── PAIRS ────────────────────────────────────────────────
+# Token pairs to monitor for arbitrage.
+#
+# trade_amount: how much to trade per arb (in token_in units)
+# watch_pools: (optional) specific pool addresses to subscribe to
+#              If empty, the bot uses periodic price checking instead
+#
+# Tip: Start with major pairs (WETH/USDC, WETH/USDT) and small trade amounts
+
+pairs:
+  # ── Optimism Pairs ──
+  - id: "op-weth-usdc"
+    chain_id: 10
+    token_in: "0x4200000000000000000000000000000000000006"   # WETH
+    token_out: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"  # USDC
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.05"       # 0.05 WETH (~$150)
+    min_swap_size: "0.01"      # Ignore swaps < 0.01 WETH
+    watch_pools: []
+
+  - id: "op-usdc-weth"
+    chain_id: 10
+    token_in: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"  # USDC
+    token_out: "0x4200000000000000000000000000000000000006"   # WETH
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"        # 100 USDC
+    min_swap_size: "10"        # Ignore swaps < 10 USDC
+    watch_pools: []
+
+  - id: "op-weth-usdt"
+    chain_id: 10
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"  # USDT
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDT"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.05"
+    min_swap_size: "0.01"
+    watch_pools: []
+
+  - id: "op-weth-op"
+    chain_id: 10
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0x4200000000000000000000000000000000000042"  # OP token
+    token_in_symbol: "WETH"
+    token_out_symbol: "OP"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "0.03"
+    min_swap_size: "0.005"
+    watch_pools: []
+
+  # ── Gnosis Pairs (uncomment when ready) ──
+  # - id: "gno-weth-usdc"
+  #   chain_id: 100
+  #   token_in: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"
+  #   token_out: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"
+  #   token_in_symbol: "WETH"
+  #   token_out_symbol: "USDC"
+  #   token_in_decimals: 18
+  #   token_out_decimals: 6
+  #   trade_amount: "0.05"
+  #   min_swap_size: "0.01"
+  #   watch_pools: []
+
+  # ── Base Pairs (uncomment when ready) ──
+  # - id: "base-weth-usdc"
+  #   chain_id: 8453
+  #   token_in: "0x4200000000000000000000000000000000000006"
+  #   token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+  #   token_in_symbol: "WETH"
+  #   token_out_symbol: "USDC"
+  #   token_in_decimals: 18
+  #   token_out_decimals: 6
+  #   trade_amount: "0.05"
+  #   min_swap_size: "0.01"
+  #   watch_pools: []
