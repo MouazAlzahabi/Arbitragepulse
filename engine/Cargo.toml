@@ -1,0 +1,37 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[dependencies]
+alloy.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true
+futures.workspace = true
+
+# HTTP + WebSocket API server
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-tungstenite = "0.26"
+
+# Concurrent state
+dashmap = "6"
+
+# Async utils
+async-trait = "0.1"
+
+# SQLite persistence
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Metrics
+prometheus = "0.13"

@@ -1,0 +1,15 @@
+[workspace]
+members = ["engine", "lab"]
+resolver = "2"
+
+[workspace.dependencies]
+alloy = { version = "1.7", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+dotenvy = "0.15"
+futures = "0.3"

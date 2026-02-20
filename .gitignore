@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Rust
+/target/
+**/*.rs.bk
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Environment files (secrets)
+**/.env
+!**/.env.example
+
+# Lab state
+.lab-state.json
+
+# Claude Code memory
+.claude/
+
+# Node
+node_modules/
+dist/
+
+# Logs
+*.log
+
+# Foundry cache
+contract/cache/
+contract/out/
+contract/broadcast/
+
+# Bun
+bun.lock

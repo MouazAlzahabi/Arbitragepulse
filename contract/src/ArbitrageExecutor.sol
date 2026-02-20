@@ -24,9 +24,24 @@ interface IUniswapV2Router02 {
     function WETH() external pure returns (address);
 }
 
+interface ISwapRouterV3 {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external returns (uint256 amountOut);
+}
+
 /**
  * @title ArbitrageExecutor v2
- * @notice Atomic cross-DEX arbitrage executor with enhanced safety.
+ * @notice Atomic cross-DEX arbitrage executor with V2 and V3 support.
  *
  * Improvements over v1:
  *   1. Caller-supplied deadline — stale txns expire instead of being held
@@ -37,9 +52,14 @@ interface IUniswapV2Router02 {
  *   6. batchExecute — multiple arbs in one transaction
  *   7. On-chain profit accumulator — track total profits without parsing logs
  *   8. Pausable — freeze execution without withdrawing
+ *   9. V3 support — dispatch to Uniswap V3 exactInputSingle when routerType is V3
  */
 contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
+
+    // ─── Router Types ─────────────────────────────────────────
+
+    enum RouterType { V2, V3 }
 
     // ─── State ────────────────────────────────────────────────
 
@@ -48,6 +68,12 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Total number of successful trades
     uint256 public totalTrades;
+
+    /// @notice Routers approved to be used in arbitrage calls
+    mapping(address => bool) public allowedRouters;
+
+    /// @notice Router protocol type (V2 or V3) — defaults to V2 if not set
+    mapping(address => RouterType) public routerType;
 
     // ─── Events ───────────────────────────────────────────────
 
@@ -63,6 +89,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     event BatchExecuted(uint256 attempted, uint256 succeeded, uint256 totalBatchProfit);
     event WithdrawETH(address indexed to, uint256 amount);
     event WithdrawToken(address indexed token, address indexed to, uint256 amount);
+    event RouterApproved(address indexed router, bool approved);
+    event RouterTypeSet(address indexed router, RouterType rtype);
 
     // ─── Errors ───────────────────────────────────────────────
 
@@ -72,12 +100,35 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     error ZeroAddress();
     error TransferFailed();
     error EmptyBatch();
+    error RouterNotAllowed(address router);
 
     // ─── Constructor ──────────────────────────────────────────
 
     /// @dev Ownable2Step (improvement #5): deployer is initial owner,
     ///      transfer requires new owner to call acceptOwnership()
     constructor() Ownable(msg.sender) {}
+
+    // ─── Router Allowlist ─────────────────────────────────────
+
+    /**
+     * @notice Approve or revoke a router for use in arbitrage.
+     *         Defaults to V2 router type.
+     */
+    function setAllowedRouter(address router, bool approved) external onlyOwner {
+        if (router == address(0)) revert ZeroAddress();
+        allowedRouters[router] = approved;
+        emit RouterApproved(router, approved);
+    }
+
+    /**
+     * @notice Set the protocol type for an already-approved router.
+     *         Call setAllowedRouter first, then setRouterType if it's V3.
+     */
+    function setRouterType(address router, RouterType rtype) external onlyOwner {
+        if (router == address(0)) revert ZeroAddress();
+        routerType[router] = rtype;
+        emit RouterTypeSet(router, rtype);
+    }
 
     // ─── Receive ETH ──────────────────────────────────────────
 
@@ -101,13 +152,17 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
      * @notice Execute an atomic arbitrage: buy tokenOut on routerA,
      *         sell tokenOut on routerB, profit in tokenIn.
      *
+     * Works with V2 and V3 routers — dispatch is automatic based on
+     * the routerType mapping set via setRouterType().
+     *
      * @param tokenIn    Base token we start and end with
      * @param tokenOut   Intermediate token to flip
      * @param amountIn   How much tokenIn to spend
      * @param routerA    DEX to buy on (cheaper)
      * @param routerB    DEX to sell on (more expensive)
+     * @param feeA       V3 fee tier for routerA (0 for V2, 500/3000/10000 for V3)
+     * @param feeB       V3 fee tier for routerB (0 for V2, 500/3000/10000 for V3)
      * @param minProfit  Minimum profit required in tokenIn units (#2)
-     *                   Set this >= estimated gas cost to avoid dust profits
      * @param deadline   Unix timestamp — revert if tx lands after this (#1)
      */
     function executeArbitrage(
@@ -116,6 +171,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 amountIn,
         address routerA,
         address routerB,
+        uint24 feeA,
+        uint24 feeB,
         uint256 minProfit,
         uint256 deadline
     )
@@ -128,9 +185,11 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         if (amountIn == 0) revert ZeroAmount();
         if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
         if (routerA == address(0) || routerB == address(0)) revert ZeroAddress();
+        if (!allowedRouters[routerA]) revert RouterNotAllowed(routerA);
+        if (!allowedRouters[routerB]) revert RouterNotAllowed(routerB);
 
         uint256 profit = _executeSwapPair(
-            tokenIn, tokenOut, amountIn, routerA, routerB, minProfit, deadline
+            tokenIn, tokenOut, amountIn, routerA, routerB, feeA, feeB, minProfit, deadline
         );
 
         // Accumulate profit (#7)
@@ -141,11 +200,11 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // CORE: Multi-Hop Arbitrage
+    // CORE: Multi-Hop Arbitrage (V2 only)
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * @notice Execute arbitrage with custom multi-hop paths.
+     * @notice Execute arbitrage with custom multi-hop paths (V2 only).
      *         e.g., USDC → WETH → TOKEN on routerA, TOKEN → USDC on routerB
      */
     function executeArbitrageMultiHop(
@@ -165,6 +224,9 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         checkDeadline(deadline)
     {
         if (amountIn == 0) revert ZeroAmount();
+        if (routerA == address(0) || routerB == address(0)) revert ZeroAddress();
+        if (!allowedRouters[routerA]) revert RouterNotAllowed(routerA);
+        if (!allowedRouters[routerB]) revert RouterNotAllowed(routerB);
         require(pathA.length >= 2 && pathB.length >= 2, "Invalid path length");
         require(pathA[0] == tokenIn, "pathA must start with tokenIn");
         require(pathB[pathB.length - 1] == tokenIn, "pathB must end with tokenIn");
@@ -176,12 +238,12 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256[] memory amountsA = IUniswapV2Router02(routerA)
             .swapExactTokensForTokens(amountIn, 0, pathA, address(this), deadline);
 
-        // Sell leg
+        // Sell leg — require at least amountIn + minProfit back for MEV protection
         address tokenMid = pathA[pathA.length - 1];
         uint256 midAmount = amountsA[amountsA.length - 1];
         _approveExact(tokenMid, routerB, midAmount);
         IUniswapV2Router02(routerB)
-            .swapExactTokensForTokens(midAmount, 0, pathB, address(this), deadline);
+            .swapExactTokensForTokens(midAmount, amountIn + minProfit, pathB, address(this), deadline);
 
         // Cleanup allowances (#4)
         _resetAllowance(tokenIn, routerA);
@@ -210,6 +272,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 amountIn;
         address routerA;
         address routerB;
+        uint24 feeA;     // V3 fee tier for routerA (0 for V2)
+        uint24 feeB;     // V3 fee tier for routerB (0 for V2)
         uint256 minProfit;
     }
 
@@ -247,6 +311,11 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
                 continue;
             }
 
+            // Skip unapproved routers
+            if (!allowedRouters[a.routerA] || !allowedRouters[a.routerB]) {
+                continue;
+            }
+
             // Skip if insufficient balance
             if (IERC20(a.tokenIn).balanceOf(address(this)) < a.amountIn) {
                 continue;
@@ -280,15 +349,17 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 deadline
     ) external returns (uint256 profit) {
         require(msg.sender == address(this), "Internal only");
+        if (!allowedRouters[a.routerA]) revert RouterNotAllowed(a.routerA);
+        if (!allowedRouters[a.routerB]) revert RouterNotAllowed(a.routerB);
 
         profit = _executeSwapPair(
             a.tokenIn, a.tokenOut, a.amountIn,
-            a.routerA, a.routerB, a.minProfit, deadline
+            a.routerA, a.routerB, a.feeA, a.feeB, a.minProfit, deadline
         );
     }
 
     // ═══════════════════════════════════════════════════════════
-    // INTERNAL: Swap Logic
+    // INTERNAL: Swap Logic (V2 + V3 dispatch)
     // ═══════════════════════════════════════════════════════════
 
     function _executeSwapPair(
@@ -297,36 +368,28 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 amountIn,
         address routerA,
         address routerB,
+        uint24 feeA,
+        uint24 feeB,
         uint256 minProfit,
         uint256 deadline
     ) internal returns (uint256 profit) {
         uint256 balanceBefore = IERC20(tokenIn).balanceOf(address(this));
 
         // ── Leg 1: Buy tokenOut on routerA ──
-        _approveExact(tokenIn, routerA, amountIn);  // #4
-
-        address[] memory pathBuy = new address[](2);
-        pathBuy[0] = tokenIn;
-        pathBuy[1] = tokenOut;
-
-        uint256[] memory amountsBuy = IUniswapV2Router02(routerA)
-            .swapExactTokensForTokens(amountIn, 0, pathBuy, address(this), deadline);
-
-        uint256 tokenOutReceived = amountsBuy[amountsBuy.length - 1];
+        uint256 tokenOutReceived;
+        if (routerType[routerA] == RouterType.V3) {
+            tokenOutReceived = _executeSwapV3(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
+        } else {
+            tokenOutReceived = _executeSwapV2(tokenIn, tokenOut, amountIn, routerA, 0, deadline);
+        }
 
         // ── Leg 2: Sell tokenOut on routerB ──
-        _approveExact(tokenOut, routerB, tokenOutReceived);  // #4
-
-        address[] memory pathSell = new address[](2);
-        pathSell[0] = tokenOut;
-        pathSell[1] = tokenIn;
-
-        IUniswapV2Router02(routerB)
-            .swapExactTokensForTokens(tokenOutReceived, 0, pathSell, address(this), deadline);
-
-        // ── Cleanup allowances ── (#4)
-        _resetAllowance(tokenIn, routerA);
-        _resetAllowance(tokenOut, routerB);
+        // amountOutMin = amountIn + minProfit: router-level MEV protection.
+        if (routerType[routerB] == RouterType.V3) {
+            _executeSwapV3(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
+        } else {
+            _executeSwapV2(tokenOut, tokenIn, tokenOutReceived, routerB, amountIn + minProfit, deadline);
+        }
 
         // ── Profitability gate ── (#2)
         uint256 balanceAfter = IERC20(tokenIn).balanceOf(address(this));
@@ -336,6 +399,54 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         }
 
         profit = balanceAfter - balanceBefore;
+    }
+
+    function _executeSwapV2(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address router,
+        uint256 amountOutMin,
+        uint256 deadline
+    ) internal returns (uint256 amountOut) {
+        _approveExact(tokenIn, router, amountIn);  // #4
+
+        address[] memory path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+
+        uint256[] memory amounts = IUniswapV2Router02(router)
+            .swapExactTokensForTokens(amountIn, amountOutMin, path, address(this), deadline);
+
+        amountOut = amounts[amounts.length - 1];
+        _resetAllowance(tokenIn, router);  // #4
+    }
+
+    function _executeSwapV3(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address router,
+        uint24 fee,
+        uint256 amountOutMin,
+        uint256 deadline
+    ) internal returns (uint256 amountOut) {
+        _approveExact(tokenIn, router, amountIn);  // #4
+
+        amountOut = ISwapRouterV3(router).exactInputSingle(
+            ISwapRouterV3.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                fee: fee,
+                recipient: address(this),
+                deadline: deadline,
+                amountIn: amountIn,
+                amountOutMinimum: amountOutMin,
+                sqrtPriceLimitX96: 0
+            })
+        );
+
+        _resetAllowance(tokenIn, router);  // #4
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -364,7 +475,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * @notice Simulate an arb off-chain (no gas cost).
+     * @notice Simulate a V2 arb off-chain (no gas cost).
      */
     function estimateArbitrage(
         address tokenIn,
@@ -435,7 +546,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     // ═══════════════════════════════════════════════════════════
 
     /// @notice Withdraw all native ETH. Always works (even when paused).
-    function withdrawETH() external onlyOwner {
+    function withdrawETH() external onlyOwner nonReentrant {
         uint256 balance = address(this).balance;
         if (balance == 0) revert ZeroAmount();
 

@@ -1,0 +1,466 @@
+# ============================================================
+# ArbitragePulse Engine — Configuration
+# ============================================================
+# Edit this file to add chains, routers, and trading pairs.
+# No code changes needed. Restart the engine to apply.
+# ============================================================
+
+
+# ─── CHAINS ────────────────────────────────────────────────
+chains:
+  # ── Local Anvil fork (for testing with MockRouters) ──
+  - id: 10
+    name: "Optimism"
+    enabled: true
+    ws_rpc: "ws://127.0.0.1:8545"
+    http_rpc: "http://127.0.0.1:8545"
+    native_currency: "ETH"
+    wrapped_native: "0x4200000000000000000000000000000000000006"
+    block_time_ms: 2000
+    contract_address: "0xd39b195ab0f1781b2286470c3e1654596900cbcd"
+    min_native_balance: 0.001
+    min_profit_usd: 0.01
+    deadline_seconds: 120
+    # QuoterV2 for Uniswap V3 price quoting
+    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+
+  - id: 8453
+    name: "Base"
+    enabled: false
+    ws_rpc: "wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    http_rpc: "https://base-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0x4200000000000000000000000000000000000006"
+    block_time_ms: 2000
+    contract_address: "0xYOUR_CONTRACT_ON_BASE"
+    min_native_balance: 0.005
+    min_profit_usd: 0.30
+    deadline_seconds: 120
+    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+
+  - id: 42161
+    name: "Arbitrum"
+    enabled: false
+    ws_rpc: "wss://arb-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    http_rpc: "https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+    block_time_ms: 250
+    contract_address: "0xYOUR_CONTRACT_ON_ARBITRUM"
+    min_native_balance: 0.005
+    min_profit_usd: 0.30
+    deadline_seconds: 60
+    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+
+  - id: 100
+    name: "Gnosis"
+    enabled: false
+    ws_rpc: "wss://rpc.gnosischain.com/wss"
+    http_rpc: "https://rpc.gnosischain.com"
+    native_currency: "xDAI"
+    wrapped_native: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"
+    block_time_ms: 5000
+    contract_address: "0xYOUR_CONTRACT_ON_GNOSIS"
+    min_native_balance: 1.0
+    min_profit_usd: 0.20
+    deadline_seconds: 180
+
+  - id: 137
+    name: "Polygon"
+    enabled: false
+    ws_rpc: "wss://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    http_rpc: "https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    native_currency: "MATIC"
+    wrapped_native: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
+    block_time_ms: 2000
+    contract_address: "0xYOUR_CONTRACT_ON_POLYGON"
+    min_native_balance: 10.0
+    min_profit_usd: 0.30
+    deadline_seconds: 120
+    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+
+  - id: 534352
+    name: "Scroll"
+    enabled: false
+    ws_rpc: "wss://scroll-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    http_rpc: "https://scroll-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0x5300000000000000000000000000000000000004"
+    block_time_ms: 3000
+    contract_address: "0xYOUR_CONTRACT_ON_SCROLL"
+    min_native_balance: 0.005
+    min_profit_usd: 0.20
+    deadline_seconds: 120
+
+  - id: 59144
+    name: "Linea"
+    enabled: false
+    ws_rpc: "wss://linea-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    http_rpc: "https://linea-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f"
+    block_time_ms: 3000
+    contract_address: "0xYOUR_CONTRACT_ON_LINEA"
+    min_native_balance: 0.005
+    min_profit_usd: 0.20
+    deadline_seconds: 120
+
+
+# ─── ROUTERS ──────────────────────────────────────────────
+# type: "v2" = Uniswap V2-compatible (getAmountsOut + swapExactTokensForTokens)
+#        "v3" = Uniswap V3-compatible (QuoterV2.quoteExactInputSingle + exactInputSingle)
+# fee_tiers: V3 only — fee tiers to try (in bps*100): 500=0.05%, 3000=0.3%, 10000=1%
+
+routers:
+  # ── Optimism mainnet routers — DISABLED for local fork testing ──
+  # Uncomment when connecting to real Optimism mainnet (not local Anvil fork).
+  # When enabled alongside MockRouters on the fork, the real QuoterV2 returns
+  # real WETH amounts but MockRouter A gives nonsensical reverse quotes → phantom profits.
+  #
+  # - id: "uniswap-v3-op"
+  #   name: "Uniswap V3 (Optimism)"
+  #   chain_id: 10
+  #   address: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+  #   type: "v3"
+  #   fee_tiers: [500, 3000, 10000]
+  #   fee_bps: 0
+  #
+  # - id: "velodrome-v2-op"
+  #   name: "Velodrome V2 (Optimism)"
+  #   chain_id: 10
+  #   address: "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858"
+  #   type: "v2"
+  #   fee_bps: 5
+
+  # ── Local Anvil fork — MockRouters (deployed by: cargo run -p lab -- setup) ──
+  # RouterB listed first so native price update gets market rate ($2500/WETH)
+  - id: "mock-router-b"
+    name: "MockRouter B (market WETH @ 2500)"
+    chain_id: 10
+    address: "0x0d37ee6c52d6f95e7db94ce48cd78bd0948ede92"
+    type: "v2"
+    fee_bps: 0
+
+  - id: "mock-router-a"
+    name: "MockRouter A (cheap WETH @ 2222)"
+    chain_id: 10
+    address: "0x3a9d4ccbb98e6a3b52a6c2671e4397db5ec88706"
+    type: "v2"
+    fee_bps: 0
+
+  # ── Base ──
+  - id: "uniswap-v3-base"
+    name: "Uniswap V3 (Base)"
+    chain_id: 8453
+    address: "0x2626664c2603336E57B271c5C0b26F421741e481"
+    type: "v3"
+    fee_tiers: [100, 500, 3000, 10000]
+    fee_bps: 0
+
+  - id: "aerodrome-base"
+    name: "Aerodrome (Base)"
+    chain_id: 8453
+    address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
+    type: "v2"
+    fee_bps: 30
+
+  # ── Arbitrum ──
+  - id: "uniswap-v3-arb"
+    name: "Uniswap V3 (Arbitrum)"
+    chain_id: 42161
+    address: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    type: "v3"
+    fee_tiers: [500, 3000, 10000]
+    fee_bps: 0
+
+  - id: "camelot-arb"
+    name: "Camelot (Arbitrum)"
+    chain_id: 42161
+    address: "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
+    type: "v2"
+    fee_bps: 30
+
+  # ── Gnosis ──
+  - id: "sushiswap-gnosis"
+    name: "SushiSwap (Gnosis)"
+    chain_id: 100
+    address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+    type: "v2"
+    fee_bps: 30
+
+  - id: "honeyswap"
+    name: "Honeyswap (Gnosis)"
+    chain_id: 100
+    address: "0x1C232F01118CB8B424793ae03F870aa7D0ac7f77"
+    type: "v2"
+    fee_bps: 30
+
+  # ── Polygon ──
+  - id: "uniswap-v3-polygon"
+    name: "Uniswap V3 (Polygon)"
+    chain_id: 137
+    address: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    type: "v3"
+    fee_tiers: [500, 3000, 10000]
+    fee_bps: 0
+
+  - id: "quickswap-polygon"
+    name: "QuickSwap (Polygon)"
+    chain_id: 137
+    address: "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff"
+    type: "v2"
+    fee_bps: 30
+
+
+# ─── PAIRS ────────────────────────────────────────────────
+# trade_amount: human-readable amount in token_in units (e.g. "1000" = 1000 USDC)
+# max_trade:    optional cap — actual trade = min(trade_amount, max_trade)
+#               prevents excessive price impact on low-liquidity pools
+# watch_pools:  optional pool addresses for real-time Swap event triggers
+
+pairs:
+  # ── Optimism mainnet pairs — DISABLED for local fork testing ──
+  # These pairs use the same token addresses as MockRouters, causing the real QuoterV2
+  # on the fork to mix with MockRouter quotes → phantom profits → circuit breaker.
+  # Uncomment when running against real Optimism mainnet.
+  #
+  # - id: "op-usdc-weth"
+  #   chain_id: 10
+  #   token_in: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
+  #   token_out: "0x4200000000000000000000000000000000000006"
+  #   token_in_symbol: "USDC"
+  #   token_out_symbol: "WETH"
+  #   token_in_decimals: 6
+  #   token_out_decimals: 18
+  #   trade_amount: "5000"
+  #   max_trade: "5000"
+  #   min_swap_size: "10"
+  #   watch_pools:
+  #     - "0x85149247691df622eaF1a8Bd0CaFd40BC45154a"
+  #     - "0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7"
+  #
+  # - id: "op-usdt-weth"
+  #   chain_id: 10
+  #   token_in: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
+  #   token_out: "0x4200000000000000000000000000000000000006"
+  #   token_in_symbol: "USDT"
+  #   token_out_symbol: "WETH"
+  #   token_in_decimals: 6
+  #   token_out_decimals: 18
+  #   trade_amount: "5000"
+  #   max_trade: "5000"
+  #   min_swap_size: "10"
+  #   watch_pools: []
+  #
+  # - id: "op-usdc-usdt"
+  #   chain_id: 10
+  #   token_in: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
+  #   token_out: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
+  #   token_in_symbol: "USDC"
+  #   token_out_symbol: "USDT"
+  #   token_in_decimals: 6
+  #   token_out_decimals: 6
+  #   trade_amount: "10000"
+  #   max_trade: "10000"
+  #   min_swap_size: "10"
+  #   watch_pools: []
+
+  # ── Local Anvil MockRouter pair ──
+  - id: "local-usdc-weth"
+    chain_id: 10
+    token_in: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"   # USDC
+    token_out: "0x4200000000000000000000000000000000000006"   # WETH
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "1000"
+    max_trade: "1000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  # ── Base ──
+  - id: "base-usdc-weth"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x4200000000000000000000000000000000000006"   # WETH
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "base-usdbc-weth"
+    chain_id: 8453
+    token_in: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC (bridged USDC)
+    token_out: "0x4200000000000000000000000000000000000006"   # WETH
+    token_in_symbol: "USDBC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "base-usdc-usdbc"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDBC"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "10000"
+    max_trade: "10000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "base-cbeth-weth"
+    chain_id: 8453
+    token_in: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH
+    token_out: "0x4200000000000000000000000000000000000006"   # WETH
+    token_in_symbol: "CBETH"
+    token_out_symbol: "WETH"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "2"
+    max_trade: "2"
+    min_swap_size: "0.01"
+    watch_pools: []
+
+  # ── Arbitrum ──
+  - id: "arb-usdc-weth"
+    chain_id: 42161
+    token_in: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"   # USDC (native)
+    token_out: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"   # WETH
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "arb-usdce-weth"
+    chain_id: 42161
+    token_in: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"   # USDC.e (bridged)
+    token_out: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"   # WETH
+    token_in_symbol: "USDC.E"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "arb-usdt-weth"
+    chain_id: 42161
+    token_in: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"   # USDT
+    token_out: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"   # WETH
+    token_in_symbol: "USDT"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "arb-usdc-usdce"
+    chain_id: 42161
+    token_in: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"   # USDC (native)
+    token_out: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"   # USDC.e
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDC.E"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "10000"
+    max_trade: "10000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  # ── Gnosis ──
+  - id: "gnosis-usdc-weth"
+    chain_id: 100
+    token_in: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC
+    token_out: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"   # WETH (bridged)
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "2000"
+    max_trade: "2000"
+    min_swap_size: "5"
+    watch_pools: []
+
+  - id: "gnosis-usdc-wxdai"
+    chain_id: 100
+    token_in: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC
+    token_out: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"   # wxDAI
+    token_in_symbol: "USDC"
+    token_out_symbol: "WXDAI"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "5"
+    watch_pools: []
+
+  # ── Polygon ──
+  - id: "polygon-usdc-weth"
+    chain_id: 137
+    token_in: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # USDC (native)
+    token_out: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"   # WETH (bridged)
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "polygon-usdce-weth"
+    chain_id: 137
+    token_in: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e (bridged)
+    token_out: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"   # WETH
+    token_in_symbol: "USDC.E"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "polygon-usdc-usdt"
+    chain_id: 137
+    token_in: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # USDC (native)
+    token_out: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"   # USDT
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDT"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "10000"
+    max_trade: "10000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "polygon-usdc-usdce"
+    chain_id: 137
+    token_in: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # USDC (native)
+    token_out: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDC.E"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "10000"
+    max_trade: "10000"
+    min_swap_size: "10"
+    watch_pools: []
