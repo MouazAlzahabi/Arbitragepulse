@@ -840,6 +840,235 @@ contract ArbitrageExecutorTest is Test {
         executor.setRouterType(address(0), ArbitrageExecutor.RouterType.V3);
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // TRIANGULAR ARBITRAGE TESTS
+    // ═══════════════════════════════════════════════════════════
+
+    function test_Triangular_V2V2V2_Profitable() public {
+        // Setup: TKA → TKB → TKC → TKA loop with profit
+        // Create tokenC (third token) with 1M supply
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
+
+        // Deploy routerBC (TKB/TKC pool) and routerCA (TKC/TKA pool)
+        // Configure pricing loop for profit:
+        // A→B: existing routerA (1 TKA → 2 TKB)
+        // B→C: new routerBC (need rate that gives profit)
+        // C→A: new routerCA (need rate that gives profit)
+        MockRouter routerBC = new MockRouter(3, 1);  // 1 TKB → 3 TKC
+        MockRouter routerCA = new MockRouter(51, 100); // 1 TKC → 0.51 TKA
+
+        // Fund routers
+        tokenC.transfer(address(routerBC), 300_000 ether);
+        tokenB.transfer(address(routerBC), 100_000 ether);
+        tokenA.transfer(address(routerCA), 100_000 ether);
+        tokenC.transfer(address(routerCA), 100_000 ether);
+
+        // Whitelist new routers
+        executor.setAllowedRouter(address(routerBC), true);
+        executor.setAllowedRouter(address(routerCA), true);
+
+        // Calculate expected profit:
+        // 100 TKA → 200 TKB (via routerA: 1→2)
+        // 200 TKB → 600 TKC (via routerBC: 1→3)
+        // 600 TKC → 306 TKA (via routerCA: 1→0.51)
+        // Net: 100 TKA → 306 TKA = +206 TKA profit
+
+        uint256 balBefore = tokenA.balanceOf(address(executor));
+
+        executor.executeTriangularArbitrage(
+            address(tokenA), // TKA
+            address(tokenB), // TKB
+            address(tokenC), // TKC
+            100 ether,
+            address(routerA),  // A→B (1→2)
+            address(routerBC), // B→C (1→3)
+            address(routerCA), // C→A (1→0.51)
+            0, 0, 0, // V2 fees
+            100 ether, // minProfit (expect ~206)
+            deadline
+        );
+
+        uint256 balAfter = tokenA.balanceOf(address(executor));
+        uint256 profit = balAfter - balBefore;
+
+        assertGt(profit, 100 ether); // At least 100 TKA profit
+        assertEq(executor.totalTrades(), 1);
+    }
+
+    function test_Triangular_V3V3V3_Profitable() public {
+        // V3 triangular: TKA → TKB → TKC → TKA with V3 routers
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
+
+        // Deploy V3 routers for B→C and C→A legs
+        MockV3Router routerV3_BC = new MockV3Router(3, 1);  // 1 TKB → 3 TKC
+        MockV3Router routerV3_CA = new MockV3Router(51, 100); // 1 TKC → 0.51 TKA
+
+        // Fund routers
+        tokenC.transfer(address(routerV3_BC), 300_000 ether);
+        tokenB.transfer(address(routerV3_BC), 100_000 ether);
+        tokenA.transfer(address(routerV3_CA), 100_000 ether);
+        tokenC.transfer(address(routerV3_CA), 100_000 ether);
+
+        // Whitelist and set types
+        executor.setAllowedRouter(address(routerV3_BC), true);
+        executor.setAllowedRouter(address(routerV3_CA), true);
+        executor.setRouterType(address(routerV3_BC), ArbitrageExecutor.RouterType.V3);
+        executor.setRouterType(address(routerV3_CA), ArbitrageExecutor.RouterType.V3);
+
+        uint256 balBefore = tokenA.balanceOf(address(executor));
+
+        executor.executeTriangularArbitrage(
+            address(tokenA),
+            address(tokenB),
+            address(tokenC),
+            100 ether,
+            address(routerV3A),   // A→B (V3, 1→2)
+            address(routerV3_BC), // B→C (V3, 1→3)
+            address(routerV3_CA), // C→A (V3, 1→0.51)
+            3000, 3000, 3000, // V3 fee tiers
+            100 ether,
+            deadline
+        );
+
+        uint256 balAfter = tokenA.balanceOf(address(executor));
+        assertGt(balAfter - balBefore, 100 ether);
+    }
+
+    function test_Triangular_MixedV2V3_Profitable() public {
+        // Mixed: V2 → V3 → V2
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
+
+        MockRouter routerCA_v2 = new MockRouter(51, 100); // 1 TKC → 0.51 TKA (V2)
+        MockV3Router routerBC_v3 = new MockV3Router(3, 1); // 1 TKB → 3 TKC (V3)
+
+        tokenA.transfer(address(routerCA_v2), 100_000 ether);
+        tokenC.transfer(address(routerCA_v2), 100_000 ether);
+        tokenB.transfer(address(routerBC_v3), 100_000 ether);
+        tokenC.transfer(address(routerBC_v3), 300_000 ether);
+
+        executor.setAllowedRouter(address(routerCA_v2), true);
+        executor.setAllowedRouter(address(routerBC_v3), true);
+        executor.setRouterType(address(routerBC_v3), ArbitrageExecutor.RouterType.V3);
+
+        uint256 balBefore = tokenA.balanceOf(address(executor));
+
+        executor.executeTriangularArbitrage(
+            address(tokenA),
+            address(tokenB),
+            address(tokenC),
+            100 ether,
+            address(routerA),      // V2 (1→2)
+            address(routerBC_v3),  // V3 (1→3)
+            address(routerCA_v2),  // V2 (1→0.51)
+            0, 3000, 0,
+            100 ether,
+            deadline
+        );
+
+        uint256 balAfter = tokenA.balanceOf(address(executor));
+        assertGt(balAfter - balBefore, 100 ether);
+    }
+
+    function test_Triangular_RevertsIfUnprofitable() public {
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
+
+        // Bad pricing: loss loop - use routerC (existing V2 loss router: 1→0.4)
+        // A→B: 100 → 200 (routerA)
+        // B→C: 200 → 80 (routerC gives 0.4 rate, treating B as input)
+        // C→A: need to get back >100 from 80 TKC → impossible
+        MockRouter routerCA_bad = new MockRouter(2, 10); // 1 TKC → 0.2 TKA (bad rate)
+        tokenA.transfer(address(routerCA_bad), 100_000 ether);
+        tokenC.transfer(address(routerCA_bad), 100_000 ether);
+        executor.setAllowedRouter(address(routerCA_bad), true);
+
+        vm.expectRevert();
+        executor.executeTriangularArbitrage(
+            address(tokenA),
+            address(tokenB),
+            address(tokenC),
+            100 ether,
+            address(routerA),    // 1→2
+            address(routerC),    // Treats input as B, gives 0.4 output
+            address(routerCA_bad), // 1→0.2
+            0, 0, 0,
+            1 ether, // require 1 TKA profit
+            deadline
+        );
+    }
+
+    function test_Triangular_RevertsIfRouterNotAllowed() public {
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
+        MockRouter routerCA_unwhitelisted = new MockRouter(51, 100);
+        // Don't whitelist
+
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(routerCA_unwhitelisted)));
+        executor.executeTriangularArbitrage(
+            address(tokenA),
+            address(tokenB),
+            address(tokenC),
+            100 ether,
+            address(routerA),
+            address(routerA),
+            address(routerCA_unwhitelisted), // not whitelisted
+            0, 0, 0,
+            1 ether,
+            deadline
+        );
+    }
+
+    function test_Triangular_RevertsIfZeroAddress() public {
+        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
+        executor.executeTriangularArbitrage(
+            address(0), // tokenA = 0
+            address(tokenB),
+            address(tokenA),
+            1000 ether,
+            address(routerA),
+            address(routerA),
+            address(routerA),
+            0, 0, 0,
+            1 ether,
+            deadline
+        );
+    }
+
+    function test_Triangular_RevertsIfZeroAmount() public {
+        MockERC20 tokenC = new MockERC20("OP", "OP", 18);
+
+        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
+        executor.executeTriangularArbitrage(
+            address(tokenA),
+            address(tokenB),
+            address(tokenC),
+            0, // amountIn = 0
+            address(routerA),
+            address(routerA),
+            address(routerA),
+            0, 0, 0,
+            1 ether,
+            deadline
+        );
+    }
+
+    function test_Triangular_NonOwnerCannotExecute() public {
+        MockERC20 tokenC = new MockERC20("OP", "OP", 18);
+
+        vm.prank(attacker);
+        vm.expectRevert();
+        executor.executeTriangularArbitrage(
+            address(tokenA),
+            address(tokenB),
+            address(tokenC),
+            1000 ether,
+            address(routerA),
+            address(routerA),
+            address(routerA),
+            0, 0, 0,
+            1 ether,
+            deadline
+        );
+    }
+
     // Allow receiving ETH for withdraw tests
     receive() external payable {}
 }

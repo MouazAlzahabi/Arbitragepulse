@@ -32,6 +32,31 @@ pub struct ArbOpportunity {
     pub router_b_id: String,
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TriangularOpportunity {
+    pub chain_id: u64,
+    pub triplet_id: String, // "USDC-WETH-OP"
+    pub token_a: Address,
+    pub token_b: Address,
+    pub token_c: Address,
+    pub amount_in: U256,
+    pub router_ab: Address,
+    pub router_bc: Address,
+    pub router_ca: Address,
+    pub router_ab_type: RouterType,
+    pub router_bc_type: RouterType,
+    pub router_ca_type: RouterType,
+    pub fee_ab: u32,
+    pub fee_bc: u32,
+    pub fee_ca: u32,
+    pub expected_profit: U256,
+    pub profit_usd: f64,
+    pub router_ab_id: String,
+    pub router_bc_id: String,
+    pub router_ca_id: String,
+}
+
 // ─── Internal task metadata ───────────────────────────────────────────────────
 
 #[derive(Clone)]

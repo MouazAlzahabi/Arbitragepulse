@@ -263,6 +263,97 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     // ═══════════════════════════════════════════════════════════
+    // CORE: Triangular Arbitrage (3-token loop)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * @notice Execute triangular arbitrage: A → B → C → A loop.
+     *         Example: USDC → WETH → OP → USDC
+     *
+     * All three legs can use V2 or V3 routers (dispatch is automatic).
+     *
+     * @param tokenA     Base token we start and end with
+     * @param tokenB     First intermediate token
+     * @param tokenC     Second intermediate token
+     * @param amountIn   How much tokenA to start with
+     * @param routerAB   Router for A→B leg
+     * @param routerBC   Router for B→C leg
+     * @param routerCA   Router for C→A leg
+     * @param feeAB      V3 fee tier for A→B (0 for V2)
+     * @param feeBC      V3 fee tier for B→C (0 for V2)
+     * @param feeCA      V3 fee tier for C→A (0 for V2)
+     * @param minProfit  Minimum profit required in tokenA units
+     * @param deadline   Unix timestamp — revert if tx lands after this
+     */
+    function executeTriangularArbitrage(
+        address tokenA,
+        address tokenB,
+        address tokenC,
+        uint256 amountIn,
+        address routerAB,
+        address routerBC,
+        address routerCA,
+        uint24 feeAB,
+        uint24 feeBC,
+        uint24 feeCA,
+        uint256 minProfit,
+        uint256 deadline
+    )
+        external
+        onlyOwner
+        whenNotPaused
+        nonReentrant
+        checkDeadline(deadline)
+    {
+        if (amountIn == 0) revert ZeroAmount();
+        if (tokenA == address(0) || tokenB == address(0) || tokenC == address(0)) {
+            revert ZeroAddress();
+        }
+        if (!allowedRouters[routerAB]) revert RouterNotAllowed(routerAB);
+        if (!allowedRouters[routerBC]) revert RouterNotAllowed(routerBC);
+        if (!allowedRouters[routerCA]) revert RouterNotAllowed(routerCA);
+
+        uint256 balanceBefore = IERC20(tokenA).balanceOf(address(this));
+
+        // ── Leg 1: A → B ──
+        uint256 amountB;
+        if (routerType[routerAB] == RouterType.V3) {
+            amountB = _executeSwapV3(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
+        } else {
+            amountB = _executeSwapV2(tokenA, tokenB, amountIn, routerAB, 0, deadline);
+        }
+
+        // ── Leg 2: B → C ──
+        uint256 amountC;
+        if (routerType[routerBC] == RouterType.V3) {
+            amountC = _executeSwapV3(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
+        } else {
+            amountC = _executeSwapV2(tokenB, tokenC, amountB, routerBC, 0, deadline);
+        }
+
+        // ── Leg 3: C → A ──
+        // Require at least amountIn + minProfit on the final leg for router-level MEV protection
+        if (routerType[routerCA] == RouterType.V3) {
+            _executeSwapV3(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
+        } else {
+            _executeSwapV2(tokenC, tokenA, amountC, routerCA, amountIn + minProfit, deadline);
+        }
+
+        // ── Profitability gate ──
+        uint256 balanceAfter = IERC20(tokenA).balanceOf(address(this));
+        if (balanceAfter < balanceBefore + minProfit) {
+            revert NotProfitable(balanceBefore, balanceAfter, minProfit);
+        }
+
+        uint256 profit = balanceAfter - balanceBefore;
+        totalProfit[tokenA] += profit;
+        totalTrades++;
+
+        // Emit event with tokenB as "tokenOut" for dashboard compatibility
+        emit ArbitrageExecuted(tokenA, tokenB, routerAB, routerCA, amountIn, profit);
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // CORE: Batch Execution (improvement #6)
     // ═══════════════════════════════════════════════════════════
 
