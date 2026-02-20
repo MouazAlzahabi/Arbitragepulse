@@ -80,6 +80,21 @@ sol! {
             uint256 deadline
         ) external;
 
+        function executeTriangularArbitrage(
+            address tokenA,
+            address tokenB,
+            address tokenC,
+            uint256 amountIn,
+            address routerAB,
+            address routerBC,
+            address routerCA,
+            uint24 feeAB,
+            uint24 feeBC,
+            uint24 feeCA,
+            uint256 minProfit,
+            uint256 deadline
+        ) external;
+
         function setAllowedRouter(address router, bool approved) external;
         function setRouterType(address router, uint8 rtype) external;
         function allowedRouters(address router) external view returns (bool);

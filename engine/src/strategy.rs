@@ -385,6 +385,152 @@ impl Strategy {
         opportunities
     }
 
+    /// Detect triangular arbitrage opportunities (A → B → C → A loops).
+    /// Returns top opportunities sorted by expected profit.
+    ///
+    /// Simplified implementation: enumerates all trusted token triplets,
+    /// quotes all 3 legs via multicall, filters profitable loops.
+    pub async fn detect_triangular<P: Provider + Clone>(
+        &self,
+        provider: &P,
+        max_opportunities: usize,
+    ) -> Vec<TriangularOpportunity> {
+        // Only run if we have at least 3 trusted tokens
+        let trusted_tokens: Vec<_> = self.pairs.iter()
+            .filter(|p| p.chain_id == self.chain_id)
+            .flat_map(|p| vec![&p.token_in, &p.token_out])
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if trusted_tokens.len() < 3 {
+            return vec![];
+        }
+
+        let chain_routers: Vec<&RouterConfig> = self.routers.iter()
+            .filter(|r| r.chain_id == self.chain_id)
+            .collect();
+
+        if chain_routers.is_empty() {
+            return vec![];
+        }
+
+        // For each triplet (A, B, C), try A→B→C→A with all router combinations
+        // Limit: only first 10 token triplets to avoid combinatorial explosion
+        let mut triplet_tasks = Vec::new();
+        for (i, token_a_str) in trusted_tokens.iter().take(10).enumerate() {
+            for (j, token_b_str) in trusted_tokens.iter().skip(i + 1).take(10).enumerate() {
+                for (_, token_c_str) in trusted_tokens.iter().skip(i + j + 2).take(10).enumerate() {
+                    let token_a: Address = match token_a_str.parse() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    let token_b: Address = match token_b_str.parse() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    let token_c: Address = match token_c_str.parse() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+
+                    // Use fixed amount: 1000 units of tokenA (assumed USDC-like)
+                    let amount_in = U256::from(1000_000_000u128); // 1000 with 6 decimals
+
+                    // Try one router combination per triplet (simplest case)
+                    // Production would try all router combinations
+                    if let Some(router) = chain_routers.first() {
+                        triplet_tasks.push((
+                            token_a, token_b, token_c, amount_in,
+                            router.address.clone(), router.router_type.clone(), router.fee_tiers.first().cloned().unwrap_or(3000),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Quote all triplets via multicall (simplified: use same router for all legs)
+        // Production would enumerate all router combinations
+        let mut opportunities = Vec::new();
+        for (token_a, token_b, token_c, amount_in, router_addr_str, router_type, fee) in triplet_tasks {
+            let router_addr: Address = match router_addr_str.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            // Quote A→B
+            let amount_b_opt = match router_type {
+                RouterType::V2 => quote_v2(provider, router_addr, amount_in, token_a, token_b).await,
+                RouterType::V3 => {
+                    let Some(quoter) = self.quoter_v2_address else { continue };
+                    quote_v3(provider, quoter, amount_in, token_a, token_b, fee).await
+                }
+            };
+            let amount_b = match amount_b_opt { Some(a) => a, None => continue };
+
+            // Quote B→C
+            let amount_c_opt = match router_type {
+                RouterType::V2 => quote_v2(provider, router_addr, amount_b, token_b, token_c).await,
+                RouterType::V3 => {
+                    let Some(quoter) = self.quoter_v2_address else { continue };
+                    quote_v3(provider, quoter, amount_b, token_b, token_c, fee).await
+                }
+            };
+            let amount_c = match amount_c_opt { Some(a) => a, None => continue };
+
+            // Quote C→A
+            let final_a_opt = match router_type {
+                RouterType::V2 => quote_v2(provider, router_addr, amount_c, token_c, token_a).await,
+                RouterType::V3 => {
+                    let Some(quoter) = self.quoter_v2_address else { continue };
+                    quote_v3(provider, quoter, amount_c, token_c, token_a, fee).await
+                }
+            };
+            let final_a = match final_a_opt { Some(a) => a, None => continue };
+
+            // Check profitability
+            if final_a <= amount_in {
+                continue;
+            }
+
+            let profit = final_a - amount_in;
+            let profit_usd = u256_to_f64(profit) / 1_000_000.0; // Assume USDC-like
+
+            if profit_usd < self.min_profit_usd {
+                continue;
+            }
+
+            let triplet_id = format!("{:?}-{:?}-{:?}", token_a, token_b, token_c);
+
+            opportunities.push(TriangularOpportunity {
+                chain_id: self.chain_id,
+                triplet_id,
+                token_a,
+                token_b,
+                token_c,
+                amount_in,
+                router_ab: router_addr,
+                router_bc: router_addr,
+                router_ca: router_addr,
+                router_ab_type: router_type.clone(),
+                router_bc_type: router_type.clone(),
+                router_ca_type: router_type.clone(),
+                fee_ab: fee,
+                fee_bc: fee,
+                fee_ca: fee,
+                expected_profit: profit,
+                profit_usd,
+                router_ab_id: router_addr_str.clone(),
+                router_bc_id: router_addr_str.clone(),
+                router_ca_id: router_addr_str,
+            });
+        }
+
+        opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
+        opportunities.truncate(max_opportunities);
+        opportunities
+    }
+
     /// Two-round adaptive size optimizer (~2 RTTs, ~200ms).
     ///
     /// Round 1 (coarse): 5 probes linearly across [10% → 200%] of `amount_in`,

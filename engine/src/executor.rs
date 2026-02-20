@@ -8,11 +8,14 @@ use tracing::{info, warn};
 
 use crate::abi::ArbitrageExecutor;
 use crate::db::Database;
-use crate::strategy::ArbOpportunity;
+use crate::strategy::{ArbOpportunity, TriangularOpportunity};
 
 // Hardcoded gas limit — 300k covers any 2-hop arb (V2+V2, V2+V3, V3+V3).
 // We skip eth_estimateGas to save one RPC round-trip per execution.
 const GAS_LIMIT: u64 = 300_000;
+
+// Triangular arb gas limit — 450k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
+const GAS_LIMIT_TRIANGULAR: u64 = 450_000;
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
@@ -232,6 +235,137 @@ impl Executor {
         }
     }
 
+    /// Execute triangular arbitrage (A→B→C→A). Same flow as execute() but with
+    /// 450k gas limit and different contract call.
+    pub async fn execute_triangular<P: Provider + Clone + 'static>(
+        &mut self,
+        provider: &P,
+        opp: &TriangularOpportunity,
+    ) -> Result<String> {
+        if self.paused {
+            return Err(anyhow!("Executor paused"));
+        }
+
+        let gas_price = provider.get_gas_price().await.unwrap_or(1_000_000_000u128);
+
+        let gas_cost_usd = {
+            let cost_wei = gas_price * GAS_LIMIT_TRIANGULAR as u128;
+            cost_wei as f64 / 1e18 * self.native_price_usd
+        };
+        let net_profit_usd = opp.profit_usd - gas_cost_usd;
+        if net_profit_usd < self.min_profit_usd {
+            return Err(anyhow!(
+                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) below threshold ${:.2}",
+                net_profit_usd, opp.profit_usd, gas_cost_usd, self.min_profit_usd,
+            ));
+        }
+
+        let deadline = self.deadline();
+        let calldata = self.build_triangular_calldata(opp, deadline);
+        let mut tx_base = TransactionRequest::default()
+            .to(self.contract_address)
+            .input(calldata.into());
+        tx_base.gas = Some(GAS_LIMIT_TRIANGULAR);
+
+        self.stats.total_attempts += 1;
+
+        if self.dry_run {
+            match provider.call(tx_base).await {
+                Ok(_) => {
+                    self.stats.total_simulated += 1;
+                    let tx_hash =
+                        "0x0000000000000000000000000000000000000000000000000000000000000000"
+                            .to_string();
+                    info!(
+                        "[{}] DRY-RUN triangular ok | gross=${:.4} gas≈${:.4} net=${:.4}",
+                        self.chain_name, opp.profit_usd, gas_cost_usd, net_profit_usd
+                    );
+                    // TODO: persist triangular trade with token_c
+                    return Ok(tx_hash);
+                }
+                Err(e) => {
+                    self.stats.total_failed += 1;
+                    return Err(anyhow!("Triangular simulation failed: {}", e));
+                }
+            }
+        }
+
+        let nonce = match self.nonce {
+            Some(n) => n,
+            None => provider
+                .get_transaction_count(self.signer_address)
+                .await
+                .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
+        };
+
+        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let tx = tx_base
+            .nonce(nonce)
+            .max_priority_fee_per_gas(priority_fee)
+            .max_fee_per_gas(gas_price + priority_fee);
+
+        let start = std::time::Instant::now();
+
+        match provider.send_transaction(tx).await {
+            Ok(pending) => {
+                self.nonce = Some(nonce + 1);
+                let tx_hash = format!("{:?}", pending.tx_hash());
+                let elapsed_send = start.elapsed().as_millis() as u64;
+
+                self.stats.total_success += 1;
+                self.stats.total_profit_wei += opp.expected_profit;
+                self.stats.last_tx_hash = Some(tx_hash.clone());
+                self.stats.last_execution_ms = Some(elapsed_send);
+
+                info!(
+                    "[{}] Triangular arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={}",
+                    self.chain_name,
+                    elapsed_send,
+                    opp.profit_usd,
+                    net_profit_usd,
+                    &tx_hash[..10.min(tx_hash.len())],
+                );
+
+                let chain_name = self.chain_name.clone();
+                let chain_id = self.chain_id;
+                let triplet_id = opp.triplet_id.clone();
+                let profit_usd = opp.profit_usd;
+                let dry_run = self.dry_run;
+                let tx_hash_bg = tx_hash.clone();
+                let provider_bg = provider.clone();
+
+                tokio::spawn(async move {
+                    match pending.get_receipt().await {
+                        Ok(receipt) => {
+                            if receipt.status() {
+                                info!(
+                                    "[{}] ✓ triangular confirmed | gas={} | tx={}",
+                                    chain_name,
+                                    receipt.gas_used,
+                                    &tx_hash_bg[..10.min(tx_hash_bg.len())],
+                                );
+                            } else {
+                                warn!("[{}] ✗ triangular reverted | tx={}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                            }
+                            // TODO: persist triangular trade to DB
+                        }
+                        Err(e) => {
+                            warn!("[{}] Triangular receipt error for {}: {}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                        }
+                    }
+                    drop(provider_bg);
+                });
+
+                Ok(tx_hash)
+            }
+            Err(e) => {
+                self.nonce = None;
+                self.stats.total_failed += 1;
+                Err(anyhow!("Triangular send failed: {}", e))
+            }
+        }
+    }
+
     /// Whitelist a router on the contract (onlyOwner call).
     #[allow(dead_code)]
     pub async fn whitelist_router<P: Provider>(
@@ -318,6 +452,24 @@ impl Executor {
             routerB: opp.router_b,
             feeA: Uint::<24, 1>::from(opp.fee_a),
             feeB: Uint::<24, 1>::from(opp.fee_b),
+            minProfit: opp.expected_profit / U256::from(2u32), // 50% slippage buffer
+            deadline,
+        }
+        .abi_encode()
+    }
+
+    fn build_triangular_calldata(&self, opp: &TriangularOpportunity, deadline: U256) -> Vec<u8> {
+        ArbitrageExecutor::executeTriangularArbitrageCall {
+            tokenA: opp.token_a,
+            tokenB: opp.token_b,
+            tokenC: opp.token_c,
+            amountIn: opp.amount_in,
+            routerAB: opp.router_ab,
+            routerBC: opp.router_bc,
+            routerCA: opp.router_ca,
+            feeAB: Uint::<24, 1>::from(opp.fee_ab),
+            feeBC: Uint::<24, 1>::from(opp.fee_bc),
+            feeCA: Uint::<24, 1>::from(opp.fee_ca),
             minProfit: opp.expected_profit / U256::from(2u32), // 50% slippage buffer
             deadline,
         }
