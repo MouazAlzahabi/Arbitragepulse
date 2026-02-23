@@ -43,6 +43,7 @@ cd contract
 DEPLOY_OUTPUT=$(forge create \
   --rpc-url $LINEA_RPC \
   --private-key $PRIVATE_KEY \
+  --broadcast \
   src/ArbitrageExecutor.sol:ArbitrageExecutor 2>&1)
 
 CONTRACT_ADDRESS=$(echo "$DEPLOY_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
