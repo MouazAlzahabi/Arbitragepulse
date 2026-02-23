@@ -18,7 +18,7 @@ use crate::db::Database;
 use crate::executor::Executor;
 use crate::listener::{Listener, SwapEvent};
 use crate::metrics::Metrics;
-use crate::strategy::Strategy;
+use crate::strategy::{Opportunity, Strategy};
 
 const COOLDOWN_SECS: u64 = 15;
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
@@ -62,6 +62,7 @@ pub async fn run_chain(
         contract_addr,
         signer_address,
         cfg.min_profit_usd,
+        cfg.block_time_ms,
         db,
     )));
 
@@ -91,6 +92,9 @@ pub async fn run_chain(
         quoter_v2_address,
     )));
 
+    // ── Router health monitoring ──
+    let router_monitor = Arc::new(crate::router_health::RouterHealthMonitor::new());
+
     // ── Register initial chain stats ──
     {
         let mut state = shared_state.write().await;
@@ -113,7 +117,7 @@ pub async fn run_chain(
     metrics.rpc_connected.with_label_values(&[&cfg.name]).set(1.0);
 
     // ── Swap event listener ──
-    let listener = Listener::new(cfg.id, cfg.name.clone(), chain_pairs.clone());
+    let listener = Listener::new(cfg.id, cfg.name.clone(), chain_pairs.clone(), cfg.min_swap_amount_filter);
     let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(256);
     {
         let provider_clone = (*provider).clone();
@@ -178,9 +182,11 @@ pub async fn run_chain(
                 return Ok(());
             }
 
-            // ── Periodic price update ──────────────────────────────────────────
+            // ── Periodic price update + cache cleanup ─────────────────────────
             _ = price_tick.tick() => {
                 update_native_price(&strategy, &executor, &provider, &chain_routers, &chain_pairs, &cfg).await;
+                // Clean up expired quote cache entries
+                { let mut strat = strategy.write().await; strat.cleanup_quote_cache(); }
             }
 
             // ── Config hot-reload ─────────────────────────────────────────────
@@ -229,6 +235,7 @@ pub async fn run_chain(
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &router_monitor,
                 ).await;
             }
 
@@ -242,6 +249,7 @@ pub async fn run_chain(
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &router_monitor,
                 ).await;
             }
 
@@ -256,6 +264,7 @@ pub async fn run_chain(
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &router_monitor,
                 ).await;
             }
         }
@@ -276,132 +285,317 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     pending_pairs: &mut HashSet<String>,
     cooldowns: &mut HashMap<String, Instant>,
     consecutive_failures: &mut u32,
+    router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
 ) {
-    let opportunities = {
+    // ── Parallel detection: 2-hop + triangular in single await ────────────────
+
+    let all_opportunities = {
         let strat = strategy.read().await;
-        strat.evaluate(provider.as_ref()).await
+        let (opps_2hop, opps_tri) = tokio::join!(
+            strat.evaluate(provider.as_ref()),
+            strat.detect_triangular(provider.as_ref(), 5)  // Top 5 triangular
+        );
+
+        // Merge both lists into unified Opportunity enum
+        let mut merged = Vec::new();
+        merged.extend(opps_2hop.into_iter().map(Opportunity::TwoHop));
+        merged.extend(opps_tri.into_iter().map(Opportunity::Triangular));
+
+        // Sort by profit_usd descending
+        merged.sort_by(|a, b| {
+            b.profit_usd()
+                .partial_cmp(&a.profit_usd())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        merged
     };
 
-    if opportunities.is_empty() {
+    if all_opportunities.is_empty() {
         return;
     }
 
     metrics.opportunities.with_label_values(&[&cfg.name]).inc();
 
-    let pair_id = opportunities[0].pair_id.clone();
+    let best_opp = &all_opportunities[0];
+    let fingerprint = best_opp.fingerprint();
+    let display_id = best_opp.pair_id();
 
-    // Per-pair cooldown
-    if let Some(&cooled_at) = cooldowns.get(&pair_id) {
+    // Full opportunity cooldown (pair + routers + amount)
+    if let Some(&cooled_at) = cooldowns.get(&fingerprint) {
         if cooled_at.elapsed().as_secs() < COOLDOWN_SECS {
-            debug!("[{}] {} in cooldown, skipping", cfg.name, pair_id);
+            debug!("[{}] {} in cooldown, skipping", cfg.name, display_id);
             return;
         }
-        cooldowns.remove(&pair_id);
+        cooldowns.remove(&fingerprint);
     }
 
-    // Pending tx dedup
-    if pending_pairs.contains(&pair_id) {
-        debug!("[{}] {} tx already in-flight, skipping", cfg.name, pair_id);
+    // Pending tx dedup (full fingerprint prevents duplicate identical opportunities)
+    if pending_pairs.contains(&fingerprint) {
+        debug!("[{}] {} tx already in-flight, skipping", cfg.name, display_id);
         return;
     }
 
-    // Two-round adaptive size optimizer
-    let best = {
-        let strat = strategy.read().await;
-        strat.optimize(&opportunities[0], provider.as_ref()).await
-    };
+    // ── Dispatch based on opportunity type ────────────────────────────────────
 
-    broadcast_log(
-        log_tx,
-        "opportunity",
-        &format!(
-            "[{}] {} | profit=${:.4} | {}/{}",
-            cfg.name, best.pair_id, best.profit_usd, best.router_a_id, best.router_b_id
-        ),
-        Some(serde_json::json!({
-            "chain":      cfg.name,
-            "pair_id":    best.pair_id,
-            "profit_usd": best.profit_usd,
-            "router_a":   best.router_a_id,
-            "router_b":   best.router_b_id,
-        })),
-    );
+    match best_opp {
+        Opportunity::TwoHop(opp) => {
+            // Two-round adaptive size optimizer (only for 2-hop)
+            let optimized = {
+                let strat = strategy.read().await;
+                strat.optimize(opp, provider.as_ref()).await
+            };
 
-    pending_pairs.insert(pair_id.clone());
-
-    let dry_run = shared_state.read().await.dry_run;
-    let mut exec = executor.lock().await;
-    exec.dry_run = dry_run;
-
-    match exec.execute(provider.as_ref(), &best).await {
-        Ok(tx_hash) => {
-            *consecutive_failures = 0;
-            pending_pairs.remove(&pair_id);
-
-            let dry_label = if dry_run { "true" } else { "false" };
-            metrics.executed.with_label_values(&[&cfg.name, dry_label]).inc();
-            if !dry_run {
-                metrics.profit_usd.with_label_values(&[&cfg.name]).add(best.profit_usd);
-            }
-
-            let mut state = shared_state.write().await;
-            if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
-                chain.total_attempts += 1;
-                chain.total_success += 1;
-                chain.total_profit_usd += best.profit_usd;
-            }
             broadcast_log(
                 log_tx,
-                "trade",
+                "opportunity",
                 &format!(
-                    "[{}] tx={} | pair={} | profit=${:.4}",
-                    cfg.name,
-                    &tx_hash[..10.min(tx_hash.len())],
-                    best.pair_id,
-                    best.profit_usd
+                    "[{}] 2-hop {} | profit=${:.4} | {}/{}",
+                    cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
                 ),
                 Some(serde_json::json!({
                     "chain":      cfg.name,
-                    "pair_id":    best.pair_id,
-                    "profit_usd": best.profit_usd,
+                    "pair_id":    optimized.pair_id,
+                    "profit_usd": optimized.profit_usd,
+                    "router_a":   optimized.router_a_id,
+                    "router_b":   optimized.router_b_id,
                 })),
             );
-        }
-        Err(e) => {
-            pending_pairs.remove(&pair_id);
-            cooldowns.insert(pair_id.clone(), Instant::now());
-            *consecutive_failures += 1;
 
-            metrics.failures.with_label_values(&[&cfg.name]).inc();
+            pending_pairs.insert(fingerprint.clone());
 
-            let mut state = shared_state.write().await;
-            if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
-                chain.total_attempts += 1;
-            }
+            let dry_run = shared_state.read().await.dry_run;
+            let mut exec = executor.lock().await;
+            exec.dry_run = dry_run;
 
-            // Circuit breaker
-            if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                warn!(
-                    "[{}] Circuit breaker: {} consecutive failures — pausing chain",
-                    cfg.name, consecutive_failures
-                );
-                if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
-                    chain.paused = true;
+            let exec_start = std::time::Instant::now();
+            let router_ids = vec![optimized.router_a_id.clone(), optimized.router_b_id.clone()];
+
+            match exec.execute(provider.as_ref(), &optimized).await {
+                Ok(tx_hash) => {
+                    let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                    handle_execution_success(
+                        &tx_hash,
+                        &fingerprint,
+                        optimized.profit_usd,
+                        &optimized.pair_id,
+                        &router_ids,
+                        pending_pairs,
+                        consecutive_failures,
+                        dry_run,
+                        cfg,
+                        shared_state,
+                        log_tx,
+                        metrics,
+                        &router_monitor,
+                        exec_time_ms,
+                    )
+                    .await;
                 }
-                broadcast_log(
-                    log_tx,
-                    "error",
-                    &format!(
-                        "[{}] Circuit breaker triggered ({} failures) — chain paused. Resume via API.",
-                        cfg.name, consecutive_failures
-                    ),
-                    None,
-                );
+                Err(e) => {
+                    handle_execution_failure(
+                        e,
+                        &fingerprint,
+                        &router_ids,
+                        pending_pairs,
+                        cooldowns,
+                        consecutive_failures,
+                        cfg,
+                        shared_state,
+                        metrics,
+                        log_tx,
+                        &router_monitor,
+                    )
+                    .await;
+                }
             }
+        }
 
-            broadcast_log(log_tx, "error", &format!("[{}] Execute failed: {}", cfg.name, e), None);
+        Opportunity::Triangular(opp) => {
+            broadcast_log(
+                log_tx,
+                "opportunity",
+                &format!(
+                    "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
+                    cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
+                ),
+                Some(serde_json::json!({
+                    "chain":        cfg.name,
+                    "triplet_id":   opp.triplet_id,
+                    "profit_usd":   opp.profit_usd,
+                    "router_ab":    opp.router_ab_id,
+                    "router_bc":    opp.router_bc_id,
+                    "router_ca":    opp.router_ca_id,
+                })),
+            );
+
+            pending_pairs.insert(fingerprint.clone());
+
+            let dry_run = shared_state.read().await.dry_run;
+            let mut exec = executor.lock().await;
+            exec.dry_run = dry_run;
+
+            let exec_start = std::time::Instant::now();
+            let router_ids = vec![
+                opp.router_ab_id.clone(),
+                opp.router_bc_id.clone(),
+                opp.router_ca_id.clone(),
+            ];
+
+            match exec.execute_triangular(provider.as_ref(), opp).await {
+                Ok(tx_hash) => {
+                    let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                    handle_execution_success(
+                        &tx_hash,
+                        &fingerprint,
+                        opp.profit_usd,
+                        &opp.triplet_id,
+                        &router_ids,
+                        pending_pairs,
+                        consecutive_failures,
+                        dry_run,
+                        cfg,
+                        shared_state,
+                        log_tx,
+                        metrics,
+                        &router_monitor,
+                        exec_time_ms,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    handle_execution_failure(
+                        e,
+                        &fingerprint,
+                        &router_ids,
+                        pending_pairs,
+                        cooldowns,
+                        consecutive_failures,
+                        cfg,
+                        shared_state,
+                        metrics,
+                        log_tx,
+                        &router_monitor,
+                    )
+                    .await;
+                }
+            }
         }
     }
+}
+
+/// Handle successful execution (both 2-hop and triangular).
+async fn handle_execution_success(
+    tx_hash: &str,
+    pair_id: &str,
+    profit_usd: f64,
+    display_id: &str,
+    router_ids: &[String],
+    pending_pairs: &mut HashSet<String>,
+    consecutive_failures: &mut u32,
+    dry_run: bool,
+    cfg: &ChainConfig,
+    shared_state: &SharedState,
+    log_tx: &LogBroadcaster,
+    metrics: &Arc<Metrics>,
+    router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
+    execution_time_ms: u64,
+) {
+    *consecutive_failures = 0;
+    pending_pairs.remove(pair_id);
+
+    // Record router health (success for all routers involved)
+    for router_id in router_ids {
+        router_monitor.record_success(router_id, execution_time_ms);
+    }
+
+    let dry_label = if dry_run { "true" } else { "false" };
+    metrics.executed.with_label_values(&[&cfg.name, dry_label]).inc();
+    if !dry_run {
+        metrics.profit_usd.with_label_values(&[&cfg.name]).add(profit_usd);
+    }
+
+    let mut state = shared_state.write().await;
+    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
+        chain.total_attempts += 1;
+        chain.total_success += 1;
+        chain.total_profit_usd += profit_usd;
+    }
+
+    broadcast_log(
+        log_tx,
+        "trade",
+        &format!(
+            "[{}] tx={} | pair={} | profit=${:.4}",
+            cfg.name,
+            &tx_hash[..10.min(tx_hash.len())],
+            display_id,
+            profit_usd
+        ),
+        Some(serde_json::json!({
+            "chain":      cfg.name,
+            "pair_id":    display_id,
+            "profit_usd": profit_usd,
+        })),
+    );
+}
+
+/// Handle execution failure (both 2-hop and triangular).
+async fn handle_execution_failure(
+    error: anyhow::Error,
+    pair_id: &str,
+    router_ids: &[String],
+    pending_pairs: &mut HashSet<String>,
+    cooldowns: &mut HashMap<String, Instant>,
+    consecutive_failures: &mut u32,
+    cfg: &ChainConfig,
+    shared_state: &SharedState,
+    metrics: &Arc<Metrics>,
+    log_tx: &LogBroadcaster,
+    router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
+) {
+    pending_pairs.remove(pair_id);
+    cooldowns.insert(pair_id.to_string(), Instant::now());
+    *consecutive_failures += 1;
+
+    // Record router health (failure for all routers involved)
+    for router_id in router_ids {
+        router_monitor.record_failure(router_id);
+    }
+
+    metrics.failures.with_label_values(&[&cfg.name]).inc();
+
+    let mut state = shared_state.write().await;
+    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
+        chain.total_attempts += 1;
+    }
+
+    // Circuit breaker
+    if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+        warn!(
+            "[{}] Circuit breaker: {} consecutive failures — pausing chain",
+            cfg.name, consecutive_failures
+        );
+        if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
+            chain.paused = true;
+        }
+        broadcast_log(
+            log_tx,
+            "error",
+            &format!(
+                "[{}] Circuit breaker triggered ({} failures) — chain paused. Resume via API.",
+                cfg.name, consecutive_failures
+            ),
+            None,
+        );
+    }
+
+    broadcast_log(
+        log_tx,
+        "error",
+        &format!("[{}] Execute failed: {}", cfg.name, error),
+        None,
+    );
 }
 
 async fn update_native_price<P: Provider>(
@@ -416,28 +610,45 @@ async fn update_native_price<P: Provider>(
     use alloy::primitives::U256;
     use crate::config::RouterType;
 
+    // Special case: xDAI and other USD-pegged stablecoins
+    if cfg.native_currency == "xDAI" {
+        { let mut strat = strategy.write().await; strat.update_native_price(1.0); }
+        { let mut exec = executor.lock().await; exec.update_native_price(1.0); }
+        return;
+    }
+
+    // Parse wrapped native address from config (WETH, WMATIC, etc.)
+    let wrapped_native: Address = match cfg.wrapped_native.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            warn!("[{}] Invalid wrapped_native address: {}", cfg.name, cfg.wrapped_native);
+            return;
+        }
+    };
+
+    // Find a pair: WrappedNative → Stablecoin (USDC, USDT, DAI)
     let stable_pair = pairs.iter().find(|p| {
         p.chain_id == cfg.id
-            && ["WETH", "ETH"].contains(&p.token_in_symbol.as_str())
+            && p.token_in == cfg.wrapped_native
             && ["USDC", "USDT", "DAI"].contains(&p.token_out_symbol.as_str())
     });
     let stable_pair = match stable_pair { Some(p) => p, None => return };
 
-    let token_in: Address = match stable_pair.token_in.parse() { Ok(a) => a, Err(_) => return };
     let token_out: Address = match stable_pair.token_out.parse() { Ok(a) => a, Err(_) => return };
-    let amount_in = U256::from(1_000_000_000_000_000_000u128);
+    let amount_in = U256::from(1_000_000_000_000_000_000u128); // 1 native token (18 decimals)
 
     for router in routers.iter().filter(|r| r.chain_id == cfg.id && r.router_type == RouterType::V2) {
         let router_addr: Address = match router.address.parse() { Ok(a) => a, Err(_) => continue };
 
         if let Ok(amounts) = IUniswapV2Router02::new(router_addr, provider.as_ref())
-            .getAmountsOut(amount_in, vec![token_in, token_out])
+            .getAmountsOut(amount_in, vec![wrapped_native, token_out])
             .call()
             .await
         {
             if let Some(&out) = amounts.last() {
                 if !out.is_zero() {
                     let price = out.to::<u128>() as f64 / 1_000_000.0;
+                    debug!("[{}] {} price updated: ${:.2}", cfg.name, cfg.native_currency, price);
                     { let mut strat = strategy.write().await; strat.update_native_price(price); }
                     { let mut exec = executor.lock().await; exec.update_native_price(price); }
                     return;

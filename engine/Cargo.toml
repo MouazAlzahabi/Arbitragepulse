@@ -35,3 +35,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Metrics
 prometheus = "0.13"
+
+# Config env-var substitution
+regex = "1"

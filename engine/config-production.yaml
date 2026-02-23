@@ -1,0 +1,291 @@
+# ============================================================
+# ArbitragePulse Engine — PRODUCTION Multi-Chain Configuration
+# ============================================================
+# Chains: Linea, Scroll, Gnosis
+# RPC: Alchemy (Linea/Scroll), Gnosis native RPC
+# All router addresses verified from block explorers
+# ============================================================
+
+# ─── CHAINS ────────────────────────────────────────────────
+
+chains:
+  # ────────────────────────────────────────────────────────
+  # LINEA (Chain ID: 59144)
+  # ────────────────────────────────────────────────────────
+  - id: 59144
+    name: "Linea"
+    enabled: true  # Start here for $60 test
+    ws_rpc: "wss://linea-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    http_rpc: "https://linea-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    block_time_ms: 2000  # 2 second blocks
+    contract_address: "0xYOUR_CONTRACT_ON_LINEA"  # Update after deployment
+    min_native_balance: 0.01  # Minimum 0.01 ETH for gas
+    min_profit_usd: 1.5  # $1.50 minimum profit (conservative for mainnet)
+    deadline_seconds: 120
+    min_swap_amount_filter: 20000000000000000  # 0.02 ETH or 20 USDC (filters dust)
+    ws_rpc_fallbacks:
+      - "wss://rpc.linea.build"  # Public fallback
+
+  # ────────────────────────────────────────────────────────
+  # SCROLL (Chain ID: 534352)
+  # ────────────────────────────────────────────────────────
+  - id: 534352
+    name: "Scroll"
+    enabled: false  # Enable after Linea test succeeds
+    ws_rpc: "wss://scroll-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    http_rpc: "https://scroll-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+    native_currency: "ETH"
+    wrapped_native: "0x5300000000000000000000000000000000000004"  # WETH
+    block_time_ms: 3000  # 3 second blocks
+    contract_address: "0xYOUR_CONTRACT_ON_SCROLL"
+    min_native_balance: 0.01
+    min_profit_usd: 1.5
+    deadline_seconds: 120
+    min_swap_amount_filter: 20000000000000000
+    ws_rpc_fallbacks:
+      - "wss://wss-rpc.scroll.io/l2"
+
+  # ────────────────────────────────────────────────────────
+  # GNOSIS (Chain ID: 100)
+  # ────────────────────────────────────────────────────────
+  - id: 100
+    name: "Gnosis"
+    enabled: false  # Enable after Linea + Scroll tests
+    ws_rpc: "wss://rpc.gnosischain.com/wss"  # Free, unlimited
+    http_rpc: "https://rpc.gnosischain.com"
+    native_currency: "xDAI"  # $1 stablecoin (no price volatility)
+    wrapped_native: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"  # wxDAI
+    block_time_ms: 5000  # 5 second blocks
+    contract_address: "0xYOUR_CONTRACT_ON_GNOSIS"
+    min_native_balance: 2.0  # 2 xDAI ($2 worth of gas)
+    min_profit_usd: 1.0  # Lower threshold (stable gas costs)
+    deadline_seconds: 180  # Longer deadline (slower blocks)
+    min_swap_amount_filter: 10000000000000000
+    ws_rpc_fallbacks:
+      - "wss://gnosis.drpc.org"
+
+
+# ─── ROUTERS ──────────────────────────────────────────────
+# type: "v2" = Uniswap V2-compatible (getAmountsOut + swapExactTokensForTokens)
+#        "v3" = Uniswap V3-compatible (QuoterV2.quoteExactInputSingle + exactInputSingle)
+# fee_tiers: V3 only — fee tiers to try (in bps*100): 500=0.05%, 3000=0.3%, 10000=1%
+# fee_bps: V2 only — fixed fee (30 = 0.3%)
+# ──────────────────────────────────────────────────────────
+
+routers:
+  # ════════════════════════════════════════════════════════
+  # LINEA ROUTERS
+  # ════════════════════════════════════════════════════════
+
+  - id: "lynex-linea"
+    name: "Lynex (Linea)"
+    chain_id: 59144
+    address: "0x1b81d678ffb9c0263b24a97847620c99d213eb14"  # Verified on LineaScan
+    type: "v2"
+    fee_bps: 30  # 0.3%
+
+  - id: "nile-linea"
+    name: "Nile Exchange (Linea)"
+    chain_id: 59144
+    address: "0xAAA45c8F5ef92a000a121d102F4e89278a711Faa"  # Official Nile docs
+    type: "v2"
+    fee_bps: 30
+
+  # ════════════════════════════════════════════════════════
+  # SCROLL ROUTERS
+  # ════════════════════════════════════════════════════════
+
+  - id: "zebra-scroll"
+    name: "Zebra V1 (Scroll)"
+    chain_id: 534352
+    address: "0x0122960d6e391478bfe8fb2408ba412d5600f621"  # Verified on Scrollscan
+    type: "v2"
+    fee_bps: 30
+
+  - id: "syncswap-scroll"
+    name: "SyncSwap (Scroll)"
+    chain_id: 534352
+    address: "0x80e38291e06339d10aab483c65695d004dbd5c69"  # Verified on Scrollscan
+    type: "v2"
+    fee_bps: 30
+
+  # ════════════════════════════════════════════════════════
+  # GNOSIS ROUTERS
+  # ════════════════════════════════════════════════════════
+
+  - id: "honeyswap-gnosis"
+    name: "Honeyswap (Gnosis)"
+    chain_id: 100
+    address: "0x1C232F01118CB8B424793ae03F870aa7D0ac7f77"  # Verified on GnosisScan
+    type: "v2"
+    fee_bps: 30
+
+  - id: "sushiswap-gnosis"
+    name: "SushiSwap (Gnosis)"
+    chain_id: 100
+    address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+    type: "v2"
+    fee_bps: 30
+
+  # Note: Balancer V2 uses Vault + BatchSwap (different interface than V2)
+  # Requires custom integration — deferred for now
+
+
+# ─── PAIRS ────────────────────────────────────────────────
+# trade_amount: human-readable amount in token_in units (e.g. "1000" = 1000 USDC)
+# max_trade:    optional cap — actual trade = min(trade_amount, max_trade)
+#               prevents excessive price impact on low-liquidity pools
+# watch_pools:  optional pool addresses for real-time Swap event triggers
+# ──────────────────────────────────────────────────────────
+
+pairs:
+  # ════════════════════════════════════════════════════════
+  # LINEA PAIRS
+  # ════════════════════════════════════════════════════════
+
+  - id: "linea-usdc-weth"
+    chain_id: 59144
+    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC (verified)
+    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH (verified)
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"  # Start with $100 trades
+    max_trade: "500"  # Cap at $500 to avoid slippage
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "linea-weth-usdc"
+    chain_id: 59144
+    token_in: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    token_out: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.05"  # 0.05 ETH (~$125 at $2500/ETH)
+    max_trade: "0.2"
+    min_swap_size: "0.01"
+    watch_pools: []
+
+  # Add more Linea pairs as liquidity grows
+  # Potential: USDT/USDC, WBTC/WETH, etc.
+
+  # ════════════════════════════════════════════════════════
+  # SCROLL PAIRS
+  # ════════════════════════════════════════════════════════
+
+  - id: "scroll-usdc-weth"
+    chain_id: 534352
+    token_in: "0x06efdbff2a14a7c8e15944d1f4a48f9f95f663a4"   # USDC (verified)
+    token_out: "0x5300000000000000000000000000000000000004"  # WETH (verified)
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"
+    max_trade: "500"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "scroll-weth-usdc"
+    chain_id: 534352
+    token_in: "0x5300000000000000000000000000000000000004"  # WETH
+    token_out: "0x06efdbff2a14a7c8e15944d1f4a48f9f95f663a4"   # USDC
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.05"
+    max_trade: "0.2"
+    min_swap_size: "0.01"
+    watch_pools: []
+
+  # ════════════════════════════════════════════════════════
+  # GNOSIS PAIRS
+  # ════════════════════════════════════════════════════════
+
+  # Gnosis uses xDAI as native currency (1 xDAI = $1 stable)
+  # Most pairs involve wxDAI (wrapped xDAI) or USDC
+
+  - id: "gnosis-usdc-wxdai"
+    chain_id: 100
+    token_in: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC (Gnosis native)
+    token_out: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"  # wxDAI
+    token_in_symbol: "USDC"
+    token_out_symbol: "WXDAI"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"
+    max_trade: "1000"  # Gnosis has deeper stablecoin liquidity
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "gnosis-wxdai-usdc"
+    chain_id: 100
+    token_in: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"  # wxDAI
+    token_out: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC
+    token_in_symbol: "WXDAI"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "100"
+    max_trade: "1000"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "gnosis-usdc-weth"
+    chain_id: 100
+    token_in: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC
+    token_out: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"  # WETH (bridged)
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"
+    max_trade: "500"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "gnosis-weth-usdc"
+    chain_id: 100
+    token_in: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"  # WETH
+    token_out: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.05"
+    max_trade: "0.2"
+    min_swap_size: "0.01"
+    watch_pools: []
+
+
+# ════════════════════════════════════════════════════════
+# DEPLOYMENT COMMANDS (for reference)
+# ════════════════════════════════════════════════════════
+#
+# After deploying contracts, set router permissions:
+#
+# LINEA:
+#   cast send $CONTRACT "setAllowedRouter(address,bool)" 0x1b81d678ffb9c0263b24a97847620c99d213eb14 true --rpc-url $LINEA_RPC --private-key $PK
+#   cast send $CONTRACT "setRouterType(address,uint8)" 0x1b81d678ffb9c0263b24a97847620c99d213eb14 0 --rpc-url $LINEA_RPC --private-key $PK
+#   cast send $CONTRACT "setAllowedRouter(address,bool)" 0xAAA45c8F5ef92a000a121d102F4e89278a711Faa true --rpc-url $LINEA_RPC --private-key $PK
+#   cast send $CONTRACT "setRouterType(address,uint8)" 0xAAA45c8F5ef92a000a121d102F4e89278a711Faa 0 --rpc-url $LINEA_RPC --private-key $PK
+#
+# SCROLL:
+#   cast send $CONTRACT "setAllowedRouter(address,bool)" 0x0122960d6e391478bfe8fb2408ba412d5600f621 true --rpc-url $SCROLL_RPC --private-key $PK
+#   cast send $CONTRACT "setRouterType(address,uint8)" 0x0122960d6e391478bfe8fb2408ba412d5600f621 0 --rpc-url $SCROLL_RPC --private-key $PK
+#   cast send $CONTRACT "setAllowedRouter(address,bool)" 0x80e38291e06339d10aab483c65695d004dbd5c69 true --rpc-url $SCROLL_RPC --private-key $PK
+#   cast send $CONTRACT "setRouterType(address,uint8)" 0x80e38291e06339d10aab483c65695d004dbd5c69 0 --rpc-url $SCROLL_RPC --private-key $PK
+#
+# GNOSIS:
+#   cast send $CONTRACT "setAllowedRouter(address,bool)" 0x1C232F01118CB8B424793ae03F870aa7D0ac7f77 true --rpc-url $GNOSIS_RPC --private-key $PK
+#   cast send $CONTRACT "setRouterType(address,uint8)" 0x1C232F01118CB8B424793ae03F870aa7D0ac7f77 0 --rpc-url $GNOSIS_RPC --private-key $PK
+#   cast send $CONTRACT "setAllowedRouter(address,bool)" 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506 true --rpc-url $GNOSIS_RPC --private-key $PK
+#   cast send $CONTRACT "setRouterType(address,uint8)" 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506 0 --rpc-url $GNOSIS_RPC --private-key $PK
+#
+# ════════════════════════════════════════════════════════

@@ -6,6 +6,7 @@ mod db;
 mod executor;
 mod listener;
 mod metrics;
+mod router_health;
 mod strategy;
 
 use anyhow::Result;

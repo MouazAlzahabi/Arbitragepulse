@@ -22,10 +22,18 @@ pub struct ChainConfig {
     /// Optional QuoterV2 address for V3 quoting (chain-specific)
     #[serde(default)]
     pub quoter_v2_address: Option<String>,
+    /// Minimum swap amount to trigger opportunity evaluation (filters dust swaps).
+    /// Default: 1e17 (0.1 ETH or 100k USDC). Set to 0 to disable filtering.
+    #[serde(default = "default_min_swap_amount")]
+    pub min_swap_amount_filter: u128,
     /// Fallback WS endpoints tried in order if the primary ws_rpc fails.
     /// Leave empty to use only the primary.
     #[serde(default)]
     pub ws_rpc_fallbacks: Vec<String>,
+}
+
+fn default_min_swap_amount() -> u128 {
+    100_000_000_000_000_000 // 1e17 = 0.1 ETH or 100k USDC (6 decimals)
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -127,9 +135,20 @@ pub fn load_env() -> Result<Env> {
     })
 }
 
+/// Replace `${VAR_NAME}` placeholders in YAML content with env var values.
+fn substitute_env_vars(content: String) -> String {
+    let re = regex::Regex::new(r"\$\{([A-Z0-9_]+)\}").expect("valid regex");
+    re.replace_all(&content, |caps: &regex::Captures| {
+        std::env::var(&caps[1]).unwrap_or_else(|_| caps[0].to_string())
+    })
+    .into_owned()
+}
+
 pub fn load_config(path: &str) -> Result<AppConfig> {
-    let content = std::fs::read_to_string(path)
+    let raw_content = std::fs::read_to_string(path)
         .map_err(|e| anyhow!("Cannot read config file '{}': {}", path, e))?;
+
+    let content = substitute_env_vars(raw_content);
 
     let raw: AppConfigRaw = serde_yaml::from_str(&content)
         .map_err(|e| anyhow!("Invalid config YAML: {}", e))?;

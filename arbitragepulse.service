@@ -1,0 +1,28 @@
+[Unit]
+Description=ArbitragePulse Multi-Chain Engine
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/arbitragepulse
+Environment="PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE"
+Environment="CONFIG_PATH=/root/arbitragepulse/engine/config.yaml"
+Environment="LOG_LEVEL=info"
+Environment="PORT=3000"
+ExecStart=/root/arbitragepulse/target/release/engine
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/arbitragepulse/engine.log
+StandardError=append:/var/log/arbitragepulse/engine.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/arbitragepulse
+
+[Install]
+WantedBy=multi-user.target

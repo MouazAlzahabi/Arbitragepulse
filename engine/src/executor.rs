@@ -4,7 +4,8 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
-use tracing::{info, warn};
+use std::time::{Duration, Instant};
+use tracing::{info, warn, debug};
 
 use crate::abi::ArbitrageExecutor;
 use crate::db::Database;
@@ -51,6 +52,10 @@ pub struct Executor {
     /// receipt arrives.
     nonce: Option<u64>,
     db: Option<Arc<Database>>,
+    /// Gas price cache: (price_wei, timestamp). TTL = 2× block_time.
+    gas_price_cache: Option<(u128, Instant)>,
+    /// Gas price cache TTL (2× block_time for the chain).
+    gas_price_cache_ttl: Duration,
 }
 
 impl Executor {
@@ -60,8 +65,12 @@ impl Executor {
         contract_address: Address,
         signer_address: Address,
         min_profit_usd: f64,
+        block_time_ms: u64,
         db: Option<Arc<Database>>,
     ) -> Self {
+        // Gas price cache TTL = 2× block time (cache valid for 2 blocks)
+        let gas_price_cache_ttl = Duration::from_millis(block_time_ms * 2);
+
         Self {
             chain_id,
             chain_name,
@@ -74,12 +83,39 @@ impl Executor {
             min_profit_usd,
             nonce: None,
             db,
+            gas_price_cache: None,
+            gas_price_cache_ttl,
         }
     }
 
     /// Called from the price-tick handler so gas cost estimates stay current.
     pub fn update_native_price(&mut self, price: f64) {
         self.native_price_usd = price;
+    }
+
+    /// Get gas price with caching. Checks cache first; if expired, fetches from chain.
+    async fn get_gas_price<P: Provider>(&mut self, provider: &P) -> u128 {
+        // Check cache
+        if let Some((cached_price, cached_at)) = self.gas_price_cache {
+            if cached_at.elapsed() < self.gas_price_cache_ttl {
+                debug!(
+                    "[{}] Gas price from cache: {} wei (age: {:?})",
+                    self.chain_name,
+                    cached_price,
+                    cached_at.elapsed()
+                );
+                return cached_price;
+            }
+        }
+
+        // Cache miss or expired — fetch from chain
+        let gas_price = provider.get_gas_price().await.unwrap_or(1_000_000_000u128);
+        self.gas_price_cache = Some((gas_price, Instant::now()));
+        debug!(
+            "[{}] Gas price fetched: {} wei (cached for {:?})",
+            self.chain_name, gas_price, self.gas_price_cache_ttl
+        );
+        gas_price
     }
 
     /// Execute (or simulate) the arb. Returns the tx hash string.
@@ -92,8 +128,8 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
 
-        // ── Gas price (single RPC call, reused for cost check + fee tuning) ───
-        let gas_price = provider.get_gas_price().await.unwrap_or(1_000_000_000u128);
+        // ── Gas price (cached with TTL = 2× block_time, reused for cost check + fee tuning) ───
+        let gas_price = self.get_gas_price(provider).await;
 
         // ── Gas profitability check (300k hardcoded — no eth_estimateGas) ─────
         let gas_cost_usd = {
@@ -212,7 +248,7 @@ impl Executor {
                             if let Some(db) = db {
                                 let success = receipt.status();
                                 let _ = tokio::task::spawn_blocking(move || {
-                                    let _ = db.insert_trade(chain_id, &chain_name, &pair_id, &router_a, &router_b, profit_usd, success, &tx_hash_bg, dry_run);
+                                    let _ = db.insert_trade(chain_id, &chain_name, &pair_id, &router_a, &router_b, None, profit_usd, success, &tx_hash_bg, dry_run);
                                 }).await;
                             }
                         }
@@ -246,7 +282,8 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
 
-        let gas_price = provider.get_gas_price().await.unwrap_or(1_000_000_000u128);
+        // Use cached gas price (TTL = 2× block_time)
+        let gas_price = self.get_gas_price(provider).await;
 
         let gas_cost_usd = {
             let cost_wei = gas_price * GAS_LIMIT_TRIANGULAR as u128;
@@ -280,7 +317,6 @@ impl Executor {
                         "[{}] DRY-RUN triangular ok | gross=${:.4} gas≈${:.4} net=${:.4}",
                         self.chain_name, opp.profit_usd, gas_cost_usd, net_profit_usd
                     );
-                    // TODO: persist triangular trade with token_c
                     return Ok(tx_hash);
                 }
                 Err(e) => {
@@ -327,8 +363,12 @@ impl Executor {
                 );
 
                 let chain_name = self.chain_name.clone();
+                let db = self.db.clone();
                 let chain_id = self.chain_id;
                 let triplet_id = opp.triplet_id.clone();
+                let router_ab = opp.router_ab_id.clone();
+                let router_bc = opp.router_bc_id.clone();
+                let router_ca = opp.router_ca_id.clone();
                 let profit_usd = opp.profit_usd;
                 let dry_run = self.dry_run;
                 let tx_hash_bg = tx_hash.clone();
@@ -347,7 +387,24 @@ impl Executor {
                             } else {
                                 warn!("[{}] ✗ triangular reverted | tx={}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
                             }
-                            // TODO: persist triangular trade to DB
+                            // Persist triangular trade to database
+                            if let Some(db) = db {
+                                let success = receipt.status();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = db.insert_trade(
+                                        chain_id,
+                                        &chain_name,
+                                        &triplet_id,
+                                        &router_ab,
+                                        &router_bc,
+                                        Some(&router_ca), // Include router_c for triangular
+                                        profit_usd,
+                                        success,
+                                        &tx_hash_bg,
+                                        dry_run,
+                                    );
+                                }).await;
+                            }
                         }
                         Err(e) => {
                             warn!("[{}] Triangular receipt error for {}: {}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
@@ -495,6 +552,7 @@ impl Executor {
                 &pair_id,
                 &router_a,
                 &router_b,
+                None, // No router_c for 2-hop arbs
                 profit_usd,
                 success,
                 &tx_hash,

@@ -1,0 +1,362 @@
+# ============================================================
+# ArbitragePulse Engine — TESTNET Configuration
+# ============================================================
+# Test deployment across all supported chains before mainnet
+# All RPCs are FREE public endpoints
+# Get testnet tokens from faucets (links in comments)
+# ============================================================
+
+
+# ─── CHAINS ────────────────────────────────────────────────
+
+chains:
+  # ────────────────────────────────────────────────────────
+  # LINEA SEPOLIA (Chain ID: 59141)
+  # ────────────────────────────────────────────────────────
+  - id: 59141
+    name: "Linea Sepolia"
+    enabled: true
+    ws_rpc: "wss://linea-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    http_rpc: "https://linea-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    native_currency: "ETH"
+    wrapped_native: "0x2C1b868d6596a18e32E61B901E4060C872647b6C"  # WETH on Linea Sepolia
+    block_time_ms: 2000
+    contract_address: "0xYOUR_CONTRACT_ON_LINEA_SEPOLIA"
+    min_native_balance: 0.01
+    min_profit_usd: 0.10  # Lower threshold for testnet
+    deadline_seconds: 120
+    min_swap_amount_filter: 1000000000000000  # 0.001 ETH
+    ws_rpc_fallbacks:
+      - "wss://rpc.sepolia.linea.build"  # Public fallback
+    # Faucet: https://faucet.sepolia.linea.build
+    # Bridge: https://bridge.linea.build
+
+  # ────────────────────────────────────────────────────────
+  # SCROLL SEPOLIA (Chain ID: 534351)
+  # ────────────────────────────────────────────────────────
+  - id: 534351
+    name: "Scroll Sepolia"
+    enabled: true
+    ws_rpc: "wss://scroll-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    http_rpc: "https://scroll-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    native_currency: "ETH"
+    wrapped_native: "0x5300000000000000000000000000000000000004"  # WETH on Scroll Sepolia
+    block_time_ms: 3000
+    contract_address: "0xYOUR_CONTRACT_ON_SCROLL_SEPOLIA"
+    min_native_balance: 0.01
+    min_profit_usd: 0.10
+    deadline_seconds: 120
+    min_swap_amount_filter: 1000000000000000
+    ws_rpc_fallbacks:
+      - "wss://sepolia-rpc.scroll.io"  # Public fallback
+    # Faucet: https://sepolia.scroll.io/faucet
+    # Bridge: https://sepolia.scroll.io/bridge
+
+  # ────────────────────────────────────────────────────────
+  # OPTIMISM SEPOLIA (Chain ID: 11155420)
+  # ────────────────────────────────────────────────────────
+  - id: 11155420
+    name: "Optimism Sepolia"
+    enabled: true
+    ws_rpc: "wss://opt-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    http_rpc: "https://opt-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    native_currency: "ETH"
+    wrapped_native: "0x4200000000000000000000000000000000000006"  # WETH on OP Sepolia
+    block_time_ms: 2000
+    contract_address: "0xYOUR_CONTRACT_ON_OPTIMISM_SEPOLIA"
+    min_native_balance: 0.01
+    min_profit_usd: 0.10
+    deadline_seconds: 120
+    min_swap_amount_filter: 1000000000000000
+    quoter_v2_address: "0xC5290058841028F1614F3A6F0F5816cAd0df5E27"  # QuoterV2 on OP Sepolia
+    ws_rpc_fallbacks:
+      - "wss://sepolia.optimism.io"  # Public fallback
+    # Faucet: https://app.optimism.io/faucet (or Alchemy faucet)
+    # Bridge: https://app.optimism.io/bridge
+
+  # ────────────────────────────────────────────────────────
+  # ARBITRUM SEPOLIA (Chain ID: 421614)
+  # ────────────────────────────────────────────────────────
+  - id: 421614
+    name: "Arbitrum Sepolia"
+    enabled: true
+    ws_rpc: "wss://arb-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    http_rpc: "https://arb-sepolia.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    native_currency: "ETH"
+    wrapped_native: "0x980B62Da83eFf3D4576C647993b0c1D7faf17c73"  # WETH on Arb Sepolia
+    block_time_ms: 250
+    contract_address: "0xYOUR_CONTRACT_ON_ARBITRUM_SEPOLIA"
+    min_native_balance: 0.01
+    min_profit_usd: 0.10
+    deadline_seconds: 60
+    min_swap_amount_filter: 1000000000000000
+    quoter_v2_address: "0x2779a0CC1c3e0E44D2542EC3e79e3864Ae93Ef0B"  # QuoterV2 on Arb Sepolia
+    ws_rpc_fallbacks:
+      - "wss://sepolia-rollup.arbitrum.io/rpc"  # Public fallback
+    # Faucet: https://faucet.quicknode.com/arbitrum/sepolia
+    # Bridge: https://bridge.arbitrum.io
+
+  # ────────────────────────────────────────────────────────
+  # POLYGON AMOY (Chain ID: 80002) — Replaces Mumbai
+  # ────────────────────────────────────────────────────────
+  - id: 80002
+    name: "Polygon Amoy"
+    enabled: true
+    ws_rpc: "wss://polygon-amoy.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    http_rpc: "https://polygon-amoy.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    native_currency: "MATIC"
+    wrapped_native: "0x360ad4f9a9A8EFe9A8DCB5f461c4Cc1047E1Dcf9"  # WMATIC on Amoy
+    block_time_ms: 2000
+    contract_address: "0xYOUR_CONTRACT_ON_POLYGON_AMOY"
+    min_native_balance: 1.0
+    min_profit_usd: 0.10
+    deadline_seconds: 120
+    min_swap_amount_filter: 1000000000000000
+    ws_rpc_fallbacks:
+      - "wss://rpc-amoy.polygon.technology"  # Public fallback
+    # Faucet: https://faucet.polygon.technology
+    # Note: Amoy is the new testnet (Mumbai deprecated Jan 2024)
+
+  # ────────────────────────────────────────────────────────
+  # GNOSIS CHIADO (Chain ID: 10200)
+  # ────────────────────────────────────────────────────────
+  - id: 10200
+    name: "Gnosis Chiado"
+    enabled: true
+    ws_rpc: "wss://gnosis-chiado.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    http_rpc: "https://gnosis-chiado.g.alchemy.com/v2/${ALCHEMY_KEY}"
+    native_currency: "xDAI"
+    wrapped_native: "0x18c8a7ec7897177E4529065a7E7B0878358B3BfF"  # wxDAI on Chiado
+    block_time_ms: 5000
+    contract_address: "0xYOUR_CONTRACT_ON_GNOSIS_CHIADO"
+    min_native_balance: 0.5
+    min_profit_usd: 0.05  # Very low threshold for testnet
+    deadline_seconds: 180
+    min_swap_amount_filter: 1000000000000000
+    ws_rpc_fallbacks:
+      - "wss://rpc.chiadochain.net/wss"  # Public fallback
+    # Faucet: https://gnosisfaucet.com
+    # Bridge: https://bridge.gnosischain.com
+
+
+# ─── ROUTERS ──────────────────────────────────────────────
+# IMPORTANT: Most testnets do NOT have production DEXes deployed.
+# You have TWO options:
+#
+# Option A: Deploy MockRouters (recommended for E2E testing)
+#   - Use lab/src/setup.rs to deploy MockRouterV2 contracts
+#   - Set custom exchange rates to simulate arbitrage opportunities
+#   - Full control over spread and liquidity
+#
+# Option B: Use testnet DEXes (limited availability)
+#   - Uniswap V3 is deployed on OP/Arb Sepolia
+#   - Most other testnets have NO reliable DEX deployments
+#   - Liquidity is often zero or stale
+#
+# ──────────────────────────────────────────────────────────
+
+routers:
+  # ════════════════════════════════════════════════════════
+  # OPTIMISM SEPOLIA — Uniswap V3 (VERIFIED)
+  # ════════════════════════════════════════════════════════
+
+  - id: "uniswap-v3-op-sepolia"
+    name: "Uniswap V3 (OP Sepolia)"
+    chain_id: 11155420
+    address: "0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4"  # SwapRouter02 on OP Sepolia
+    type: "v3"
+    fee_tiers: [500, 3000, 10000]
+    fee_bps: 0
+
+  # ════════════════════════════════════════════════════════
+  # ARBITRUM SEPOLIA — Uniswap V3 (VERIFIED)
+  # ════════════════════════════════════════════════════════
+
+  - id: "uniswap-v3-arb-sepolia"
+    name: "Uniswap V3 (Arb Sepolia)"
+    chain_id: 421614
+    address: "0x101F443B4d1b059569D643917553c771E1b9663E"  # SwapRouter02 on Arb Sepolia
+    type: "v3"
+    fee_tiers: [500, 3000, 10000]
+    fee_bps: 0
+
+  # ════════════════════════════════════════════════════════
+  # MOCK ROUTERS (Deploy yourself using lab/src/setup.rs)
+  # ════════════════════════════════════════════════════════
+  # After deploying, update addresses below and uncomment
+
+  # - id: "mock-router-a-linea-sepolia"
+  #   name: "MockRouter A (Linea Sepolia)"
+  #   chain_id: 59141
+  #   address: "0xYOUR_MOCK_ROUTER_A_ADDRESS"
+  #   type: "v2"
+  #   fee_bps: 0
+
+  # - id: "mock-router-b-linea-sepolia"
+  #   name: "MockRouter B (Linea Sepolia)"
+  #   chain_id: 59141
+  #   address: "0xYOUR_MOCK_ROUTER_B_ADDRESS"
+  #   type: "v2"
+  #   fee_bps: 0
+
+  # Repeat for each testnet...
+
+
+# ─── PAIRS ────────────────────────────────────────────────
+# IMPORTANT: Testnet token addresses vary by network.
+# Below are common testnet tokens where available.
+# For chains without testnet tokens, deploy MockERC20 tokens.
+# ──────────────────────────────────────────────────────────
+
+pairs:
+  # ════════════════════════════════════════════════════════
+  # OPTIMISM SEPOLIA PAIRS
+  # ════════════════════════════════════════════════════════
+  # Note: OP Sepolia has Uniswap V3 pools but liquidity may be sparse
+
+  - id: "op-sepolia-weth-usdc"
+    chain_id: 11155420
+    token_in: "0x4200000000000000000000000000000000000006"   # WETH
+    token_out: "0x5fd84259d66Cd46123540766Be93DFE6D43130D7"  # USDC (testnet)
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.01"
+    max_trade: "0.1"
+    min_swap_size: "0.001"
+    watch_pools: []
+
+  - id: "op-sepolia-usdc-weth"
+    chain_id: 11155420
+    token_in: "0x5fd84259d66Cd46123540766Be93DFE6D43130D7"   # USDC
+    token_out: "0x4200000000000000000000000000000000000006"  # WETH
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "10"
+    max_trade: "100"
+    min_swap_size: "1"
+    watch_pools: []
+
+  # ════════════════════════════════════════════════════════
+  # ARBITRUM SEPOLIA PAIRS
+  # ════════════════════════════════════════════════════════
+
+  - id: "arb-sepolia-weth-usdc"
+    chain_id: 421614
+    token_in: "0x980B62Da83eFf3D4576C647993b0c1D7faf17c73"   # WETH
+    token_out: "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"  # USDC (testnet)
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.01"
+    max_trade: "0.1"
+    min_swap_size: "0.001"
+    watch_pools: []
+
+  - id: "arb-sepolia-usdc-weth"
+    chain_id: 421614
+    token_in: "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"   # USDC
+    token_out: "0x980B62Da83eFf3D4576C647993b0c1D7faf17c73"  # WETH
+    token_in_symbol: "USDC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "10"
+    max_trade: "100"
+    min_swap_size: "1"
+    watch_pools: []
+
+  # ════════════════════════════════════════════════════════
+  # MOCK PAIRS (After deploying MockRouters + MockTokens)
+  # ════════════════════════════════════════════════════════
+  # Deploy MockERC20 tokens and MockRouters, then add pairs here
+
+  # - id: "linea-sepolia-mock-usdc-weth"
+  #   chain_id: 59141
+  #   token_in: "0xYOUR_MOCK_USDC_ADDRESS"
+  #   token_out: "0xYOUR_MOCK_WETH_ADDRESS"
+  #   token_in_symbol: "USDC"
+  #   token_out_symbol: "WETH"
+  #   token_in_decimals: 6
+  #   token_out_decimals: 18
+  #   trade_amount: "100"
+  #   max_trade: "1000"
+  #   min_swap_size: "10"
+  #   watch_pools: []
+
+
+# ════════════════════════════════════════════════════════
+# TESTNET DEPLOYMENT NOTES
+# ════════════════════════════════════════════════════════
+#
+# 1. GET TESTNET ETH/MATIC
+#    - Linea Sepolia: https://faucet.sepolia.linea.build
+#    - Scroll Sepolia: https://sepolia.scroll.io/faucet
+#    - Optimism Sepolia: https://app.optimism.io/faucet
+#    - Arbitrum Sepolia: https://faucet.quicknode.com/arbitrum/sepolia
+#    - Polygon Amoy: https://faucet.polygon.technology
+#    - Gnosis Chiado: https://gnosisfaucet.com
+#
+# 2. DEPLOY CONTRACT
+#    For each testnet:
+#    ```bash
+#    export TESTNET_RPC="https://rpc.sepolia.linea.build"  # Example
+#    export PRIVATE_KEY="0xYOUR_TESTNET_PRIVATE_KEY"
+#
+#    forge create \
+#      --rpc-url $TESTNET_RPC \
+#      --private-key $PRIVATE_KEY \
+#      src/ArbitrageExecutor.sol:ArbitrageExecutor
+#
+#    # Update contract_address in this config for that chain
+#    ```
+#
+# 3. DEPLOY MOCK ROUTERS (Recommended)
+#    Testnets have limited DEX liquidity. Deploy MockRouters for reliable testing:
+#
+#    a. Deploy MockRouterV2 contracts (2 per chain for arbitrage)
+#    b. Deploy MockERC20 tokens (USDC, WETH)
+#    c. Seed routers with liquidity
+#    d. Set different exchange rates to create arbitrage spread
+#
+#    See lab/src/setup.rs for reference implementation.
+#
+# 4. SET ROUTER PERMISSIONS
+#    ```bash
+#    cast send $CONTRACT_ADDRESS \
+#      "setAllowedRouter(address,bool)" \
+#      $ROUTER_ADDRESS \
+#      true \
+#      --rpc-url $TESTNET_RPC \
+#      --private-key $PRIVATE_KEY
+#
+#    cast send $CONTRACT_ADDRESS \
+#      "setRouterType(address,uint8)" \
+#      $ROUTER_ADDRESS \
+#      0 \
+#      --rpc-url $TESTNET_RPC \
+#      --private-key $PRIVATE_KEY
+#    ```
+#
+# 5. FUND CONTRACT
+#    - Transfer testnet USDC/tokens to contract
+#    - Ensure contract has enough ETH/MATIC for gas
+#
+# 6. RUN ENGINE
+#    ```bash
+#    PRIVATE_KEY=$PRIVATE_KEY \
+#      CONFIG_PATH=/path/to/config-testnet.yaml \
+#      cargo run -p engine
+#    ```
+#
+# 7. TEST IN DRY-RUN MODE FIRST
+#    - Let engine run for 30+ minutes
+#    - Verify opportunities detected
+#    - Check logs for errors
+#    - Enable live mode only after dry-run succeeds
+#
+# ════════════════════════════════════════════════════════

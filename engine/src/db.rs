@@ -14,6 +14,8 @@ pub struct TradeRecord {
     pub pair_id: String,
     pub router_a: String,
     pub router_b: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_c: Option<String>, // For triangular arbs (A→B→C→A)
     pub profit_usd: f64,
     pub success: bool,
     pub tx_hash: String,
@@ -49,6 +51,7 @@ impl Database {
                 pair_id     TEXT    NOT NULL,
                 router_a    TEXT    NOT NULL,
                 router_b    TEXT    NOT NULL,
+                router_c    TEXT,
                 profit_usd  REAL    NOT NULL,
                 success     INTEGER NOT NULL,
                 tx_hash     TEXT    NOT NULL,
@@ -57,6 +60,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_trades_ts    ON trades(ts);
             CREATE INDEX IF NOT EXISTS idx_trades_chain ON trades(chain_id, ts);",
         )?;
+
+        // Migration: Add router_c column if it doesn't exist (for existing databases)
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN router_c TEXT", []);
+
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -67,6 +74,7 @@ impl Database {
         pair_id: &str,
         router_a: &str,
         router_b: &str,
+        router_c: Option<&str>, // None for 2-hop, Some(router) for triangular
         profit_usd: f64,
         success: bool,
         tx_hash: &str,
@@ -79,9 +87,9 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO trades
-             (ts, chain_id, chain_name, pair_id, router_a, router_b,
+             (ts, chain_id, chain_name, pair_id, router_a, router_b, router_c,
               profit_usd, success, tx_hash, dry_run)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 ts,
                 chain_id as i64,
@@ -89,6 +97,7 @@ impl Database {
                 pair_id,
                 router_a,
                 router_b,
+                router_c,
                 profit_usd,
                 success as i64,
                 tx_hash,
@@ -102,7 +111,7 @@ impl Database {
     pub fn get_trades(&self, limit: i64) -> Result<Vec<TradeRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, ts, chain_id, chain_name, pair_id, router_a, router_b,
+            "SELECT id, ts, chain_id, chain_name, pair_id, router_a, router_b, router_c,
                     profit_usd, success, tx_hash, dry_run
              FROM trades ORDER BY ts DESC LIMIT ?1",
         )?;
@@ -116,10 +125,11 @@ impl Database {
                     pair_id: row.get(4)?,
                     router_a: row.get(5)?,
                     router_b: row.get(6)?,
-                    profit_usd: row.get(7)?,
-                    success: row.get::<_, i64>(8)? != 0,
-                    tx_hash: row.get(9)?,
-                    dry_run: row.get::<_, i64>(10)? != 0,
+                    router_c: row.get(7)?,
+                    profit_usd: row.get(8)?,
+                    success: row.get::<_, i64>(9)? != 0,
+                    tx_hash: row.get(10)?,
+                    dry_run: row.get::<_, i64>(11)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

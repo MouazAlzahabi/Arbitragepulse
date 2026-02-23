@@ -27,14 +27,16 @@ pub struct Listener {
     pub chain_id: u64,
     pub chain_name: String,
     pub pairs: Vec<PairConfig>,
+    pub min_swap_amount: u128,
 }
 
 impl Listener {
-    pub fn new(chain_id: u64, chain_name: String, pairs: Vec<PairConfig>) -> Self {
+    pub fn new(chain_id: u64, chain_name: String, pairs: Vec<PairConfig>, min_swap_amount: u128) -> Self {
         Self {
             chain_id,
             chain_name,
             pairs,
+            min_swap_amount,
         }
     }
 
@@ -75,8 +77,9 @@ impl Listener {
         let chain_id = self.chain_id;
         let chain_name = self.chain_name.clone();
         let tx2 = tx.clone();
+        let min_amount = self.min_swap_amount;
 
-        // V2 subscription with reconnect
+        // V2 subscription with reconnect + amount filtering
         let provider2 = provider.clone();
         let chain_name2 = chain_name.clone();
         let filter2 = v2_filter.clone();
@@ -90,8 +93,28 @@ impl Listener {
                         while let Some(log) = stream.next().await {
                             let pool = log.address();
                             let block = log.block_number.unwrap_or(0);
-                            debug!("[{}] V2 Swap on {:?} block={}", chain_name2, pool, block);
-                            let _ = tx2.send(SwapEvent { chain_id, pool, block_number: block }).await;
+
+                            // Decode swap event to get amounts
+                            if let Ok(decoded) = PairSwapV2::decode_log(log.as_ref()) {
+                                // Check if any amount exceeds minimum threshold
+                                let max_amount = decoded.amount0In.max(decoded.amount1In)
+                                    .max(decoded.amount0Out).max(decoded.amount1Out);
+
+                                if max_amount < alloy::primitives::U256::from(min_amount) {
+                                    debug!("[{}] V2 Swap on {:?} filtered (max_amount={} < {})",
+                                        chain_name2, pool, max_amount, min_amount);
+                                    continue;
+                                }
+
+                                debug!("[{}] V2 Swap on {:?} block={} max_amount={}",
+                                    chain_name2, pool, block, max_amount);
+                                let _ = tx2.send(SwapEvent { chain_id, pool, block_number: block }).await;
+                            } else {
+                                // If decode fails, forward anyway (don't filter out valid swaps)
+                                debug!("[{}] V2 Swap on {:?} block={} (decode failed, forwarding)",
+                                    chain_name2, pool, block);
+                                let _ = tx2.send(SwapEvent { chain_id, pool, block_number: block }).await;
+                            }
                         }
                         warn!("[{}] V2 subscription stream ended, reconnecting in {:?}", chain_name2, backoff);
                     }
@@ -104,9 +127,10 @@ impl Listener {
             }
         });
 
-        // V3 subscription with reconnect
+        // V3 subscription with reconnect + amount filtering
         let provider3 = provider.clone();
         let chain_name3 = chain_name.clone();
+        let min_amount3 = min_amount;
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
@@ -117,8 +141,38 @@ impl Listener {
                         while let Some(log) = stream.next().await {
                             let pool = log.address();
                             let block = log.block_number.unwrap_or(0);
-                            debug!("[{}] V3 Swap on {:?} block={}", chain_name3, pool, block);
-                            let _ = tx.send(SwapEvent { chain_id, pool, block_number: block }).await;
+
+                            // Decode V3 swap event (amounts are signed int256)
+                            if let Ok(decoded) = PoolSwapV3::decode_log(log.as_ref()) {
+                                // V3 amounts can be negative, so use absolute value
+                                let abs_amount0 = if decoded.amount0 < alloy::primitives::I256::ZERO {
+                                    decoded.amount0.wrapping_neg().into_raw()
+                                } else {
+                                    decoded.amount0.into_raw()
+                                };
+                                let abs_amount1 = if decoded.amount1 < alloy::primitives::I256::ZERO {
+                                    decoded.amount1.wrapping_neg().into_raw()
+                                } else {
+                                    decoded.amount1.into_raw()
+                                };
+
+                                let max_amount = abs_amount0.max(abs_amount1);
+
+                                if max_amount < alloy::primitives::U256::from(min_amount3) {
+                                    debug!("[{}] V3 Swap on {:?} filtered (max_amount={} < {})",
+                                        chain_name3, pool, max_amount, min_amount3);
+                                    continue;
+                                }
+
+                                debug!("[{}] V3 Swap on {:?} block={} max_amount={}",
+                                    chain_name3, pool, block, max_amount);
+                                let _ = tx.send(SwapEvent { chain_id, pool, block_number: block }).await;
+                            } else {
+                                // If decode fails, forward anyway (don't filter out valid swaps)
+                                debug!("[{}] V3 Swap on {:?} block={} (decode failed, forwarding)",
+                                    chain_name3, pool, block);
+                                let _ = tx.send(SwapEvent { chain_id, pool, block_number: block }).await;
+                            }
                         }
                         warn!("[{}] V3 subscription stream ended, reconnecting in {:?}", chain_name3, backoff);
                     }
