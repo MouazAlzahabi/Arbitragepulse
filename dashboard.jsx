@@ -43,6 +43,18 @@ function useWebSocket(url, apiKey) {
 
   const connect = useCallback(() => {
     if (!url) return;
+    // Null out old socket's handlers before closing so onclose doesn't
+    // schedule a reconnect that races with the new connection (React StrictMode
+    // double-mounts trigger this and result in two live WS connections).
+    if (wsRef.current) {
+      wsRef.current.onopen = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    clearTimeout(reconnRef.current);
     try {
       const wsUrl = apiKey ? `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(apiKey)}` : url;
       const ws = new WebSocket(wsUrl);
@@ -281,7 +293,8 @@ function ChainCards({ apiStats }) {
               <span style={{ fontSize: 9, color: "#34d399", background: "#052e16", padding: "2px 8px", borderRadius: 10 }}>ACTIVE</span>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 11 }}>
-              <div><span style={{ color: "#475569" }}>Attempts </span><span style={{ color: "#94a3b8" }}>{c.total_attempts}</span></div>
+              <div><span style={{ color: "#475569" }}>Scans </span><span style={{ color: "#94a3b8" }}>{c.total_scans || 0}</span></div>
+              <div><span style={{ color: "#475569" }}>Executions </span><span style={{ color: "#94a3b8" }}>{c.total_attempts}</span></div>
               <div><span style={{ color: "#475569" }}>Success </span><span style={{ color: "#34d399" }}>{c.total_success}</span></div>
               <div><span style={{ color: "#475569" }}>Profit </span><span style={{ color: "#a78bfa" }}>${(c.total_profit_usd || 0).toFixed(2)}</span></div>
               <div><span style={{ color: "#475569" }}>Fail </span><span style={{ color: failed > 0 ? "#f87171" : "#334155" }}>{failed}</span></div>

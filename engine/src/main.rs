@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     };
 
     // ── API server ──
-    let api_server = api::ApiServer::new(env.port, env.api_key.clone(), db.clone(), metrics.clone());
+    let api_server = api::ApiServer::new(env.port, env.api_key.clone(), db.clone(), metrics.clone(), env.dry_run);
     let log_tx = api_server.log_sender();
     let shared_state = api_server.shared_state();
 
@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
                     state.chains.push(api::ChainStats {
                         chain_id,
                         chain_name,
+                        total_scans: 0,
                         total_attempts: attempts,
                         total_success: successes,
                         total_profit_usd: profit,

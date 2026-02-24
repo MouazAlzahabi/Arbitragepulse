@@ -107,13 +107,13 @@ impl Database {
         Ok(())
     }
 
-    /// Returns trades ordered newest-first.
+    /// Returns live (non-dry-run) trades ordered newest-first.
     pub fn get_trades(&self, limit: i64) -> Result<Vec<TradeRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, ts, chain_id, chain_name, pair_id, router_a, router_b, router_c,
                     profit_usd, success, tx_hash, dry_run
-             FROM trades ORDER BY ts DESC LIMIT ?1",
+             FROM trades WHERE dry_run=0 ORDER BY ts DESC LIMIT ?1",
         )?;
         let records = stmt
             .query_map(params![limit], |row| {

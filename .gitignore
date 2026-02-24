@@ -34,3 +34,6 @@ contract/broadcast/
 
 # Bun
 bun.lock
+
+# Backup files
+*.bak

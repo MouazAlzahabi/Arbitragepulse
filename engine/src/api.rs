@@ -46,6 +46,9 @@ pub struct Token {
 pub struct ChainStats {
     pub chain_id: u64,
     pub chain_name: String,
+    /// Number of times the engine evaluated prices (scanned for opportunities).
+    pub total_scans: u64,
+    /// Number of times an execution was attempted (opportunity found + profitable).
     pub total_attempts: u64,
     pub total_success: u64,
     pub total_profit_usd: f64,
@@ -83,13 +86,14 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    pub fn new(port: u16, api_key: String, db: Option<Arc<Database>>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(port: u16, api_key: String, db: Option<Arc<Database>>, metrics: Arc<Metrics>, dry_run: bool) -> Self {
         let (log_tx, _) = broadcast::channel(1024);
         Self {
             port,
             api_key,
             state: Arc::new(RwLock::new(EngineState {
                 uptime_start: now_secs(),
+                dry_run,
                 ..Default::default()
             })),
             log_tx,
@@ -153,6 +157,9 @@ struct AppState {
 // ─── Auth middleware ───────────────────────────────────────────────────────────
 
 /// Bearer token auth. Skipped if api_key is empty (local dev).
+/// Accepts the key in two ways:
+///   1. `Authorization: Bearer <key>` header (REST clients, curl)
+///   2. `?token=<key>` query param (browsers — WebSocket cannot set custom headers)
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -162,13 +169,31 @@ async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let auth = req
+    // Check Authorization header
+    let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .and_then(|v| v.strip_prefix("Bearer "));
 
-    if auth != format!("Bearer {}", state.api_key) {
+    // Check ?token= query param (used by browser WebSocket which can't set headers)
+    let query_token = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&').find_map(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                if parts.next()? == "token" {
+                    parts.next().map(|v| urlencoding_decode(v))
+                } else {
+                    None
+                }
+            })
+        });
+
+    let provided = bearer.map(str::to_owned).or(query_token);
+
+    if provided.as_deref() != Some(state.api_key.as_str()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Unauthorized" })),
@@ -177,6 +202,31 @@ async fn auth_middleware(
     }
 
     next.run(req).await
+}
+
+/// Minimal percent-decode for URL query params (`%20` → ` `, `+` → ` `).
+/// Handles the common case without pulling in an extra crate.
+fn urlencoding_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '+' {
+            out.push(' ');
+        } else if c == '%' {
+            let hi = chars.next();
+            let lo = chars.next();
+            if let (Some(h), Some(l)) = (hi, lo) {
+                if let Ok(byte) = u8::from_str_radix(&format!("{h}{l}"), 16) {
+                    out.push(byte as char);
+                    continue;
+                }
+            }
+            out.push('%');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -389,17 +439,41 @@ async fn ws_handler(
 
 async fn handle_ws(mut socket: WebSocket, log_tx: LogBroadcaster) {
     let mut rx = log_tx.subscribe();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+    heartbeat.tick().await; // consume the first immediate tick
     loop {
-        match rx.recv().await {
-            Ok(entry) => {
-                if let Ok(msg) = serde_json::to_string(&entry) {
-                    if socket.send(Message::Text(msg.into())).await.is_err() {
-                        break;
+        tokio::select! {
+            result = rx.recv() => {
+                match result {
+                    Ok(entry) => {
+                        if let Ok(msg) = serde_json::to_string(&entry) {
+                            if socket.send(Message::Text(msg.into())).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 }
             }
-            Err(broadcast::error::RecvError::Closed) => break,
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            _ = heartbeat.tick() => {
+                // Send a ping to keep the connection alive and confirm to the browser
+                // that the engine is still running even when no log entries are emitted.
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
+            // Drain all incoming messages from the browser — we never act on them
+            // but MUST read them to prevent the TCP receive buffer from filling up.
+            // Without this, Pong frames (responses to our Ping) + any browser-sent
+            // commands accumulate → backpressure → connection stalls and drops.
+            msg = socket.recv() => {
+                match msg {
+                    None | Some(Err(_)) => break,           // socket closed / error
+                    Some(Ok(Message::Close(_))) => break,   // explicit close frame
+                    Some(Ok(_)) => {}                       // discard everything else
+                }
+            }
         }
     }
 }

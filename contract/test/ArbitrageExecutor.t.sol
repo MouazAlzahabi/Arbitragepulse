@@ -6,6 +6,9 @@ import "../src/ArbitrageExecutor.sol";
 import "../src/mocks/MockERC20.sol";
 import "../src/mocks/MockRouter.sol";
 import "../src/mocks/MockV3Router.sol";
+import "../src/mocks/MockSolidlyRouter.sol";
+import "../src/mocks/MockSyncSwapPool.sol";
+import "../src/mocks/MockSyncSwapFactory.sol";
 
 /**
  * @title ArbitrageExecutor v2 — Full Test Suite (Forge)
@@ -38,6 +41,13 @@ contract ArbitrageExecutorTest is Test {
     MockV3Router public routerV3A; // V3: 1 TKA → 2 TKB (buy side)
     MockV3Router public routerV3B; // V3: 1 TKB → 0.6 TKA → profit
     MockV3Router public routerV3C; // V3: 1 TKB → 0.4 TKA → loss
+    MockSolidlyRouter public routerSolidlyA; // Solidly: 1 TKA → 2 TKB (buy side)
+    MockSolidlyRouter public routerSolidlyB; // Solidly: 1 TKB → 0.6 TKA → profit
+    MockSolidlyRouter public routerSolidlyC; // Solidly: 1 TKB → 0.4 TKA → loss
+    MockSyncSwapFactory public factorySyncSwap;
+    MockSyncSwapPool public poolSyncSwapA;   // SyncSwap: 1 TKA → 2 TKB (buy side)
+    MockSyncSwapPool public poolSyncSwapB;   // SyncSwap: 1 TKB → 0.6 TKA → profit
+    MockSyncSwapPool public poolSyncSwapC;   // SyncSwap: 1 TKB → 0.4 TKA → loss
 
     address public owner;
     address public attacker;
@@ -104,6 +114,43 @@ contract ArbitrageExecutorTest is Test {
         executor.setRouterType(address(routerV3B), ArbitrageExecutor.RouterType.V3);
         executor.setAllowedRouter(address(routerV3C), true);
         executor.setRouterType(address(routerV3C), ArbitrageExecutor.RouterType.V3);
+
+        // Deploy Solidly mock routers with same rates as V2/V3
+        routerSolidlyA = new MockSolidlyRouter(2, 1);   // 1 TKA → 2 TKB
+        routerSolidlyB = new MockSolidlyRouter(6, 10);  // 1 TKB → 0.6 TKA = PROFIT
+        routerSolidlyC = new MockSolidlyRouter(4, 10);  // 1 TKB → 0.4 TKA = LOSS
+
+        // Fund Solidly routers
+        tokenB.transfer(address(routerSolidlyA), 100_000 ether);
+        tokenA.transfer(address(routerSolidlyB), 100_000 ether);
+        tokenA.transfer(address(routerSolidlyC), 100_000 ether);
+
+        // Whitelist Solidly routers and set their type
+        executor.setAllowedRouter(address(routerSolidlyA), true);
+        executor.setRouterType(address(routerSolidlyA), ArbitrageExecutor.RouterType.Solidly);
+        executor.setAllowedRouter(address(routerSolidlyB), true);
+        executor.setRouterType(address(routerSolidlyB), ArbitrageExecutor.RouterType.Solidly);
+        executor.setAllowedRouter(address(routerSolidlyC), true);
+        executor.setRouterType(address(routerSolidlyC), ArbitrageExecutor.RouterType.Solidly);
+
+        // Deploy SyncSwap mock factory and pools
+        factorySyncSwap = new MockSyncSwapFactory();
+        poolSyncSwapA = new MockSyncSwapPool(address(tokenA), address(tokenB), 2, 1);   // 1 TKA → 2 TKB
+        poolSyncSwapB = new MockSyncSwapPool(address(tokenB), address(tokenA), 6, 10);  // 1 TKB → 0.6 TKA
+        poolSyncSwapC = new MockSyncSwapPool(address(tokenB), address(tokenA), 4, 10);  // 1 TKB → 0.4 TKA
+
+        // Fund SyncSwap pools
+        tokenB.transfer(address(poolSyncSwapA), 100_000 ether);
+        tokenA.transfer(address(poolSyncSwapB), 100_000 ether);
+        tokenA.transfer(address(poolSyncSwapC), 100_000 ether);
+
+        // Register pools in factory
+        factorySyncSwap.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
+        factorySyncSwap.setPool(address(tokenB), address(tokenA), address(poolSyncSwapB));
+
+        // Whitelist SyncSwap factory and set its type
+        executor.setAllowedRouter(address(factorySyncSwap), true);
+        executor.setRouterType(address(factorySyncSwap), ArbitrageExecutor.RouterType.SyncSwap);
 
         // Default deadline: 1 hour from now
         deadline = block.timestamp + 3600;
@@ -1067,6 +1114,309 @@ contract ArbitrageExecutorTest is Test {
             1 ether,
             deadline
         );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Solidly (ve(3,3)) support tests
+    // ════════════════════════════════════════════════════════════
+
+    function test_Solidly_RouterType_SetAndGet() public view {
+        assertEq(uint8(executor.routerType(address(routerSolidlyA))), uint8(ArbitrageExecutor.RouterType.Solidly));
+        assertEq(uint8(executor.routerType(address(routerSolidlyB))), uint8(ArbitrageExecutor.RouterType.Solidly));
+        // V2 routers still report V2 (0)
+        assertEq(uint8(executor.routerType(address(routerA))), uint8(ArbitrageExecutor.RouterType.V2));
+    }
+
+    function test_Solidly_ExecuteProfitableArb_Volatile() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        // Solidly→Solidly volatile: buy on routerSolidlyA (1 TKA → 2 TKB), sell on routerSolidlyB (1 TKB → 0.6 TKA)
+        // 100 TKA → 200 TKB → 120 TKA: profit = 20 TKA
+        // fee=0 means volatile (stable=false)
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerSolidlyA), address(routerSolidlyB),
+            0, 0,  // fee=0 = volatile
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_Solidly_ExecuteProfitableArb_Stable() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        // fee=1 means stable pool — MockSolidlyRouter uses same rate regardless of stable flag
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerSolidlyA), address(routerSolidlyB),
+            1, 1,  // fee=1 = stable
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_Solidly_RevertsIfUnprofitable() public {
+        vm.expectRevert();
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerSolidlyA), address(routerSolidlyC), // loss router
+            0, 0,
+            0, deadline
+        );
+    }
+
+    function test_MixedV2Solidly_ArbBuyV2SellSolidly() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        // Buy on V2 routerA (1 TKA → 2 TKB), sell on Solidly routerSolidlyB (1 TKB → 0.6 TKA)
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerA), address(routerSolidlyB),
+            0, 0,
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_MixedSolidlyV2_ArbBuySolidlySellV2() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        // Buy on Solidly routerSolidlyA (1 TKA → 2 TKB), sell on V2 routerB (1 TKB → 0.6 TKA)
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerSolidlyA), address(routerB),
+            0, 0,
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_MixedSolidlyV3_ArbBuySolidlySellV3() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        // Buy on Solidly routerSolidlyA (1 TKA → 2 TKB), sell on V3 routerV3B (1 TKB → 0.6 TKA)
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerSolidlyA), address(routerV3B),
+            0, 3000,
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_Solidly_AllowanceResetAfterArb() public {
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerSolidlyA), address(routerSolidlyB),
+            0, 0,
+            0, deadline
+        );
+
+        // Allowances must be reset to 0
+        assertEq(tokenA.allowance(address(executor), address(routerSolidlyA)), 0);
+        assertEq(tokenB.allowance(address(executor), address(routerSolidlyB)), 0);
+    }
+
+    function test_Solidly_RevertsIfRouterNotWhitelisted() public {
+        MockSolidlyRouter unwhitelisted = new MockSolidlyRouter(2, 1);
+        tokenB.transfer(address(unwhitelisted), 100_000 ether);
+
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(unwhitelisted)));
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(unwhitelisted), address(routerSolidlyB),
+            0, 0,
+            0, deadline
+        );
+    }
+
+    function test_Solidly_Triangular_Profitable() public {
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
+
+        // A→B: Solidly (1 TKA → 2 TKB), B→C: Solidly (1 TKB → 3 TKC), C→A: Solidly (1 TKC → 0.51 TKA)
+        MockSolidlyRouter routerSolidlyBC = new MockSolidlyRouter(3, 1);   // 1 TKB → 3 TKC
+        MockSolidlyRouter routerSolidlyCA = new MockSolidlyRouter(51, 100); // 1 TKC → 0.51 TKA
+
+        tokenC.transfer(address(routerSolidlyBC), 300_000 ether);
+        tokenB.transfer(address(routerSolidlyBC), 100_000 ether);
+        tokenA.transfer(address(routerSolidlyCA), 100_000 ether);
+        tokenC.transfer(address(routerSolidlyCA), 100_000 ether);
+
+        executor.setAllowedRouter(address(routerSolidlyBC), true);
+        executor.setRouterType(address(routerSolidlyBC), ArbitrageExecutor.RouterType.Solidly);
+        executor.setAllowedRouter(address(routerSolidlyCA), true);
+        executor.setRouterType(address(routerSolidlyCA), ArbitrageExecutor.RouterType.Solidly);
+
+        uint256 balBefore = tokenA.balanceOf(address(executor));
+
+        executor.executeTriangularArbitrage(
+            address(tokenA), address(tokenB), address(tokenC),
+            100 ether,
+            address(routerSolidlyA),  // A→B: Solidly volatile
+            address(routerSolidlyBC), // B→C: Solidly volatile
+            address(routerSolidlyCA), // C→A: Solidly volatile
+            0, 0, 0,
+            100 ether,
+            deadline
+        );
+
+        uint256 balAfter = tokenA.balanceOf(address(executor));
+        assertGt(balAfter - balBefore, 100 ether);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // SyncSwap Tests
+    // ════════════════════════════════════════════════════════════
+
+    function test_SyncSwap_RouterType_SetAndGet() public {
+        assertEq(
+            uint8(executor.routerType(address(factorySyncSwap))),
+            uint8(ArbitrageExecutor.RouterType.SyncSwap)
+        );
+        assertTrue(executor.allowedRouters(address(factorySyncSwap)));
+    }
+
+    function test_SyncSwap_ExecuteProfitableArb() public {
+        // SyncSwap→SyncSwap: buy on poolA (1 TKA → 2 TKB), sell on poolB (1 TKB → 0.6 TKA)
+        // 100 TKA → 200 TKB → 120 TKA: profit = 20 TKA
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(factorySyncSwap), address(factorySyncSwap),
+            0, 0,
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_SyncSwap_RevertsIfUnprofitable() public {
+        // Pool C gives 0.4 TKA per TKB → 100 TKA → 200 TKB → 80 TKA → loss
+        MockSyncSwapFactory factoryLoss = new MockSyncSwapFactory();
+        factoryLoss.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
+        factoryLoss.setPool(address(tokenB), address(tokenA), address(poolSyncSwapC));
+        executor.setAllowedRouter(address(factoryLoss), true);
+        executor.setRouterType(address(factoryLoss), ArbitrageExecutor.RouterType.SyncSwap);
+
+        // Fund loss pool
+        tokenA.transfer(address(poolSyncSwapC), 100_000 ether);
+
+        vm.expectRevert();
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(factoryLoss), address(factoryLoss),
+            0, 0,
+            1 ether, deadline
+        );
+    }
+
+    function test_MixedV2SyncSwap_ArbBuyV2SellSyncSwap() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(routerA),          // V2: buy 200 TKB for 100 TKA
+            address(factorySyncSwap),  // SyncSwap: sell 200 TKB → 120 TKA
+            0, 0,
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_MixedSyncSwapV2_ArbBuySyncSwapSellV2() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(factorySyncSwap),  // SyncSwap: buy 200 TKB for 100 TKA
+            address(routerB),          // V2: sell 200 TKB → 120 TKA
+            0, 0,
+            0, deadline
+        );
+
+        uint256 after_ = tokenA.balanceOf(address(executor));
+        assertEq(after_ - before, 20 ether);
+    }
+
+    function test_SyncSwap_RevertsIfFactoryNotWhitelisted() public {
+        MockSyncSwapFactory unwhitelisted = new MockSyncSwapFactory();
+        unwhitelisted.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
+        unwhitelisted.setPool(address(tokenB), address(tokenA), address(poolSyncSwapB));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(unwhitelisted))
+        );
+        executor.executeArbitrage(
+            address(tokenA), address(tokenB),
+            100 ether,
+            address(unwhitelisted), address(unwhitelisted),
+            0, 0,
+            0, deadline
+        );
+    }
+
+    function test_SyncSwap_Triangular_Profitable() public {
+        // Deploy tokenC for triangular test
+        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
+
+        // SyncSwap pools for triangular: A→B→C→A
+        // A→B: 1 TKA → 2 TKB (pool AB already exists in factorySyncSwap)
+        // B→C: 1 TKB → 3 TKC
+        // C→A: 1 TKC → 0.51 TKA  → 100 TKA → 200 TKB → 600 TKC → 306 TKA: profit = 206 TKA
+        MockSyncSwapPool poolBC = new MockSyncSwapPool(address(tokenB), address(tokenC), 3, 1);
+        MockSyncSwapPool poolCA = new MockSyncSwapPool(address(tokenC), address(tokenA), 51, 100);
+
+        tokenC.transfer(address(poolBC), 300_000 ether);
+        tokenA.transfer(address(poolCA), 100_000 ether);
+        tokenC.transfer(address(poolCA), 100_000 ether);
+
+        MockSyncSwapFactory factoryTri = new MockSyncSwapFactory();
+        factoryTri.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
+        factoryTri.setPool(address(tokenB), address(tokenC), address(poolBC));
+        factoryTri.setPool(address(tokenC), address(tokenA), address(poolCA));
+
+        executor.setAllowedRouter(address(factoryTri), true);
+        executor.setRouterType(address(factoryTri), ArbitrageExecutor.RouterType.SyncSwap);
+
+        uint256 balBefore = tokenA.balanceOf(address(executor));
+
+        executor.executeTriangularArbitrage(
+            address(tokenA), address(tokenB), address(tokenC),
+            100 ether,
+            address(factoryTri), address(factoryTri), address(factoryTri),
+            0, 0, 0,
+            100 ether,
+            deadline
+        );
+
+        uint256 balAfter = tokenA.balanceOf(address(executor));
+        assertGt(balAfter - balBefore, 100 ether);
     }
 
     // Allow receiving ETH for withdraw tests

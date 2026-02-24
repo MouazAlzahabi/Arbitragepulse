@@ -41,6 +41,14 @@ fn default_min_swap_amount() -> u128 {
 pub enum RouterType {
     V2,
     V3,
+    /// Solidly / ve(3,3) fork (Lynex, Nile, Velodrome-style).
+    /// Uses Route[]{from, to, stable} interface.
+    /// fee field encodes pool type: 0=volatile, 1=stable.
+    Solidly,
+    /// SyncSwap: per-pool quoting via pool.getAmountOut(tokenIn, amountIn, sender).
+    /// The router `address` in config points to the Pool Factory.
+    /// Quoting only — execution requires major contract changes (not yet supported).
+    SyncSwap,
 }
 
 impl Default for RouterType {
@@ -63,6 +71,12 @@ pub struct RouterConfig {
     /// V3 fee tiers to try (500, 3000, 10000)
     #[serde(default)]
     pub fee_tiers: Vec<u32>,
+    /// Per-router QuoterV2 address for V3 quotes.
+    /// If set, overrides the chain-level quoter_v2_address for this specific router.
+    /// Required when multiple V3 protocols on the same chain each have their own QuoterV2
+    /// (e.g., PancakeSwap V3 vs Uniswap V3 on Linea).
+    #[serde(default)]
+    pub quoter_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -111,6 +125,9 @@ pub struct Env {
     pub log_level: String,
     pub api_key: String,
     pub config_path: String,
+    /// Whether to start in dry-run mode (detect-only, no tx submission).
+    /// Set DRY_RUN=false in .env to start live. Default: true (safe default).
+    pub dry_run: bool,
 }
 
 pub fn load_env() -> Result<Env> {
@@ -132,6 +149,9 @@ pub fn load_env() -> Result<Env> {
         log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
         api_key: std::env::var("API_KEY").unwrap_or_default(),
         config_path: std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".into()),
+        dry_run: std::env::var("DRY_RUN")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true), // safe default: start dry unless explicitly set to false
     })
 }
 

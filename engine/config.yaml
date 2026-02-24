@@ -8,10 +8,10 @@
 
 # ─── CHAINS ────────────────────────────────────────────────
 chains:
-  # ── Local Anvil fork (for testing with MockRouters) ──
+  # ── Local Anvil fork (for testing with MockRouters) — disabled for production ──
   - id: 10
     name: "Optimism"
-    enabled: true
+    enabled: false
     ws_rpc: "ws://127.0.0.1:8545"
     http_rpc: "http://127.0.0.1:8545"
     native_currency: "ETH"
@@ -94,17 +94,20 @@ chains:
 
   - id: 59144
     name: "Linea"
-    enabled: false  # Set to true after deployment
+    enabled: true
     ws_rpc: "wss://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
     http_rpc: "https://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
     native_currency: "ETH"
     wrapped_native: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"
     block_time_ms: 2000  # 2 second blocks
-    contract_address: "0xYOUR_CONTRACT_ON_LINEA"  # Update after deployment
+    contract_address: "0xF962fF73082509A2A9EED572e24E13D567419C9d"
     min_native_balance: 0.01
-    min_profit_usd: 1.5  # $1.50 minimum (conservative for mainnet)
+    min_profit_usd: 0.0001  # Near-zero for test execution — any real spread will trigger
     deadline_seconds: 120
-    min_swap_amount_filter: 20000000000000000  # 0.02 ETH or 20 USDC (filters dust)
+    min_swap_amount_filter: 10000000  # 10 USDC minimum (reduced to catch more opportunities)
+    # Chain-level fallback quoter — used for routers that don't have their own quoter_address.
+    # Set to Uniswap's QuoterV2 (deepest liquidity → most accurate ETH price).
+    quoter_v2_address: "0x42bE4D6527829FeFA1493e1fb9F3676d2425C3C1"  # Uniswap V3 QuoterV2 (Linea)
     ws_rpc_fallbacks:
       - "wss://rpc.linea.build"  # Public fallback
 
@@ -230,19 +233,70 @@ routers:
     fee_bps: 30
 
   # ── Linea ──
-  - id: "lynex-linea"
-    name: "Lynex (Linea)"
+  - id: "pancake-v2-linea"
+    name: "PancakeSwap V2 (Linea)"
     chain_id: 59144
-    address: "0x1b81d678ffb9c0263b24a97847620c99d213eb14"
+    address: "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb"
     type: "v2"
-    fee_bps: 30
+    fee_bps: 25
 
-  - id: "nile-linea"
-    name: "Nile Exchange (Linea)"
+  - id: "pancake-v3-linea"
+    name: "PancakeSwap V3 (Linea)"
+    chain_id: 59144
+    address: "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86"
+    type: "v3"
+    fee_bps: 5
+    fee_tiers: [100, 500, 2500]  # 100bp is the only confirmed pool with liquidity on Linea
+    # PancakeSwap has its own QuoterV2 — different factory from Uniswap
+    quoter_address: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"
+
+  - id: "uniswap-v3-linea"
+    name: "Uniswap V3 (Linea)"
+    chain_id: 59144
+    address: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"  # SwapRouter02
+    type: "v3"
+    fee_bps: 0
+    fee_tiers: [500, 3000, 10000]
+    # Uses chain-level quoter_v2_address (Uniswap's own QuoterV2)
+
+  # Nile Exchange — Solidly ve(3,3) fork on Linea
+  # Same Route[]{from, to, stable} interface as Lynex
+  - id: "nile-solidly-linea"
+    name: "Nile Exchange (Solidly, Linea)"
     chain_id: 59144
     address: "0xAAA45c8F5ef92a000a121d102F4e89278a711Faa"
-    type: "v2"
-    fee_bps: 30
+    type: "solidly"
+    fee_bps: 20  # ~0.2% volatile pool default
+
+  # Lynex — Solidly ve(3,3) fork (largest native Linea DEX by TVL)
+  # Uses Route[]{from, to, stable} interface.
+  # fee=0 → volatile pool (vAMM), fee=1 → stable pool (sAMM)
+  # IMPORTANT: Must be whitelisted on-chain after re-deploying updated contract:
+  #   executor.setAllowedRouter(0x610D..., true)
+  #   executor.setRouterType(0x610D..., 2)   # 2 = Solidly
+  - id: "lynex-solidly-linea"
+    name: "Lynex (Solidly, Linea)"
+    chain_id: 59144
+    address: "0x610D2f07b7EdC67565160F587F37636194C34E74"
+    type: "solidly"
+    fee_bps: 20  # ~0.2% Solidly volatile pool default
+
+  # SyncSwap — largest DEX on Linea by volume (custom per-pool quoting interface)
+  # The `address` field is the Pool Factory — used to look up pool addresses at startup.
+  # Opportunities are DETECT-ONLY (not executed) until contract-level support is added.
+  - id: "syncswap-classic-linea"
+    name: "SyncSwap Classic Pool Factory (Linea)"
+    chain_id: 59144
+    address: "0x37BAc764494c8db4e54BDE72f6965beA9fa0AC2d"
+    type: "syncswap"
+    fee_bps: 10  # 0.1% classic pools
+
+  - id: "syncswap-stable-linea"
+    name: "SyncSwap Stable Pool Factory (Linea)"
+    chain_id: 59144
+    address: "0xE4CF807E351b56720B17A59094179e7Ed9dD3727"
+    type: "syncswap"
+    fee_bps: 1   # 0.01% stable pools
 
 
 # ─── PAIRS ────────────────────────────────────────────────
@@ -534,9 +588,9 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "100"  # Increased from $60 test amount
-    max_trade: "500"
-    min_swap_size: "10"
+    trade_amount: "80"   # $80 of $101 balance — at 0.073% spread: $0.058 gross > $0.022 gas
+    max_trade: "80"
+    min_swap_size: "5"
     watch_pools: []
 
   - id: "linea-weth-usdc"
@@ -547,7 +601,59 @@ pairs:
     token_out_symbol: "USDC"
     token_in_decimals: 18
     token_out_decimals: 6
-    trade_amount: "0.05"
-    max_trade: "0.2"
-    min_swap_size: "0.01"
+    trade_amount: "0.048"   # ~$79 at current price
+    max_trade: "0.048"
+    min_swap_size: "0.003"
+    watch_pools: []
+
+  - id: "linea-usdc-usdt"
+    chain_id: 59144
+    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
+    token_out: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDT"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "80"
+    max_trade: "80"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "linea-usdt-weth"
+    chain_id: 59144
+    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
+    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    token_in_symbol: "USDT"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "80"
+    max_trade: "80"
+    min_swap_size: "5"
+    watch_pools: []
+
+  - id: "linea-wbtc-weth"
+    chain_id: 59144
+    token_in: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
+    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    token_in_symbol: "WBTC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 8
+    token_out_decimals: 18
+    trade_amount: "0.0005"   # ~$45 at current price
+    max_trade: "0.0005"
+    min_swap_size: "0.0001"
+    watch_pools: []
+
+  - id: "linea-wsteth-weth"
+    chain_id: 59144
+    token_in: "0xB5beDd42000b71FddE22D3eF8173158d76a5094B"  # wstETH
+    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    token_in_symbol: "WSTETH"
+    token_out_symbol: "WETH"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "0.048"   # ~$79 at current price
+    max_trade: "0.048"
+    min_swap_size: "0.005"
     watch_pools: []

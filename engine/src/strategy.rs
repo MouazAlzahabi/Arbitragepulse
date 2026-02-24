@@ -6,10 +6,9 @@ use futures::future::join_all;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, Instant};
 use tracing::debug;
 
-use crate::abi::{IMulticall3, IQuoterV2, IUniswapV2Router02};
+use crate::abi::{IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Router02};
 use crate::config::{PairConfig, RouterConfig, RouterType};
 
 // ─── Opportunity ──────────────────────────────────────────────────────────────
@@ -82,6 +81,12 @@ impl Opportunity {
         }
     }
 
+    /// Returns true if this opportunity can be sent to the contract for execution.
+    /// All router types (V2, V3, Solidly, SyncSwap) are supported by the deployed contract.
+    pub fn is_executable(&self) -> bool {
+        true
+    }
+
     /// Full opportunity fingerprint for deduplication.
     /// Includes pair, routers, and amount to prevent re-evaluating identical opportunities.
     pub fn fingerprint(&self) -> String {
@@ -119,6 +124,9 @@ struct ForwardTask {
     amount_in: U256,
     token_in: Address,
     token_out: Address,
+    /// V3 only: the QuoterV2 address used for this task's quote.
+    /// Carried through so the reverse phase uses the same quoter for that router.
+    quoter_addr: Option<Address>,
 }
 
 #[derive(Clone)]
@@ -142,35 +150,8 @@ struct ReverseTask {
     token_out: Address,
 }
 
-#[derive(Clone, Debug)]
-struct TriangularTask {
-    triplet_id: String,     // "A-B-C"
-    leg: TriangularLeg,     // AB, BC, or CA
-    token_a: Address,
-    token_b: Address,
-    token_c: Address,
-    amount_in: U256,
-    router_addr: Address,
-    router_id: String,
-    router_type: RouterType,
-    fee: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum TriangularLeg {
-    AB,  // A→B
-    BC,  // B→C
-    CA,  // C→A
-}
 
 // ─── Strategy ─────────────────────────────────────────────────────────────────
-
-/// Cached quote result with timestamp
-#[derive(Clone)]
-struct CachedQuote {
-    result: U256,
-    cached_at: Instant,
-}
 
 pub struct Strategy {
     pub chain_id: u64,
@@ -180,10 +161,11 @@ pub struct Strategy {
     pub min_profit_usd: f64,
     /// QuoterV2 contract address for V3 quotes (chain-specific, NOT the swap router)
     pub quoter_v2_address: Option<Address>,
-    /// Quote cache: maps quote fingerprint → (result, timestamp)
-    /// TTL = 4 seconds (2 blocks on most chains)
-    quote_cache: HashMap<String, CachedQuote>,
-    quote_cache_ttl: Duration,
+    /// SyncSwap pool address cache.
+    /// Key: "router_id:token_in_lowercase:token_out_lowercase"
+    /// Value: Some(pool_address) if pool exists, None if no pool for this pair.
+    /// Populated at startup and after config hot-reload via populate_syncswap_pools().
+    pub syncswap_pool_cache: HashMap<String, Option<Address>>,
 }
 
 impl Strategy {
@@ -201,14 +183,113 @@ impl Strategy {
             native_price_usd: 2500.0,
             min_profit_usd,
             quoter_v2_address,
-            quote_cache: HashMap::new(),
-            quote_cache_ttl: Duration::from_secs(4), // 2 blocks on most chains
+            syncswap_pool_cache: HashMap::new(),
         }
+    }
+
+    /// Populate the SyncSwap pool address cache by calling getPool() on each factory
+    /// for every configured pair. Must be awaited at startup and after config hot-reload.
+    ///
+    /// SyncSwap config entries use the `address` field as the Pool Factory address.
+    /// Both forward (A→B) and reverse (B→A) directions are stored (same pool address).
+    pub async fn populate_syncswap_pools<P: Provider + Clone>(&mut self, provider: &P) {
+        let syncswap_routers: Vec<RouterConfig> = self
+            .routers
+            .iter()
+            .filter(|r| r.chain_id == self.chain_id && r.router_type == RouterType::SyncSwap)
+            .cloned()
+            .collect();
+
+        if syncswap_routers.is_empty() {
+            return;
+        }
+
+        let chain_pairs: Vec<&PairConfig> = self
+            .pairs
+            .iter()
+            .filter(|p| p.chain_id == self.chain_id)
+            .collect();
+
+        let mut mc_calls: Vec<(Address, Vec<u8>)> = Vec::new();
+        // Metadata: (router_id, token_in_lower, token_out_lower)
+        let mut mc_meta: Vec<(String, String, String)> = Vec::new();
+
+        for pair in &chain_pairs {
+            let token_in: Address = match pair.token_in.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let token_out: Address = match pair.token_out.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            // Normalize addresses by parsing then formatting then lowercasing
+            let token_in_lower = format!("{token_in}").to_lowercase();
+            let token_out_lower = format!("{token_out}").to_lowercase();
+
+            for router in &syncswap_routers {
+                let factory_addr: Address = match router.address.parse() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+
+                let calldata = ISyncSwapClassicPoolFactory::getPoolCall {
+                    tokenA: token_in,
+                    tokenB: token_out,
+                }
+                .abi_encode();
+
+                mc_calls.push((factory_addr, calldata));
+                mc_meta.push((router.id.clone(), token_in_lower.clone(), token_out_lower.clone()));
+            }
+        }
+
+        if mc_calls.is_empty() {
+            return;
+        }
+
+        let results = run_multicall(provider, mc_calls).await;
+        let mut found = 0usize;
+
+        for ((router_id, token_in_lower, token_out_lower), raw_opt) in
+            mc_meta.into_iter().zip(results.into_iter())
+        {
+            let pool_opt: Option<Address> = raw_opt
+                .and_then(|raw| {
+                    ISyncSwapClassicPoolFactory::getPoolCall::abi_decode_returns(&raw).ok()
+                })
+                .filter(|a: &Address| !a.is_zero());
+
+            if pool_opt.is_some() {
+                found += 1;
+            }
+
+            // Store under forward AND reverse key (same pool serves both directions)
+            let key_fwd = format!("{}:{}:{}", router_id, token_in_lower, token_out_lower);
+            let key_rev = format!("{}:{}:{}", router_id, token_out_lower, token_in_lower);
+            self.syncswap_pool_cache.insert(key_fwd, pool_opt);
+            self.syncswap_pool_cache.insert(key_rev, pool_opt);
+        }
+
+        debug!(
+            "[chain={}] SyncSwap pool cache populated: {}/{} pairs have pools",
+            self.chain_id,
+            found,
+            self.syncswap_pool_cache.len() / 2
+        );
     }
 
     /// Evaluate all pairs on all router combinations for arb opportunities.
     /// All quotes run concurrently (two phases: forward then reverse).
-    pub async fn evaluate<P: Provider + Clone>(&self, provider: &P) -> Vec<ArbOpportunity> {
+    /// Returns `(opportunities, best_raw_profit_usd, fwd_quotes_ok, pairs_with_multi, best_spread_pct, pairs_with_any)`:
+    /// - `best_raw_profit_usd`: highest profit even if below min_profit_usd (for status logging)
+    /// - `fwd_quotes_ok`: total number of successful non-zero forward quotes
+    /// - `pairs_with_multi`: number of pairs with quotes from ≥2 distinct router IDs
+    /// - `best_spread_pct`: best (reverse_out/amount_in - 1.0) seen, even when negative.
+    ///   Negative = market is efficient (e.g. -0.002 = 0.2% below break-even).
+    ///   Positive = profitable spread found.
+    /// - `pairs_with_any`: number of pairs with at least 1 non-zero quote (shows coverage)
+    pub async fn evaluate<P: Provider + Clone>(&self, provider: &P) -> (Vec<ArbOpportunity>, f64, usize, usize, f64, usize) {
         let chain_routers: Vec<&RouterConfig> = self
             .routers
             .iter()
@@ -261,13 +342,20 @@ impl Strategy {
                             amount_in,
                             token_in,
                             token_out,
+                            quoter_addr: None,
                         });
                     }
                     RouterType::V3 => {
-                        let quoter = match self.quoter_v2_address {
+                        // Per-router quoter takes priority; fall back to chain-level.
+                        // This allows multiple V3 protocols on the same chain (e.g.
+                        // PancakeSwap V3 + Uniswap V3) each using their own QuoterV2.
+                        let quoter = router.quoter_address.as_deref()
+                            .and_then(|s| s.parse::<Address>().ok())
+                            .or(self.quoter_v2_address);
+                        let quoter = match quoter {
                             Some(q) => q,
                             None => {
-                                debug!("No QuoterV2 address for chain {} — skipping V3 quotes", self.chain_id);
+                                debug!("No QuoterV2 for router {} on chain {} — skipping V3 quotes", router.id, self.chain_id);
                                 continue;
                             }
                         };
@@ -297,6 +385,63 @@ impl Strategy {
                                 amount_in,
                                 token_in,
                                 token_out,
+                                quoter_addr: Some(quoter),
+                            });
+                        }
+                    }
+                    RouterType::Solidly => {
+                        // Try both volatile (fee=0) and stable (fee=1) pools.
+                        // fee encoding: 0=volatile (vAMM xy=k), 1=stable (sAMM x³y+y³x=k)
+                        for stable_flag in [0u32, 1u32] {
+                            let stable = stable_flag != 0;
+                            let calldata = ISolidlyRouter::getAmountsOutCall {
+                                amountIn: amount_in,
+                                routes: vec![ISolidlyRouter::Route {
+                                    from: token_in,
+                                    to: token_out,
+                                    stable,
+                                }],
+                            }
+                            .abi_encode();
+                            fwd_mc.push((router_addr, calldata));
+                            fwd_tasks.push(ForwardTask {
+                                pair_idx: pi,
+                                router_id: format!("{}::{}", router.id, if stable { "stable" } else { "volatile" }),
+                                router_addr,
+                                router_type: RouterType::Solidly,
+                                fee: stable_flag,
+                                amount_in,
+                                token_in,
+                                token_out,
+                                quoter_addr: None,
+                            });
+                        }
+                    }
+                    RouterType::SyncSwap => {
+                        // Look up pool address from cache (populated at startup).
+                        let token_in_lower = format!("{token_in}").to_lowercase();
+                        let token_out_lower = format!("{token_out}").to_lowercase();
+                        let cache_key = format!("{}:{}:{}", router.id, token_in_lower, token_out_lower);
+                        if let Some(Some(pool_addr)) = self.syncswap_pool_cache.get(&cache_key) {
+                            let pool_addr = *pool_addr;
+                            let calldata = ISyncSwapPool::getAmountOutCall {
+                                tokenIn: token_in,
+                                amountIn: amount_in,
+                                sender: Address::ZERO,
+                            }
+                            .abi_encode();
+                            fwd_mc.push((pool_addr, calldata));
+                            fwd_tasks.push(ForwardTask {
+                                pair_idx: pi,
+                                router_id: router.id.clone(),
+                                router_addr,
+                                router_type: RouterType::SyncSwap,
+                                fee: 0,
+                                amount_in,
+                                token_in,
+                                token_out,
+                                // quoter_addr carries the pool address for reverse-phase lookup
+                                quoter_addr: Some(pool_addr),
                             });
                         }
                     }
@@ -319,6 +464,14 @@ impl Strategy {
                 RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
                     .ok()
                     .map(|r| r.amountOut),
+                RouterType::Solidly => {
+                    ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
+                        .ok()
+                        .and_then(|v| v.last().copied())
+                }
+                RouterType::SyncSwap => {
+                    ISyncSwapPool::getAmountOutCall::abi_decode_returns(&raw).ok()
+                }
             };
             if let Some(out) = amount_out.filter(|o| !o.is_zero()) {
                 let mut t = task;
@@ -326,6 +479,21 @@ impl Strategy {
                 pair_quotes.entry(t.pair_idx).or_default().push(t);
             }
         }
+
+        // ── Diagnostic: compute multi-router coverage stats ─────────────────────
+        // Returned to caller (chain.rs) which broadcasts to live feed once per 60s.
+        // Not logged here to avoid terminal flood on every block.
+        let total_fwd_ok: usize = pair_quotes.values().map(|v| v.len()).sum();
+        let pairs_with_any: usize = pair_quotes.len(); // pairs with ≥1 quote from any DEX
+        let pairs_with_multi: usize = pair_quotes.values().filter(|v| {
+            let unique_routers: std::collections::HashSet<&String> =
+                v.iter().map(|q| &q.router_id).collect();
+            unique_routers.len() >= 2
+        }).count();
+        debug!(
+            "[chain={}] Forward quotes: ok={} pairs_with_any={} pairs_with_multi_dex={}",
+            self.chain_id, total_fwd_ok, pairs_with_any, pairs_with_multi
+        );
 
         // ── Phase 2: Reverse quotes via multicall3 (1 RPC round-trip) ───────────
 
@@ -369,7 +537,8 @@ impl Strategy {
                             (rb_addr, cd)
                         }
                         RouterType::V3 => {
-                            let quoter = match self.quoter_v2_address {
+                            // Use the same quoter that worked for q_b's forward quote
+                            let quoter = match q_b.quoter_addr.or(self.quoter_v2_address) {
                                 Some(q) => q,
                                 None => continue,
                             };
@@ -384,6 +553,34 @@ impl Strategy {
                             }
                             .abi_encode();
                             (quoter, cd)
+                        }
+                        RouterType::Solidly => {
+                            // fee_b: 0=volatile, 1=stable — same encoding as forward
+                            let stable = fee_b != 0;
+                            let cd = ISolidlyRouter::getAmountsOutCall {
+                                amountIn: token_out_amount,
+                                routes: vec![ISolidlyRouter::Route {
+                                    from: token_out,
+                                    to: token_in,
+                                    stable,
+                                }],
+                            }
+                            .abi_encode();
+                            (rb_addr, cd)
+                        }
+                        RouterType::SyncSwap => {
+                            // quoter_addr carries the pool address from the forward phase
+                            let pool_addr = match q_b.quoter_addr {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            let cd = ISyncSwapPool::getAmountOutCall {
+                                tokenIn: token_out,
+                                amountIn: token_out_amount,
+                                sender: Address::ZERO,
+                            }
+                            .abi_encode();
+                            (pool_addr, cd)
                         }
                     };
 
@@ -415,6 +612,10 @@ impl Strategy {
         // ── Find profitable opportunities ──────────────────────────────────────
 
         let mut opportunities = Vec::new();
+        let mut best_raw_usd: f64 = 0.0;
+        // Best signed spread ratio: (reverse_out / amount_in) - 1.0
+        // Negative = below break-even; positive = profitable.
+        let mut best_spread_pct: f64 = f64::NEG_INFINITY;
 
         for (task, raw_opt) in rev_tasks.iter().zip(rev_raw.into_iter()) {
             let raw = match raw_opt { Some(r) => r, None => continue };
@@ -425,228 +626,65 @@ impl Strategy {
                 RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
                     .ok()
                     .map(|r| r.amountOut),
-            };
-            if let Some(amount_back) = amount_back_opt.filter(|&b| b > task.amount_in) {
-                let profit = amount_back - task.amount_in;
-                let profit_usd = token_amount_to_usd(
-                    profit,
-                    task.token_in_decimals,
-                    &task.token_in_symbol,
-                    self.native_price_usd,
-                );
-
-                if profit_usd >= self.min_profit_usd {
-                    debug!(
-                        "[{}] Arb: {} | profit=${:.4} | {}/{}",
-                        self.chain_id,
-                        task.pair_id,
-                        profit_usd,
-                        task.router_a_id,
-                        task.router_b_id
-                    );
-                    opportunities.push(ArbOpportunity {
-                        chain_id: self.chain_id,
-                        pair_id: task.pair_id.clone(),
-                        token_in: task.token_in,
-                        token_out: task.token_out,
-                        amount_in: task.amount_in,
-                        router_a: task.router_a_addr,
-                        router_b: task.router_b_addr,
-                        router_a_type: task.router_a_type.clone(),
-                        router_b_type: task.router_b_type.clone(),
-                        fee_a: task.fee_a,
-                        fee_b: task.fee_b,
-                        expected_profit: profit,
-                        profit_usd,
-                        router_a_id: task.router_a_id.clone(),
-                        router_b_id: task.router_b_id.clone(),
-                    });
+                RouterType::Solidly => {
+                    ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
+                        .ok()
+                        .and_then(|v| v.last().copied())
                 }
-            }
-        }
-
-        opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
-        opportunities
-    }
-
-    /// Detect triangular arbitrage opportunities (A → B → C → A loops).
-    /// Returns top opportunities sorted by expected profit.
-    ///
-    /// Uses multicall batching for all quotes (1 RPC call instead of 3N sequential calls).
-    /// Enumerates all router combinations for maximum opportunity discovery.
-    pub async fn detect_triangular<P: Provider + Clone>(
-        &self,
-        provider: &P,
-        max_opportunities: usize,
-    ) -> Vec<TriangularOpportunity> {
-        // Only run if we have at least 3 trusted tokens
-        let trusted_tokens: Vec<_> = self.pairs.iter()
-            .filter(|p| p.chain_id == self.chain_id)
-            .flat_map(|p| vec![&p.token_in, &p.token_out])
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        if trusted_tokens.len() < 3 {
-            return vec![];
-        }
-
-        let chain_routers: Vec<&RouterConfig> = self.routers.iter()
-            .filter(|r| r.chain_id == self.chain_id)
-            .collect();
-
-        if chain_routers.is_empty() {
-            return vec![];
-        }
-
-        // ── Phase 1: Build all multicall tasks upfront ────────────────────────────
-
-        let mut mc_calls: Vec<(Address, Vec<u8>)> = Vec::new();
-        let mut tasks: Vec<TriangularTask> = Vec::new();
-
-        // Enumerate token triplets (limit to 10 to avoid explosion)
-        for (i, token_a_str) in trusted_tokens.iter().take(10).enumerate() {
-            for (j, token_b_str) in trusted_tokens.iter().skip(i + 1).take(10).enumerate() {
-                for (_, token_c_str) in trusted_tokens.iter().skip(i + j + 2).take(10).enumerate() {
-                    let token_a: Address = match token_a_str.parse() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let token_b: Address = match token_b_str.parse() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-                    let token_c: Address = match token_c_str.parse() {
-                        Ok(a) => a,
-                        Err(_) => continue,
-                    };
-
-                    let amount_in = U256::from(1000_000_000u128); // 1000 USDC
-                    let triplet_id = format!("{:?}-{:?}-{:?}", token_a, token_b, token_c);
-
-                    // Enumerate all router combinations (R³ for 3 legs)
-                    for router_ab in &chain_routers {
-                        for router_bc in &chain_routers {
-                            for router_ca in &chain_routers {
-                                self.build_triangular_multicall(
-                                    &mut mc_calls,
-                                    &mut tasks,
-                                    triplet_id.clone(),
-                                    token_a,
-                                    token_b,
-                                    token_c,
-                                    amount_in,
-                                    router_ab,
-                                    router_bc,
-                                    router_ca,
-                                );
-                            }
-                        }
+                RouterType::SyncSwap => {
+                    ISyncSwapPool::getAmountOutCall::abi_decode_returns(&raw).ok()
+                }
+            };
+            if let Some(amount_back) = amount_back_opt.filter(|&b| !b.is_zero()) {
+                // Track signed spread % for all quotes (even unprofitable)
+                let amount_in_f64 = task.amount_in.to::<u128>() as f64;
+                let amount_back_f64 = amount_back.to::<u128>() as f64;
+                if amount_in_f64 > 0.0 {
+                    let spread = amount_back_f64 / amount_in_f64 - 1.0;
+                    if spread > best_spread_pct {
+                        best_spread_pct = spread;
                     }
                 }
-            }
-        }
 
-        if mc_calls.is_empty() {
-            return vec![];
-        }
+                if amount_back > task.amount_in {
+                    let profit = amount_back - task.amount_in;
+                    let profit_usd = token_amount_to_usd(
+                        profit,
+                        task.token_in_decimals,
+                        &task.token_in_symbol,
+                        self.native_price_usd,
+                    );
 
-        // ── Phase 2: Execute ALL quotes in single multicall ───────────────────────
+                    // Track best profit seen regardless of threshold (for status logging)
+                    if profit_usd > best_raw_usd {
+                        best_raw_usd = profit_usd;
+                    }
 
-        let raw_results = run_multicall(provider, mc_calls).await;
-
-        // ── Phase 3: Decode results and group by triplet_id ──────────────────────
-
-        use std::collections::HashMap;
-        let mut triplet_quotes: HashMap<String, HashMap<TriangularLeg, Vec<(TriangularTask, U256)>>> =
-            HashMap::new();
-
-        for (task, raw_opt) in tasks.into_iter().zip(raw_results.into_iter()) {
-            let raw = match raw_opt {
-                Some(r) => r,
-                None => continue,
-            };
-
-            let amount_out = match task.router_type {
-                RouterType::V2 => IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&raw)
-                    .ok()
-                    .and_then(|v| v.last().copied()),
-                RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
-                    .ok()
-                    .map(|r| r.amountOut),
-            };
-
-            if let Some(out) = amount_out.filter(|o| !o.is_zero()) {
-                triplet_quotes
-                    .entry(task.triplet_id.clone())
-                    .or_default()
-                    .entry(task.leg.clone())
-                    .or_default()
-                    .push((task, out));
-            }
-        }
-
-        // ── Phase 4: Reconstruct profitable loops ─────────────────────────────────
-
-        let mut opportunities = Vec::new();
-
-        for (triplet_id, legs) in triplet_quotes {
-            let ab_quotes = match legs.get(&TriangularLeg::AB) {
-                Some(q) if !q.is_empty() => q,
-                _ => continue,
-            };
-            let bc_quotes = match legs.get(&TriangularLeg::BC) {
-                Some(q) if !q.is_empty() => q,
-                _ => continue,
-            };
-            let ca_quotes = match legs.get(&TriangularLeg::CA) {
-                Some(q) if !q.is_empty() => q,
-                _ => continue,
-            };
-
-            // Try all combinations of (AB quote, BC quote, CA quote)
-            for (task_ab, _amount_b) in ab_quotes {
-                for (task_bc, _amount_c) in bc_quotes {
-                    for (task_ca, final_a) in ca_quotes {
-                        // Validate amounts match across legs (BC input = AB output, CA input = BC output)
-                        // Note: We can't perfectly validate since we quoted with fixed amounts,
-                        // but we filter obviously broken paths where amounts are wildly mismatched.
-
-                        let amount_in = task_ab.amount_in;
-
-                        // Check profitability
-                        if *final_a <= amount_in {
-                            continue;
-                        }
-
-                        let profit = *final_a - amount_in;
-                        let profit_usd = u256_to_f64(profit) / 1_000_000.0;
-
-                        if profit_usd < self.min_profit_usd {
-                            continue;
-                        }
-
-                        opportunities.push(TriangularOpportunity {
+                    if profit_usd >= self.min_profit_usd {
+                        debug!(
+                            "[{}] Arb: {} | profit=${:.4} | {}/{}",
+                            self.chain_id,
+                            task.pair_id,
+                            profit_usd,
+                            task.router_a_id,
+                            task.router_b_id
+                        );
+                        opportunities.push(ArbOpportunity {
                             chain_id: self.chain_id,
-                            triplet_id: triplet_id.clone(),
-                            token_a: task_ab.token_a,
-                            token_b: task_ab.token_b,
-                            token_c: task_ab.token_c,
-                            amount_in,
-                            router_ab: task_ab.router_addr,
-                            router_bc: task_bc.router_addr,
-                            router_ca: task_ca.router_addr,
-                            router_ab_type: task_ab.router_type.clone(),
-                            router_bc_type: task_bc.router_type.clone(),
-                            router_ca_type: task_ca.router_type.clone(),
-                            fee_ab: task_ab.fee,
-                            fee_bc: task_bc.fee,
-                            fee_ca: task_ca.fee,
+                            pair_id: task.pair_id.clone(),
+                            token_in: task.token_in,
+                            token_out: task.token_out,
+                            amount_in: task.amount_in,
+                            router_a: task.router_a_addr,
+                            router_b: task.router_b_addr,
+                            router_a_type: task.router_a_type.clone(),
+                            router_b_type: task.router_b_type.clone(),
+                            fee_a: task.fee_a,
+                            fee_b: task.fee_b,
                             expected_profit: profit,
                             profit_usd,
-                            router_ab_id: task_ab.router_id.clone(),
-                            router_bc_id: task_bc.router_id.clone(),
-                            router_ca_id: task_ca.router_id.clone(),
+                            router_a_id: task.router_a_id.clone(),
+                            router_b_id: task.router_b_id.clone(),
                         });
                     }
                 }
@@ -654,152 +692,383 @@ impl Strategy {
         }
 
         opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
-        opportunities.truncate(max_opportunities);
-        opportunities
+        (opportunities, best_raw_usd, total_fwd_ok, pairs_with_multi, best_spread_pct, pairs_with_any)
     }
 
-    /// Build multicall tasks for one triangular arbitrage triplet.
-    /// Adds 3 quote tasks (A→B, B→C, C→A) to the multicall batch.
-    fn build_triangular_multicall(
+    /// Detect triangular arbitrage opportunities (A → B → C → A loops).
+    ///
+    /// Uses 3-phase chained multicall:
+    ///   Phase 1: Quote A→B with the real `amount_in` for each (triplet × router_ab)
+    ///   Phase 2: Quote B→C with the *actual* amount_b from Phase 1
+    ///   Phase 3: Quote C→A with the *actual* amount_c from Phase 2
+    ///
+    /// This eliminates the phantom-profit bug caused by quoting legs with estimated
+    /// amounts that don't reflect real exchange rates (especially USDC↔WETH scale).
+    ///
+    /// Returns `(opportunities, best_raw_profit_usd)` — best_raw_profit_usd tracks
+    /// the highest profit seen even below `min_profit_usd` (for status logging).
+    pub async fn detect_triangular<P: Provider + Clone>(
         &self,
-        mc_calls: &mut Vec<(Address, Vec<u8>)>,
-        tasks: &mut Vec<TriangularTask>,
-        triplet_id: String,
-        token_a: Address,
-        token_b: Address,
-        token_c: Address,
-        amount_in: U256,
-        router_ab: &RouterConfig,
-        router_bc: &RouterConfig,
-        router_ca: &RouterConfig,
-    ) {
-        // ── Leg AB: A→B ───────────────────────────────────────────────────────────
-        self.add_triangular_leg_quote(
-            mc_calls,
-            tasks,
-            triplet_id.clone(),
-            TriangularLeg::AB,
-            token_a,
-            token_b,
-            token_c,
-            amount_in,
-            token_a,
-            token_b,
-            router_ab,
-        );
+        provider: &P,
+        max_opportunities: usize,
+    ) -> (Vec<TriangularOpportunity>, f64) {
+        use std::collections::HashMap;
 
-        // ── Leg BC: B→C (we don't know amount_b yet, so use a reasonable estimate) ──
-        // Use 2× amount_in as a conservative upper bound for quoting purposes.
-        // The actual execution will use the real amount_b from leg AB.
-        let estimated_amount_b = amount_in * U256::from(2u32);
-        self.add_triangular_leg_quote(
-            mc_calls,
-            tasks,
-            triplet_id.clone(),
-            TriangularLeg::BC,
-            token_a,
-            token_b,
-            token_c,
-            estimated_amount_b,
-            token_b,
-            token_c,
-            router_bc,
-        );
+        // ── Build token info from all pairs on this chain ─────────────────────────
+        // addr_lower → (symbol, decimals)
+        let mut token_info: HashMap<String, (String, u8)> = HashMap::new();
+        // addr_lower → trade amount (from the first pair that starts with this token)
+        let mut token_amounts: HashMap<String, U256> = HashMap::new();
 
-        // ── Leg CA: C→A (similarly estimate amount_c) ─────────────────────────────
-        let estimated_amount_c = amount_in * U256::from(4u32);
-        self.add_triangular_leg_quote(
-            mc_calls,
-            tasks,
-            triplet_id,
-            TriangularLeg::CA,
-            token_a,
-            token_b,
-            token_c,
-            estimated_amount_c,
-            token_c,
-            token_a,
-            router_ca,
-        );
-    }
-
-    /// Add a single triangular leg quote to the multicall batch.
-    fn add_triangular_leg_quote(
-        &self,
-        mc_calls: &mut Vec<(Address, Vec<u8>)>,
-        tasks: &mut Vec<TriangularTask>,
-        triplet_id: String,
-        leg: TriangularLeg,
-        token_a: Address,
-        token_b: Address,
-        token_c: Address,
-        amount_in: U256,
-        token_in: Address,
-        token_out: Address,
-        router: &RouterConfig,
-    ) {
-        let router_addr: Address = match router.address.parse() {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-
-        match router.router_type {
-            RouterType::V2 => {
-                let calldata = IUniswapV2Router02::getAmountsOutCall {
-                    amountIn: amount_in,
-                    path: vec![token_in, token_out],
+        for p in self.pairs.iter().filter(|p| p.chain_id == self.chain_id) {
+            let key_in  = p.token_in.to_lowercase();
+            let key_out = p.token_out.to_lowercase();
+            token_info.entry(key_in.clone())
+                .or_insert_with(|| (p.token_in_symbol.clone(), p.token_in_decimals));
+            token_info.entry(key_out.clone())
+                .or_insert_with(|| (p.token_out_symbol.clone(), p.token_out_decimals));
+            if !token_amounts.contains_key(&key_in) {
+                if let Some(amt) = parse_amount_capped(&p.trade_amount, p.max_trade.as_deref(), p.token_in_decimals) {
+                    token_amounts.insert(key_in, amt);
                 }
-                .abi_encode();
-                mc_calls.push((router_addr, calldata));
-                tasks.push(TriangularTask {
-                    triplet_id,
-                    leg,
-                    token_a,
-                    token_b,
-                    token_c,
-                    amount_in,
-                    router_addr,
-                    router_id: router.id.clone(),
-                    router_type: RouterType::V2,
-                    fee: 0,
-                });
-            }
-            RouterType::V3 => {
-                let Some(quoter) = self.quoter_v2_address else {
-                    return;
-                };
-                let tiers = if router.fee_tiers.is_empty() {
-                    vec![3000u32]
-                } else {
-                    router.fee_tiers.clone()
-                };
-                // For triangular, only use first fee tier to reduce combinatorial explosion
-                let fee = tiers[0];
-                let calldata = IQuoterV2::quoteExactInputSingleCall {
-                    params: IQuoterV2::QuoteExactInputSingleParams {
-                        tokenIn: token_in,
-                        tokenOut: token_out,
-                        amountIn: amount_in,
-                        fee: Uint::from(fee),
-                        sqrtPriceLimitX96: Uint::ZERO,
-                    },
-                }
-                .abi_encode();
-                mc_calls.push((quoter, calldata));
-                tasks.push(TriangularTask {
-                    triplet_id,
-                    leg,
-                    token_a,
-                    token_b,
-                    token_c,
-                    amount_in,
-                    router_addr,
-                    router_id: router.id.clone(),
-                    router_type: RouterType::V3,
-                    fee,
-                });
             }
         }
+
+        // Parse unique token addresses
+        let tokens: Vec<(Address, String)> = token_info.keys()
+            .filter_map(|k| k.parse::<Address>().ok().map(|a| (a, k.clone())))
+            .collect();
+
+        if tokens.len() < 3 {
+            return (vec![], 0.0);
+        }
+
+        let chain_routers: Vec<&RouterConfig> = self.routers.iter()
+            .filter(|r| r.chain_id == self.chain_id)
+            .collect();
+
+        if chain_routers.is_empty() {
+            return (vec![], 0.0);
+        }
+
+        // ── Build all ordered triplets ────────────────────────────────────────────
+        // For N tokens: N×(N-1)×(N-2) ordered triplets. Capped at 6 tokens → max 120.
+        struct Triplet {
+            token_a: Address, key_a: String,
+            token_b: Address,
+            token_c: Address,
+            amount_in: U256,
+            triplet_id: String,
+        }
+
+        let max_tokens = 6usize;
+        let mut triplets: Vec<Triplet> = Vec::new();
+
+        for &(token_a, ref key_a) in tokens.iter().take(max_tokens) {
+            let Some(&amount_in) = token_amounts.get(key_a) else { continue };
+            let Some((sym_a, _)) = token_info.get(key_a) else { continue };
+
+            for &(token_b, ref key_b) in &tokens {
+                if token_b == token_a { continue; }
+                let Some((sym_b, _)) = token_info.get(key_b) else { continue };
+
+                for &(token_c, ref key_c) in &tokens {
+                    if token_c == token_a || token_c == token_b { continue; }
+                    let Some((sym_c, _)) = token_info.get(key_c) else { continue };
+
+                    let _ = sym_c; // used only for triplet_id
+                    triplets.push(Triplet {
+                        token_a, key_a: key_a.clone(),
+                        token_b, token_c,
+                        amount_in,
+                        triplet_id: format!("{}→{}→{}", sym_a, sym_b, sym_c),
+                    });
+                }
+            }
+        }
+
+        if triplets.is_empty() {
+            return (vec![], 0.0);
+        }
+
+        // Helper: build a single quote call for (token_in → token_out, amount, router)
+        // Returns (multicall_target, calldata) or None if unsupported.
+        let make_quote = |router: &RouterConfig, token_in: Address, token_out: Address, amount: U256| -> Option<(Address, Vec<u8>)> {
+            let router_addr: Address = router.address.parse().ok()?;
+            match router.router_type {
+                RouterType::V2 => {
+                    let cd = IUniswapV2Router02::getAmountsOutCall {
+                        amountIn: amount,
+                        path: vec![token_in, token_out],
+                    }.abi_encode();
+                    Some((router_addr, cd))
+                }
+                RouterType::V3 => {
+                    // Per-router quoter takes priority; fall back to chain-level
+                    let quoter = router.quoter_address.as_deref()
+                        .and_then(|s| s.parse::<Address>().ok())
+                        .or(self.quoter_v2_address)?;
+                    // Use first fee tier only (limits explosion; most liquid pool usually first)
+                    let fee = router.fee_tiers.first().copied().unwrap_or(500);
+                    let cd = IQuoterV2::quoteExactInputSingleCall {
+                        params: IQuoterV2::QuoteExactInputSingleParams {
+                            tokenIn: token_in,
+                            tokenOut: token_out,
+                            amountIn: amount,
+                            fee: Uint::from(fee),
+                            sqrtPriceLimitX96: Uint::ZERO,
+                        },
+                    }.abi_encode();
+                    Some((quoter, cd))
+                }
+                RouterType::Solidly => {
+                    // Only use volatile pool (fee=0) for triangular to limit explosion.
+                    // Stable pools are designed for stablecoin pairs, not cross-asset loops.
+                    let cd = ISolidlyRouter::getAmountsOutCall {
+                        amountIn: amount,
+                        routes: vec![ISolidlyRouter::Route {
+                            from: token_in,
+                            to: token_out,
+                            stable: false,
+                        }],
+                    }.abi_encode();
+                    Some((router_addr, cd))
+                }
+                RouterType::SyncSwap => {
+                    // Look up pool from cache
+                    let token_in_lower = format!("{token_in}").to_lowercase();
+                    let token_out_lower = format!("{token_out}").to_lowercase();
+                    let cache_key = format!("{}:{}:{}", router.id, token_in_lower, token_out_lower);
+                    let pool_addr = self.syncswap_pool_cache.get(&cache_key)
+                        .and_then(|opt| opt.as_ref().copied())?;
+                    let cd = ISyncSwapPool::getAmountOutCall {
+                        tokenIn: token_in,
+                        amountIn: amount,
+                        sender: Address::ZERO,
+                    }.abi_encode();
+                    Some((pool_addr, cd))
+                }
+            }
+        };
+
+        let decode_amount = |raw: &[u8], rtype: &RouterType| -> Option<U256> {
+            match rtype {
+                RouterType::V2 => IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(raw)
+                    .ok().and_then(|v| v.last().copied()),
+                RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw)
+                    .ok().map(|r| r.amountOut),
+                RouterType::Solidly => {
+                    ISolidlyRouter::getAmountsOutCall::abi_decode_returns(raw)
+                        .ok().and_then(|v| v.last().copied())
+                }
+                RouterType::SyncSwap => {
+                    ISyncSwapPool::getAmountOutCall::abi_decode_returns(raw).ok()
+                }
+            }
+        };
+
+        // ── Phase 1: A→B ─────────────────────────────────────────────────────────
+
+        struct P1Entry {
+            triplet_idx: usize,
+            router_id: String,
+            router_addr: Address,
+            router_type: RouterType,
+            fee: u32,
+        }
+
+        let mut p1_entries: Vec<P1Entry> = Vec::new();
+        let mut p1_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+
+        for (ti, trip) in triplets.iter().enumerate() {
+            for router in &chain_routers {
+                if let Some(call) = make_quote(router, trip.token_a, trip.token_b, trip.amount_in) {
+                    let router_addr: Address = router.address.parse().unwrap_or_default();
+                    let fee = match router.router_type {
+                        RouterType::V2 => 0,
+                        RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                        RouterType::Solidly => 0, // volatile pool (fee=0) for triangular
+                        RouterType::SyncSwap => 0,
+                    };
+                    p1_mc.push(call);
+                    p1_entries.push(P1Entry {
+                        triplet_idx: ti,
+                        router_id: router.id.clone(),
+                        router_addr,
+                        router_type: router.router_type.clone(),
+                        fee,
+                    });
+                }
+            }
+        }
+
+        let p1_results = run_multicall(provider, p1_mc).await;
+
+        // ── Phase 2: B→C with actual amount_b ────────────────────────────────────
+
+        struct P2Entry {
+            triplet_idx: usize,
+            router_ab_id: String, router_ab_addr: Address,
+            router_ab_type: RouterType, fee_ab: u32,
+            router_bc_id: String, router_bc_addr: Address,
+            router_bc_type: RouterType, fee_bc: u32,
+        }
+
+        let mut p2_entries: Vec<P2Entry> = Vec::new();
+        let mut p2_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+
+        for (p1e, raw_opt) in p1_entries.iter().zip(p1_results.iter()) {
+            let raw = match raw_opt { Some(r) => r, None => continue };
+            let amount_b = match decode_amount(raw, &p1e.router_type).filter(|b| !b.is_zero()) {
+                Some(b) => b, None => continue,
+            };
+            let trip = &triplets[p1e.triplet_idx];
+
+            for router in &chain_routers {
+                if let Some(call) = make_quote(router, trip.token_b, trip.token_c, amount_b) {
+                    let router_addr: Address = router.address.parse().unwrap_or_default();
+                    let fee = match router.router_type {
+                        RouterType::V2 => 0,
+                        RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                        RouterType::Solidly => 0,
+                        RouterType::SyncSwap => 0,
+                    };
+                    p2_mc.push(call);
+                    p2_entries.push(P2Entry {
+                        triplet_idx: p1e.triplet_idx,
+                        router_ab_id: p1e.router_id.clone(),
+                        router_ab_addr: p1e.router_addr,
+                        router_ab_type: p1e.router_type.clone(),
+                        fee_ab: p1e.fee,
+                        router_bc_id: router.id.clone(),
+                        router_bc_addr: router_addr,
+                        router_bc_type: router.router_type.clone(),
+                        fee_bc: fee,
+                    });
+                }
+            }
+        }
+
+        let p2_results = run_multicall(provider, p2_mc).await;
+
+        // ── Phase 3: C→A with actual amount_c ────────────────────────────────────
+
+        struct P3Entry {
+            triplet_idx: usize,
+            router_ab_id: String, router_ab_addr: Address,
+            router_ab_type: RouterType, fee_ab: u32,
+            router_bc_id: String, router_bc_addr: Address,
+            router_bc_type: RouterType, fee_bc: u32,
+            router_ca_id: String, router_ca_addr: Address,
+            router_ca_type: RouterType, fee_ca: u32,
+        }
+
+        let mut p3_entries: Vec<P3Entry> = Vec::new();
+        let mut p3_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+
+        for (p2e, raw_opt) in p2_entries.iter().zip(p2_results.iter()) {
+            let raw = match raw_opt { Some(r) => r, None => continue };
+            let amount_c = match decode_amount(raw, &p2e.router_bc_type).filter(|c| !c.is_zero()) {
+                Some(c) => c, None => continue,
+            };
+            let trip = &triplets[p2e.triplet_idx];
+
+            for router in &chain_routers {
+                if let Some(call) = make_quote(router, trip.token_c, trip.token_a, amount_c) {
+                    let router_addr: Address = router.address.parse().unwrap_or_default();
+                    let fee = match router.router_type {
+                        RouterType::V2 => 0,
+                        RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                        RouterType::Solidly => 0,
+                        RouterType::SyncSwap => 0,
+                    };
+                    p3_mc.push(call);
+                    p3_entries.push(P3Entry {
+                        triplet_idx: p2e.triplet_idx,
+                        router_ab_id: p2e.router_ab_id.clone(),
+                        router_ab_addr: p2e.router_ab_addr,
+                        router_ab_type: p2e.router_ab_type.clone(),
+                        fee_ab: p2e.fee_ab,
+                        router_bc_id: p2e.router_bc_id.clone(),
+                        router_bc_addr: p2e.router_bc_addr,
+                        router_bc_type: p2e.router_bc_type.clone(),
+                        fee_bc: p2e.fee_bc,
+                        router_ca_id: router.id.clone(),
+                        router_ca_addr: router_addr,
+                        router_ca_type: router.router_type.clone(),
+                        fee_ca: fee,
+                    });
+                }
+            }
+        }
+
+        let p3_results = run_multicall(provider, p3_mc).await;
+
+        // ── Calculate profits ─────────────────────────────────────────────────────
+
+        let mut opportunities: Vec<TriangularOpportunity> = Vec::new();
+        let mut best_raw_usd: f64 = 0.0;
+
+        for (p3e, raw_opt) in p3_entries.iter().zip(p3_results.iter()) {
+            let raw = match raw_opt { Some(r) => r, None => continue };
+            let amount_a_final = match decode_amount(raw, &p3e.router_ca_type) {
+                Some(a) => a, None => continue,
+            };
+            let trip = &triplets[p3e.triplet_idx];
+            if amount_a_final <= trip.amount_in { continue; }
+
+            let profit = amount_a_final - trip.amount_in;
+
+            // Use correct decimals for profit-to-USD conversion (token_a may be USDC, WETH, etc.)
+            let (sym_a, dec_a) = match token_info.get(&trip.key_a) {
+                Some(info) => info, None => continue,
+            };
+            let profit_usd = token_amount_to_usd(profit, *dec_a, sym_a, self.native_price_usd);
+
+            // Track best profit seen regardless of threshold (for status logging)
+            if profit_usd > best_raw_usd {
+                best_raw_usd = profit_usd;
+            }
+
+            if profit_usd < self.min_profit_usd { continue; }
+
+            debug!(
+                "[{}] Triangular: {} | profit=${:.4} | {}/{}/{}",
+                self.chain_id, trip.triplet_id, profit_usd,
+                p3e.router_ab_id, p3e.router_bc_id, p3e.router_ca_id,
+            );
+
+            opportunities.push(TriangularOpportunity {
+                chain_id: self.chain_id,
+                triplet_id: trip.triplet_id.clone(),
+                token_a: trip.token_a,
+                token_b: trip.token_b,
+                token_c: trip.token_c,
+                amount_in: trip.amount_in,
+                router_ab: p3e.router_ab_addr,
+                router_bc: p3e.router_bc_addr,
+                router_ca: p3e.router_ca_addr,
+                router_ab_type: p3e.router_ab_type.clone(),
+                router_bc_type: p3e.router_bc_type.clone(),
+                router_ca_type: p3e.router_ca_type.clone(),
+                fee_ab: p3e.fee_ab,
+                fee_bc: p3e.fee_bc,
+                fee_ca: p3e.fee_ca,
+                expected_profit: profit,
+                profit_usd,
+                router_ab_id: p3e.router_ab_id.clone(),
+                router_bc_id: p3e.router_bc_id.clone(),
+                router_ca_id: p3e.router_ca_id.clone(),
+            });
+        }
+
+        opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
+        // Deduplicate identical paths (same triplet + same 3 routers)
+        opportunities.dedup_by_key(|o| {
+            format!("{}|{}|{}|{}", o.triplet_id, o.router_ab_id, o.router_bc_id, o.router_ca_id)
+        });
+        opportunities.truncate(max_opportunities);
+        (opportunities, best_raw_usd)
     }
 
     /// Two-round adaptive size optimizer (~2 RTTs, ~200ms).
@@ -931,34 +1200,6 @@ impl Strategy {
         self.native_price_usd = price;
     }
 
-    /// Generate cache key for a quote
-    fn quote_fingerprint(router: &Address, token_in: &Address, token_out: &Address, amount_in: &U256, fee: u32) -> String {
-        format!("{:?}|{:?}|{:?}|{}|{}", router, token_in, token_out, amount_in, fee)
-    }
-
-    /// Get cached quote if available and fresh
-    fn get_cached_quote(&self, key: &str) -> Option<U256> {
-        self.quote_cache.get(key).and_then(|cached| {
-            if cached.cached_at.elapsed() < self.quote_cache_ttl {
-                Some(cached.result)
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Cache a quote result
-    fn cache_quote(&mut self, key: String, result: U256) {
-        self.quote_cache.insert(key, CachedQuote {
-            result,
-            cached_at: Instant::now(),
-        });
-    }
-
-    /// Clean up expired cache entries (called periodically)
-    pub fn cleanup_quote_cache(&mut self) {
-        self.quote_cache.retain(|_, cached| cached.cached_at.elapsed() < self.quote_cache_ttl);
-    }
 }
 
 // ─── Multicall3 batch helper ───────────────────────────────────────────────────
@@ -1060,6 +1301,10 @@ async fn probe_range<P: Provider + Clone + 'static>(
                     Some(q) => quote_v3(&p, q, probe_amount, token_in, token_out, fa).await,
                     None => None,
                 },
+                RouterType::Solidly => {
+                    quote_solidly(&p, ra, probe_amount, token_in, token_out, fa).await
+                }
+                RouterType::SyncSwap => None, // pool address not available in probe_range
             };
             let mid = mid.filter(|m| !m.is_zero())?;
 
@@ -1069,6 +1314,10 @@ async fn probe_range<P: Provider + Clone + 'static>(
                     Some(q) => quote_v3(&p, q, mid, token_out, token_in, fb).await,
                     None => None,
                 },
+                RouterType::Solidly => {
+                    quote_solidly(&p, rb, mid, token_out, token_in, fb).await
+                }
+                RouterType::SyncSwap => None,
             };
             back.filter(|&b| b > probe_amount).map(|b| (probe_amount, b))
         }));
@@ -1129,6 +1378,35 @@ async fn quote_v3<P: Provider>(
         Ok(r) => Some(r.amountOut),
         Err(e) => {
             debug!("V3 quote failed on {:?} fee={}: {}", quoter, fee, e);
+            None
+        }
+    }
+}
+
+async fn quote_solidly<P: Provider>(
+    provider: &P,
+    router: Address,
+    amount_in: U256,
+    token_in: Address,
+    token_out: Address,
+    fee: u32, // 0=volatile, 1=stable
+) -> Option<U256> {
+    let stable = fee != 0;
+    match ISolidlyRouter::new(router, provider)
+        .getAmountsOut(
+            amount_in,
+            vec![ISolidlyRouter::Route {
+                from: token_in,
+                to: token_out,
+                stable,
+            }],
+        )
+        .call()
+        .await
+    {
+        Ok(amounts) => amounts.last().copied(),
+        Err(e) => {
+            debug!("Solidly quote failed on {:?} stable={}: {}", router, stable, e);
             None
         }
     }

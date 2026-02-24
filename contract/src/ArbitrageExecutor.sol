@@ -39,6 +39,39 @@ interface ISwapRouterV3 {
         external returns (uint256 amountOut);
 }
 
+interface ISolidlyRouter {
+    struct Route {
+        address from;
+        address to;
+        bool stable;
+    }
+    function getAmountsOut(uint256 amountIn, Route[] calldata routes)
+        external view returns (uint256[] memory amounts);
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Route[] calldata routes,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+// SyncSwap — pools are called directly (transfer-then-swap, no approve pattern)
+interface ISyncSwapPool {
+    // data = abi.encode(tokenIn, recipient, withdrawMode)
+    // withdrawMode: 1 = ERC20 transfer, 2 = native unwrap
+    function swap(
+        bytes calldata data,
+        address sender,
+        address callback,
+        bytes calldata callbackData
+    ) external returns (uint256 amountOut);
+}
+
+interface ISyncSwapFactory {
+    function getPool(address tokenA, address tokenB) external view returns (address pool);
+}
+
 /**
  * @title ArbitrageExecutor v2
  * @notice Atomic cross-DEX arbitrage executor with V2 and V3 support.
@@ -59,7 +92,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     // ─── Router Types ─────────────────────────────────────────
 
-    enum RouterType { V2, V3 }
+    enum RouterType { V2, V3, Solidly, SyncSwap }
 
     // ─── State ────────────────────────────────────────────────
 
@@ -101,6 +134,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     error TransferFailed();
     error EmptyBatch();
     error RouterNotAllowed(address router);
+    error InsufficientOutput(uint256 got, uint256 min);
+    error PoolNotFound(address factory);
 
     // ─── Constructor ──────────────────────────────────────────
 
@@ -122,7 +157,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     /**
      * @notice Set the protocol type for an already-approved router.
-     *         Call setAllowedRouter first, then setRouterType if it's V3.
+     *         Call setAllowedRouter first, then setRouterType if not V2.
+     *         RouterType: 0=V2, 1=V3, 2=Solidly
      */
     function setRouterType(address router, RouterType rtype) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
@@ -152,7 +188,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
      * @notice Execute an atomic arbitrage: buy tokenOut on routerA,
      *         sell tokenOut on routerB, profit in tokenIn.
      *
-     * Works with V2 and V3 routers — dispatch is automatic based on
+     * Works with V2, V3, and Solidly routers — dispatch is automatic based on
      * the routerType mapping set via setRouterType().
      *
      * @param tokenIn    Base token we start and end with
@@ -160,8 +196,11 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
      * @param amountIn   How much tokenIn to spend
      * @param routerA    DEX to buy on (cheaper)
      * @param routerB    DEX to sell on (more expensive)
-     * @param feeA       V3 fee tier for routerA (0 for V2, 500/3000/10000 for V3)
-     * @param feeB       V3 fee tier for routerB (0 for V2, 500/3000/10000 for V3)
+     * @param feeA       Fee encoding for routerA:
+     *                     V2: ignored (pass 0)
+     *                     V3: fee tier (500/3000/10000)
+     *                     Solidly: pool type (0=volatile, 1=stable)
+     * @param feeB       Fee encoding for routerB (same convention as feeA)
      * @param minProfit  Minimum profit required in tokenIn units (#2)
      * @param deadline   Unix timestamp — revert if tx lands after this (#1)
      */
@@ -319,6 +358,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 amountB;
         if (routerType[routerAB] == RouterType.V3) {
             amountB = _executeSwapV3(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
+        } else if (routerType[routerAB] == RouterType.Solidly) {
+            amountB = _executeSwapSolidly(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
+        } else if (routerType[routerAB] == RouterType.SyncSwap) {
+            amountB = _executeSwapSyncSwap(tokenA, tokenB, amountIn, routerAB, 0, deadline);
         } else {
             amountB = _executeSwapV2(tokenA, tokenB, amountIn, routerAB, 0, deadline);
         }
@@ -327,6 +370,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 amountC;
         if (routerType[routerBC] == RouterType.V3) {
             amountC = _executeSwapV3(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
+        } else if (routerType[routerBC] == RouterType.Solidly) {
+            amountC = _executeSwapSolidly(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
+        } else if (routerType[routerBC] == RouterType.SyncSwap) {
+            amountC = _executeSwapSyncSwap(tokenB, tokenC, amountB, routerBC, 0, deadline);
         } else {
             amountC = _executeSwapV2(tokenB, tokenC, amountB, routerBC, 0, deadline);
         }
@@ -335,6 +382,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         // Require at least amountIn + minProfit on the final leg for router-level MEV protection
         if (routerType[routerCA] == RouterType.V3) {
             _executeSwapV3(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
+        } else if (routerType[routerCA] == RouterType.Solidly) {
+            _executeSwapSolidly(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
+        } else if (routerType[routerCA] == RouterType.SyncSwap) {
+            _executeSwapSyncSwap(tokenC, tokenA, amountC, routerCA, amountIn + minProfit, deadline);
         } else {
             _executeSwapV2(tokenC, tokenA, amountC, routerCA, amountIn + minProfit, deadline);
         }
@@ -470,6 +521,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 tokenOutReceived;
         if (routerType[routerA] == RouterType.V3) {
             tokenOutReceived = _executeSwapV3(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
+        } else if (routerType[routerA] == RouterType.Solidly) {
+            tokenOutReceived = _executeSwapSolidly(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
+        } else if (routerType[routerA] == RouterType.SyncSwap) {
+            tokenOutReceived = _executeSwapSyncSwap(tokenIn, tokenOut, amountIn, routerA, 0, deadline);
         } else {
             tokenOutReceived = _executeSwapV2(tokenIn, tokenOut, amountIn, routerA, 0, deadline);
         }
@@ -478,6 +533,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         // amountOutMin = amountIn + minProfit: router-level MEV protection.
         if (routerType[routerB] == RouterType.V3) {
             _executeSwapV3(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
+        } else if (routerType[routerB] == RouterType.Solidly) {
+            _executeSwapSolidly(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
+        } else if (routerType[routerB] == RouterType.SyncSwap) {
+            _executeSwapSyncSwap(tokenOut, tokenIn, tokenOutReceived, routerB, amountIn + minProfit, deadline);
         } else {
             _executeSwapV2(tokenOut, tokenIn, tokenOutReceived, routerB, amountIn + minProfit, deadline);
         }
@@ -538,6 +597,51 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         );
 
         _resetAllowance(tokenIn, router);  // #4
+    }
+
+    function _executeSwapSolidly(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address router,
+        uint24 fee,
+        uint256 amountOutMin,
+        uint256 deadline
+    ) internal returns (uint256 amountOut) {
+        _approveExact(tokenIn, router, amountIn);  // #4
+
+        // fee=0 → volatile pool (xy=k), fee≠0 → stable pool (x³y+y³x=k)
+        bool stable = (fee != 0);
+
+        ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
+        routes[0] = ISolidlyRouter.Route({ from: tokenIn, to: tokenOut, stable: stable });
+
+        uint256[] memory amounts = ISolidlyRouter(router)
+            .swapExactTokensForTokens(amountIn, amountOutMin, routes, address(this), deadline);
+
+        amountOut = amounts[amounts.length - 1];
+        _resetAllowance(tokenIn, router);  // #4
+    }
+
+    function _executeSwapSyncSwap(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address factory,      // routerA/routerB = SyncSwap pool factory address
+        uint256 amountOutMin,
+        uint256 /*deadline*/  // deadline enforced by outer checkDeadline modifier
+    ) internal returns (uint256 amountOut) {
+        address pool = ISyncSwapFactory(factory).getPool(tokenIn, tokenOut);
+        if (pool == address(0)) revert PoolNotFound(factory);
+
+        // SyncSwap pools: transfer tokens in, then call swap (no approve needed)
+        IERC20(tokenIn).safeTransfer(pool, amountIn);
+
+        // withdrawMode = 1 → ERC20 transfer to recipient
+        bytes memory swapData = abi.encode(tokenIn, address(this), uint8(1));
+        amountOut = ISyncSwapPool(pool).swap(swapData, address(this), address(0), "");
+
+        if (amountOut < amountOutMin) revert InsufficientOutput(amountOut, amountOutMin);
     }
 
     // ═══════════════════════════════════════════════════════════
