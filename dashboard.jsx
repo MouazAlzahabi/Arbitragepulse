@@ -4,7 +4,9 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "rec
 // ═══════════════════════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════════════════════
-const DEFAULT_WS = "ws://localhost:3000/ws";
+const DEFAULT_WS = location.port === "5174"
+  ? "ws://localhost:3000/ws"                                              // local Vite dev
+  : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`; // served from engine
 
 // Known chain ID → display name mapping
 const CHAIN_NAMES = {
@@ -33,7 +35,9 @@ const extractChain = (msg) => {
 // ═══════════════════════════════════════════════════════════
 function useWebSocket(url, apiKey) {
   const [status, setStatus] = useState("disconnected");
-  const [logs, setLogs] = useState([]);
+  const [logs, setLogs] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("ap_logs") || "[]"); } catch { return []; }
+  });
   const [stats, setStats] = useState(null);
   const [engineState, setEngineState] = useState(null);
   const [authError, setAuthError] = useState(false);
@@ -75,7 +79,11 @@ function useWebSocket(url, apiKey) {
           if (d.data?.stats) setStats(d.data.stats || d.data);
           // Normalize: Rust engine sends `level`, TS engine sends `type`
           const entry = { ...d, type: d.type || d.level, _id: Date.now() + Math.random() };
-          setLogs((p) => [...p.slice(-500), entry]);
+          setLogs((p) => {
+            const next = [...p.slice(-499), entry];
+            try { localStorage.setItem("ap_logs", JSON.stringify(next)); } catch {}
+            return next;
+          });
         } catch {}
       };
       ws.onclose = (e) => {
@@ -104,7 +112,7 @@ function useWebSocket(url, apiKey) {
 
   return {
     status, logs, stats, engineState, authError, send,
-    clearLogs: () => setLogs([]),
+    clearLogs: () => { setLogs([]); try { localStorage.removeItem("ap_logs"); } catch {} },
     disconnect: () => { clearTimeout(reconnRef.current); attempts.current = 999; wsRef.current?.close(); setStatus("disconnected"); },
     reconnect: () => { attempts.current = 0; connect(); },
     refreshState: () => send({ command: "state" }),
@@ -780,9 +788,13 @@ function TokenManager({ api }) {
 // MAIN
 // ═══════════════════════════════════════════════════════════
 export default function Dashboard() {
-  const [url, setUrl] = useState(DEFAULT_WS);
-  const [apiKey, setApiKey] = useState("");
-  const [authenticated, setAuthenticated] = useState(false);
+  const [url, setUrl] = useState(() => localStorage.getItem("ap_url") || DEFAULT_WS);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("ap_key") || "");
+  const [authenticated, setAuthenticated] = useState(
+    () => !!(localStorage.getItem("ap_url") && localStorage.getItem("ap_key"))
+  );
+  useEffect(() => { localStorage.setItem("ap_url", url); }, [url]);
+  useEffect(() => { localStorage.setItem("ap_key", apiKey); }, [apiKey]);
   const apiUrl = url.replace("ws://", "http://").replace("wss://", "https://").replace("/ws", "");
   const ws = useWebSocket(url, apiKey);
   const api = useApi(apiUrl, apiKey);

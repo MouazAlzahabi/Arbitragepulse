@@ -20,6 +20,10 @@ use crate::pool_cache::PoolCache;
 /// This filters out uninitialized pools and ghost liquidity without needing USD valuation.
 const MIN_V3_LIQUIDITY: u128 = 1_000_000_000; // 10^9
 
+/// Max calls per Multicall3 batch.  Keeps individual eth_call payloads small so Alchemy
+/// evaluates each in <200ms.  Chunks are fired concurrently, so total latency ≈ max(chunk).
+const MULTICALL_CHUNK_SIZE: usize = 50;
+
 // ─── Opportunity ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1513,7 +1517,10 @@ impl Strategy {
 /// Batch all calls into a single `eth_call` to Multicall3.
 /// Returns `Some(Vec<u8>)` for each call that succeeded, `None` for failures.
 /// Falls back to parallel individual `eth_call`s if Multicall3 is unavailable.
-async fn run_multicall<P: Provider>(
+/// Batch calls via Multicall3, chunking into groups of MULTICALL_CHUNK_SIZE.
+/// All chunks are fired concurrently so total latency ≈ max(slowest chunk), not sum.
+/// Falls back to sequential individual eth_calls for any chunk that fails entirely.
+async fn run_multicall<P: Provider + Clone>(
     provider: &P,
     calls: Vec<(Address, Vec<u8>)>,
 ) -> Vec<Option<Vec<u8>>> {
@@ -1525,39 +1532,52 @@ async fn run_multicall<P: Provider>(
         .parse()
         .expect("hardcoded multicall3 address");
 
-    let mc_calls: Vec<IMulticall3::Call3> = calls
-        .iter()
-        .map(|(target, data)| IMulticall3::Call3 {
-            target: *target,
-            allowFailure: true,
-            callData: data.clone().into(),
+    // Build one future per chunk; all chunks fire concurrently.
+    let chunk_futs: Vec<_> = calls
+        .chunks(MULTICALL_CHUNK_SIZE)
+        .map(|chunk| {
+            let mc_calls: Vec<IMulticall3::Call3> = chunk
+                .iter()
+                .map(|(target, data)| IMulticall3::Call3 {
+                    target: *target,
+                    allowFailure: true,
+                    callData: data.clone().into(),
+                })
+                .collect();
+            let agg_calldata = IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
+            let tx = TransactionRequest::default().to(mc3).input(agg_calldata.into());
+            let p = provider.clone();
+            async move { p.call(tx).await.ok() }
         })
         .collect();
 
-    let agg_calldata = IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
-    let tx = TransactionRequest::default()
-        .to(mc3)
-        .input(agg_calldata.into());
+    let chunk_raw: Vec<Option<_>> = join_all(chunk_futs).await;
 
-    if let Ok(raw) = provider.call(tx).await {
-        if let Ok(ret) = IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
-            return ret
-                .into_iter()
-                .map(|r| if r.success { Some(r.returnData.to_vec()) } else { None })
-                .collect();
+    // Flatten results in order; fall back per-chunk if Multicall3 decode fails.
+    let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
+    let mut call_offset = 0usize;
+    for raw_opt in chunk_raw {
+        let chunk_len = MULTICALL_CHUNK_SIZE.min(calls.len() - call_offset);
+        match raw_opt.and_then(|raw| IMulticall3::aggregate3Call::abi_decode_returns(&raw).ok()) {
+            Some(decoded) => {
+                out.extend(decoded.into_iter().map(|r| {
+                    if r.success { Some(r.returnData.to_vec()) } else { None }
+                }));
+            }
+            None => {
+                // Chunk failed (Multicall3 unavailable or gas exceeded) — fall back sequentially.
+                debug!("Multicall3 chunk failed — using sequential fallback for {} calls", chunk_len);
+                for (target, data) in calls[call_offset..call_offset + chunk_len].iter() {
+                    let tx = TransactionRequest::default()
+                        .to(*target)
+                        .input(data.clone().into());
+                    out.push(provider.call(tx).await.ok().map(|b| b.to_vec()));
+                }
+            }
         }
+        call_offset += chunk_len;
     }
-
-    // Fallback: sequential individual eth_calls (e.g. local chain without Multicall3)
-    debug!("Multicall3 unavailable — using sequential individual calls");
-    let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
-    for (target, data) in calls.iter() {
-        let tx = TransactionRequest::default()
-            .to(*target)
-            .input(data.clone().into());
-        results.push(provider.call(tx).await.ok().map(|b| b.to_vec()));
-    }
-    results
+    out
 }
 
 // ─── Probe helper ─────────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use tracing::info;
 
 use crate::db::Database;
@@ -135,6 +136,7 @@ impl ApiServer {
             .route("/tokens/pairs", get(tokens_pairs))
             .route("/tokens/{chain_id}/{address}", patch(token_trust).delete(token_remove))
             .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+            .fallback_service(ServeDir::new("dist").append_index_html_on_directories(true))
             .layer(CorsLayer::permissive())
             .with_state(state);
 
