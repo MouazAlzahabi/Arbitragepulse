@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
                         total_scans: 0,
                         total_attempts: attempts,
                         total_success: successes,
+                        total_failed: 0,
                         total_profit_usd: profit,
                         dry_run: true,
                         paused: false,

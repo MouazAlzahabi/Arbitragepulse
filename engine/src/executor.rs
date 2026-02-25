@@ -4,6 +4,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn, debug};
 
@@ -23,6 +24,9 @@ const GAS_LIMIT_TRIANGULAR: u64 = 450_000;
 #[derive(Debug, Default, Clone)]
 pub struct ExecutorStats {
     pub total_attempts: u64,
+    /// Txs sent successfully (NOT yet confirmed — use confirmed_success for real count).
+    pub total_sent: u64,
+    /// Confirmed on-chain successes (receipt.status() == true).
     pub total_success: u64,
     pub total_failed: u64,
     pub total_simulated: u64,
@@ -56,6 +60,11 @@ pub struct Executor {
     gas_price_cache: Option<(u128, Instant)>,
     /// Gas price cache TTL (2× block_time for the chain).
     gas_price_cache_ttl: Duration,
+    /// Atomics updated from receipt background tasks — safe to clone into spawns.
+    pub confirmed_success: Arc<AtomicU64>,
+    pub confirmed_failed: Arc<AtomicU64>,
+    /// Confirmed profit in USD (stored as f64 bits in AtomicU64 for lock-free access).
+    pub confirmed_profit_usd_bits: Arc<AtomicU64>,
 }
 
 impl Executor {
@@ -85,6 +94,9 @@ impl Executor {
             db,
             gas_price_cache: None,
             gas_price_cache_ttl,
+            confirmed_success: Arc::new(AtomicU64::new(0)),
+            confirmed_failed: Arc::new(AtomicU64::new(0)),
+            confirmed_profit_usd_bits: Arc::new(AtomicU64::new(0u64)),
         }
     }
 
@@ -206,8 +218,9 @@ impl Executor {
                 let tx_hash = format!("{:?}", pending.tx_hash());
                 let elapsed_send = start.elapsed().as_millis() as u64;
 
-                self.stats.total_success += 1;
-                self.stats.total_profit_wei += opp.expected_profit;
+                // total_sent = tx accepted by mempool (NOT yet confirmed).
+                // total_success is updated only after receipt confirms success.
+                self.stats.total_sent += 1;
                 self.stats.last_tx_hash = Some(tx_hash.clone());
                 self.stats.last_execution_ms = Some(elapsed_send);
 
@@ -231,11 +244,19 @@ impl Executor {
                 let dry_run = self.dry_run;
                 let tx_hash_bg = tx_hash.clone();
                 let provider_bg = provider.clone();
+                let confirmed_success = self.confirmed_success.clone();
+                let confirmed_failed = self.confirmed_failed.clone();
+                let confirmed_profit_bits = self.confirmed_profit_usd_bits.clone();
 
                 tokio::spawn(async move {
                     match pending.get_receipt().await {
                         Ok(receipt) => {
                             if receipt.status() {
+                                confirmed_success.fetch_add(1, Ordering::Relaxed);
+                                // Accumulate profit atomically (f64 add via fetch_update)
+                                confirmed_profit_bits.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                                    Some((f64::from_bits(bits) + profit_usd).to_bits())
+                                }).ok();
                                 info!(
                                     "[{}] ✓ confirmed | gas={} | tx={}",
                                     chain_name,
@@ -243,6 +264,7 @@ impl Executor {
                                     &tx_hash_bg[..10.min(tx_hash_bg.len())],
                                 );
                             } else {
+                                confirmed_failed.fetch_add(1, Ordering::Relaxed);
                                 warn!("[{}] ✗ reverted | tx={}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
                             }
                             if let Some(db) = db {
@@ -253,6 +275,7 @@ impl Executor {
                             }
                         }
                         Err(e) => {
+                            confirmed_failed.fetch_add(1, Ordering::Relaxed);
                             warn!("[{}] Receipt error for {}: {}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
                         }
                     }
@@ -348,8 +371,7 @@ impl Executor {
                 let tx_hash = format!("{:?}", pending.tx_hash());
                 let elapsed_send = start.elapsed().as_millis() as u64;
 
-                self.stats.total_success += 1;
-                self.stats.total_profit_wei += opp.expected_profit;
+                self.stats.total_sent += 1;
                 self.stats.last_tx_hash = Some(tx_hash.clone());
                 self.stats.last_execution_ms = Some(elapsed_send);
 
@@ -373,11 +395,18 @@ impl Executor {
                 let dry_run = self.dry_run;
                 let tx_hash_bg = tx_hash.clone();
                 let provider_bg = provider.clone();
+                let confirmed_success = self.confirmed_success.clone();
+                let confirmed_failed = self.confirmed_failed.clone();
+                let confirmed_profit_bits = self.confirmed_profit_usd_bits.clone();
 
                 tokio::spawn(async move {
                     match pending.get_receipt().await {
                         Ok(receipt) => {
                             if receipt.status() {
+                                confirmed_success.fetch_add(1, Ordering::Relaxed);
+                                confirmed_profit_bits.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                                    Some((f64::from_bits(bits) + profit_usd).to_bits())
+                                }).ok();
                                 info!(
                                     "[{}] ✓ triangular confirmed | gas={} | tx={}",
                                     chain_name,
@@ -385,9 +414,9 @@ impl Executor {
                                     &tx_hash_bg[..10.min(tx_hash_bg.len())],
                                 );
                             } else {
+                                confirmed_failed.fetch_add(1, Ordering::Relaxed);
                                 warn!("[{}] ✗ triangular reverted | tx={}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
                             }
-                            // Persist triangular trade to database
                             if let Some(db) = db {
                                 let success = receipt.status();
                                 let _ = tokio::task::spawn_blocking(move || {
@@ -397,7 +426,7 @@ impl Executor {
                                         &triplet_id,
                                         &router_ab,
                                         &router_bc,
-                                        Some(&router_ca), // Include router_c for triangular
+                                        Some(&router_ca),
                                         profit_usd,
                                         success,
                                         &tx_hash_bg,
@@ -407,6 +436,7 @@ impl Executor {
                             }
                         }
                         Err(e) => {
+                            confirmed_failed.fetch_add(1, Ordering::Relaxed);
                             warn!("[{}] Triangular receipt error for {}: {}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
                         }
                     }

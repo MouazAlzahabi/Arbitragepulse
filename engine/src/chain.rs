@@ -114,6 +114,7 @@ pub async fn run_chain(
                 total_scans: 0,
                 total_attempts: 0,
                 total_success: 0,
+                total_failed: 0,
                 total_profit_usd: 0.0,
                 dry_run: true,
                 paused: false,
@@ -224,12 +225,29 @@ pub async fn run_chain(
                 update_native_price(&strategy, &executor, &provider, &chain_routers, &chain_pairs, &cfg).await;
                 // Broadcast a heartbeat log so the Live Feed shows the engine is active
                 // even when no opportunities are detected. Fires every ~60 seconds.
+                // Sync confirmed_success from executor atomics into shared_state
+                // (receipt background tasks update the atomics, not shared_state directly).
+                let confirmed_ok = {
+                    let exec = executor.lock().await;
+                    let ok = exec.confirmed_success.load(Ordering::Relaxed);
+                    let fail = exec.confirmed_failed.load(Ordering::Relaxed);
+                    let profit = f64::from_bits(exec.confirmed_profit_usd_bits.load(Ordering::Relaxed));
+                    drop(exec);
+                    // Sync confirmed counts from executor atomics → shared_state
+                    let mut state = shared_state.write().await;
+                    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
+                        chain.total_success = ok;
+                        chain.total_failed = fail;
+                        chain.total_profit_usd = profit;
+                    }
+                    ok
+                };
                 let (scans, attempts, success) = {
                     let state = shared_state.read().await;
                     state.chains.iter()
                         .find(|c| c.chain_id == cfg.id)
                         .map(|c| (c.total_scans, c.total_attempts, c.total_success))
-                        .unwrap_or_default()
+                        .unwrap_or((0, 0, confirmed_ok))
                 };
                 let native_price = { strategy.read().await.native_price_usd };
                 // Read and reset the best raw profit seen since last tick
@@ -680,11 +698,11 @@ async fn handle_execution_success(
         metrics.profit_usd.with_label_values(&[&cfg.name]).add(profit_usd);
     }
 
+    // total_attempts = tx sent; total_success is updated in the heartbeat
+    // from executor.confirmed_success (set after receipt confirms on-chain).
     let mut state = shared_state.write().await;
     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
         chain.total_attempts += 1;
-        chain.total_success += 1;
-        chain.total_profit_usd += profit_usd;
     }
 
     broadcast_log(

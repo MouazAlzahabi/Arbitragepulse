@@ -51,6 +51,7 @@ pub struct ChainStats {
     /// Number of times an execution was attempted (opportunity found + profitable).
     pub total_attempts: u64,
     pub total_success: u64,
+    pub total_failed: u64,
     pub total_profit_usd: f64,
     pub dry_run: bool,
     pub paused: bool,
