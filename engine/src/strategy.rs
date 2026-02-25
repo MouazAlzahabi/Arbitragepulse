@@ -416,18 +416,18 @@ impl Strategy {
                         for fee in tiers {
                             // ── Smart Guesser: 3-step V3 screening ──────────────────
                             // Step 1: spot-price screen (zero RPC)
-                            if let Some((spot_out, liquidity)) = self.pool_cache.quote_v3_spot(
+                            if let Some((_spot_out, liquidity)) = self.pool_cache.quote_v3_spot(
                                 &router.id, token_in, token_out, fee, amount_in,
                             ) {
                                 // Step 2: depth check — skip dead/shallow pools
                                 if liquidity < MIN_V3_LIQUIDITY {
                                     continue;
                                 }
-                                // Step 3: directional screen — spot says unprofitable?
-                                if spot_out <= amount_in {
-                                    continue; // no opportunity in this direction
-                                }
-                                // Spot looks profitable: cap query amount to safe tick capacity,
+                                // (Step 3 removed: directional screen `spot_out <= amount_in`
+                                // was broken for mixed-decimal pairs — WETH→USDC always filtered
+                                // because raw USDC (1e6 scale) < raw WETH (1e18 scale) numerically.
+                                // QuoterV2 is the authoritative profitability check.)
+                                // Cap query amount to safe tick capacity,
                                 // then confirm with QuoterV2 for accuracy.
                                 // Find pool address to call estimate_safe_v3_capacity
                                 let t_in_lower = format!("{token_in}").to_lowercase();
