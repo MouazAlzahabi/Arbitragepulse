@@ -110,6 +110,9 @@ chains:
     quoter_v2_address: "0x42bE4D6527829FeFA1493e1fb9F3676d2425C3C1"  # Uniswap V3 QuoterV2 (Linea)
     ws_rpc_fallbacks:
       - "wss://rpc.linea.build"  # Public fallback
+    # Max concurrent Multicall3 chunks per scan.
+    # Each chunk = 1 eth_call (26 CU). Free plan (330 CU/s): 3. Growth plan (3000 CU/s): 10.
+    rpc_concurrency: 3
 
 
 # ─── ROUTERS ──────────────────────────────────────────────

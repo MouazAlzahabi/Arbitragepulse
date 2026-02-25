@@ -3,6 +3,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use futures::future::join_all;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -20,9 +21,8 @@ use crate::pool_cache::PoolCache;
 /// This filters out uninitialized pools and ghost liquidity without needing USD valuation.
 const MIN_V3_LIQUIDITY: u128 = 1_000_000_000; // 10^9
 
-/// Max calls per Multicall3 batch.  Keeps individual eth_call payloads small so Alchemy
-/// evaluates each in <200ms.  Chunks are fired concurrently, so total latency ≈ max(chunk).
-const MULTICALL_CHUNK_SIZE: usize = 50;
+/// Max calls per Multicall3 batch.  Larger chunks = fewer total eth_calls = lower CU usage.
+const MULTICALL_CHUNK_SIZE: usize = 100;
 
 // ─── Opportunity ──────────────────────────────────────────────────────────────
 
@@ -176,6 +176,8 @@ pub struct Strategy {
     pub min_profit_usd: f64,
     /// QuoterV2 contract address for V3 quotes (chain-specific, NOT the swap router)
     pub quoter_v2_address: Option<Address>,
+    /// Max concurrent Multicall3 chunks per scan (from config rpc_concurrency).
+    pub rpc_concurrency: usize,
     /// SyncSwap pool address cache.
     /// Key: "router_id:token_in_lowercase:token_out_lowercase"
     /// Value: Some(pool_address) if pool exists, None if no pool for this pair.
@@ -195,6 +197,7 @@ impl Strategy {
         min_profit_usd: f64,
         quoter_v2_address: Option<Address>,
         pool_cache: Arc<PoolCache>,
+        rpc_concurrency: usize,
     ) -> Self {
         Self {
             chain_id,
@@ -205,6 +208,7 @@ impl Strategy {
             quoter_v2_address,
             syncswap_pool_cache: HashMap::new(),
             pool_cache,
+            rpc_concurrency,
         }
     }
 
@@ -269,7 +273,7 @@ impl Strategy {
             return;
         }
 
-        let results = run_multicall(provider, mc_calls).await;
+        let results = run_multicall(provider, mc_calls, self.rpc_concurrency).await;
         let mut found = 0usize;
 
         for ((router_id, token_in_lower, token_out_lower), raw_opt) in
@@ -571,7 +575,7 @@ impl Strategy {
         }
 
         // Run multicall for routers that couldn't be resolved locally
-        let fwd_raw = run_multicall(provider, fwd_mc).await;
+        let fwd_raw = run_multicall(provider, fwd_mc, self.rpc_concurrency).await;
 
         // Add multicall results to pair_quotes (locally-resolved already added above)
         for (task, raw_opt) in fwd_tasks.into_iter().zip(fwd_raw.into_iter()) {
@@ -758,7 +762,7 @@ impl Strategy {
         }
 
         // Run multicall for reverse quotes that need it
-        let rev_raw = run_multicall(provider, rev_mc).await;
+        let rev_raw = run_multicall(provider, rev_mc, self.rpc_concurrency).await;
 
         // Map multicall results back to rev_tasks
         let mut rev_raw_by_task: Vec<Option<Vec<u8>>> = vec![None; rev_tasks.len()];
@@ -1123,7 +1127,7 @@ impl Strategy {
             }
         }
 
-        let p1_raw = run_multicall(provider, p1_mc).await;
+        let p1_raw = run_multicall(provider, p1_mc, self.rpc_concurrency).await;
         let mut p1_results_by_entry: Vec<Option<Vec<u8>>> = vec![None; p1_entries.len()];
         for (mc_i, &entry_i) in p1_mc_entry_idx.iter().enumerate() {
             p1_results_by_entry[entry_i] = p1_raw.get(mc_i).and_then(|r| r.clone());
@@ -1210,7 +1214,7 @@ impl Strategy {
             }
         }
 
-        let p2_raw = run_multicall(provider, p2_mc).await;
+        let p2_raw = run_multicall(provider, p2_mc, self.rpc_concurrency).await;
         let mut p2_results_by_entry: Vec<Option<Vec<u8>>> = vec![None; p2_entries.len()];
         for (mc_i, &entry_i) in p2_mc_entry_idx.iter().enumerate() {
             p2_results_by_entry[entry_i] = p2_raw.get(mc_i).and_then(|r| r.clone());
@@ -1303,7 +1307,7 @@ impl Strategy {
             }
         }
 
-        let p3_raw = run_multicall(provider, p3_mc).await;
+        let p3_raw = run_multicall(provider, p3_mc, self.rpc_concurrency).await;
         let mut p3_results_by_entry: Vec<Option<Vec<u8>>> = vec![None; p3_entries.len()];
         for (mc_i, &entry_i) in p3_mc_entry_idx.iter().enumerate() {
             p3_results_by_entry[entry_i] = p3_raw.get(mc_i).and_then(|r| r.clone());
@@ -1523,6 +1527,7 @@ impl Strategy {
 async fn run_multicall<P: Provider + Clone>(
     provider: &P,
     calls: Vec<(Address, Vec<u8>)>,
+    concurrency: usize,
 ) -> Vec<Option<Vec<u8>>> {
     if calls.is_empty() {
         return vec![];
@@ -1532,26 +1537,32 @@ async fn run_multicall<P: Provider + Clone>(
         .parse()
         .expect("hardcoded multicall3 address");
 
-    // Build one future per chunk; all chunks fire concurrently.
-    let chunk_futs: Vec<_> = calls
+    // Materialise chunks into owned Vecs so the stream doesn't hold a borrow across awaits
+    // (borrowed slice refs across await → future !Send → tokio::spawn compile error).
+    let owned_chunks: Vec<Vec<(Address, Vec<u8>)>> = calls
         .chunks(MULTICALL_CHUNK_SIZE)
-        .map(|chunk| {
-            let mc_calls: Vec<IMulticall3::Call3> = chunk
-                .iter()
-                .map(|(target, data)| IMulticall3::Call3 {
-                    target: *target,
-                    allowFailure: true,
-                    callData: data.clone().into(),
-                })
-                .collect();
-            let agg_calldata = IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
-            let tx = TransactionRequest::default().to(mc3).input(agg_calldata.into());
-            let p = provider.clone();
-            async move { p.call(tx).await.ok() }
-        })
+        .map(|c| c.to_vec())
         .collect();
 
-    let chunk_raw: Vec<Option<_>> = join_all(chunk_futs).await;
+    // Run at most MULTICALL_MAX_CONCURRENT chunks at a time; buffer_unordered smooths
+    // the Alchemy CU burst that firing everything with join_all caused.
+    let chunk_raw: Vec<Option<_>> = futures::stream::iter(owned_chunks.into_iter().map(|chunk| {
+        let mc_calls: Vec<IMulticall3::Call3> = chunk
+            .iter()
+            .map(|(target, data)| IMulticall3::Call3 {
+                target: *target,
+                allowFailure: true,
+                callData: data.clone().into(),
+            })
+            .collect();
+        let agg_calldata = IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
+        let tx = TransactionRequest::default().to(mc3).input(agg_calldata.into());
+        let p = provider.clone();
+        async move { p.call(tx).await.ok() }
+    }))
+    .buffer_unordered(concurrency.max(1))
+    .collect()
+    .await;
 
     // Flatten results in order; fall back per-chunk if Multicall3 decode fails.
     let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
