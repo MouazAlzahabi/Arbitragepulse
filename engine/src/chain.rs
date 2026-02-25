@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::abi::{IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair};
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
-use crate::config::{self, ChainConfig, PairConfig, RouterConfig};
+use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
 use crate::executor::Executor;
 use crate::listener::{Listener, SwapEvent};
 use crate::metrics::Metrics;
+use crate::pool_cache::{PoolCache, PoolInfo};
 use crate::strategy::{Opportunity, Strategy};
 
 const COOLDOWN_SECS: u64 = 15;
@@ -87,12 +89,20 @@ pub async fn run_chain(
         .as_deref()
         .and_then(|s| s.parse().ok());
 
+    // ── Pool discovery: populate V2/Solidly-volatile reserve cache ────────────
+    // Eliminates per-block eth_calls for xy=k routers — reserves stay fresh via
+    // on-chain Sync events (listener.rs subscribes and updates the cache live).
+    let pool_cache = Arc::new(PoolCache::new());
+    discover_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
+    info!("[{}] Pool cache: {} pools discovered", cfg.name, pool_cache.by_address.len());
+
     let strategy = Arc::new(RwLock::new(Strategy::new(
         cfg.id,
         chain_pairs.clone(),
         chain_routers.clone(),
         cfg.min_profit_usd,
         quoter_v2_address,
+        pool_cache.clone(),
     )));
 
     // Populate SyncSwap pool cache at startup (no-op if no SyncSwap routers configured)
@@ -132,7 +142,7 @@ pub async fn run_chain(
     let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(256);
     {
         let provider_clone = (*provider).clone();
-        listener.subscribe(provider_clone, swap_tx).await?;
+        listener.subscribe(provider_clone, swap_tx, pool_cache.clone()).await?;
     }
 
     // ── Block-header subscription (drives immediate scanning on each new block) ──
@@ -895,6 +905,173 @@ async fn update_native_price<P: Provider>(
                 }
             }
         }
+    }
+}
+
+// ─── Pool discovery (startup) ─────────────────────────────────────────────────
+
+/// Discover V2 and Solidly-volatile pools for all configured pairs and routers.
+/// Populates `pool_cache` with initial reserves so strategy can quote locally.
+///
+/// Three multicall rounds:
+///   1. router.factory()  per V2/Solidly router
+///   2. factory.getPair() per (router × pair)
+///   3. pair.token0() + pair.getReserves() per discovered pool
+async fn discover_pools<P: Provider>(
+    routers: &[RouterConfig],
+    pairs: &[PairConfig],
+    provider: &P,
+    pool_cache: &PoolCache,
+) {
+    use alloy::primitives::U256;
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::sol_types::SolCall;
+
+    // Inline multicall helper — avoids dependency on strategy's private fn.
+    let mc = async |calls: Vec<(Address, Vec<u8>)>| -> Vec<Option<Vec<u8>>> {
+        let mc3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
+            .parse()
+            .expect("hardcoded Multicall3");
+        if calls.is_empty() {
+            return vec![];
+        }
+        let mc_calls: Vec<crate::abi::IMulticall3::Call3> = calls
+            .iter()
+            .map(|(t, d)| crate::abi::IMulticall3::Call3 {
+                target: *t,
+                allowFailure: true,
+                callData: d.clone().into(),
+            })
+            .collect();
+        let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
+        let tx = TransactionRequest::default().to(mc3).input(calldata.into());
+        if let Ok(raw) = provider.call(tx).await {
+            if let Ok(ret) = crate::abi::IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
+                return ret
+                    .into_iter()
+                    .map(|r| if r.success { Some(r.returnData.to_vec()) } else { None })
+                    .collect();
+            }
+        }
+        // Fallback: sequential calls
+        let mut out = Vec::with_capacity(calls.len());
+        for (target, data) in &calls {
+            let tx2 = TransactionRequest::default()
+                .to(*target)
+                .input(data.clone().into());
+            out.push(provider.call(tx2).await.ok().map(|b| b.to_vec()));
+        }
+        out
+    };
+
+    // ── Collect V2 and Solidly routers ────────────────────────────────────────
+    struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32 }
+    let target_routers: Vec<RouterMeta> = routers
+        .iter()
+        .filter(|r| r.router_type == RouterType::V2 || r.router_type == RouterType::Solidly)
+        .filter_map(|r| {
+            let addr: Address = r.address.parse().ok()?;
+            Some(RouterMeta { id: r.id.clone(), addr, rtype: r.router_type.clone(), fee_bps: r.fee_bps })
+        })
+        .collect();
+
+    if target_routers.is_empty() { return; }
+
+    // ── Round 1: factory address per router ───────────────────────────────────
+    let factory_calls: Vec<(Address, Vec<u8>)> = target_routers
+        .iter()
+        .map(|r| (r.addr, IRouterWithFactory::factoryCall {}.abi_encode()))
+        .collect();
+    let factory_raw = mc(factory_calls).await;
+    let factories: Vec<Option<Address>> = factory_raw
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .and_then(|raw| IRouterWithFactory::factoryCall::abi_decode_returns(raw).ok())
+                .filter(|a: &Address| !a.is_zero())
+        })
+        .collect();
+
+    // ── Round 2: getPair per (router × pair) ─────────────────────────────────
+    struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address }
+    let mut pair_calls: Vec<(Address, Vec<u8>)> = Vec::new();
+    let mut pair_metas: Vec<PairMeta> = Vec::new();
+
+    for (ri, rm) in target_routers.iter().enumerate() {
+        let factory = match factories[ri] { Some(f) => f, None => continue };
+        for pair in pairs {
+            let ta: Address = match pair.token_in.parse() { Ok(a) => a, Err(_) => continue };
+            let tb: Address = match pair.token_out.parse() { Ok(a) => a, Err(_) => continue };
+            let cd = match rm.rtype {
+                RouterType::V2 => IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode(),
+                RouterType::Solidly => ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode(),
+                _ => continue,
+            };
+            pair_calls.push((factory, cd));
+            pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb });
+        }
+    }
+
+    if pair_calls.is_empty() { return; }
+    let pair_raw = mc(pair_calls).await;
+
+    // ── Round 3: token0 + getReserves per discovered pool ────────────────────
+    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address }
+    let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
+    let mut pool_metas: Vec<PoolMeta> = Vec::new();
+    let mut seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
+
+    fn decode_addr(raw: &[u8]) -> Option<Address> {
+        if raw.len() >= 32 {
+            let bytes: [u8; 20] = raw[12..32].try_into().ok()?;
+            let a = Address::from(bytes);
+            if !a.is_zero() { Some(a) } else { None }
+        } else { None }
+    }
+
+    for (pm, raw_opt) in pair_metas.iter().zip(pair_raw.iter()) {
+        let pool = match raw_opt.as_ref().and_then(|r| decode_addr(r)) { Some(a) => a, None => continue };
+        if !seen.insert(pool) { continue; }
+        rv_calls.push((pool, IUniswapV2Pair::token0Call {}.abi_encode()));
+        rv_calls.push((pool, IUniswapV2Pair::getReservesCall {}.abi_encode()));
+        pool_metas.push(PoolMeta {
+            pool,
+            router_id: pm.router_id.clone(),
+            rtype: pm.rtype.clone(),
+            fee_bps: pm.fee_bps,
+            ta: pm.ta,
+            tb: pm.tb,
+        });
+    }
+
+    if pool_metas.is_empty() { return; }
+    let rv_raw = mc(rv_calls).await;
+
+    // ── Insert into pool_cache ────────────────────────────────────────────────
+    for (i, pm) in pool_metas.iter().enumerate() {
+        let t0_raw = match rv_raw.get(2 * i) { Some(Some(r)) => r, _ => continue };
+        let res_raw = match rv_raw.get(2 * i + 1) { Some(Some(r)) => r, _ => continue };
+
+        let token0 = match IUniswapV2Pair::token0Call::abi_decode_returns(t0_raw).ok() { Some(t) => t, None => continue };
+        let reserves = match IUniswapV2Pair::getReservesCall::abi_decode_returns(res_raw).ok() { Some(r) => r, None => continue };
+
+        // token1 = whichever of (ta, tb) is not token0
+        let token1 = if pm.ta == token0 { pm.tb } else { pm.ta };
+
+        // Solidly-volatile uses "router_id::volatile" in pool_cache keys
+        let effective_id = match pm.rtype {
+            RouterType::Solidly => format!("{}::volatile", pm.router_id),
+            _ => pm.router_id.clone(),
+        };
+
+        pool_cache.insert(pm.pool, PoolInfo {
+            token0,
+            token1,
+            reserve0: U256::from(reserves.reserve0),
+            reserve1: U256::from(reserves.reserve1),
+            fee_bps: pm.fee_bps,
+            router_id: effective_id,
+        });
     }
 }
 

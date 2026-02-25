@@ -183,7 +183,7 @@ sol! {
     }
 }
 
-// ─── V2 Pair (for swap event subscriptions) ───────────────────────────────────
+// ─── V2 / Solidly Pair events ─────────────────────────────────────────────────
 
 sol! {
     event PairSwapV2(
@@ -194,6 +194,41 @@ sol! {
         uint256 amount1Out,
         address indexed to
     );
+
+    /// Emitted by every V2 and Solidly-volatile pair on every swap.
+    /// reserve0/reserve1 are the NEW balances after the swap.
+    event PairSyncV2(uint112 reserve0, uint112 reserve1);
+}
+
+// ─── Pool discovery (startup, one-time) ───────────────────────────────────────
+
+sol! {
+    #[sol(rpc)]
+    interface IRouterWithFactory {
+        function factory() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface IUniswapV2Factory {
+        function getPair(address tokenA, address tokenB) external view returns (address pair);
+    }
+
+    #[sol(rpc)]
+    interface ISolidlyFactory {
+        /// stable=false → volatile (xy=k), stable=true → stable (x³y+y³x=k)
+        function getPair(address tokenA, address tokenB, bool stable) external view returns (address pair);
+    }
+
+    #[sol(rpc)]
+    interface IUniswapV2Pair {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function getReserves() external view returns (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32 blockTimestampLast
+        );
+    }
 }
 
 // ─── Multicall3 (batch quoting) ───────────────────────────────────────────────

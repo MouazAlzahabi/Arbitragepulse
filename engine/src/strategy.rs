@@ -6,10 +6,12 @@ use futures::future::join_all;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::abi::{IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Router02};
 use crate::config::{PairConfig, RouterConfig, RouterType};
+use crate::pool_cache::PoolCache;
 
 // ─── Opportunity ──────────────────────────────────────────────────────────────
 
@@ -148,6 +150,8 @@ struct ReverseTask {
     token_out_amount: U256,
     token_in: Address,
     token_out: Address,
+    /// Pre-computed reverse amount from pool cache (zero eth_call). None = needs multicall.
+    local_back: Option<U256>,
 }
 
 
@@ -166,6 +170,10 @@ pub struct Strategy {
     /// Value: Some(pool_address) if pool exists, None if no pool for this pair.
     /// Populated at startup and after config hot-reload via populate_syncswap_pools().
     pub syncswap_pool_cache: HashMap<String, Option<Address>>,
+    /// V2/Solidly-volatile pool reserve cache — updated live from on-chain Sync events.
+    /// When populated, forward and reverse quotes for V2/Solidly-volatile routers are
+    /// computed locally (zero eth_call) instead of via multicall.
+    pub pool_cache: Arc<PoolCache>,
 }
 
 impl Strategy {
@@ -175,6 +183,7 @@ impl Strategy {
         routers: Vec<RouterConfig>,
         min_profit_usd: f64,
         quoter_v2_address: Option<Address>,
+        pool_cache: Arc<PoolCache>,
     ) -> Self {
         Self {
             chain_id,
@@ -184,6 +193,7 @@ impl Strategy {
             min_profit_usd,
             quoter_v2_address,
             syncswap_pool_cache: HashMap::new(),
+            pool_cache,
         }
     }
 
@@ -296,7 +306,14 @@ impl Strategy {
             .filter(|r| r.chain_id == self.chain_id)
             .collect();
 
-        // ── Phase 1: Forward quotes via multicall3 (1 RPC round-trip) ───────────
+        // ── Phase 1: Forward quotes ───────────────────────────────────────────────
+        // V2 and Solidly-volatile pools use xy=k (constant-product AMM), so we compute
+        // quotes locally from cached reserves — zero eth_calls.
+        // V3, SyncSwap, and Solidly-stable still need multicall (different curves / no cache).
+
+        // pair_quotes is pre-populated here for locally-resolved routers.
+        let mut pair_quotes: std::collections::HashMap<usize, Vec<ForwardTask>> =
+            std::collections::HashMap::new();
 
         let mut fwd_tasks: Vec<ForwardTask> = Vec::new();
         let mut fwd_mc: Vec<(Address, Vec<u8>)> = Vec::new();
@@ -327,23 +344,40 @@ impl Strategy {
 
                 match router.router_type {
                     RouterType::V2 => {
-                        let calldata = IUniswapV2Router02::getAmountsOutCall {
-                            amountIn: amount_in,
-                            path: vec![token_in, token_out],
+                        // Try local xy=k reserve cache first (no eth_call needed)
+                        if let Some(out) = self.pool_cache.get_amount_out_by_key(
+                            &router.id, token_in, token_out, amount_in,
+                        ) {
+                            pair_quotes.entry(pi).or_default().push(ForwardTask {
+                                pair_idx: pi,
+                                router_id: router.id.clone(),
+                                router_addr,
+                                router_type: RouterType::V2,
+                                fee: 0,
+                                amount_in: out, // repurposed: carries token_out amount
+                                token_in,
+                                token_out,
+                                quoter_addr: None,
+                            });
+                        } else {
+                            let calldata = IUniswapV2Router02::getAmountsOutCall {
+                                amountIn: amount_in,
+                                path: vec![token_in, token_out],
+                            }
+                            .abi_encode();
+                            fwd_mc.push((router_addr, calldata));
+                            fwd_tasks.push(ForwardTask {
+                                pair_idx: pi,
+                                router_id: router.id.clone(),
+                                router_addr,
+                                router_type: RouterType::V2,
+                                fee: 0,
+                                amount_in,
+                                token_in,
+                                token_out,
+                                quoter_addr: None,
+                            });
                         }
-                        .abi_encode();
-                        fwd_mc.push((router_addr, calldata));
-                        fwd_tasks.push(ForwardTask {
-                            pair_idx: pi,
-                            router_id: router.id.clone(),
-                            router_addr,
-                            router_type: RouterType::V2,
-                            fee: 0,
-                            amount_in,
-                            token_in,
-                            token_out,
-                            quoter_addr: None,
-                        });
                     }
                     RouterType::V3 => {
                         // Per-router quoter takes priority; fall back to chain-level.
@@ -392,8 +426,33 @@ impl Strategy {
                     RouterType::Solidly => {
                         // Try both volatile (fee=0) and stable (fee=1) pools.
                         // fee encoding: 0=volatile (vAMM xy=k), 1=stable (sAMM x³y+y³x=k)
+                        // Volatile uses xy=k — same as V2, so we check pool cache.
+                        // Stable uses a different curve — always via multicall for accuracy.
                         for stable_flag in [0u32, 1u32] {
                             let stable = stable_flag != 0;
+                            let eff_id = format!("{}::{}", router.id, if stable { "stable" } else { "volatile" });
+
+                            if !stable {
+                                // Volatile: try local xy=k cache first
+                                if let Some(out) = self.pool_cache.get_amount_out_by_key(
+                                    &eff_id, token_in, token_out, amount_in,
+                                ) {
+                                    pair_quotes.entry(pi).or_default().push(ForwardTask {
+                                        pair_idx: pi,
+                                        router_id: eff_id,
+                                        router_addr,
+                                        router_type: RouterType::Solidly,
+                                        fee: 0,
+                                        amount_in: out, // repurposed: carries token_out amount
+                                        token_in,
+                                        token_out,
+                                        quoter_addr: None,
+                                    });
+                                    continue; // advance to stable_flag=1
+                                }
+                            }
+
+                            // Stable pool or volatile cache miss: multicall
                             let calldata = ISolidlyRouter::getAmountsOutCall {
                                 amountIn: amount_in,
                                 routes: vec![ISolidlyRouter::Route {
@@ -406,7 +465,7 @@ impl Strategy {
                             fwd_mc.push((router_addr, calldata));
                             fwd_tasks.push(ForwardTask {
                                 pair_idx: pi,
-                                router_id: format!("{}::{}", router.id, if stable { "stable" } else { "volatile" }),
+                                router_id: eff_id,
                                 router_addr,
                                 router_type: RouterType::Solidly,
                                 fee: stable_flag,
@@ -449,12 +508,10 @@ impl Strategy {
             }
         }
 
+        // Run multicall for routers that couldn't be resolved locally
         let fwd_raw = run_multicall(provider, fwd_mc).await;
 
-        // Group successful forward quotes by pair_idx
-        let mut pair_quotes: std::collections::HashMap<usize, Vec<ForwardTask>> =
-            std::collections::HashMap::new();
-
+        // Add multicall results to pair_quotes (locally-resolved already added above)
         for (task, raw_opt) in fwd_tasks.into_iter().zip(fwd_raw.into_iter()) {
             let raw = match raw_opt { Some(r) => r, None => continue };
             let amount_out = match task.router_type {
@@ -495,10 +552,14 @@ impl Strategy {
             self.chain_id, total_fwd_ok, pairs_with_any, pairs_with_multi
         );
 
-        // ── Phase 2: Reverse quotes via multicall3 (1 RPC round-trip) ───────────
+        // ── Phase 2: Reverse quotes ───────────────────────────────────────────────
+        // V2 and Solidly-volatile reverse quotes use the same local xy=k cache.
+        // V3, SyncSwap, and Solidly-stable still need multicall.
 
         let mut rev_tasks: Vec<ReverseTask> = Vec::new();
         let mut rev_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        // Maps rev_mc[i] → rev_tasks[j] so we can write results back after multicall.
+        let mut rev_mc_task_idx: Vec<usize> = Vec::new();
 
         for (pi, quotes) in &pair_quotes {
             if quotes.len() < 2 {
@@ -527,64 +588,21 @@ impl Strategy {
                     let rb_addr = q_b.router_addr;
                     let fee_b = q_b.fee;
 
-                    let (target, calldata) = match q_b.router_type {
-                        RouterType::V2 => {
-                            let cd = IUniswapV2Router02::getAmountsOutCall {
-                                amountIn: token_out_amount,
-                                path: vec![token_out, token_in],
-                            }
-                            .abi_encode();
-                            (rb_addr, cd)
+                    // Try local reverse quote for V2 and Solidly-volatile
+                    let local_back = match q_b.router_type {
+                        RouterType::V2 => self.pool_cache.get_amount_out_by_key(
+                            &q_b.router_id, token_out, token_in, token_out_amount,
+                        ),
+                        RouterType::Solidly if fee_b == 0 => {
+                            // volatile: router_id already has "::volatile" suffix
+                            self.pool_cache.get_amount_out_by_key(
+                                &q_b.router_id, token_out, token_in, token_out_amount,
+                            )
                         }
-                        RouterType::V3 => {
-                            // Use the same quoter that worked for q_b's forward quote
-                            let quoter = match q_b.quoter_addr.or(self.quoter_v2_address) {
-                                Some(q) => q,
-                                None => continue,
-                            };
-                            let cd = IQuoterV2::quoteExactInputSingleCall {
-                                params: IQuoterV2::QuoteExactInputSingleParams {
-                                    tokenIn: token_out,
-                                    tokenOut: token_in,
-                                    amountIn: token_out_amount,
-                                    fee: Uint::from(fee_b),
-                                    sqrtPriceLimitX96: Uint::ZERO,
-                                },
-                            }
-                            .abi_encode();
-                            (quoter, cd)
-                        }
-                        RouterType::Solidly => {
-                            // fee_b: 0=volatile, 1=stable — same encoding as forward
-                            let stable = fee_b != 0;
-                            let cd = ISolidlyRouter::getAmountsOutCall {
-                                amountIn: token_out_amount,
-                                routes: vec![ISolidlyRouter::Route {
-                                    from: token_out,
-                                    to: token_in,
-                                    stable,
-                                }],
-                            }
-                            .abi_encode();
-                            (rb_addr, cd)
-                        }
-                        RouterType::SyncSwap => {
-                            // quoter_addr carries the pool address from the forward phase
-                            let pool_addr = match q_b.quoter_addr {
-                                Some(p) => p,
-                                None => continue,
-                            };
-                            let cd = ISyncSwapPool::getAmountOutCall {
-                                tokenIn: token_out,
-                                amountIn: token_out_amount,
-                                sender: Address::ZERO,
-                            }
-                            .abi_encode();
-                            (pool_addr, cd)
-                        }
+                        _ => None,
                     };
 
-                    rev_mc.push((target, calldata));
+                    let task_idx = rev_tasks.len();
                     rev_tasks.push(ReverseTask {
                         pair_idx: *pi,
                         pair_id: pair.id.clone(),
@@ -602,12 +620,89 @@ impl Strategy {
                         token_out_amount,
                         token_in,
                         token_out,
+                        local_back,
                     });
+
+                    // Only add to multicall if no local result
+                    if local_back.is_none() {
+                        let mc_entry = match q_b.router_type {
+                            RouterType::V2 => {
+                                let cd = IUniswapV2Router02::getAmountsOutCall {
+                                    amountIn: token_out_amount,
+                                    path: vec![token_out, token_in],
+                                }
+                                .abi_encode();
+                                Some((rb_addr, cd))
+                            }
+                            RouterType::V3 => {
+                                let quoter = match q_b.quoter_addr.or(self.quoter_v2_address) {
+                                    Some(q) => q,
+                                    None => {
+                                        // No quoter: remove the task we just pushed
+                                        rev_tasks.pop();
+                                        continue;
+                                    }
+                                };
+                                let cd = IQuoterV2::quoteExactInputSingleCall {
+                                    params: IQuoterV2::QuoteExactInputSingleParams {
+                                        tokenIn: token_out,
+                                        tokenOut: token_in,
+                                        amountIn: token_out_amount,
+                                        fee: Uint::from(fee_b),
+                                        sqrtPriceLimitX96: Uint::ZERO,
+                                    },
+                                }
+                                .abi_encode();
+                                Some((quoter, cd))
+                            }
+                            RouterType::Solidly => {
+                                let stable = fee_b != 0;
+                                let cd = ISolidlyRouter::getAmountsOutCall {
+                                    amountIn: token_out_amount,
+                                    routes: vec![ISolidlyRouter::Route {
+                                        from: token_out,
+                                        to: token_in,
+                                        stable,
+                                    }],
+                                }
+                                .abi_encode();
+                                Some((rb_addr, cd))
+                            }
+                            RouterType::SyncSwap => {
+                                match q_b.quoter_addr {
+                                    Some(pool_addr) => {
+                                        let cd = ISyncSwapPool::getAmountOutCall {
+                                            tokenIn: token_out,
+                                            amountIn: token_out_amount,
+                                            sender: Address::ZERO,
+                                        }
+                                        .abi_encode();
+                                        Some((pool_addr, cd))
+                                    }
+                                    None => {
+                                        rev_tasks.pop();
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(entry) = mc_entry {
+                            rev_mc_task_idx.push(task_idx);
+                            rev_mc.push(entry);
+                        }
+                    }
                 }
             }
         }
 
+        // Run multicall for reverse quotes that need it
         let rev_raw = run_multicall(provider, rev_mc).await;
+
+        // Map multicall results back to rev_tasks
+        let mut rev_raw_by_task: Vec<Option<Vec<u8>>> = vec![None; rev_tasks.len()];
+        for (mc_i, &task_i) in rev_mc_task_idx.iter().enumerate() {
+            rev_raw_by_task[task_i] = rev_raw.get(mc_i).and_then(|r| r.clone());
+        }
 
         // ── Find profitable opportunities ──────────────────────────────────────
 
@@ -617,22 +712,26 @@ impl Strategy {
         // Negative = below break-even; positive = profitable.
         let mut best_spread_pct: f64 = f64::NEG_INFINITY;
 
-        for (task, raw_opt) in rev_tasks.iter().zip(rev_raw.into_iter()) {
-            let raw = match raw_opt { Some(r) => r, None => continue };
-            let amount_back_opt = match task.router_b_type {
-                RouterType::V2 => IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&raw)
-                    .ok()
-                    .and_then(|v| v.last().copied()),
-                RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
-                    .ok()
-                    .map(|r| r.amountOut),
-                RouterType::Solidly => {
-                    ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
+        for (task, raw_opt) in rev_tasks.iter().zip(rev_raw_by_task.into_iter()) {
+            let amount_back_opt: Option<U256> = if let Some(local) = task.local_back {
+                Some(local)
+            } else {
+                let raw = match raw_opt { Some(r) => r, None => continue };
+                match task.router_b_type {
+                    RouterType::V2 => IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&raw)
                         .ok()
-                        .and_then(|v| v.last().copied())
-                }
-                RouterType::SyncSwap => {
-                    ISyncSwapPool::getAmountOutCall::abi_decode_returns(&raw).ok()
+                        .and_then(|v| v.last().copied()),
+                    RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
+                        .ok()
+                        .map(|r| r.amountOut),
+                    RouterType::Solidly => {
+                        ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
+                            .ok()
+                            .and_then(|v| v.last().copied())
+                    }
+                    RouterType::SyncSwap => {
+                        ISyncSwapPool::getAmountOutCall::abi_decode_returns(&raw).ok()
+                    }
                 }
             };
             if let Some(amount_back) = amount_back_opt.filter(|&b| !b.is_zero()) {
@@ -868,6 +967,8 @@ impl Strategy {
         };
 
         // ── Phase 1: A→B ─────────────────────────────────────────────────────────
+        // V2 and Solidly-volatile: try pool cache first (zero eth_call).
+        // V3 / SyncSwap / Solidly-stable: multicall.
 
         struct P1Entry {
             triplet_idx: usize,
@@ -875,34 +976,70 @@ impl Strategy {
             router_addr: Address,
             router_type: RouterType,
             fee: u32,
+            /// Pre-computed A→B amount from local xy=k cache. None = needs multicall result.
+            local_result: Option<U256>,
         }
 
         let mut p1_entries: Vec<P1Entry> = Vec::new();
         let mut p1_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        let mut p1_mc_entry_idx: Vec<usize> = Vec::new();
 
         for (ti, trip) in triplets.iter().enumerate() {
             for router in &chain_routers {
-                if let Some(call) = make_quote(router, trip.token_a, trip.token_b, trip.amount_in) {
-                    let router_addr: Address = router.address.parse().unwrap_or_default();
-                    let fee = match router.router_type {
-                        RouterType::V2 => 0,
-                        RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
-                        RouterType::Solidly => 0, // volatile pool (fee=0) for triangular
-                        RouterType::SyncSwap => 0,
-                    };
+                let router_addr: Address = router.address.parse().unwrap_or_default();
+                let fee = match router.router_type {
+                    RouterType::V2 => 0,
+                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                    RouterType::Solidly => 0,
+                    RouterType::SyncSwap => 0,
+                };
+
+                // Try local cache for V2 and Solidly-volatile
+                let local_ab = match router.router_type {
+                    RouterType::V2 => self.pool_cache.get_amount_out_by_key(
+                        &router.id, trip.token_a, trip.token_b, trip.amount_in,
+                    ),
+                    RouterType::Solidly => {
+                        let key = format!("{}::volatile", router.id);
+                        self.pool_cache.get_amount_out_by_key(
+                            &key, trip.token_a, trip.token_b, trip.amount_in,
+                        )
+                    }
+                    _ => None,
+                };
+
+                let mc_call = if local_ab.is_none() {
+                    make_quote(router, trip.token_a, trip.token_b, trip.amount_in)
+                } else {
+                    None
+                };
+
+                // Skip router if no quote source at all
+                if local_ab.is_none() && mc_call.is_none() {
+                    continue;
+                }
+
+                let entry_idx = p1_entries.len();
+                p1_entries.push(P1Entry {
+                    triplet_idx: ti,
+                    router_id: router.id.clone(),
+                    router_addr,
+                    router_type: router.router_type.clone(),
+                    fee,
+                    local_result: local_ab,
+                });
+                if let Some(call) = mc_call {
+                    p1_mc_entry_idx.push(entry_idx);
                     p1_mc.push(call);
-                    p1_entries.push(P1Entry {
-                        triplet_idx: ti,
-                        router_id: router.id.clone(),
-                        router_addr,
-                        router_type: router.router_type.clone(),
-                        fee,
-                    });
                 }
             }
         }
 
-        let p1_results = run_multicall(provider, p1_mc).await;
+        let p1_raw = run_multicall(provider, p1_mc).await;
+        let mut p1_results_by_entry: Vec<Option<Vec<u8>>> = vec![None; p1_entries.len()];
+        for (mc_i, &entry_i) in p1_mc_entry_idx.iter().enumerate() {
+            p1_results_by_entry[entry_i] = p1_raw.get(mc_i).and_then(|r| r.clone());
+        }
 
         // ── Phase 2: B→C with actual amount_b ────────────────────────────────────
 
@@ -912,44 +1049,81 @@ impl Strategy {
             router_ab_type: RouterType, fee_ab: u32,
             router_bc_id: String, router_bc_addr: Address,
             router_bc_type: RouterType, fee_bc: u32,
+            local_result: Option<U256>,
         }
 
         let mut p2_entries: Vec<P2Entry> = Vec::new();
         let mut p2_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        let mut p2_mc_entry_idx: Vec<usize> = Vec::new();
 
-        for (p1e, raw_opt) in p1_entries.iter().zip(p1_results.iter()) {
-            let raw = match raw_opt { Some(r) => r, None => continue };
-            let amount_b = match decode_amount(raw, &p1e.router_type).filter(|b| !b.is_zero()) {
-                Some(b) => b, None => continue,
+        for (p1e, raw_opt) in p1_entries.iter().zip(p1_results_by_entry.iter()) {
+            let amount_b: U256 = if let Some(local) = p1e.local_result {
+                local
+            } else {
+                let raw = match raw_opt { Some(r) => r, None => continue };
+                match decode_amount(raw, &p1e.router_type).filter(|b| !b.is_zero()) {
+                    Some(b) => b, None => continue,
+                }
             };
             let trip = &triplets[p1e.triplet_idx];
 
             for router in &chain_routers {
-                if let Some(call) = make_quote(router, trip.token_b, trip.token_c, amount_b) {
-                    let router_addr: Address = router.address.parse().unwrap_or_default();
-                    let fee = match router.router_type {
-                        RouterType::V2 => 0,
-                        RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
-                        RouterType::Solidly => 0,
-                        RouterType::SyncSwap => 0,
-                    };
+                let router_addr: Address = router.address.parse().unwrap_or_default();
+                let fee = match router.router_type {
+                    RouterType::V2 => 0,
+                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                    RouterType::Solidly => 0,
+                    RouterType::SyncSwap => 0,
+                };
+
+                let local_bc = match router.router_type {
+                    RouterType::V2 => self.pool_cache.get_amount_out_by_key(
+                        &router.id, trip.token_b, trip.token_c, amount_b,
+                    ),
+                    RouterType::Solidly => {
+                        let key = format!("{}::volatile", router.id);
+                        self.pool_cache.get_amount_out_by_key(
+                            &key, trip.token_b, trip.token_c, amount_b,
+                        )
+                    }
+                    _ => None,
+                };
+
+                let mc_call = if local_bc.is_none() {
+                    make_quote(router, trip.token_b, trip.token_c, amount_b)
+                } else {
+                    None
+                };
+
+                if local_bc.is_none() && mc_call.is_none() {
+                    continue;
+                }
+
+                let entry_idx = p2_entries.len();
+                p2_entries.push(P2Entry {
+                    triplet_idx: p1e.triplet_idx,
+                    router_ab_id: p1e.router_id.clone(),
+                    router_ab_addr: p1e.router_addr,
+                    router_ab_type: p1e.router_type.clone(),
+                    fee_ab: p1e.fee,
+                    router_bc_id: router.id.clone(),
+                    router_bc_addr: router_addr,
+                    router_bc_type: router.router_type.clone(),
+                    fee_bc: fee,
+                    local_result: local_bc,
+                });
+                if let Some(call) = mc_call {
+                    p2_mc_entry_idx.push(entry_idx);
                     p2_mc.push(call);
-                    p2_entries.push(P2Entry {
-                        triplet_idx: p1e.triplet_idx,
-                        router_ab_id: p1e.router_id.clone(),
-                        router_ab_addr: p1e.router_addr,
-                        router_ab_type: p1e.router_type.clone(),
-                        fee_ab: p1e.fee,
-                        router_bc_id: router.id.clone(),
-                        router_bc_addr: router_addr,
-                        router_bc_type: router.router_type.clone(),
-                        fee_bc: fee,
-                    });
                 }
             }
         }
 
-        let p2_results = run_multicall(provider, p2_mc).await;
+        let p2_raw = run_multicall(provider, p2_mc).await;
+        let mut p2_results_by_entry: Vec<Option<Vec<u8>>> = vec![None; p2_entries.len()];
+        for (mc_i, &entry_i) in p2_mc_entry_idx.iter().enumerate() {
+            p2_results_by_entry[entry_i] = p2_raw.get(mc_i).and_then(|r| r.clone());
+        }
 
         // ── Phase 3: C→A with actual amount_c ────────────────────────────────────
 
@@ -961,58 +1135,99 @@ impl Strategy {
             router_bc_type: RouterType, fee_bc: u32,
             router_ca_id: String, router_ca_addr: Address,
             router_ca_type: RouterType, fee_ca: u32,
+            local_result: Option<U256>,
         }
 
         let mut p3_entries: Vec<P3Entry> = Vec::new();
         let mut p3_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        let mut p3_mc_entry_idx: Vec<usize> = Vec::new();
 
-        for (p2e, raw_opt) in p2_entries.iter().zip(p2_results.iter()) {
-            let raw = match raw_opt { Some(r) => r, None => continue };
-            let amount_c = match decode_amount(raw, &p2e.router_bc_type).filter(|c| !c.is_zero()) {
-                Some(c) => c, None => continue,
+        for (p2e, raw_opt) in p2_entries.iter().zip(p2_results_by_entry.iter()) {
+            let amount_c: U256 = if let Some(local) = p2e.local_result {
+                local
+            } else {
+                let raw = match raw_opt { Some(r) => r, None => continue };
+                match decode_amount(raw, &p2e.router_bc_type).filter(|c| !c.is_zero()) {
+                    Some(c) => c, None => continue,
+                }
             };
             let trip = &triplets[p2e.triplet_idx];
 
             for router in &chain_routers {
-                if let Some(call) = make_quote(router, trip.token_c, trip.token_a, amount_c) {
-                    let router_addr: Address = router.address.parse().unwrap_or_default();
-                    let fee = match router.router_type {
-                        RouterType::V2 => 0,
-                        RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
-                        RouterType::Solidly => 0,
-                        RouterType::SyncSwap => 0,
-                    };
+                let router_addr: Address = router.address.parse().unwrap_or_default();
+                let fee = match router.router_type {
+                    RouterType::V2 => 0,
+                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                    RouterType::Solidly => 0,
+                    RouterType::SyncSwap => 0,
+                };
+
+                let local_ca = match router.router_type {
+                    RouterType::V2 => self.pool_cache.get_amount_out_by_key(
+                        &router.id, trip.token_c, trip.token_a, amount_c,
+                    ),
+                    RouterType::Solidly => {
+                        let key = format!("{}::volatile", router.id);
+                        self.pool_cache.get_amount_out_by_key(
+                            &key, trip.token_c, trip.token_a, amount_c,
+                        )
+                    }
+                    _ => None,
+                };
+
+                let mc_call = if local_ca.is_none() {
+                    make_quote(router, trip.token_c, trip.token_a, amount_c)
+                } else {
+                    None
+                };
+
+                if local_ca.is_none() && mc_call.is_none() {
+                    continue;
+                }
+
+                let entry_idx = p3_entries.len();
+                p3_entries.push(P3Entry {
+                    triplet_idx: p2e.triplet_idx,
+                    router_ab_id: p2e.router_ab_id.clone(),
+                    router_ab_addr: p2e.router_ab_addr,
+                    router_ab_type: p2e.router_ab_type.clone(),
+                    fee_ab: p2e.fee_ab,
+                    router_bc_id: p2e.router_bc_id.clone(),
+                    router_bc_addr: p2e.router_bc_addr,
+                    router_bc_type: p2e.router_bc_type.clone(),
+                    fee_bc: p2e.fee_bc,
+                    router_ca_id: router.id.clone(),
+                    router_ca_addr: router_addr,
+                    router_ca_type: router.router_type.clone(),
+                    fee_ca: fee,
+                    local_result: local_ca,
+                });
+                if let Some(call) = mc_call {
+                    p3_mc_entry_idx.push(entry_idx);
                     p3_mc.push(call);
-                    p3_entries.push(P3Entry {
-                        triplet_idx: p2e.triplet_idx,
-                        router_ab_id: p2e.router_ab_id.clone(),
-                        router_ab_addr: p2e.router_ab_addr,
-                        router_ab_type: p2e.router_ab_type.clone(),
-                        fee_ab: p2e.fee_ab,
-                        router_bc_id: p2e.router_bc_id.clone(),
-                        router_bc_addr: p2e.router_bc_addr,
-                        router_bc_type: p2e.router_bc_type.clone(),
-                        fee_bc: p2e.fee_bc,
-                        router_ca_id: router.id.clone(),
-                        router_ca_addr: router_addr,
-                        router_ca_type: router.router_type.clone(),
-                        fee_ca: fee,
-                    });
                 }
             }
         }
 
-        let p3_results = run_multicall(provider, p3_mc).await;
+        let p3_raw = run_multicall(provider, p3_mc).await;
+        let mut p3_results_by_entry: Vec<Option<Vec<u8>>> = vec![None; p3_entries.len()];
+        for (mc_i, &entry_i) in p3_mc_entry_idx.iter().enumerate() {
+            p3_results_by_entry[entry_i] = p3_raw.get(mc_i).and_then(|r| r.clone());
+        }
 
         // ── Calculate profits ─────────────────────────────────────────────────────
 
         let mut opportunities: Vec<TriangularOpportunity> = Vec::new();
         let mut best_raw_usd: f64 = 0.0;
 
-        for (p3e, raw_opt) in p3_entries.iter().zip(p3_results.iter()) {
-            let raw = match raw_opt { Some(r) => r, None => continue };
-            let amount_a_final = match decode_amount(raw, &p3e.router_ca_type) {
-                Some(a) => a, None => continue,
+        for (p3e, raw_opt) in p3_entries.iter().zip(p3_results_by_entry.iter()) {
+            let amount_a_final: U256 = if let Some(local) = p3e.local_result {
+                local
+            } else {
+                let raw = match raw_opt { Some(r) => r, None => continue };
+                match decode_amount(raw, &p3e.router_ca_type) {
+                    Some(a) => a, None => continue,
+                }
             };
             let trip = &triplets[p3e.triplet_idx];
             if amount_a_final <= trip.amount_in { continue; }

@@ -6,6 +6,7 @@ mod db;
 mod executor;
 mod listener;
 mod metrics;
+mod pool_cache;
 mod router_health;
 mod strategy;
 
