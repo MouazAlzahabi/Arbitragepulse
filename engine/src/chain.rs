@@ -377,12 +377,6 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                 ).await;
-
-                // Drain events that accumulated during the scan.  Without this, N swaps
-                // per block → N back-to-back scans → CU rate-limit spike on Alchemy.
-                while block_rx.try_recv().is_ok() {}
-                while swap_rx.try_recv().is_ok() {}
-                poll_tick.reset(); // don't fire poll immediately after a block scan
             }
 
             // ── Periodic fallback scan (safety net if block subscription is down) ──
@@ -397,38 +391,16 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                 ).await;
-
-                while block_rx.try_recv().is_ok() {}
-                while swap_rx.try_recv().is_ok() {}
             }
 
-            // ── Swap event → immediate scan ───────────────────────────────────
+            // ── Swap event → pool cache updated by listener; no full scan here ──
+            // V3 QuoterV2 reads live on-chain state regardless of when it's called,
+            // so scanning immediately after a swap gives no accuracy advantage over
+            // the next block scan (≤2s away on Linea).  Triggering a full evaluate
+            // on every swap was the primary cause of Alchemy CU rate-limit spikes:
+            // dozens of swaps per block → dozens of V3 multicall batches per second.
             Some(event) = swap_rx.recv() => {
-                debug!("[{}] Swap event on pool {:?}", cfg.name, event.pool);
-                let state = shared_state.read().await;
-                let chain_paused = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
-                if state.paused || chain_paused { continue; }
-                drop(state);
-
-                // Increment scan counter on swap-triggered evaluation too
-                {
-                    let mut state = shared_state.write().await;
-                    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
-                        chain.total_scans += 1;
-                    }
-                }
-
-                evaluate_and_execute(
-                    &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
-                    &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                ).await;
-
-                // Drain remaining swap events and any queued block events — all stale
-                // now that we just evaluated on fresh state.
-                while block_rx.try_recv().is_ok() {}
-                while swap_rx.try_recv().is_ok() {}
-                poll_tick.reset();
+                debug!("[{}] Swap on pool {:?} — V2 cache updated, next block scan picks it up", cfg.name, event.pool);
             }
         }
     }
