@@ -188,6 +188,15 @@ impl Executor {
             }
         }
 
+        // ── Pre-flight simulation (live mode) ─────────────────────────────────
+        // Catches reverts before spending gas. Adds ~50ms latency but prevents
+        // wasted gas on opportunities that have already closed.
+        if let Err(e) = provider.call(tx_base.clone()).await {
+            self.stats.total_failed += 1;
+            return Err(anyhow!("Pre-flight simulation failed (opportunity closed): {}", e));
+        }
+        debug!("[{}] Pre-flight sim ok", self.chain_name);
+
         // ── Nonce management ──────────────────────────────────────────────────
         // Fetch from chain on first use; afterwards increment locally so the
         // mutex can be released immediately after send (not after receipt).
@@ -348,6 +357,13 @@ impl Executor {
                 }
             }
         }
+
+        // ── Pre-flight simulation (live mode) ─────────────────────────────────
+        if let Err(e) = provider.call(tx_base.clone()).await {
+            self.stats.total_failed += 1;
+            return Err(anyhow!("Triangular pre-flight simulation failed (opportunity closed): {}", e));
+        }
+        debug!("[{}] Triangular pre-flight sim ok", self.chain_name);
 
         let nonce = match self.nonce {
             Some(n) => n,
