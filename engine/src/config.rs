@@ -77,6 +77,10 @@ pub struct RouterConfig {
     /// (e.g., PancakeSwap V3 vs Uniswap V3 on Linea).
     #[serde(default)]
     pub quoter_address: Option<String>,
+    /// V3 pool factory address. Required for V3 pool discovery at startup.
+    /// V3 swap routers don't expose factory() on-chain, so this must be configured.
+    #[serde(default)]
+    pub factory_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

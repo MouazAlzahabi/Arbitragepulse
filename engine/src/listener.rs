@@ -9,8 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-use crate::abi::{PairSwapV2, PairSyncV2, PoolSwapV3};
-use crate::config::PairConfig;
+use crate::abi::{PairSyncV2, PoolSwapV3};
 use crate::pool_cache::PoolCache;
 
 // ─── Swap event (generic across V2 + V3) ─────────────────────────────────────
@@ -28,25 +27,26 @@ pub struct SwapEvent {
 pub struct Listener {
     pub chain_id: u64,
     pub chain_name: String,
-    pub pairs: Vec<PairConfig>,
-    pub min_swap_amount: u128,
 }
 
 impl Listener {
-    pub fn new(chain_id: u64, chain_name: String, pairs: Vec<PairConfig>, min_swap_amount: u128) -> Self {
-        Self { chain_id, chain_name, pairs, min_swap_amount }
+    pub fn new(chain_id: u64, chain_name: String) -> Self {
+        Self { chain_id, chain_name }
     }
 
-    /// Subscribe to events for all watched pools.
+    /// Subscribe to on-chain events for all discovered pools.
     ///
-    /// For V2/Solidly pools (in `pool_cache`):
-    ///   — Subscribes to `Sync(reserve0, reserve1)` and updates local reserves directly.
-    ///   — Sends a `SwapEvent` to trigger opportunity evaluation.
+    /// **V2/Solidly pools** (pool_cache.by_address — seeded by discover_pools at startup):
+    ///   — Subscribes to `Sync(reserve0, reserve1)` events.
+    ///   — Updates local reserves immediately (zero RPC cost).
+    ///   — Sends SwapEvent to trigger opportunity evaluation.
     ///
-    /// For V3 pools (in `watch_pools` config, not in pool_cache):
-    ///   — Subscribes to `Swap` events and sends a `SwapEvent`.
+    /// **V3 pools** (pool_cache.v3_by_address — seeded by discover_v3_pools at startup):
+    ///   — Subscribes to `Swap(sqrtPriceX96, liquidity, ...)` events.
+    ///   — Updates sqrtPriceX96 + liquidity in cache immediately (zero RPC cost).
+    ///   — Sends SwapEvent to trigger opportunity evaluation.
     ///
-    /// If no pools are configured, returns immediately (periodic polling is used instead).
+    /// If no pools are in the cache, returns immediately (periodic polling continues).
     pub async fn subscribe<P: Provider + Clone + 'static>(
         &self,
         provider: P,
@@ -107,106 +107,66 @@ impl Listener {
             });
         }
 
-        // ── V3 / other pools: subscribe to Swap events ────────────────────────
-        // These are watch_pools from config that are NOT in pool_cache
-        // (V3 concentrated liquidity pools, SyncSwap pools, etc.).
-        let v3_watch_pools: Vec<Address> = self
-            .pairs
-            .iter()
-            .filter(|p| p.chain_id == chain_id)
-            .flat_map(|p| p.watch_pools.iter())
-            .filter_map(|addr| addr.parse::<Address>().ok())
-            .filter(|addr| !pool_cache.by_address.contains_key(addr)) // only non-V2 pools
-            .collect();
+        // ── V3 pools: subscribe to Swap events and update local state cache ──────
+        // Pool addresses come from pool_cache.v3_by_address (populated by discover_v3_pools
+        // at startup). No manual watch_pools config needed — auto-discovered.
+        //
+        // On each Swap event:
+        //   1. Update sqrtPriceX96 + liquidity in pool_cache (keeps state fresh, zero RPC)
+        //   2. Send SwapEvent to trigger evaluate_and_execute()
+        let v3_pool_addrs = pool_cache.v3_pool_addresses();
+        let v3_pool_addrs_empty = v3_pool_addrs.is_empty();
 
-        if v3_watch_pools.is_empty() && v2_pool_addrs.is_empty() {
-            debug!("[{}] No pools configured — using periodic polling", chain_name);
-            return Ok(());
-        }
-
-        if !v3_watch_pools.is_empty() {
-            let v2_filter = Filter::new()
-                .address(v3_watch_pools.clone())
-                .event_signature(PairSwapV2::SIGNATURE_HASH);
+        if !v3_pool_addrs_empty {
             let v3_filter = Filter::new()
-                .address(v3_watch_pools)
+                .address(v3_pool_addrs)
                 .event_signature(PoolSwapV3::SIGNATURE_HASH);
 
-            let min_amount = self.min_swap_amount;
+            let provider_v3 = provider.clone();
+            let chain_name_v3 = chain_name.clone();
+            let tx_v3 = tx.clone();
+            let cache_v3 = pool_cache.clone();
 
-            // V2 Swap events on non-cache pools
-            {
-                let provider2 = provider.clone();
-                let chain_name2 = chain_name.clone();
-                let tx2 = tx.clone();
-                let f2 = v2_filter;
-                tokio::spawn(async move {
-                    let mut backoff = Duration::from_secs(1);
-                    loop {
-                        match provider2.subscribe_logs(&f2).await {
-                            Ok(sub) => {
-                                backoff = Duration::from_secs(1);
-                                let mut stream = sub.into_stream();
-                                while let Some(log) = stream.next().await {
-                                    let pool = log.address();
-                                    let block = log.block_number.unwrap_or(0);
-                                    if let Ok(decoded) = PairSwapV2::decode_log(log.as_ref()) {
-                                        let max_amount = decoded.amount0In.max(decoded.amount1In)
-                                            .max(decoded.amount0Out).max(decoded.amount1Out);
-                                        if max_amount < alloy::primitives::U256::from(min_amount) {
-                                            continue;
-                                        }
-                                    }
-                                    let _ = tx2.send(SwapEvent { chain_id, pool, block_number: block }).await;
-                                }
-                                warn!("[{}] V2-Swap subscription ended, reconnecting in {:?}", chain_name2, backoff);
-                            }
-                            Err(e) => error!("[{}] V2-Swap error: {}", chain_name2, e),
-                        }
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
-                    }
-                });
-            }
+            tokio::spawn(async move {
+                let mut backoff = Duration::from_secs(1);
+                loop {
+                    match provider_v3.subscribe_logs(&v3_filter).await {
+                        Ok(sub) => {
+                            backoff = Duration::from_secs(1);
+                            let mut stream = sub.into_stream();
+                            while let Some(log) = stream.next().await {
+                                let pool = log.address();
+                                let block = log.block_number.unwrap_or(0);
 
-            // V3 Swap events
-            {
-                let provider3 = provider.clone();
-                let chain_name3 = chain_name.clone();
-                let tx3 = tx.clone();
-                let f3 = v3_filter;
-                tokio::spawn(async move {
-                    let mut backoff = Duration::from_secs(1);
-                    loop {
-                        match provider3.subscribe_logs(&f3).await {
-                            Ok(sub) => {
-                                backoff = Duration::from_secs(1);
-                                let mut stream = sub.into_stream();
-                                while let Some(log) = stream.next().await {
-                                    let pool = log.address();
-                                    let block = log.block_number.unwrap_or(0);
-                                    if let Ok(decoded) = PoolSwapV3::decode_log(log.as_ref()) {
-                                        let abs0 = if decoded.amount0 < alloy::primitives::I256::ZERO {
-                                            decoded.amount0.wrapping_neg().into_raw()
-                                        } else { decoded.amount0.into_raw() };
-                                        let abs1 = if decoded.amount1 < alloy::primitives::I256::ZERO {
-                                            decoded.amount1.wrapping_neg().into_raw()
-                                        } else { decoded.amount1.into_raw() };
-                                        if abs0.max(abs1) < alloy::primitives::U256::from(min_amount) {
-                                            continue;
-                                        }
-                                    }
-                                    let _ = tx3.send(SwapEvent { chain_id, pool, block_number: block }).await;
+                                if let Ok(decoded) = PoolSwapV3::decode_log(log.as_ref()) {
+                                    // Update both sqrtPriceX96 and liquidity atomically.
+                                    // The V3 Swap event always emits the post-swap values for both.
+                                    let sqrtp = alloy::primitives::U256::from(decoded.sqrtPriceX96);
+                                    let liq: u128 = decoded.liquidity.into();
+                                    cache_v3.update_v3_state(pool, sqrtp, liq);
+                                    debug!(
+                                        "[{}] V3 state updated pool={:?} sqrtp={} liq={} block={}",
+                                        chain_name_v3, pool, sqrtp, liq, block
+                                    );
                                 }
-                                warn!("[{}] V3-Swap subscription ended, reconnecting in {:?}", chain_name3, backoff);
+
+                                // Trigger opportunity evaluation regardless of decode result
+                                let _ = tx_v3.send(SwapEvent { chain_id, pool, block_number: block }).await;
                             }
-                            Err(e) => error!("[{}] V3-Swap error: {}", chain_name3, e),
+                            warn!("[{}] V3-Swap subscription ended, reconnecting in {:?}", chain_name_v3, backoff);
                         }
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        Err(e) => {
+                            error!("[{}] V3-Swap subscription error: {} — retrying in {:?}", chain_name_v3, e, backoff);
+                        }
                     }
-                });
-            }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            });
+        }
+
+        if v3_pool_addrs_empty && v2_pool_addrs.is_empty() {
+            debug!("[{}] No pools configured — using periodic polling", chain_name);
         }
 
         Ok(())

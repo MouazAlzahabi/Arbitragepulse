@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::abi::{IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair};
+use crate::abi::{IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool};
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
 use crate::executor::Executor;
 use crate::listener::{Listener, SwapEvent};
 use crate::metrics::Metrics;
-use crate::pool_cache::{PoolCache, PoolInfo};
+use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
 use crate::strategy::{Opportunity, Strategy};
 
 const COOLDOWN_SECS: u64 = 15;
@@ -94,7 +94,12 @@ pub async fn run_chain(
     // on-chain Sync events (listener.rs subscribes and updates the cache live).
     let pool_cache = Arc::new(PoolCache::new());
     discover_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
-    info!("[{}] Pool cache: {} pools discovered", cfg.name, pool_cache.by_address.len());
+    info!("[{}] Pool cache: {} V2/Solidly pools discovered", cfg.name, pool_cache.by_address.len());
+
+    // ── V3 pool discovery: seed sqrtPriceX96 + liquidity from slot0() ─────────
+    // Subscribes to V3 Swap events after startup to keep state fresh with zero RPC cost.
+    discover_v3_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
+    info!("[{}] V3 pool cache: {} pools seeded", cfg.name, pool_cache.v3_by_address.len());
 
     let strategy = Arc::new(RwLock::new(Strategy::new(
         cfg.id,
@@ -138,7 +143,7 @@ pub async fn run_chain(
     metrics.rpc_connected.with_label_values(&[&cfg.name]).set(1.0);
 
     // ── Swap event listener ──
-    let listener = Listener::new(cfg.id, cfg.name.clone(), chain_pairs.clone(), cfg.min_swap_amount_filter);
+    let listener = Listener::new(cfg.id, cfg.name.clone());
     let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(256);
     {
         let provider_clone = (*provider).clone();
@@ -1071,6 +1076,176 @@ async fn discover_pools<P: Provider>(
             reserve1: U256::from(reserves.reserve1),
             fee_bps: pm.fee_bps,
             router_id: effective_id,
+        });
+    }
+}
+
+// ─── V3 pool discovery (startup) ──────────────────────────────────────────────
+
+/// Discover Uniswap V3 pools for all configured pairs and V3 routers.
+/// Populates `pool_cache.v3_by_address` with initial sqrtPriceX96 + liquidity
+/// so that the strategy can run spot-price screens without RPC calls.
+///
+/// After startup, the listener subscribes to V3 Swap events on discovered pools
+/// and keeps state fresh via `pool_cache.update_v3_state()`.
+///
+/// Two multicall rounds:
+///   1. factory.getPool(A, B, fee)  per (V3 router × pair × fee_tier)
+///   2. pool.slot0() + pool.liquidity() per discovered pool
+async fn discover_v3_pools<P: Provider>(
+    routers: &[RouterConfig],
+    pairs: &[PairConfig],
+    provider: &P,
+    pool_cache: &PoolCache,
+) {
+    use alloy::primitives::U256;
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::sol_types::SolCall;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    // Inline multicall helper (same as in discover_pools)
+    let mc = async |calls: Vec<(Address, Vec<u8>)>| -> Vec<Option<Vec<u8>>> {
+        let mc3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
+            .parse()
+            .expect("hardcoded Multicall3");
+        if calls.is_empty() {
+            return vec![];
+        }
+        let mc_calls: Vec<crate::abi::IMulticall3::Call3> = calls
+            .iter()
+            .map(|(t, d)| crate::abi::IMulticall3::Call3 {
+                target: *t,
+                allowFailure: true,
+                callData: d.clone().into(),
+            })
+            .collect();
+        let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
+        let tx = TransactionRequest::default().to(mc3).input(calldata.into());
+        if let Ok(raw) = provider.call(tx).await {
+            if let Ok(ret) = crate::abi::IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
+                return ret
+                    .into_iter()
+                    .map(|r| if r.success { Some(r.returnData.to_vec()) } else { None })
+                    .collect();
+            }
+        }
+        let mut out = Vec::with_capacity(calls.len());
+        for (target, data) in &calls {
+            let tx2 = TransactionRequest::default().to(*target).input(data.clone().into());
+            out.push(provider.call(tx2).await.ok().map(|b| b.to_vec()));
+        }
+        out
+    };
+
+    // ── Collect V3 routers with factory_address ───────────────────────────────
+    struct V3Router { id: String, factory: Address, fee_tiers: Vec<u32> }
+    let v3_routers: Vec<V3Router> = routers
+        .iter()
+        .filter(|r| r.router_type == RouterType::V3)
+        .filter_map(|r| {
+            let factory = r.factory_address.as_deref()?.parse::<Address>().ok()?;
+            let tiers = if r.fee_tiers.is_empty() { vec![500u32, 3000, 10000] } else { r.fee_tiers.clone() };
+            Some(V3Router { id: r.id.clone(), factory, fee_tiers: tiers })
+        })
+        .collect();
+
+    if v3_routers.is_empty() {
+        return;
+    }
+
+    // ── Round 1: getPool(A, B, fee) per (router × pair × fee_tier) ───────────
+    struct PoolQuery { router_id: String, ta: Address, tb: Address, fee: u32 }
+    let mut pool_calls: Vec<(Address, Vec<u8>)> = Vec::new();
+    let mut pool_queries: Vec<PoolQuery> = Vec::new();
+
+    for vr in &v3_routers {
+        for pair in pairs {
+            let ta: Address = match pair.token_in.parse() { Ok(a) => a, Err(_) => continue };
+            let tb: Address = match pair.token_out.parse() { Ok(a) => a, Err(_) => continue };
+            for &fee in &vr.fee_tiers {
+                use alloy::primitives::Uint;
+                let cd = IUniswapV3Factory::getPoolCall {
+                    tokenA: ta,
+                    tokenB: tb,
+                    fee: Uint::from(fee),
+                }.abi_encode();
+                pool_calls.push((vr.factory, cd));
+                pool_queries.push(PoolQuery { router_id: vr.id.clone(), ta, tb, fee });
+            }
+        }
+    }
+
+    if pool_calls.is_empty() {
+        return;
+    }
+    let pool_raw = mc(pool_calls).await;
+
+    // ── Round 2: slot0() + liquidity() per discovered pool ────────────────────
+    struct StateQuery { pool: Address, router_id: String, ta: Address, tb: Address, fee: u32 }
+    let mut state_calls: Vec<(Address, Vec<u8>)> = Vec::new();
+    let mut state_queries: Vec<StateQuery> = Vec::new();
+    let mut seen: HashSet<Address> = HashSet::new();
+
+    for (pq, raw_opt) in pool_queries.iter().zip(pool_raw.iter()) {
+        let pool: Address = raw_opt
+            .as_ref()
+            .and_then(|raw| IUniswapV3Factory::getPoolCall::abi_decode_returns(raw).ok())
+            .filter(|a: &Address| !a.is_zero())
+            .unwrap_or(Address::ZERO);
+
+        if pool.is_zero() || !seen.insert(pool) {
+            continue;
+        }
+
+        // Two calls per pool: slot0() and liquidity()
+        state_calls.push((pool, IUniswapV3Pool::slot0Call {}.abi_encode()));
+        state_calls.push((pool, IUniswapV3Pool::liquidityCall {}.abi_encode()));
+        state_queries.push(StateQuery {
+            pool,
+            router_id: pq.router_id.clone(),
+            ta: pq.ta,
+            tb: pq.tb,
+            fee: pq.fee,
+        });
+    }
+
+    if state_queries.is_empty() {
+        return;
+    }
+    let state_raw = mc(state_calls).await;
+
+    // ── Insert into pool_cache ────────────────────────────────────────────────
+    // Also need token0 to know direction. We derive it: token0 = min(ta, tb) by address.
+    for (i, sq) in state_queries.iter().enumerate() {
+        let slot0_raw = match state_raw.get(2 * i) { Some(Some(r)) => r, _ => continue };
+        let liq_raw   = match state_raw.get(2 * i + 1) { Some(Some(r)) => r, _ => continue };
+
+        let slot0 = match IUniswapV3Pool::slot0Call::abi_decode_returns(slot0_raw).ok() {
+            Some(s) => s,
+            None => continue,
+        };
+        let liquidity = match IUniswapV3Pool::liquidityCall::abi_decode_returns(liq_raw).ok() {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let sqrt_price_x96 = U256::from(slot0.sqrtPriceX96);
+        if sqrt_price_x96.is_zero() {
+            continue; // pool not initialised
+        }
+
+        // In V3 pools, token0 is always the lower address
+        let (token0, token1) = if sq.ta < sq.tb { (sq.ta, sq.tb) } else { (sq.tb, sq.ta) };
+
+        pool_cache.insert_v3(sq.pool, V3PoolState {
+            token0,
+            token1,
+            fee: sq.fee,
+            sqrt_price_x96,
+            liquidity: liquidity.into(),
+            router_id: sq.router_id.clone(),
+            last_updated: Instant::now(),
         });
     }
 }

@@ -24,13 +24,10 @@ const GAS_LIMIT_TRIANGULAR: u64 = 450_000;
 #[derive(Debug, Default, Clone)]
 pub struct ExecutorStats {
     pub total_attempts: u64,
-    /// Txs sent successfully (NOT yet confirmed — use confirmed_success for real count).
+    /// Txs sent successfully (NOT yet confirmed — confirmed count is tracked via atomics).
     pub total_sent: u64,
-    /// Confirmed on-chain successes (receipt.status() == true).
-    pub total_success: u64,
     pub total_failed: u64,
     pub total_simulated: u64,
-    pub total_profit_wei: U256,
     pub last_tx_hash: Option<String>,
     pub last_execution_ms: Option<u64>,
 }
@@ -228,7 +225,6 @@ impl Executor {
                 let elapsed_send = start.elapsed().as_millis() as u64;
 
                 // total_sent = tx accepted by mempool (NOT yet confirmed).
-                // total_success is updated only after receipt confirms success.
                 self.stats.total_sent += 1;
                 self.stats.last_tx_hash = Some(tx_hash.clone());
                 self.stats.last_execution_ms = Some(elapsed_send);

@@ -102,7 +102,7 @@ chains:
     block_time_ms: 2000  # 2 second blocks
     contract_address: "0xF962fF73082509A2A9EED572e24E13D567419C9d"
     min_native_balance: 0.01
-    min_profit_usd: 0.0001  # Near-zero for test execution — any real spread will trigger
+    min_profit_usd: 0.30    # Minimum NET profit after gas. Triangular gas ~$0.09–0.88 at Linea prices.
     deadline_seconds: 120
     min_swap_amount_filter: 10000000  # 10 USDC minimum (reduced to catch more opportunities)
     # Chain-level fallback quoter — used for routers that don't have their own quoter_address.
@@ -249,6 +249,8 @@ routers:
     fee_tiers: [100, 500, 2500]  # 100bp is the only confirmed pool with liquidity on Linea
     # PancakeSwap has its own QuoterV2 — different factory from Uniswap
     quoter_address: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"
+    # V3 factory for pool discovery at startup (pools subscribe to Swap events for local state cache)
+    factory_address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
 
   - id: "uniswap-v3-linea"
     name: "Uniswap V3 (Linea)"
@@ -258,6 +260,7 @@ routers:
     fee_bps: 0
     fee_tiers: [500, 3000, 10000]
     # Uses chain-level quoter_v2_address (Uniswap's own QuoterV2)
+    factory_address: "0x31FAfd4889FA1269F7a13A66eE0fB458f27D72A9"
 
   # Nile Exchange — Solidly ve(3,3) fork on Linea
   # Same Route[]{from, to, stable} interface as Lynex

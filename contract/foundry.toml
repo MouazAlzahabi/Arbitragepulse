@@ -8,7 +8,7 @@ optimizer_runs = 1000
 via_ir = true
 
 # Anvil fork for integration tests
-[profile.default.rpc_endpoints]
+[rpc_endpoints]
 optimism = "${OPTIMISM_RPC}"
 base = "${BASE_RPC}"
 gnosis = "${GNOSIS_RPC}"

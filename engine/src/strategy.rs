@@ -13,6 +13,13 @@ use crate::abi::{IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFac
 use crate::config::{PairConfig, RouterConfig, RouterType};
 use crate::pool_cache::PoolCache;
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/// Minimum active-tick liquidity for a V3 pool to be considered tradeable.
+/// Real Linea pools: 10^15 – 10^20. Dead/empty pools: near zero.
+/// This filters out uninitialized pools and ghost liquidity without needing USD valuation.
+const MIN_V3_LIQUIDITY: u128 = 1_000_000_000; // 10^9
+
 // ─── Opportunity ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -399,28 +406,79 @@ impl Strategy {
                             router.fee_tiers.clone()
                         };
                         for fee in tiers {
-                            let calldata = IQuoterV2::quoteExactInputSingleCall {
-                                params: IQuoterV2::QuoteExactInputSingleParams {
-                                    tokenIn: token_in,
-                                    tokenOut: token_out,
-                                    amountIn: amount_in,
-                                    fee: Uint::from(fee),
-                                    sqrtPriceLimitX96: Uint::ZERO,
-                                },
+                            // ── Smart Guesser: 3-step V3 screening ──────────────────
+                            // Step 1: spot-price screen (zero RPC)
+                            if let Some((spot_out, liquidity)) = self.pool_cache.quote_v3_spot(
+                                &router.id, token_in, token_out, fee, amount_in,
+                            ) {
+                                // Step 2: depth check — skip dead/shallow pools
+                                if liquidity < MIN_V3_LIQUIDITY {
+                                    continue;
+                                }
+                                // Step 3: directional screen — spot says unprofitable?
+                                if spot_out <= amount_in {
+                                    continue; // no opportunity in this direction
+                                }
+                                // Spot looks profitable: cap query amount to safe tick capacity,
+                                // then confirm with QuoterV2 for accuracy.
+                                // Find pool address to call estimate_safe_v3_capacity
+                                let t_in_lower = format!("{token_in}").to_lowercase();
+                                let t_out_lower = format!("{token_out}").to_lowercase();
+                                let v3_key = format!("{}:{}:{}:{}", router.id, t_in_lower, t_out_lower, fee);
+                                let query_amount = if let Some(pool_addr) = self.pool_cache.v3_by_key.get(&v3_key) {
+                                    let cap = self.pool_cache.estimate_safe_v3_capacity(*pool_addr, token_in);
+                                    if cap.is_zero() { amount_in } else { amount_in.min(cap) }
+                                } else {
+                                    amount_in
+                                };
+
+                                let calldata = IQuoterV2::quoteExactInputSingleCall {
+                                    params: IQuoterV2::QuoteExactInputSingleParams {
+                                        tokenIn: token_in,
+                                        tokenOut: token_out,
+                                        amountIn: query_amount,
+                                        fee: Uint::from(fee),
+                                        sqrtPriceLimitX96: Uint::ZERO,
+                                    },
+                                }
+                                .abi_encode();
+                                fwd_mc.push((quoter, calldata));
+                                fwd_tasks.push(ForwardTask {
+                                    pair_idx: pi,
+                                    router_id: router.id.clone(),
+                                    router_addr,
+                                    router_type: RouterType::V3,
+                                    fee,
+                                    amount_in: query_amount, // capped amount, not full balance
+                                    token_in,
+                                    token_out,
+                                    quoter_addr: Some(quoter),
+                                });
+                            } else {
+                                // No V3 cache state yet (startup or stale) — always call QuoterV2
+                                let calldata = IQuoterV2::quoteExactInputSingleCall {
+                                    params: IQuoterV2::QuoteExactInputSingleParams {
+                                        tokenIn: token_in,
+                                        tokenOut: token_out,
+                                        amountIn: amount_in,
+                                        fee: Uint::from(fee),
+                                        sqrtPriceLimitX96: Uint::ZERO,
+                                    },
+                                }
+                                .abi_encode();
+                                fwd_mc.push((quoter, calldata));
+                                fwd_tasks.push(ForwardTask {
+                                    pair_idx: pi,
+                                    router_id: router.id.clone(),
+                                    router_addr,
+                                    router_type: RouterType::V3,
+                                    fee,
+                                    amount_in,
+                                    token_in,
+                                    token_out,
+                                    quoter_addr: Some(quoter),
+                                });
                             }
-                            .abi_encode();
-                            fwd_mc.push((quoter, calldata));
-                            fwd_tasks.push(ForwardTask {
-                                pair_idx: pi,
-                                router_id: router.id.clone(),
-                                router_addr,
-                                router_type: RouterType::V3,
-                                fee,
-                                amount_in,
-                                token_in,
-                                token_out,
-                                quoter_addr: Some(quoter),
-                            });
                         }
                     }
                     RouterType::Solidly => {
@@ -909,6 +967,14 @@ impl Strategy {
                         .or(self.quoter_v2_address)?;
                     // Use first fee tier only (limits explosion; most liquid pool usually first)
                     let fee = router.fee_tiers.first().copied().unwrap_or(500);
+                    // Depth check: skip dead/empty pools (avoids wasted QuoterV2 calls)
+                    if let Some((_spot, liquidity)) = self.pool_cache.quote_v3_spot(
+                        &router.id, token_in, token_out, fee, amount,
+                    ) {
+                        if liquidity < MIN_V3_LIQUIDITY {
+                            return None;
+                        }
+                    }
                     let cd = IQuoterV2::quoteExactInputSingleCall {
                         params: IQuoterV2::QuoteExactInputSingleParams {
                             tokenIn: token_in,
@@ -978,6 +1044,9 @@ impl Strategy {
             fee: u32,
             /// Pre-computed A→B amount from local xy=k cache. None = needs multicall result.
             local_result: Option<U256>,
+            /// Actual capital deployed for leg A→B.
+            /// May be < trip.amount_in when V3 capacity cap is applied.
+            effective_amount_in: U256,
         }
 
         let mut p1_entries: Vec<P1Entry> = Vec::new();
@@ -994,22 +1063,36 @@ impl Strategy {
                     RouterType::SyncSwap => 0,
                 };
 
+                // For V3 Phase 1: apply Smart Guesser capacity cap so the QuoterV2 query
+                // stays within the active tick. Capped amount = effective capital deployed.
+                let effective_amount_in = if router.router_type == RouterType::V3 {
+                    let t_in_l = format!("{}", trip.token_a).to_lowercase();
+                    let t_out_l = format!("{}", trip.token_b).to_lowercase();
+                    let v3_key = format!("{}:{}:{}:{}", router.id, t_in_l, t_out_l, fee);
+                    let cap = self.pool_cache.v3_by_key.get(&v3_key)
+                        .map(|p| self.pool_cache.estimate_safe_v3_capacity(*p, trip.token_a))
+                        .unwrap_or(U256::ZERO);
+                    if cap.is_zero() { trip.amount_in } else { trip.amount_in.min(cap) }
+                } else {
+                    trip.amount_in
+                };
+
                 // Try local cache for V2 and Solidly-volatile
                 let local_ab = match router.router_type {
                     RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_a, trip.token_b, trip.amount_in,
+                        &router.id, trip.token_a, trip.token_b, effective_amount_in,
                     ),
                     RouterType::Solidly => {
                         let key = format!("{}::volatile", router.id);
                         self.pool_cache.get_amount_out_by_key(
-                            &key, trip.token_a, trip.token_b, trip.amount_in,
+                            &key, trip.token_a, trip.token_b, effective_amount_in,
                         )
                     }
                     _ => None,
                 };
 
                 let mc_call = if local_ab.is_none() {
-                    make_quote(router, trip.token_a, trip.token_b, trip.amount_in)
+                    make_quote(router, trip.token_a, trip.token_b, effective_amount_in)
                 } else {
                     None
                 };
@@ -1027,6 +1110,7 @@ impl Strategy {
                     router_type: router.router_type.clone(),
                     fee,
                     local_result: local_ab,
+                    effective_amount_in,
                 });
                 if let Some(call) = mc_call {
                     p1_mc_entry_idx.push(entry_idx);
@@ -1050,6 +1134,8 @@ impl Strategy {
             router_bc_id: String, router_bc_addr: Address,
             router_bc_type: RouterType, fee_bc: u32,
             local_result: Option<U256>,
+            /// Carried from P1: actual capital deployed for the initial A→B leg.
+            effective_amount_in: U256,
         }
 
         let mut p2_entries: Vec<P2Entry> = Vec::new();
@@ -1111,6 +1197,7 @@ impl Strategy {
                     router_bc_type: router.router_type.clone(),
                     fee_bc: fee,
                     local_result: local_bc,
+                    effective_amount_in: p1e.effective_amount_in,
                 });
                 if let Some(call) = mc_call {
                     p2_mc_entry_idx.push(entry_idx);
@@ -1136,6 +1223,8 @@ impl Strategy {
             router_ca_id: String, router_ca_addr: Address,
             router_ca_type: RouterType, fee_ca: u32,
             local_result: Option<U256>,
+            /// Carried from P1: actual capital deployed for the initial A→B leg.
+            effective_amount_in: U256,
         }
 
         let mut p3_entries: Vec<P3Entry> = Vec::new();
@@ -1201,6 +1290,7 @@ impl Strategy {
                     router_ca_type: router.router_type.clone(),
                     fee_ca: fee,
                     local_result: local_ca,
+                    effective_amount_in: p2e.effective_amount_in,
                 });
                 if let Some(call) = mc_call {
                     p3_mc_entry_idx.push(entry_idx);
@@ -1230,9 +1320,10 @@ impl Strategy {
                 }
             };
             let trip = &triplets[p3e.triplet_idx];
-            if amount_a_final <= trip.amount_in { continue; }
+            // Compare against effective_amount_in (may be < trip.amount_in if V3 leg was capped)
+            if amount_a_final <= p3e.effective_amount_in { continue; }
 
-            let profit = amount_a_final - trip.amount_in;
+            let profit = amount_a_final - p3e.effective_amount_in;
 
             // Use correct decimals for profit-to-USD conversion (token_a may be USDC, WETH, etc.)
             let (sym_a, dec_a) = match token_info.get(&trip.key_a) {
@@ -1259,7 +1350,7 @@ impl Strategy {
                 token_a: trip.token_a,
                 token_b: trip.token_b,
                 token_c: trip.token_c,
-                amount_in: trip.amount_in,
+                amount_in: p3e.effective_amount_in,
                 router_ab: p3e.router_ab_addr,
                 router_bc: p3e.router_bc_addr,
                 router_ca: p3e.router_ca_addr,
