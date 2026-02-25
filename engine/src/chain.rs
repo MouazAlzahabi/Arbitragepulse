@@ -377,6 +377,12 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                 ).await;
+
+                // Drain events that accumulated during the scan.  Without this, N swaps
+                // per block → N back-to-back scans → CU rate-limit spike on Alchemy.
+                while block_rx.try_recv().is_ok() {}
+                while swap_rx.try_recv().is_ok() {}
+                poll_tick.reset(); // don't fire poll immediately after a block scan
             }
 
             // ── Periodic fallback scan (safety net if block subscription is down) ──
@@ -391,6 +397,9 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                 ).await;
+
+                while block_rx.try_recv().is_ok() {}
+                while swap_rx.try_recv().is_ok() {}
             }
 
             // ── Swap event → immediate scan ───────────────────────────────────
@@ -414,6 +423,12 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                 ).await;
+
+                // Drain remaining swap events and any queued block events — all stale
+                // now that we just evaluated on fresh state.
+                while block_rx.try_recv().is_ok() {}
+                while swap_rx.try_recv().is_ok() {}
+                poll_tick.reset();
             }
         }
     }
