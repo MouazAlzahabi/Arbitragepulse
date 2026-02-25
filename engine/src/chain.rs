@@ -222,6 +222,8 @@ pub async fn run_chain(
     let mut consecutive_zero_fwd: u32 = 0;
 
     // ── Main loop ──
+    // Tracks when the last full evaluate ran — used to rate-limit swap-triggered scans.
+    let mut last_scan_at = Instant::now() - Duration::from_secs(60);
     let poll_interval = Duration::from_millis(cfg.block_time_ms * 2);
     let mut poll_tick    = tokio::time::interval(poll_interval);
     let mut price_tick   = tokio::time::interval(Duration::from_secs(60));
@@ -377,6 +379,7 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                 ).await;
+                last_scan_at = Instant::now();
             }
 
             // ── Periodic fallback scan (safety net if block subscription is down) ──
@@ -391,16 +394,35 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                 ).await;
+                last_scan_at = Instant::now();
             }
 
-            // ── Swap event → pool cache updated by listener; no full scan here ──
-            // V3 QuoterV2 reads live on-chain state regardless of when it's called,
-            // so scanning immediately after a swap gives no accuracy advantage over
-            // the next block scan (≤2s away on Linea).  Triggering a full evaluate
-            // on every swap was the primary cause of Alchemy CU rate-limit spikes:
-            // dozens of swaps per block → dozens of V3 multicall batches per second.
+            // ── Swap event → rate-limited scan ───────────────────────────────────
+            // Re-enabled: reacting within a block to a large price-moving swap gives
+            // a meaningful edge. Guard: skip if a block/poll scan ran within the last
+            // block_time_ms so N swaps per block don't trigger N full scans.
             Some(event) = swap_rx.recv() => {
-                debug!("[{}] Swap on pool {:?} — V2 cache updated, next block scan picks it up", cfg.name, event.pool);
+                if last_scan_at.elapsed() < Duration::from_millis(cfg.block_time_ms) {
+                    debug!("[{}] Swap on {:?} — skipped (recent scan)", cfg.name, event.pool);
+                    continue;
+                }
+                debug!("[{}] Swap on {:?} — triggering scan", cfg.name, event.pool);
+                let state = shared_state.read().await;
+                let chain_paused = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
+                if state.paused || chain_paused { continue; }
+                drop(state);
+                {
+                    let mut state = shared_state.write().await;
+                    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
+                        chain.total_scans += 1;
+                    }
+                }
+                evaluate_and_execute(
+                    &strategy, &executor, &provider, &shared_state, &log_tx,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                ).await;
+                last_scan_at = Instant::now();
             }
         }
     }
