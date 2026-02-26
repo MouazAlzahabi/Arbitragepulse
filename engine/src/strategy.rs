@@ -332,6 +332,9 @@ impl Strategy {
 
         let mut fwd_tasks: Vec<ForwardTask> = Vec::new();
         let mut fwd_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        // V3 scan diagnostic counters: cached=used spot (0 HTTP), no_cache=QuoterV2 needed.
+        let mut v3_cached: usize = 0;
+        let mut v3_no_cache: usize = 0;
 
         for (pi, pair) in self.pairs.iter().enumerate().filter(|(_, p)| p.chain_id == self.chain_id) {
             let token_in = match pair.token_in.parse::<Address>() {
@@ -414,56 +417,34 @@ impl Strategy {
                             router.fee_tiers.clone()
                         };
                         for fee in tiers {
-                            // ── Smart Guesser: 3-step V3 screening ──────────────────
-                            // Step 1: spot-price screen (zero RPC)
-                            if let Some((_spot_out, liquidity)) = self.pool_cache.quote_v3_spot(
+                            // ── V3 cache-first: use sqrtPriceX96 spot if fresh (0 HTTP) ──
+                            // quote_v3_spot() returns None only when the pool state is stale
+                            // (no Swap event in the last 30s) — at startup before the listener
+                            // has seen any Swap events.
+                            if let Some((spot_out, liquidity)) = self.pool_cache.quote_v3_spot(
                                 &router.id, token_in, token_out, fee, amount_in,
                             ) {
-                                // Step 2: depth check — skip dead/shallow pools
                                 if liquidity < MIN_V3_LIQUIDITY {
+                                    v3_cached += 1;
                                     continue;
                                 }
-                                // (Step 3 removed: directional screen `spot_out <= amount_in`
-                                // was broken for mixed-decimal pairs — WETH→USDC always filtered
-                                // because raw USDC (1e6 scale) < raw WETH (1e18 scale) numerically.
-                                // QuoterV2 is the authoritative profitability check.)
-                                // Cap query amount to safe tick capacity,
-                                // then confirm with QuoterV2 for accuracy.
-                                // Find pool address to call estimate_safe_v3_capacity
-                                let t_in_lower = format!("{token_in}").to_lowercase();
-                                let t_out_lower = format!("{token_out}").to_lowercase();
-                                let v3_key = format!("{}:{}:{}:{}", router.id, t_in_lower, t_out_lower, fee);
-                                let query_amount = if let Some(pool_addr) = self.pool_cache.v3_by_key.get(&v3_key) {
-                                    let cap = self.pool_cache.estimate_safe_v3_capacity(*pool_addr, token_in);
-                                    if cap.is_zero() { amount_in } else { amount_in.min(cap) }
-                                } else {
-                                    amount_in
-                                };
-
-                                let calldata = IQuoterV2::quoteExactInputSingleCall {
-                                    params: IQuoterV2::QuoteExactInputSingleParams {
-                                        tokenIn: token_in,
-                                        tokenOut: token_out,
-                                        amountIn: query_amount,
-                                        fee: Uint::from(fee),
-                                        sqrtPriceLimitX96: Uint::ZERO,
-                                    },
-                                }
-                                .abi_encode();
-                                fwd_mc.push((quoter, calldata));
-                                fwd_tasks.push(ForwardTask {
+                                // Cache is fresh — use spot price directly (same as V2 local path).
+                                // The spot is a single-tick approximation; the optimizer and
+                                // pre-flight simulation will catch any inaccuracy before execution.
+                                pair_quotes.entry(pi).or_default().push(ForwardTask {
                                     pair_idx: pi,
                                     router_id: router.id.clone(),
                                     router_addr,
                                     router_type: RouterType::V3,
                                     fee,
-                                    amount_in: query_amount, // capped amount, not full balance
+                                    amount_in: spot_out, // repurposed: carries token_out amount
                                     token_in,
                                     token_out,
-                                    quoter_addr: Some(quoter),
+                                    quoter_addr: Some(quoter), // preserve for reverse pass
                                 });
+                                v3_cached += 1;
                             } else {
-                                // No V3 cache state yet (startup or stale) — always call QuoterV2
+                                // No V3 cache state yet (startup or stale) — call QuoterV2
                                 let calldata = IQuoterV2::quoteExactInputSingleCall {
                                     params: IQuoterV2::QuoteExactInputSingleParams {
                                         tokenIn: token_in,
@@ -486,6 +467,7 @@ impl Strategy {
                                     token_out,
                                     quoter_addr: Some(quoter),
                                 });
+                                v3_no_cache += 1;
                             }
                         }
                     }
@@ -617,10 +599,17 @@ impl Strategy {
             "[chain={}] Forward quotes: ok={} pairs_with_any={} pairs_with_multi_dex={}",
             self.chain_id, total_fwd_ok, pairs_with_any, pairs_with_multi
         );
+        if v3_cached + v3_no_cache > 0 {
+            debug!(
+                "[chain={}] V3 scan: {} cached (0 HTTP), {} QuoterV2 queued (stale/startup)",
+                self.chain_id, v3_cached, v3_no_cache
+            );
+        }
 
         // ── Phase 2: Reverse quotes ───────────────────────────────────────────────
         // V2 and Solidly-volatile reverse quotes use the same local xy=k cache.
-        // V3, SyncSwap, and Solidly-stable still need multicall.
+        // V3 uses cached spot when fresh; falls back to QuoterV2 only when stale.
+        // SyncSwap and Solidly-stable still need multicall.
 
         let mut rev_tasks: Vec<ReverseTask> = Vec::new();
         let mut rev_mc: Vec<(Address, Vec<u8>)> = Vec::new();
@@ -654,7 +643,7 @@ impl Strategy {
                     let rb_addr = q_b.router_addr;
                     let fee_b = q_b.fee;
 
-                    // Try local reverse quote for V2 and Solidly-volatile
+                    // Try local reverse quote for V2, Solidly-volatile, and V3 (when cache fresh)
                     let local_back = match q_b.router_type {
                         RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                             &q_b.router_id, token_out, token_in, token_out_amount,
@@ -664,6 +653,12 @@ impl Strategy {
                             self.pool_cache.get_amount_out_by_key(
                                 &q_b.router_id, token_out, token_in, token_out_amount,
                             )
+                        }
+                        RouterType::V3 => {
+                            // Use cached sqrtPriceX96 spot for reverse V3 leg when fresh
+                            self.pool_cache.quote_v3_spot(
+                                &q_b.router_id, token_out, token_in, fee_b, token_out_amount,
+                            ).map(|(spot_out, _)| spot_out)
                         }
                         _ => None,
                     };
@@ -1403,6 +1398,7 @@ impl Strategy {
         &self,
         opp: &ArbOpportunity,
         provider: &P,
+        max_balance: Option<U256>,
     ) -> ArbOpportunity {
         const COARSE: usize = 5;
         const FINE: usize = 5;
@@ -1439,6 +1435,18 @@ impl Strategy {
             })
             .map(|cap| double_amount.min(cap))
             .unwrap_or(double_amount);
+
+        // Also cap by the contract's known token_in balance (from periodic refresh).
+        // Prevents the optimizer from probing amounts the contract cannot cover.
+        let max_amount = if let Some(bal) = max_balance {
+            if bal.is_zero() {
+                // Contract has no balance — cannot execute, skip optimizer
+                return opp.clone();
+            }
+            max_amount.min(bal)
+        } else {
+            max_amount
+        };
 
         if min_amount >= max_amount || min_amount.is_zero() {
             return opp.clone();
@@ -1752,7 +1760,7 @@ async fn quote_solidly<P: Provider>(
 // ─── Utility ──────────────────────────────────────────────────────────────────
 
 /// Parse trade amount, capping at max_trade if set.
-fn parse_amount_capped(trade_amount: &str, max_trade: Option<&str>, decimals: u8) -> Option<U256> {
+pub(crate) fn parse_amount_capped(trade_amount: &str, max_trade: Option<&str>, decimals: u8) -> Option<U256> {
     let parsed: f64 = trade_amount.parse().ok()?;
     let capped = if let Some(max_str) = max_trade {
         let max: f64 = max_str.parse().ok()?;

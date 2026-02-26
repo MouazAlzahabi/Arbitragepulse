@@ -3,12 +3,14 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tracing::{info, warn, debug};
 
-use crate::abi::ArbitrageExecutor;
+use crate::abi::{ArbitrageExecutor, IERC20};
 use crate::db::Database;
 use crate::strategy::{ArbOpportunity, TriangularOpportunity};
 
@@ -62,6 +64,11 @@ pub struct Executor {
     pub confirmed_failed: Arc<AtomicU64>,
     /// Confirmed profit in USD (stored as f64 bits in AtomicU64 for lock-free access).
     pub confirmed_profit_usd_bits: Arc<AtomicU64>,
+    /// Shared contract balance cache. Set by chain.rs after construction.
+    /// After a confirmed trade, the receipt spawn refreshes this cache so
+    /// the next optimize() call sees the updated balance without waiting for
+    /// the 30s periodic timer.
+    pub contract_balances: Option<Arc<RwLock<HashMap<Address, U256>>>>,
 }
 
 impl Executor {
@@ -94,6 +101,7 @@ impl Executor {
             confirmed_success: Arc::new(AtomicU64::new(0)),
             confirmed_failed: Arc::new(AtomicU64::new(0)),
             confirmed_profit_usd_bits: Arc::new(AtomicU64::new(0u64)),
+            contract_balances: None,
         }
     }
 
@@ -252,6 +260,8 @@ impl Executor {
                 let confirmed_success = self.confirmed_success.clone();
                 let confirmed_failed = self.confirmed_failed.clone();
                 let confirmed_profit_bits = self.confirmed_profit_usd_bits.clone();
+                let contract_addr_bg = self.contract_address;
+                let contract_balances_bg = self.contract_balances.clone();
 
                 tokio::spawn(async move {
                     match pending.get_receipt().await {
@@ -268,6 +278,19 @@ impl Executor {
                                     receipt.gas_used,
                                     &tx_hash_bg[..10.min(tx_hash_bg.len())],
                                 );
+                                // Immediate balance refresh so optimize() sees updated capital
+                                if let Some(bals) = contract_balances_bg {
+                                    let token_addrs: Vec<Address> = {
+                                        let b = bals.read().await;
+                                        b.keys().copied().collect()
+                                    };
+                                    for token in token_addrs {
+                                        if let Ok(bal) = IERC20::new(token, &provider_bg).balanceOf(contract_addr_bg).call().await {
+                                            let mut b = bals.write().await;
+                                            b.insert(token, bal);
+                                        }
+                                    }
+                                }
                             } else {
                                 confirmed_failed.fetch_add(1, Ordering::Relaxed);
                                 warn!("[{}] ✗ reverted | tx={}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
@@ -410,6 +433,8 @@ impl Executor {
                 let confirmed_success = self.confirmed_success.clone();
                 let confirmed_failed = self.confirmed_failed.clone();
                 let confirmed_profit_bits = self.confirmed_profit_usd_bits.clone();
+                let contract_addr_bg = self.contract_address;
+                let contract_balances_bg = self.contract_balances.clone();
 
                 tokio::spawn(async move {
                     match pending.get_receipt().await {
@@ -425,6 +450,19 @@ impl Executor {
                                     receipt.gas_used,
                                     &tx_hash_bg[..10.min(tx_hash_bg.len())],
                                 );
+                                // Immediate balance refresh so optimize() sees updated capital
+                                if let Some(bals) = contract_balances_bg {
+                                    let token_addrs: Vec<Address> = {
+                                        let b = bals.read().await;
+                                        b.keys().copied().collect()
+                                    };
+                                    for token in token_addrs {
+                                        if let Ok(bal) = IERC20::new(token, &provider_bg).balanceOf(contract_addr_bg).call().await {
+                                            let mut b = bals.write().await;
+                                            b.insert(token, bal);
+                                        }
+                                    }
+                                }
                             } else {
                                 confirmed_failed.fetch_add(1, Ordering::Relaxed);
                                 warn!("[{}] ✗ triangular reverted | tx={}", chain_name, &tx_hash_bg[..10.min(tx_hash_bg.len())]);

@@ -1,5 +1,5 @@
 use alloy::network::Ethereum;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::network::EthereumWallet;
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::abi::{IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool};
+use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool};
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
@@ -116,6 +116,29 @@ pub async fn run_chain(
         let mut strat = strategy.write().await;
         strat.populate_syncswap_pools(provider.as_ref()).await;
     }
+
+    // ── Contract balance cache ─────────────────────────────────────────────────
+    // Caches the ArbitrageExecutor's token_in balances. Refreshed every 30s and
+    // immediately after each confirmed trade. Used by optimize() to cap the probe
+    // range — prevents querying amounts the contract cannot cover.
+    //
+    // Only token_in addresses matter: token_out balances are not held by the contract
+    // (the arb is atomic: in → profit → back to token_in).
+    let contract_balances: Arc<RwLock<HashMap<Address, U256>>> = {
+        let mut initial: HashMap<Address, U256> = HashMap::new();
+        for pair in &chain_pairs {
+            if let Ok(addr) = pair.token_in.parse::<Address>() {
+                initial.insert(addr, U256::ZERO);
+            }
+        }
+        Arc::new(RwLock::new(initial))
+    };
+    // Fetch initial balances so the optimizer has data from the first scan.
+    refresh_contract_balances(provider.as_ref(), contract_addr, &contract_balances).await;
+    // Startup funding check: warn for any underfunded pair.
+    check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances).await;
+    // Wire balances into executor for post-trade immediate refresh.
+    { executor.lock().await.contract_balances = Some(contract_balances.clone()); }
 
     // ── Router health monitoring ──
     let router_monitor = Arc::new(crate::router_health::RouterHealthMonitor::new());
@@ -225,9 +248,10 @@ pub async fn run_chain(
     // Tracks when the last full evaluate ran — used to rate-limit swap-triggered scans.
     let mut last_scan_at = Instant::now() - Duration::from_secs(60);
     let poll_interval = Duration::from_millis(cfg.block_time_ms * 2);
-    let mut poll_tick    = tokio::time::interval(poll_interval);
-    let mut price_tick   = tokio::time::interval(Duration::from_secs(60));
-    let mut config_tick  = tokio::time::interval(Duration::from_secs(30));
+    let mut poll_tick     = tokio::time::interval(poll_interval);
+    let mut price_tick    = tokio::time::interval(Duration::from_secs(60));
+    let mut config_tick   = tokio::time::interval(Duration::from_secs(30));
+    let mut balance_tick  = tokio::time::interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
@@ -328,6 +352,11 @@ pub async fn run_chain(
                 }
             }
 
+            // ── Periodic contract balance refresh ─────────────────────────────
+            _ = balance_tick.tick() => {
+                refresh_contract_balances(provider.as_ref(), contract_addr, &contract_balances).await;
+            }
+
             // ── Config hot-reload ─────────────────────────────────────────────
             _ = config_tick.tick() => {
                 if let Ok(new_cfg) = config::load_config(&config_path) {
@@ -378,6 +407,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                    &contract_balances,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -393,6 +423,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                    &contract_balances,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -421,6 +452,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                    &contract_balances,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -448,6 +480,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     last_fwd_count: &Arc<AtomicU64>,
     last_multi_count: &Arc<AtomicU64>,
     last_active_count: &Arc<AtomicU64>,
+    contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
 ) {
     // ── Parallel detection: 2-hop + triangular ────────────────────────────────
 
@@ -549,9 +582,13 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     match best_opp {
         Opportunity::TwoHop(opp) => {
             // Two-round adaptive size optimizer (only for 2-hop)
+            let max_bal = {
+                let bals = contract_balances.read().await;
+                bals.get(&opp.token_in).copied()
+            };
             let optimized = {
                 let strat = strategy.read().await;
-                strat.optimize(opp, provider.as_ref()).await
+                strat.optimize(opp, provider.as_ref(), max_bal).await
             };
 
             broadcast_log(
@@ -923,6 +960,74 @@ async fn update_native_price<P: Provider>(
     }
 }
 
+// ─── Contract balance helpers ─────────────────────────────────────────────────
+
+/// Refresh the cached token_in balances held by the ArbitrageExecutor contract.
+///
+/// Called at startup and every 30s by the balance_tick timer. The balance map
+/// is keyed by token address and initialised to U256::ZERO at startup; this
+/// function overwrites each entry with the live on-chain value.
+async fn refresh_contract_balances<P: Provider>(
+    provider: &P,
+    contract_addr: Address,
+    balances: &Arc<RwLock<HashMap<Address, U256>>>,
+) {
+    let token_addrs: Vec<Address> = {
+        let b = balances.read().await;
+        b.keys().copied().collect()
+    };
+    for token in token_addrs {
+        match IERC20::new(token, provider).balanceOf(contract_addr).call().await {
+            Ok(bal) => {
+                let mut b = balances.write().await;
+                b.insert(token, bal);
+            }
+            Err(e) => {
+                debug!("Failed to fetch balance for {:?}: {}", token, e);
+            }
+        }
+    }
+}
+
+/// Startup check: log a warning for any pair whose token_in balance in the
+/// ArbitrageExecutor contract is below the configured trade_amount.
+/// The engine continues running — detection is still valid; only execution
+/// will fail (caught by pre-flight simulation) until the contract is funded.
+async fn check_contract_funding(
+    chain_name: &str,
+    pairs: &[crate::config::PairConfig],
+    contract_addr: Address,
+    balances: &Arc<RwLock<HashMap<Address, U256>>>,
+) {
+    let b = balances.read().await;
+    for pair in pairs {
+        let token_addr = match pair.token_in.parse::<Address>() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let balance = b.get(&token_addr).copied().unwrap_or(U256::ZERO);
+        let required = match crate::strategy::parse_amount_capped(
+            &pair.trade_amount,
+            pair.max_trade.as_deref(),
+            pair.token_in_decimals,
+        ) {
+            Some(a) => a,
+            None => continue,
+        };
+        if balance < required {
+            warn!(
+                "[{}] ⚠ Contract underfunded for {} | balance={} trade_amount={} {} | fund {}",
+                chain_name,
+                pair.id,
+                balance,
+                required,
+                pair.token_in_symbol,
+                contract_addr,
+            );
+        }
+    }
+}
+
 // ─── Pool discovery (startup) ─────────────────────────────────────────────────
 
 /// Discover V2 and Solidly-volatile pools for all configured pairs and routers.
@@ -939,45 +1044,7 @@ async fn discover_pools<P: Provider>(
     pool_cache: &PoolCache,
 ) {
     use alloy::primitives::U256;
-    use alloy::rpc::types::TransactionRequest;
     use alloy::sol_types::SolCall;
-
-    // Inline multicall helper — avoids dependency on strategy's private fn.
-    let mc = async |calls: Vec<(Address, Vec<u8>)>| -> Vec<Option<Vec<u8>>> {
-        let mc3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
-            .parse()
-            .expect("hardcoded Multicall3");
-        if calls.is_empty() {
-            return vec![];
-        }
-        let mc_calls: Vec<crate::abi::IMulticall3::Call3> = calls
-            .iter()
-            .map(|(t, d)| crate::abi::IMulticall3::Call3 {
-                target: *t,
-                allowFailure: true,
-                callData: d.clone().into(),
-            })
-            .collect();
-        let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
-        let tx = TransactionRequest::default().to(mc3).input(calldata.into());
-        if let Ok(raw) = provider.call(tx).await {
-            if let Ok(ret) = crate::abi::IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
-                return ret
-                    .into_iter()
-                    .map(|r| if r.success { Some(r.returnData.to_vec()) } else { None })
-                    .collect();
-            }
-        }
-        // Fallback: sequential calls
-        let mut out = Vec::with_capacity(calls.len());
-        for (target, data) in &calls {
-            let tx2 = TransactionRequest::default()
-                .to(*target)
-                .input(data.clone().into());
-            out.push(provider.call(tx2).await.ok().map(|b| b.to_vec()));
-        }
-        out
-    };
 
     // ── Collect V2 and Solidly routers ────────────────────────────────────────
     struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32 }
@@ -997,7 +1064,7 @@ async fn discover_pools<P: Provider>(
         .iter()
         .map(|r| (r.addr, IRouterWithFactory::factoryCall {}.abi_encode()))
         .collect();
-    let factory_raw = mc(factory_calls).await;
+    let factory_raw = discover_mc(factory_calls, provider).await;
     let factories: Vec<Option<Address>> = factory_raw
         .iter()
         .map(|r| {
@@ -1028,7 +1095,7 @@ async fn discover_pools<P: Provider>(
     }
 
     if pair_calls.is_empty() { return; }
-    let pair_raw = mc(pair_calls).await;
+    let pair_raw = discover_mc(pair_calls, provider).await;
 
     // ── Round 3: token0 + getReserves per discovered pool ────────────────────
     struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address }
@@ -1060,7 +1127,7 @@ async fn discover_pools<P: Provider>(
     }
 
     if pool_metas.is_empty() { return; }
-    let rv_raw = mc(rv_calls).await;
+    let rv_raw = discover_mc(rv_calls, provider).await;
 
     // ── Insert into pool_cache ────────────────────────────────────────────────
     for (i, pm) in pool_metas.iter().enumerate() {
@@ -1109,44 +1176,9 @@ async fn discover_v3_pools<P: Provider>(
     pool_cache: &PoolCache,
 ) {
     use alloy::primitives::U256;
-    use alloy::rpc::types::TransactionRequest;
     use alloy::sol_types::SolCall;
     use std::collections::HashSet;
     use std::time::Instant;
-
-    // Inline multicall helper (same as in discover_pools)
-    let mc = async |calls: Vec<(Address, Vec<u8>)>| -> Vec<Option<Vec<u8>>> {
-        let mc3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
-            .parse()
-            .expect("hardcoded Multicall3");
-        if calls.is_empty() {
-            return vec![];
-        }
-        let mc_calls: Vec<crate::abi::IMulticall3::Call3> = calls
-            .iter()
-            .map(|(t, d)| crate::abi::IMulticall3::Call3 {
-                target: *t,
-                allowFailure: true,
-                callData: d.clone().into(),
-            })
-            .collect();
-        let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
-        let tx = TransactionRequest::default().to(mc3).input(calldata.into());
-        if let Ok(raw) = provider.call(tx).await {
-            if let Ok(ret) = crate::abi::IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
-                return ret
-                    .into_iter()
-                    .map(|r| if r.success { Some(r.returnData.to_vec()) } else { None })
-                    .collect();
-            }
-        }
-        let mut out = Vec::with_capacity(calls.len());
-        for (target, data) in &calls {
-            let tx2 = TransactionRequest::default().to(*target).input(data.clone().into());
-            out.push(provider.call(tx2).await.ok().map(|b| b.to_vec()));
-        }
-        out
-    };
 
     // ── Collect V3 routers with factory_address ───────────────────────────────
     struct V3Router { id: String, factory: Address, fee_tiers: Vec<u32> }
@@ -1189,7 +1221,7 @@ async fn discover_v3_pools<P: Provider>(
     if pool_calls.is_empty() {
         return;
     }
-    let pool_raw = mc(pool_calls).await;
+    let pool_raw = discover_mc(pool_calls, provider).await;
 
     // ── Round 2: slot0() + liquidity() per discovered pool ────────────────────
     struct StateQuery { pool: Address, router_id: String, ta: Address, tb: Address, fee: u32 }
@@ -1223,7 +1255,7 @@ async fn discover_v3_pools<P: Provider>(
     if state_queries.is_empty() {
         return;
     }
-    let state_raw = mc(state_calls).await;
+    let state_raw = discover_mc(state_calls, provider).await;
 
     // ── Insert into pool_cache ────────────────────────────────────────────────
     // Also need token0 to know direction. We derive it: token0 = min(ta, tb) by address.
@@ -1299,4 +1331,64 @@ async fn connect_with_fallback(
         urls.len(),
         last_err
     ))
+}
+
+// ─── Chunked multicall for pool discovery ─────────────────────────────────────
+
+/// Multicall3 helper used at startup by discover_pools / discover_v3_pools.
+///
+/// Splits `calls` into chunks of `DISCOVER_CHUNK` items, issuing one Multicall3
+/// call per chunk sequentially. This smooths the startup CU burst:
+///   • Old: 90 sub-calls in one Multicall3 (or worse, 90 sequential eth_calls on fallback)
+///   • New: 5 × 20 = 5 Multicall3 calls, ~5 × 26 CU = 130 CU spread over ~150ms
+const DISCOVER_CHUNK: usize = 20;
+
+async fn discover_mc<P: Provider>(
+    calls: Vec<(Address, Vec<u8>)>,
+    provider: &P,
+) -> Vec<Option<Vec<u8>>> {
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::sol_types::SolCall;
+
+    if calls.is_empty() {
+        return vec![];
+    }
+
+    let mc3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
+        .parse()
+        .expect("hardcoded Multicall3");
+
+    let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
+
+    for chunk in calls.chunks(DISCOVER_CHUNK) {
+        let mc_calls: Vec<crate::abi::IMulticall3::Call3> = chunk
+            .iter()
+            .map(|(t, d)| crate::abi::IMulticall3::Call3 {
+                target: *t,
+                allowFailure: true,
+                callData: d.clone().into(),
+            })
+            .collect();
+        let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
+        let tx = TransactionRequest::default().to(mc3).input(calldata.into());
+
+        if let Ok(raw) = provider.call(tx).await {
+            if let Ok(ret) = crate::abi::IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
+                results.extend(
+                    ret.into_iter()
+                        .map(|r| if r.success { Some(r.returnData.to_vec()) } else { None }),
+                );
+                continue;
+            }
+        }
+        // Fallback: sequential calls for this chunk
+        for (target, data) in chunk {
+            let tx2 = TransactionRequest::default()
+                .to(*target)
+                .input(data.clone().into());
+            results.push(provider.call(tx2).await.ok().map(|b| b.to_vec()));
+        }
+    }
+
+    results
 }
