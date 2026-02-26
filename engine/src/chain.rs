@@ -810,6 +810,21 @@ async fn handle_execution_failure(
         return;
     }
 
+    // RPC rate-limit (429) is an infra issue, not a strategy failure.
+    // Don't increment the circuit-breaker counter — just log and cool down.
+    if err_str.contains("429")
+        || err_str.contains("compute units")
+        || err_str.contains("rate limit")
+    {
+        broadcast_log(
+            log_tx,
+            "error",
+            &format!("[{}] Execute failed: {}", cfg.name, error),
+            None,
+        );
+        return;
+    }
+
     *consecutive_failures += 1;
 
     // Record router health (failure for all routers involved)
