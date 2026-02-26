@@ -593,7 +593,7 @@ function LogFeed({ logs, filter, setFilter }) {
   );
 }
 
-function ControlPanel({ ws, api, apiStats }) {
+function ControlPanel({ ws, api, apiStats, clearAll }) {
   const [confirmLive, setConfirmLive] = useState(false);
   const dryRun = apiStats?.dry_run ?? true;
   const paused = apiStats?.paused ?? false;
@@ -672,13 +672,24 @@ function ControlPanel({ ws, api, apiStats }) {
       </div>
 
       {/* Sound */}
-      <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <div>
           <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, fontWeight: 700 }}>SOUND ALERTS</div>
           <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Beep on trade execution</div>
         </div>
         <button onClick={() => setSoundOn(!soundOn)} style={{ ...btn, background: soundOn ? "#052e16" : "#1e293b", color: soundOn ? "#34d399" : "#475569", padding: "8px 20px" }}>
           {soundOn ? "?? ON" : "?? OFF"}
+        </button>
+      </div>
+
+      {/* Clear Monitor */}
+      <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, fontWeight: 700 }}>MONITOR</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Clear all logs and trade history for fresh monitoring</div>
+        </div>
+        <button onClick={clearAll} style={{ ...btn, background: "#1e293b", color: "#94a3b8", padding: "8px 20px" }}>
+          ✕ Clear
         </button>
       </div>
     </div>
@@ -830,6 +841,9 @@ export default function Dashboard() {
   // Merged view: historical records + live websocket logs
   const allLogs = useMemo(() => [...historicalLogs, ...ws.logs], [historicalLogs, ws.logs]);
 
+  // Clear all monitoring state for fresh tracking
+  const clearAll = () => { ws.clearLogs(); setHistoricalLogs([]); };
+
   // Poll /stats via HTTP every 3s to keep pause/dry-run state accurate
   const [apiStats, setApiStats] = useState(null);
   useEffect(() => {
@@ -901,7 +915,7 @@ export default function Dashboard() {
       )}
 
       {tab === "tokens" && <div style={{ flex: 1, overflow: "auto" }}><TokenManager api={api} /></div>}
-      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} /></div>}
+      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} /></div>}
     </div>
   );
 }

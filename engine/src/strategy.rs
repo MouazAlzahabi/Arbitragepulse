@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::abi::{IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Router02};
 use crate::config::{PairConfig, RouterConfig, RouterType};
@@ -1370,6 +1370,19 @@ impl Strategy {
             let trip = &triplets[p3e.triplet_idx];
             // Compare against effective_amount_in (may be < trip.amount_in if V3 leg was capped)
             if amount_a_final <= p3e.effective_amount_in { continue; }
+
+            // Sanity cap: real on-chain arbitrage never returns >200% in a single tx.
+            // Catches Solidly-echo phantoms (non-existent pairs returning amountIn back)
+            // and V3 spot chaining errors before they reach the executor.
+            if amount_a_final > p3e.effective_amount_in.saturating_mul(U256::from(3)) {
+                warn!(
+                    "[{}] Triangular phantom skipped: {} | {}x return",
+                    self.chain_id,
+                    trip.triplet_id,
+                    amount_a_final / p3e.effective_amount_in.max(U256::from(1)),
+                );
+                continue;
+            }
 
             let profit = amount_a_final - p3e.effective_amount_in;
 
