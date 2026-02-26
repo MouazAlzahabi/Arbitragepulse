@@ -796,16 +796,6 @@ impl Strategy {
                 }
             };
             if let Some(amount_back) = amount_back_opt.filter(|&b| !b.is_zero()) {
-                // Track signed spread % for all quotes (even unprofitable)
-                let amount_in_f64 = task.amount_in.to::<u128>() as f64;
-                let amount_back_f64 = amount_back.to::<u128>() as f64;
-                if amount_in_f64 > 0.0 {
-                    let spread = amount_back_f64 / amount_in_f64 - 1.0;
-                    if spread > best_spread_pct {
-                        best_spread_pct = spread;
-                    }
-                }
-
                 if amount_back > task.amount_in {
                     // Sanity cap: profit > 5% of input is almost certainly a V3 spot
                     // mismatch phantom (different routers' sqrtPriceX96 values compound
@@ -817,6 +807,21 @@ impl Strategy {
                         );
                         continue;
                     }
+                }
+
+                // Track signed spread % for all non-phantom quotes (even unprofitable ones).
+                // Must be after the sanity cap to prevent V3 spot mismatch artifacts from
+                // corrupting the spread metric with astronomical values.
+                let amount_in_f64 = task.amount_in.to::<u128>() as f64;
+                let amount_back_f64 = amount_back.to::<u128>() as f64;
+                if amount_in_f64 > 0.0 {
+                    let spread = amount_back_f64 / amount_in_f64 - 1.0;
+                    if spread > best_spread_pct {
+                        best_spread_pct = spread;
+                    }
+                }
+
+                if amount_back > task.amount_in {
                     let profit = amount_back - task.amount_in;
                     let profit_usd = token_amount_to_usd(
                         profit,
