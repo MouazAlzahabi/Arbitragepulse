@@ -1055,6 +1055,9 @@ impl Strategy {
         let mut p1_entries: Vec<P1Entry> = Vec::new();
         let mut p1_mc: Vec<(Address, Vec<u8>)> = Vec::new();
         let mut p1_mc_entry_idx: Vec<usize> = Vec::new();
+        // Triangular V3 diagnostic counters
+        let mut tri_v3_spot: usize = 0;
+        let mut tri_v3_mc: usize = 0;
 
         for (ti, trip) in triplets.iter().enumerate() {
             for router in &chain_routers {
@@ -1080,7 +1083,9 @@ impl Strategy {
                     trip.amount_in
                 };
 
-                // Try local cache for V2 and Solidly-volatile
+                // Try local cache for V2, Solidly-volatile, and V3 (spot from sqrtPriceX96).
+                // When V3 spot is fresh, it is used directly (0 HTTP). Stale → make_quote falls
+                // back to QuoterV2 multicall below.
                 let local_ab = match router.router_type {
                     RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                         &router.id, trip.token_a, trip.token_b, effective_amount_in,
@@ -1090,6 +1095,13 @@ impl Strategy {
                         self.pool_cache.get_amount_out_by_key(
                             &key, trip.token_a, trip.token_b, effective_amount_in,
                         )
+                    }
+                    RouterType::V3 => {
+                        self.pool_cache.quote_v3_spot(
+                            &router.id, trip.token_a, trip.token_b, fee, effective_amount_in,
+                        ).and_then(|(spot_out, liquidity)| {
+                            if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
+                        })
                     }
                     _ => None,
                 };
@@ -1103,6 +1115,10 @@ impl Strategy {
                 // Skip router if no quote source at all
                 if local_ab.is_none() && mc_call.is_none() {
                     continue;
+                }
+
+                if router.router_type == RouterType::V3 {
+                    if local_ab.is_some() { tri_v3_spot += 1; } else if mc_call.is_some() { tri_v3_mc += 1; }
                 }
 
                 let entry_idx = p1_entries.len();
@@ -1175,6 +1191,14 @@ impl Strategy {
                             &key, trip.token_b, trip.token_c, amount_b,
                         )
                     }
+                    RouterType::V3 => {
+                        let fee = router.fee_tiers.first().copied().unwrap_or(500);
+                        self.pool_cache.quote_v3_spot(
+                            &router.id, trip.token_b, trip.token_c, fee, amount_b,
+                        ).and_then(|(spot_out, liquidity)| {
+                            if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
+                        })
+                    }
                     _ => None,
                 };
 
@@ -1186,6 +1210,10 @@ impl Strategy {
 
                 if local_bc.is_none() && mc_call.is_none() {
                     continue;
+                }
+
+                if router.router_type == RouterType::V3 {
+                    if local_bc.is_some() { tri_v3_spot += 1; } else if mc_call.is_some() { tri_v3_mc += 1; }
                 }
 
                 let entry_idx = p2_entries.len();
@@ -1264,6 +1292,14 @@ impl Strategy {
                             &key, trip.token_c, trip.token_a, amount_c,
                         )
                     }
+                    RouterType::V3 => {
+                        let fee = router.fee_tiers.first().copied().unwrap_or(500);
+                        self.pool_cache.quote_v3_spot(
+                            &router.id, trip.token_c, trip.token_a, fee, amount_c,
+                        ).and_then(|(spot_out, liquidity)| {
+                            if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
+                        })
+                    }
                     _ => None,
                 };
 
@@ -1275,6 +1311,10 @@ impl Strategy {
 
                 if local_ca.is_none() && mc_call.is_none() {
                     continue;
+                }
+
+                if router.router_type == RouterType::V3 {
+                    if local_ca.is_some() { tri_v3_spot += 1; } else if mc_call.is_some() { tri_v3_mc += 1; }
                 }
 
                 let entry_idx = p3_entries.len();
@@ -1309,6 +1349,11 @@ impl Strategy {
         }
 
         // ── Calculate profits ─────────────────────────────────────────────────────
+
+        debug!(
+            "[{}] triangular scan: {} V3 spot (0 HTTP), {} V3 QuoterV2, {} triplets",
+            self.chain_id, tri_v3_spot, tri_v3_mc, triplets.len()
+        );
 
         let mut opportunities: Vec<TriangularOpportunity> = Vec::new();
         let mut best_raw_usd: f64 = 0.0;
