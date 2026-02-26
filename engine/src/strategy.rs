@@ -807,6 +807,16 @@ impl Strategy {
                 }
 
                 if amount_back > task.amount_in {
+                    // Sanity cap: profit > 5% of input is almost certainly a V3 spot
+                    // mismatch phantom (different routers' sqrtPriceX96 values compound
+                    // errors across the fwd/rev legs, producing billion-dollar phantoms).
+                    if (amount_back - task.amount_in).saturating_mul(U256::from(20)) > task.amount_in {
+                        warn!(
+                            "[{}] 2-hop phantom skipped: {} | profit/input > 5% | {}/{}",
+                            self.chain_id, task.pair_id, task.router_a_id, task.router_b_id
+                        );
+                        continue;
+                    }
                     let profit = amount_back - task.amount_in;
                     let profit_usd = token_amount_to_usd(
                         profit,
@@ -1371,15 +1381,14 @@ impl Strategy {
             // Compare against effective_amount_in (may be < trip.amount_in if V3 leg was capped)
             if amount_a_final <= p3e.effective_amount_in { continue; }
 
-            // Sanity cap: real on-chain arbitrage never returns >200% in a single tx.
-            // Catches Solidly-echo phantoms (non-existent pairs returning amountIn back)
-            // and V3 spot chaining errors before they reach the executor.
-            if amount_a_final > p3e.effective_amount_in.saturating_mul(U256::from(3)) {
+            // Sanity cap: profit > 5% of input is almost certainly a detection artifact.
+            // Catches Solidly-echo phantoms and V3 spot mismatch phantoms (including
+            // medium-range $37-$121 phantoms that passed the old 3× absolute cap).
+            if (amount_a_final - p3e.effective_amount_in).saturating_mul(U256::from(20)) > p3e.effective_amount_in {
                 warn!(
-                    "[{}] Triangular phantom skipped: {} | {}x return",
+                    "[{}] Triangular phantom skipped: {} | profit/input > 5%",
                     self.chain_id,
                     trip.triplet_id,
-                    amount_a_final / p3e.effective_amount_in.max(U256::from(1)),
                 );
                 continue;
             }
