@@ -58,7 +58,8 @@ pub struct V3PoolState {
 pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
-pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(60);
+/// 300s (5 min): covers pools that swap every few minutes (typical on Linea).
+pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// How long a Solidly-stable / SyncSwap-stable pool reserve is considered fresh.
 pub const STABLE_MAX_AGE: Duration = Duration::from_secs(120);

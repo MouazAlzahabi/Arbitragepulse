@@ -323,9 +323,6 @@ impl Strategy {
         // After this, the Sync event listener will keep reserves fresh with zero RPC cost.
         if !pool_entries.is_empty() {
             let rv_raw = run_multicall(provider, rv_calls, self.rpc_concurrency).await;
-            let stale_instant = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(3600))
-                .unwrap_or_else(std::time::Instant::now);
 
             for (i, pe) in pool_entries.iter().enumerate() {
                 let t0_raw  = match rv_raw.get(4 * i)     { Some(Some(r)) => r, _ => continue };
@@ -351,7 +348,7 @@ impl Strategy {
                     is_stable: pe.is_stable,
                     decimals0,
                     decimals1,
-                    last_sync: stale_instant,
+                    last_sync: std::time::Instant::now(), // startup reserves are accurate (just fetched)
                 });
             }
             debug!("[chain={}] SyncSwap: {} pools seeded into pool_cache", self.chain_id, pool_entries.len());

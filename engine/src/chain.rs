@@ -1256,12 +1256,9 @@ async fn discover_pools<P: Provider>(
             _ => pm.router_id.clone(),
         };
 
-        // last_sync is set to a far-past instant so startup reserves are treated as stale
-        // until the first live Sync event arrives and stamps Instant::now().
-        // Use saturating_sub to avoid panics — if the system clock is near epoch this
-        // still produces an instant older than any MAX_AGE threshold.
-        let stale_instant = Instant::now() - Duration::from_secs(3600);
-
+        // last_sync = Instant::now(): startup reserves were just fetched from chain via
+        // multicall — they ARE the current on-chain state. Use them immediately.
+        // The Sync event listener will keep them fresh from here on.
         pool_cache.insert(pm.pool, PoolInfo {
             token0,
             token1,
@@ -1272,7 +1269,7 @@ async fn discover_pools<P: Provider>(
             is_stable: pm.is_stable,
             decimals0,
             decimals1,
-            last_sync: stale_instant,
+            last_sync: Instant::now(),
         });
     }
 }
