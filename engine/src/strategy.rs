@@ -21,8 +21,11 @@ use crate::pool_cache::PoolCache;
 /// This filters out uninitialized pools and ghost liquidity without needing USD valuation.
 const MIN_V3_LIQUIDITY: u128 = 1_000_000_000; // 10^9
 
-/// Max calls per Multicall3 batch.  Larger chunks = fewer total eth_calls = lower CU usage.
-const MULTICALL_CHUNK_SIZE: usize = 100;
+/// Max calls per Multicall3 batch.
+/// 20 keeps each batch under ~30M gas (Alchemy eth_call limit) even with expensive
+/// V3 quoteExactInputSingle calls (~1-2M gas each). Larger chunks caused the batch
+/// to exceed the gas limit → silent fallback to 100 individual eth_calls per chunk.
+const MULTICALL_CHUNK_SIZE: usize = 20;
 
 // ─── Opportunity ──────────────────────────────────────────────────────────────
 
@@ -1657,7 +1660,7 @@ async fn run_multicall<P: Provider + Clone>(
             }
             None => {
                 // Chunk failed (Multicall3 unavailable or gas exceeded) — fall back sequentially.
-                debug!("Multicall3 chunk failed — using sequential fallback for {} calls", chunk_len);
+                warn!("Multicall3 chunk failed (gas limit exceeded?) — falling back to {} sequential eth_calls; reduce MULTICALL_CHUNK_SIZE if this persists", chunk_len);
                 for (target, data) in calls[call_offset..call_offset + chunk_len].iter() {
                     let tx = TransactionRequest::default()
                         .to(*target)
