@@ -35,10 +35,19 @@ pub struct ChainConfig {
     /// Each chunk = 1 eth_call (26 CU). Default: 3.
     #[serde(default = "default_rpc_concurrency")]
     pub rpc_concurrency: usize,
+    /// How often to scan for opportunities (milliseconds).
+    /// Decoupled from block_time_ms — set lower to scan more frequently.
+    /// Default: 1000ms (60 scans/min). Must be ≤ block_time_ms for meaningful effect.
+    #[serde(default = "default_scan_interval_ms")]
+    pub scan_interval_ms: u64,
 }
 
 fn default_rpc_concurrency() -> usize {
     3
+}
+
+fn default_scan_interval_ms() -> u64 {
+    1000
 }
 
 fn default_min_swap_amount() -> u128 {

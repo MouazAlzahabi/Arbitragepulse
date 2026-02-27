@@ -247,7 +247,10 @@ pub async fn run_chain(
     // ── Main loop ──
     // Tracks when the last full evaluate ran — used to rate-limit swap-triggered scans.
     let mut last_scan_at = Instant::now() - Duration::from_secs(60);
-    let poll_interval = Duration::from_millis(cfg.block_time_ms * 2);
+    // scan_interval_ms controls how often the poll_tick can fire a scan.
+    // Decoupled from block_time_ms: set lower to scan more often between blocks.
+    // Default 1000ms gives ~60 scans/min on a 2s-block chain (alternates block/poll).
+    let poll_interval = Duration::from_millis(cfg.scan_interval_ms);
     let mut poll_tick     = tokio::time::interval(poll_interval);
     let mut price_tick    = tokio::time::interval(Duration::from_secs(60));
     let mut config_tick   = tokio::time::interval(Duration::from_secs(30));
@@ -438,10 +441,10 @@ pub async fn run_chain(
 
             // ── Swap event → rate-limited scan ───────────────────────────────────
             // Re-enabled: reacting within a block to a large price-moving swap gives
-            // a meaningful edge. Guard: skip if a block/poll scan ran within the last
-            // block_time_ms so N swaps per block don't trigger N full scans.
+            // a meaningful edge. Guard: skip if a scan ran within scan_interval_ms
+            // so N swaps per block don't trigger N full scans.
             Some(event) = swap_rx.recv() => {
-                if last_scan_at.elapsed() < Duration::from_millis(cfg.block_time_ms) {
+                if last_scan_at.elapsed() < Duration::from_millis(cfg.scan_interval_ms) {
                     debug!("[{}] Swap on {:?} — skipped (recent scan)", cfg.name, event.pool);
                     continue;
                 }

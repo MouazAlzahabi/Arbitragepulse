@@ -113,6 +113,9 @@ chains:
     # Max concurrent Multicall3 chunks per scan.
     # Each chunk = 1 eth_call (26 CU). Free plan (330 CU/s): 3. Growth plan (3000 CU/s): 10.
     rpc_concurrency: 3
+    # How often to scan between blocks (milliseconds). Default: 1000.
+    # With 2s Linea blocks + 1s poll: alternates block/poll → ~60 scans/min.
+    scan_interval_ms: 1000
 
 
 # ─── ROUTERS ──────────────────────────────────────────────
