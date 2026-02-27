@@ -478,33 +478,15 @@ impl Strategy {
                     RouterType::Solidly => {
                         // Try both volatile (fee=0) and stable (fee=1) pools.
                         // fee encoding: 0=volatile (vAMM xy=k), 1=stable (sAMM x³y+y³x=k)
-                        // Volatile uses xy=k — same as V2, so we check pool cache.
-                        // Stable uses a different curve — always via multicall for accuracy.
+                        // Both go through multicall to get the true on-chain rate.
+                        // Volatile xy=k cache is NOT used here — startup reserves can be
+                        // stale (no Sync events if pool is illiquid), causing phantom profits
+                        // when the pool is imbalanced but has since been rebalanced on-chain.
                         for stable_flag in [0u32, 1u32] {
                             let stable = stable_flag != 0;
                             let eff_id = format!("{}::{}", router.id, if stable { "stable" } else { "volatile" });
 
-                            if !stable {
-                                // Volatile: try local xy=k cache first
-                                if let Some(out) = self.pool_cache.get_amount_out_by_key(
-                                    &eff_id, token_in, token_out, amount_in,
-                                ) {
-                                    pair_quotes.entry(pi).or_default().push(ForwardTask {
-                                        pair_idx: pi,
-                                        router_id: eff_id,
-                                        router_addr,
-                                        router_type: RouterType::Solidly,
-                                        fee: 0,
-                                        amount_in: out, // repurposed: carries token_out amount
-                                        token_in,
-                                        token_out,
-                                        quoter_addr: None,
-                                    });
-                                    continue; // advance to stable_flag=1
-                                }
-                            }
-
-                            // Stable pool or volatile cache miss: multicall
+                            // Always multicall for both stable and volatile: fresh on-chain rate
                             let calldata = ISolidlyRouter::getAmountsOutCall {
                                 amountIn: amount_in,
                                 routes: vec![ISolidlyRouter::Route {
@@ -647,16 +629,16 @@ impl Strategy {
                     let rb_addr = q_b.router_addr;
                     let fee_b = q_b.fee;
 
-                    // Try local reverse quote for V2, Solidly-volatile, and V3 (when cache fresh)
+                    // Try local reverse quote for V2 and V3 (when cache fresh).
+                    // Solidly volatile deliberately uses multicall (returns None here) to
+                    // get the true on-chain rate — stale xy=k cache causes phantom profits.
                     let local_back = match q_b.router_type {
                         RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                             &q_b.router_id, token_out, token_in, token_out_amount,
                         ),
                         RouterType::Solidly if fee_b == 0 => {
-                            // volatile: router_id already has "::volatile" suffix
-                            self.pool_cache.get_amount_out_by_key(
-                                &q_b.router_id, token_out, token_in, token_out_amount,
-                            )
+                            // Volatile: always multicall for fresh on-chain rate (not stale cache).
+                            None
                         }
                         RouterType::V3 => {
                             // Use cached sqrtPriceX96 spot for reverse V3 leg when fresh

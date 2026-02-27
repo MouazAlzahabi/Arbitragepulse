@@ -833,6 +833,19 @@ async fn handle_execution_failure(
         return;
     }
 
+    // Pre-flight simulation failures are expected — the opportunity closed between
+    // detection and execution. Don't count toward circuit breaker; this is working
+    // as intended. Only tx SEND failures indicate systemic problems (nonce, wallet).
+    if err_str.contains("simulation failed") || err_str.contains("Pre-flight") {
+        broadcast_log(
+            log_tx,
+            "warn",
+            &format!("[{}] Pre-flight failed (skipping): {}", cfg.name, error),
+            None,
+        );
+        return;
+    }
+
     *consecutive_failures += 1;
 
     // Record router health (failure for all routers involved)
