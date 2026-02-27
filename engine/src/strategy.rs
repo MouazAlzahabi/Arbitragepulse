@@ -10,9 +10,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::abi::{IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Router02};
+use crate::abi::{IERC20, IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Pair, IUniswapV2Router02};
 use crate::config::{PairConfig, RouterConfig, RouterType};
-use crate::pool_cache::PoolCache;
+use crate::pool_cache::{PoolCache, PoolInfo, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -278,6 +278,12 @@ impl Strategy {
         let results = run_multicall(provider, mc_calls, self.rpc_concurrency).await;
         let mut found = 0usize;
 
+        // Collect pool entries for the second round (seeding pool_cache with reserves).
+        struct SyncSwapPoolEntry { pool: Address, router_id: String, token_in: Address, token_out: Address, is_stable: bool }
+        let mut pool_entries: Vec<SyncSwapPoolEntry> = Vec::new();
+        let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
+        let mut seen_pools: std::collections::HashSet<Address> = std::collections::HashSet::new();
+
         for ((router_id, token_in_lower, token_out_lower), raw_opt) in
             mc_meta.into_iter().zip(results.into_iter())
         {
@@ -296,6 +302,59 @@ impl Strategy {
             let key_rev = format!("{}:{}:{}", router_id, token_out_lower, token_in_lower);
             self.syncswap_pool_cache.insert(key_fwd, pool_opt);
             self.syncswap_pool_cache.insert(key_rev, pool_opt);
+
+            // Seed this pool into pool_cache for local computation (0 multicall detection).
+            // Stable/classic determined by router_id suffix matching "stable".
+            if let Some(pool_addr) = pool_opt {
+                if seen_pools.insert(pool_addr) {
+                    let token_in: Address = match token_in_lower.parse() { Ok(a) => a, Err(_) => continue };
+                    let token_out: Address = match token_out_lower.parse() { Ok(a) => a, Err(_) => continue };
+                    let is_stable = router_id.contains("stable");
+                    rv_calls.push((pool_addr, IUniswapV2Pair::token0Call {}.abi_encode()));
+                    rv_calls.push((pool_addr, IUniswapV2Pair::getReservesCall {}.abi_encode()));
+                    rv_calls.push((token_in, IERC20::decimalsCall {}.abi_encode()));
+                    rv_calls.push((token_out, IERC20::decimalsCall {}.abi_encode()));
+                    pool_entries.push(SyncSwapPoolEntry { pool: pool_addr, router_id: router_id.clone(), token_in, token_out, is_stable });
+                }
+            }
+        }
+
+        // Second multicall round: fetch token0 + reserves + decimals to seed pool_cache.
+        // After this, the Sync event listener will keep reserves fresh with zero RPC cost.
+        if !pool_entries.is_empty() {
+            let rv_raw = run_multicall(provider, rv_calls, self.rpc_concurrency).await;
+            let stale_instant = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(3600))
+                .unwrap_or_else(std::time::Instant::now);
+
+            for (i, pe) in pool_entries.iter().enumerate() {
+                let t0_raw  = match rv_raw.get(4 * i)     { Some(Some(r)) => r, _ => continue };
+                let res_raw = match rv_raw.get(4 * i + 1) { Some(Some(r)) => r, _ => continue };
+                let dec_ti: u8 = rv_raw.get(4 * i + 2).and_then(|r| r.as_ref())
+                    .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok()).unwrap_or(18);
+                let dec_to: u8 = rv_raw.get(4 * i + 3).and_then(|r| r.as_ref())
+                    .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok()).unwrap_or(18);
+
+                let token0   = match IUniswapV2Pair::token0Call::abi_decode_returns(t0_raw).ok()       { Some(t) => t, None => continue };
+                let reserves = match IUniswapV2Pair::getReservesCall::abi_decode_returns(res_raw).ok() { Some(r) => r, None => continue };
+
+                let token1 = if pe.token_in == token0 { pe.token_out } else { pe.token_in };
+                let (decimals0, decimals1) = if pe.token_in == token0 { (dec_ti, dec_to) } else { (dec_to, dec_ti) };
+
+                self.pool_cache.insert(pe.pool, PoolInfo {
+                    token0,
+                    token1,
+                    reserve0: U256::from(reserves.reserve0),
+                    reserve1: U256::from(reserves.reserve1),
+                    fee_bps: 10, // SyncSwap default ≈ 0.1% = 10 bps
+                    router_id: pe.router_id.clone(),
+                    is_stable: pe.is_stable,
+                    decimals0,
+                    decimals1,
+                    last_sync: stale_instant,
+                });
+            }
+            debug!("[chain={}] SyncSwap: {} pools seeded into pool_cache", self.chain_id, pool_entries.len());
         }
 
         debug!(
@@ -304,6 +363,19 @@ impl Strategy {
             found,
             self.syncswap_pool_cache.len() / 2
         );
+    }
+
+    /// Returns indices into `self.pairs` for all pairs that trade `token_a` or `token_b`.
+    /// Used by the targeted scan to narrow evaluation to pairs affected by a Swap event.
+    pub fn pairs_for_tokens(&self, token_a: Address, token_b: Address) -> Vec<usize> {
+        self.pairs.iter().enumerate()
+            .filter(|(_, p)| {
+                let ta: Address = p.token_in.parse().unwrap_or_default();
+                let tb: Address = p.token_out.parse().unwrap_or_default();
+                ta == token_a || ta == token_b || tb == token_a || tb == token_b
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Evaluate all pairs on all router combinations for arb opportunities.
@@ -316,7 +388,14 @@ impl Strategy {
     ///   Negative = market is efficient (e.g. -0.002 = 0.2% below break-even).
     ///   Positive = profitable spread found.
     /// - `pairs_with_any`: number of pairs with at least 1 non-zero quote (shows coverage)
-    pub async fn evaluate<P: Provider + Clone>(&self, provider: &P) -> (Vec<ArbOpportunity>, f64, usize, usize, f64, usize) {
+    ///
+    /// `pair_mask`: if Some, only evaluate pairs at those indices (targeted scan).
+    /// Pass None for a full scan of all pairs.
+    pub async fn evaluate<P: Provider + Clone>(
+        &self,
+        provider: &P,
+        pair_mask: Option<&std::collections::HashSet<usize>>,
+    ) -> (Vec<ArbOpportunity>, f64, usize, usize, f64, usize) {
         let chain_routers: Vec<&RouterConfig> = self
             .routers
             .iter()
@@ -338,7 +417,10 @@ impl Strategy {
         let mut v3_cached: usize = 0;
         let mut v3_no_cache: usize = 0;
 
-        for (pi, pair) in self.pairs.iter().enumerate().filter(|(_, p)| p.chain_id == self.chain_id) {
+        for (pi, pair) in self.pairs.iter().enumerate()
+            .filter(|(_, p)| p.chain_id == self.chain_id)
+            .filter(|(i, _)| pair_mask.map_or(true, |m| m.contains(i)))
+        {
             let token_in = match pair.token_in.parse::<Address>() {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -446,93 +528,57 @@ impl Strategy {
                                 });
                                 v3_cached += 1;
                             } else {
-                                // No V3 cache state yet (startup or stale) — call QuoterV2
-                                let calldata = IQuoterV2::quoteExactInputSingleCall {
-                                    params: IQuoterV2::QuoteExactInputSingleParams {
-                                        tokenIn: token_in,
-                                        tokenOut: token_out,
-                                        amountIn: amount_in,
-                                        fee: Uint::from(fee),
-                                        sqrtPriceLimitX96: Uint::ZERO,
-                                    },
-                                }
-                                .abi_encode();
-                                fwd_mc.push((quoter, calldata));
-                                fwd_tasks.push(ForwardTask {
-                                    pair_idx: pi,
-                                    router_id: router.id.clone(),
-                                    router_addr,
-                                    router_type: RouterType::V3,
-                                    fee,
-                                    amount_in,
-                                    token_in,
-                                    token_out,
-                                    quoter_addr: Some(quoter),
-                                });
+                                // V3 state stale (no recent Swap event) = pool likely inactive.
+                                // Skip rather than fall back to QuoterV2 multicall — stale means
+                                // no on-chain swap activity → no arb opportunity to detect.
                                 v3_no_cache += 1;
+                                continue;
                             }
                         }
                     }
                     RouterType::Solidly => {
-                        // Try both volatile (fee=0) and stable (fee=1) pools.
-                        // fee encoding: 0=volatile (vAMM xy=k), 1=stable (sAMM x³y+y³x=k)
-                        // Both go through multicall to get the true on-chain rate.
-                        // Volatile xy=k cache is NOT used here — startup reserves can be
-                        // stale (no Sync events if pool is illiquid), causing phantom profits
-                        // when the pool is imbalanced but has since been rebalanced on-chain.
-                        for stable_flag in [0u32, 1u32] {
-                            let stable = stable_flag != 0;
-                            let eff_id = format!("{}::{}", router.id, if stable { "stable" } else { "volatile" });
-
-                            // Always multicall for both stable and volatile: fresh on-chain rate
-                            let calldata = ISolidlyRouter::getAmountsOutCall {
-                                amountIn: amount_in,
-                                routes: vec![ISolidlyRouter::Route {
-                                    from: token_in,
-                                    to: token_out,
-                                    stable,
-                                }],
+                        // Both volatile (fee=0) and stable (fee=1) pools use local reserve cache.
+                        // Only adds to pair_quotes when the pool has had a recent Sync event
+                        // (last_sync.elapsed() < max_age). Stale = no on-chain activity = skip.
+                        for (suffix, fee, max_age) in [
+                            ("volatile", 0u32, VOLATILE_MAX_AGE),
+                            ("stable",   1u32, STABLE_MAX_AGE),
+                        ] {
+                            let eff_id = format!("{}::{}", router.id, suffix);
+                            if let Some(out) = self.pool_cache.get_amount_out_by_key_fresh(
+                                &eff_id, token_in, token_out, amount_in, max_age,
+                            ) {
+                                pair_quotes.entry(pi).or_default().push(ForwardTask {
+                                    pair_idx: pi,
+                                    router_id: eff_id,
+                                    router_addr,
+                                    router_type: RouterType::Solidly,
+                                    fee,
+                                    amount_in: out, // repurposed: carries token_out amount
+                                    token_in,
+                                    token_out,
+                                    quoter_addr: None,
+                                });
                             }
-                            .abi_encode();
-                            fwd_mc.push((router_addr, calldata));
-                            fwd_tasks.push(ForwardTask {
-                                pair_idx: pi,
-                                router_id: eff_id,
-                                router_addr,
-                                router_type: RouterType::Solidly,
-                                fee: stable_flag,
-                                amount_in,
-                                token_in,
-                                token_out,
-                                quoter_addr: None,
-                            });
                         }
                     }
                     RouterType::SyncSwap => {
-                        // Look up pool address from cache (populated at startup).
-                        let token_in_lower = format!("{token_in}").to_lowercase();
-                        let token_out_lower = format!("{token_out}").to_lowercase();
-                        let cache_key = format!("{}:{}:{}", router.id, token_in_lower, token_out_lower);
-                        if let Some(Some(pool_addr)) = self.syncswap_pool_cache.get(&cache_key) {
-                            let pool_addr = *pool_addr;
-                            let calldata = ISyncSwapPool::getAmountOutCall {
-                                tokenIn: token_in,
-                                amountIn: amount_in,
-                                sender: Address::ZERO,
-                            }
-                            .abi_encode();
-                            fwd_mc.push((pool_addr, calldata));
-                            fwd_tasks.push(ForwardTask {
+                        // SyncSwap pools are now seeded into pool_cache at startup
+                        // (populate_syncswap_pools also calls pool_cache.insert).
+                        // Use local reserve state with freshness check (0 eth_call).
+                        if let Some(out) = self.pool_cache.get_amount_out_by_key_fresh(
+                            &router.id, token_in, token_out, amount_in, VOLATILE_MAX_AGE,
+                        ) {
+                            pair_quotes.entry(pi).or_default().push(ForwardTask {
                                 pair_idx: pi,
                                 router_id: router.id.clone(),
                                 router_addr,
                                 router_type: RouterType::SyncSwap,
                                 fee: 0,
-                                amount_in,
+                                amount_in: out, // repurposed: carries token_out amount
                                 token_in,
                                 token_out,
-                                // quoter_addr carries the pool address for reverse-phase lookup
-                                quoter_addr: Some(pool_addr),
+                                quoter_addr: None,
                             });
                         }
                     }
@@ -585,7 +631,7 @@ impl Strategy {
         );
         if v3_cached + v3_no_cache > 0 {
             debug!(
-                "[chain={}] V3 scan: {} cached (0 HTTP), {} QuoterV2 queued (stale/startup)",
+                "[chain={}] V3 scan: {} cached (0 HTTP), {} skipped (stale/startup — no QuoterV2 fallback)",
                 self.chain_id, v3_cached, v3_no_cache
             );
         }
@@ -627,16 +673,19 @@ impl Strategy {
                     let rb_addr = q_b.router_addr;
                     let fee_b = q_b.fee;
 
-                    // Try local reverse quote for V2 and V3 (when cache fresh).
-                    // Solidly volatile deliberately uses multicall (returns None here) to
-                    // get the true on-chain rate — stale xy=k cache causes phantom profits.
+                    // Try local reverse quote for all DEX types.
+                    // Solidly and SyncSwap now use pool_cache with freshness check;
+                    // stale reserves (>VOLATILE/STABLE_MAX_AGE since last Sync event) → None → skip.
                     let local_back = match q_b.router_type {
                         RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                             &q_b.router_id, token_out, token_in, token_out_amount,
                         ),
-                        RouterType::Solidly if fee_b == 0 => {
-                            // Volatile: always multicall for fresh on-chain rate (not stale cache).
-                            None
+                        RouterType::Solidly => {
+                            // q_b.router_id is "router::volatile" or "router::stable"
+                            let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
+                            self.pool_cache.get_amount_out_by_key_fresh(
+                                &q_b.router_id, token_out, token_in, token_out_amount, max_age,
+                            )
                         }
                         RouterType::V3 => {
                             // Use cached sqrtPriceX96 spot for reverse V3 leg when fresh
@@ -644,7 +693,11 @@ impl Strategy {
                                 &q_b.router_id, token_out, token_in, fee_b, token_out_amount,
                             ).map(|(spot_out, _)| spot_out)
                         }
-                        _ => None,
+                        RouterType::SyncSwap => {
+                            self.pool_cache.get_amount_out_by_key_fresh(
+                                &q_b.router_id, token_out, token_in, token_out_amount, VOLATILE_MAX_AGE,
+                            )
+                        }
                     };
 
                     let task_idx = rev_tasks.len();
@@ -701,17 +754,10 @@ impl Strategy {
                                 Some((quoter, cd))
                             }
                             RouterType::Solidly => {
-                                let stable = fee_b != 0;
-                                let cd = ISolidlyRouter::getAmountsOutCall {
-                                    amountIn: token_out_amount,
-                                    routes: vec![ISolidlyRouter::Route {
-                                        from: token_out,
-                                        to: token_in,
-                                        stable,
-                                    }],
-                                }
-                                .abi_encode();
-                                Some((rb_addr, cd))
+                                // local_back returned None = stale reserves = no recent activity.
+                                // Skip rather than multicall: stale pool has no arb opportunity.
+                                rev_tasks.pop();
+                                continue;
                             }
                             RouterType::SyncSwap => {
                                 match q_b.quoter_addr {
@@ -866,10 +912,13 @@ impl Strategy {
     ///
     /// Returns `(opportunities, best_raw_profit_usd)` — best_raw_profit_usd tracks
     /// the highest profit seen even below `min_profit_usd` (for status logging).
+    /// `token_filter`: if Some, only consider triplets that include at least one of the
+    /// given token addresses (targeted scan). Pass None for a full sweep.
     pub async fn detect_triangular<P: Provider + Clone>(
         &self,
         provider: &P,
         max_opportunities: usize,
+        token_filter: Option<&[Address]>,
     ) -> (Vec<TriangularOpportunity>, f64) {
         use std::collections::HashMap;
 
@@ -946,13 +995,20 @@ impl Strategy {
             }
         }
 
+        // Targeted scan: keep only triplets that contain at least one of the target tokens.
+        if let Some(filter) = token_filter {
+            triplets.retain(|t| {
+                filter.iter().any(|f| *f == t.token_a || *f == t.token_b || *f == t.token_c)
+            });
+        }
+
         if triplets.is_empty() {
             return (vec![], 0.0);
         }
 
-        // Helper: build a single quote call for (token_in → token_out, amount, router)
-        // Returns (multicall_target, calldata) or None if unsupported.
-        let make_quote = |router: &RouterConfig, token_in: Address, token_out: Address, amount: U256| -> Option<(Address, Vec<u8>)> {
+        // _make_quote: previously used for multicall fallbacks, now unused.
+        // All DEX types use local state (0 eth_call) in P1/P2/P3.
+        let _make_quote = |router: &RouterConfig, token_in: Address, token_out: Address, amount: U256| -> Option<(Address, Vec<u8>)> {
             let router_addr: Address = router.address.parse().ok()?;
             match router.router_type {
                 RouterType::V2 => {
@@ -1076,9 +1132,8 @@ impl Strategy {
         let mut p1_entries: Vec<P1Entry> = Vec::new();
         let mut p1_mc: Vec<(Address, Vec<u8>)> = Vec::new();
         let mut p1_mc_entry_idx: Vec<usize> = Vec::new();
-        // Triangular V3 diagnostic counters
+        // Triangular V3 diagnostic counter (no multicall in triangular)
         let mut tri_v3_spot: usize = 0;
-        let mut tri_v3_mc: usize = 0;
 
         for (ti, trip) in triplets.iter().enumerate() {
             for router in &chain_routers {
@@ -1104,18 +1159,22 @@ impl Strategy {
                     trip.amount_in
                 };
 
-                // Try local cache for V2, Solidly-volatile, and V3 (spot from sqrtPriceX96).
-                // When V3 spot is fresh, it is used directly (0 HTTP). Stale → make_quote falls
-                // back to QuoterV2 multicall below.
+                // All DEX types use local reserve cache (0 eth_call).
+                // Solidly: try volatile then stable, both with freshness check.
+                // SyncSwap: pool_cache seeded at startup by populate_syncswap_pools.
+                // V3: spot price from sqrtPriceX96; skip if stale (no QuoterV2 in triangular).
                 let local_ab = match router.router_type {
                     RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                         &router.id, trip.token_a, trip.token_b, effective_amount_in,
                     ),
                     RouterType::Solidly => {
-                        let key = format!("{}::volatile", router.id);
-                        self.pool_cache.get_amount_out_by_key(
-                            &key, trip.token_a, trip.token_b, effective_amount_in,
-                        )
+                        let vol = format!("{}::volatile", router.id);
+                        let sta = format!("{}::stable", router.id);
+                        self.pool_cache.get_amount_out_by_key_fresh(
+                            &vol, trip.token_a, trip.token_b, effective_amount_in, VOLATILE_MAX_AGE,
+                        ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
+                            &sta, trip.token_a, trip.token_b, effective_amount_in, STABLE_MAX_AGE,
+                        ))
                     }
                     RouterType::V3 => {
                         self.pool_cache.quote_v3_spot(
@@ -1124,22 +1183,23 @@ impl Strategy {
                             if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
                         })
                     }
-                    _ => None,
+                    RouterType::SyncSwap => {
+                        self.pool_cache.get_amount_out_by_key_fresh(
+                            &router.id, trip.token_a, trip.token_b, effective_amount_in, VOLATILE_MAX_AGE,
+                        )
+                    }
                 };
 
-                let mc_call = if local_ab.is_none() {
-                    make_quote(router, trip.token_a, trip.token_b, effective_amount_in)
-                } else {
-                    None
-                };
+                // No multicall fallback in triangular — local or skip.
+                let mc_call: Option<(Address, Vec<u8>)> = None;
 
-                // Skip router if no quote source at all
-                if local_ab.is_none() && mc_call.is_none() {
+                // Skip router if no local quote available
+                if local_ab.is_none() {
                     continue;
                 }
 
                 if router.router_type == RouterType::V3 {
-                    if local_ab.is_some() { tri_v3_spot += 1; } else if mc_call.is_some() { tri_v3_mc += 1; }
+                    if local_ab.is_some() { tri_v3_spot += 1; } // mc_call always None — no QuoterV2 in triangular
                 }
 
                 let entry_idx = p1_entries.len();
@@ -1207,10 +1267,13 @@ impl Strategy {
                         &router.id, trip.token_b, trip.token_c, amount_b,
                     ),
                     RouterType::Solidly => {
-                        let key = format!("{}::volatile", router.id);
-                        self.pool_cache.get_amount_out_by_key(
-                            &key, trip.token_b, trip.token_c, amount_b,
-                        )
+                        let vol = format!("{}::volatile", router.id);
+                        let sta = format!("{}::stable", router.id);
+                        self.pool_cache.get_amount_out_by_key_fresh(
+                            &vol, trip.token_b, trip.token_c, amount_b, VOLATILE_MAX_AGE,
+                        ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
+                            &sta, trip.token_b, trip.token_c, amount_b, STABLE_MAX_AGE,
+                        ))
                     }
                     RouterType::V3 => {
                         let fee = router.fee_tiers.first().copied().unwrap_or(500);
@@ -1220,21 +1283,21 @@ impl Strategy {
                             if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
                         })
                     }
-                    _ => None,
+                    RouterType::SyncSwap => {
+                        self.pool_cache.get_amount_out_by_key_fresh(
+                            &router.id, trip.token_b, trip.token_c, amount_b, VOLATILE_MAX_AGE,
+                        )
+                    }
                 };
 
-                let mc_call = if local_bc.is_none() {
-                    make_quote(router, trip.token_b, trip.token_c, amount_b)
-                } else {
-                    None
-                };
+                let mc_call: Option<(Address, Vec<u8>)> = None;
 
-                if local_bc.is_none() && mc_call.is_none() {
+                if local_bc.is_none() {
                     continue;
                 }
 
                 if router.router_type == RouterType::V3 {
-                    if local_bc.is_some() { tri_v3_spot += 1; } else if mc_call.is_some() { tri_v3_mc += 1; }
+                    if local_bc.is_some() { tri_v3_spot += 1; }
                 }
 
                 let entry_idx = p2_entries.len();
@@ -1308,10 +1371,13 @@ impl Strategy {
                         &router.id, trip.token_c, trip.token_a, amount_c,
                     ),
                     RouterType::Solidly => {
-                        let key = format!("{}::volatile", router.id);
-                        self.pool_cache.get_amount_out_by_key(
-                            &key, trip.token_c, trip.token_a, amount_c,
-                        )
+                        let vol = format!("{}::volatile", router.id);
+                        let sta = format!("{}::stable", router.id);
+                        self.pool_cache.get_amount_out_by_key_fresh(
+                            &vol, trip.token_c, trip.token_a, amount_c, VOLATILE_MAX_AGE,
+                        ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
+                            &sta, trip.token_c, trip.token_a, amount_c, STABLE_MAX_AGE,
+                        ))
                     }
                     RouterType::V3 => {
                         let fee = router.fee_tiers.first().copied().unwrap_or(500);
@@ -1321,21 +1387,21 @@ impl Strategy {
                             if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
                         })
                     }
-                    _ => None,
+                    RouterType::SyncSwap => {
+                        self.pool_cache.get_amount_out_by_key_fresh(
+                            &router.id, trip.token_c, trip.token_a, amount_c, VOLATILE_MAX_AGE,
+                        )
+                    }
                 };
 
-                let mc_call = if local_ca.is_none() {
-                    make_quote(router, trip.token_c, trip.token_a, amount_c)
-                } else {
-                    None
-                };
+                let mc_call: Option<(Address, Vec<u8>)> = None;
 
-                if local_ca.is_none() && mc_call.is_none() {
+                if local_ca.is_none() {
                     continue;
                 }
 
                 if router.router_type == RouterType::V3 {
-                    if local_ca.is_some() { tri_v3_spot += 1; } else if mc_call.is_some() { tri_v3_mc += 1; }
+                    if local_ca.is_some() { tri_v3_spot += 1; }
                 }
 
                 let entry_idx = p3_entries.len();
@@ -1372,8 +1438,8 @@ impl Strategy {
         // ── Calculate profits ─────────────────────────────────────────────────────
 
         debug!(
-            "[{}] triangular scan: {} V3 spot (0 HTTP), {} V3 QuoterV2, {} triplets",
-            self.chain_id, tri_v3_spot, tri_v3_mc, triplets.len()
+            "[{}] triangular scan: {} V3 spot (0 HTTP), {} triplets (no multicall)",
+            self.chain_id, tri_v3_spot, triplets.len()
         );
 
         let mut opportunities: Vec<TriangularOpportunity> = Vec::new();

@@ -175,7 +175,7 @@ pub async fn run_chain(
     }
 
     // ── Block-header subscription (drives immediate scanning on each new block) ──
-    let (block_tx, mut block_rx) = mpsc::channel::<u64>(64);
+    let (block_tx, mut block_rx) = mpsc::channel::<(u64, u128)>(64);
     {
         let provider_for_blocks = (*provider).clone();
         let chain_name_b = cfg.name.clone();
@@ -189,8 +189,9 @@ pub async fn run_chain(
                         let mut stream = sub.into_stream();
                         while let Some(header) = stream.next().await {
                             let num = header.number;
+                            let base_fee = header.base_fee_per_gas.unwrap_or(1_000_000_000) as u128;
                             debug!("[{}] New block #{}", chain_name_b, num);
-                            let _ = block_tx_b.send(num).await;
+                            let _ = block_tx_b.send((num, base_fee)).await;
                         }
                         warn!("[{}] Block subscription stream ended, reconnecting in {:?}", chain_name_b, backoff);
                     }
@@ -245,8 +246,10 @@ pub async fn run_chain(
     let mut consecutive_zero_fwd: u32 = 0;
 
     // ── Main loop ──
-    // Tracks when the last full evaluate ran — used to rate-limit swap-triggered scans.
+    // Tracks when the last full evaluate ran — used to gate the poll_tick fallback.
     let mut last_scan_at = Instant::now() - Duration::from_secs(60);
+    // Per-pool burst guard for targeted Swap-triggered scans (50ms cooldown per pool).
+    let mut pool_last_scan: HashMap<Address, Instant> = HashMap::new();
     // scan_interval_ms controls how often the poll_tick can fire a scan.
     // Decoupled from block_time_ms: set lower to scan more often between blocks.
     // Default 1000ms gives ~60 scans/min on a 2s-block chain (alternates block/poll).
@@ -388,7 +391,10 @@ pub async fn run_chain(
             }
 
             // ── New block header → immediate scan ─────────────────────────────
-            Some(block_num) = block_rx.recv() => {
+            Some((block_num, base_fee)) = block_rx.recv() => {
+                // Pre-populate gas price cache from block header — eliminates eth_gasPrice RPC calls.
+                executor.lock().await.update_gas_price(base_fee);
+
                 // Update RPC health + block number in shared state, count each block as a scan
                 {
                     let mut state = shared_state.write().await;
@@ -410,7 +416,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &contract_balances,
+                    &contract_balances, None,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -434,38 +440,69 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &contract_balances,
+                    &contract_balances, None,
                 ).await;
                 last_scan_at = Instant::now();
             }
 
-            // ── Swap event → rate-limited scan ───────────────────────────────────
-            // Re-enabled: reacting within a block to a large price-moving swap gives
-            // a meaningful edge. Guard: skip if a scan ran within scan_interval_ms
-            // so N swaps per block don't trigger N full scans.
+            // ── Swap event → instant targeted scan ───────────────────────────────
+            // Reacts to intra-block price moves with zero rate limit.
+            // Only evaluates pairs that contain the tokens from the swapped pool,
+            // so the scan takes <0.1ms (pure local math, 0 RPC).
+            // 50ms per-pool burst guard prevents CPU saturation from event floods.
+            // last_scan_at is NOT updated — targeted scans must not suppress the
+            // block-triggered full scan or the poll_tick fallback.
             Some(event) = swap_rx.recv() => {
-                if last_scan_at.elapsed() < Duration::from_millis(cfg.scan_interval_ms) {
-                    debug!("[{}] Swap on {:?} — skipped (recent scan)", cfg.name, event.pool);
-                    continue;
+                // Per-pool burst protection
+                if let Some(&fired_at) = pool_last_scan.get(&event.pool) {
+                    if fired_at.elapsed() < Duration::from_millis(50) {
+                        continue;
+                    }
                 }
-                debug!("[{}] Swap on {:?} — triggering scan", cfg.name, event.pool);
+                pool_last_scan.insert(event.pool, Instant::now());
+
+                // Identify which tokens moved in this pool (V2/Solidly/SyncSwap + V3)
+                let tokens = {
+                    let strat = strategy.read().await;
+                    strat.pool_cache.get_pool_tokens(event.pool)
+                };
+                let (tok_a, tok_b) = match tokens {
+                    Some(t) => t,
+                    None => continue, // Pool not in cache — block scan covers it
+                };
+
+                // Find which configured pairs involve these tokens
+                let (pair_mask, token_filter) = {
+                    let strat = strategy.read().await;
+                    let indices = strat.pairs_for_tokens(tok_a, tok_b);
+                    (indices.into_iter().collect::<HashSet<usize>>(), vec![tok_a, tok_b])
+                };
+                if pair_mask.is_empty() { continue; }
+
                 let state = shared_state.read().await;
                 let chain_paused = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                 if state.paused || chain_paused { continue; }
                 drop(state);
+
                 {
                     let mut state = shared_state.write().await;
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
                         chain.total_scans += 1;
                     }
                 }
+
+                debug!(
+                    "[{}] Swap on {:?} — targeted scan ({} pairs)",
+                    cfg.name, event.pool, pair_mask.len()
+                );
+
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &contract_balances,
+                    &contract_balances, Some((pair_mask, token_filter)),
                 ).await;
-                last_scan_at = Instant::now();
+                // NOTE: last_scan_at intentionally NOT updated here.
             }
         }
     }
@@ -492,14 +529,16 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     last_multi_count: &Arc<AtomicU64>,
     last_active_count: &Arc<AtomicU64>,
     contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
+    // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
+    targeted: Option<(HashSet<usize>, Vec<Address>)>,
 ) {
     // ── Parallel detection: 2-hop + triangular ────────────────────────────────
 
     let all_opportunities = {
         let strat = strategy.read().await;
         let ((opps_2hop, best_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
-            strat.evaluate(provider.as_ref()),
-            strat.detect_triangular(provider.as_ref(), 5),
+            strat.evaluate(provider.as_ref(), targeted.as_ref().map(|(m, _)| m)),
+            strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice())),
         );
 
         // Update quote diagnostic counters (last scan — overwrites on every call)
@@ -1114,7 +1153,9 @@ async fn discover_pools<P: Provider>(
         .collect();
 
     // ── Round 2: getPair per (router × pair) ─────────────────────────────────
-    struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address }
+    // Solidly routers produce TWO calls per pair: volatile (stable:false) and
+    // stable (stable:true). Both pools are discovered and cached independently.
+    struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool }
     let mut pair_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pair_metas: Vec<PairMeta> = Vec::new();
 
@@ -1123,21 +1164,34 @@ async fn discover_pools<P: Provider>(
         for pair in pairs {
             let ta: Address = match pair.token_in.parse() { Ok(a) => a, Err(_) => continue };
             let tb: Address = match pair.token_out.parse() { Ok(a) => a, Err(_) => continue };
-            let cd = match rm.rtype {
-                RouterType::V2 => IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode(),
-                RouterType::Solidly => ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode(),
+            match rm.rtype {
+                RouterType::V2 => {
+                    let cd = IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode();
+                    pair_calls.push((factory, cd));
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
+                }
+                RouterType::Solidly => {
+                    // Volatile pool (xy=k)
+                    let cd_vol = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
+                    pair_calls.push((factory, cd_vol));
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
+                    // Stable pool (x³y+xy³=k) — Solidly deploys a separate pool address
+                    let cd_sta = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: true }.abi_encode();
+                    pair_calls.push((factory, cd_sta));
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: true });
+                }
                 _ => continue,
-            };
-            pair_calls.push((factory, cd));
-            pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb });
+            }
         }
     }
 
     if pair_calls.is_empty() { return; }
     let pair_raw = discover_mc(pair_calls, provider).await;
 
-    // ── Round 3: token0 + getReserves per discovered pool ────────────────────
-    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address }
+    // ── Round 3: token0 + getReserves + decimals(ta) + decimals(tb) per pool ──
+    // 4 calls per pool. The pool address from the stable=true call is a different
+    // contract from stable=false, so `seen` naturally allows both.
+    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool }
     let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pool_metas: Vec<PoolMeta> = Vec::new();
     let mut seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
@@ -1155,6 +1209,8 @@ async fn discover_pools<P: Provider>(
         if !seen.insert(pool) { continue; }
         rv_calls.push((pool, IUniswapV2Pair::token0Call {}.abi_encode()));
         rv_calls.push((pool, IUniswapV2Pair::getReservesCall {}.abi_encode()));
+        rv_calls.push((pm.ta, IERC20::decimalsCall {}.abi_encode()));
+        rv_calls.push((pm.tb, IERC20::decimalsCall {}.abi_encode()));
         pool_metas.push(PoolMeta {
             pool,
             router_id: pm.router_id.clone(),
@@ -1162,6 +1218,7 @@ async fn discover_pools<P: Provider>(
             fee_bps: pm.fee_bps,
             ta: pm.ta,
             tb: pm.tb,
+            is_stable: pm.is_stable,
         });
     }
 
@@ -1170,20 +1227,40 @@ async fn discover_pools<P: Provider>(
 
     // ── Insert into pool_cache ────────────────────────────────────────────────
     for (i, pm) in pool_metas.iter().enumerate() {
-        let t0_raw = match rv_raw.get(2 * i) { Some(Some(r)) => r, _ => continue };
-        let res_raw = match rv_raw.get(2 * i + 1) { Some(Some(r)) => r, _ => continue };
+        let t0_raw  = match rv_raw.get(4 * i)     { Some(Some(r)) => r, _ => continue };
+        let res_raw = match rv_raw.get(4 * i + 1) { Some(Some(r)) => r, _ => continue };
+        // Decimals are best-effort — fall back to 18 if call reverted (e.g. non-standard tokens)
+        let dec_ta: u8 = rv_raw.get(4 * i + 2).and_then(|r| r.as_ref())
+            .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok())
+            .unwrap_or(18);
+        let dec_tb: u8 = rv_raw.get(4 * i + 3).and_then(|r| r.as_ref())
+            .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok())
+            .unwrap_or(18);
 
-        let token0 = match IUniswapV2Pair::token0Call::abi_decode_returns(t0_raw).ok() { Some(t) => t, None => continue };
+        let token0   = match IUniswapV2Pair::token0Call::abi_decode_returns(t0_raw).ok()    { Some(t) => t, None => continue };
         let reserves = match IUniswapV2Pair::getReservesCall::abi_decode_returns(res_raw).ok() { Some(r) => r, None => continue };
 
         // token1 = whichever of (ta, tb) is not token0
         let token1 = if pm.ta == token0 { pm.tb } else { pm.ta };
 
-        // Solidly-volatile uses "router_id::volatile" in pool_cache keys
+        // Map ta/tb decimals to token0/token1 order
+        let (decimals0, decimals1) = if pm.ta == token0 { (dec_ta, dec_tb) } else { (dec_tb, dec_ta) };
+
+        // Key suffix: Solidly volatile → "::volatile", Solidly stable → "::stable", V2 → unchanged
         let effective_id = match pm.rtype {
-            RouterType::Solidly => format!("{}::volatile", pm.router_id),
+            RouterType::Solidly => if pm.is_stable {
+                format!("{}::stable", pm.router_id)
+            } else {
+                format!("{}::volatile", pm.router_id)
+            },
             _ => pm.router_id.clone(),
         };
+
+        // last_sync is set to a far-past instant so startup reserves are treated as stale
+        // until the first live Sync event arrives and stamps Instant::now().
+        // Use saturating_sub to avoid panics — if the system clock is near epoch this
+        // still produces an instant older than any MAX_AGE threshold.
+        let stale_instant = Instant::now() - Duration::from_secs(3600);
 
         pool_cache.insert(pm.pool, PoolInfo {
             token0,
@@ -1192,6 +1269,10 @@ async fn discover_pools<P: Provider>(
             reserve1: U256::from(reserves.reserve1),
             fee_bps: pm.fee_bps,
             router_id: effective_id,
+            is_stable: pm.is_stable,
+            decimals0,
+            decimals1,
+            last_sync: stale_instant,
         });
     }
 }

@@ -110,6 +110,13 @@ impl Executor {
     }
 
     /// Get gas price with caching. Checks cache first; if expired, fetches from chain.
+    /// Called by chain.rs on each new block header to pre-populate the gas price
+    /// cache from the block's baseFeePerGas. Eliminates `eth_gasPrice` RPC calls
+    /// since the cache is refreshed before every scan.
+    pub fn update_gas_price(&mut self, base_fee_wei: u128) {
+        self.gas_price_cache = Some((base_fee_wei, Instant::now()));
+    }
+
     async fn get_gas_price<P: Provider>(&mut self, provider: &P) -> u128 {
         // Check cache
         if let Some((cached_price, cached_at)) = self.gas_price_cache {
@@ -191,15 +198,6 @@ impl Executor {
                 }
             }
         }
-
-        // ── Pre-flight simulation (live mode) ─────────────────────────────────
-        // Catches reverts before spending gas. Adds ~50ms latency but prevents
-        // wasted gas on opportunities that have already closed.
-        if let Err(e) = provider.call(tx_base.clone()).await {
-            self.stats.total_failed += 1;
-            return Err(anyhow!("Pre-flight simulation failed (opportunity closed): {}", e));
-        }
-        debug!("[{}] Pre-flight sim ok", self.chain_name);
 
         // ── Nonce management ──────────────────────────────────────────────────
         // Fetch from chain on first use; afterwards increment locally so the
@@ -375,13 +373,6 @@ impl Executor {
                 }
             }
         }
-
-        // ── Pre-flight simulation (live mode) ─────────────────────────────────
-        if let Err(e) = provider.call(tx_base.clone()).await {
-            self.stats.total_failed += 1;
-            return Err(anyhow!("Triangular pre-flight simulation failed (opportunity closed): {}", e));
-        }
-        debug!("[{}] Triangular pre-flight sim ok", self.chain_name);
 
         let nonce = match self.nonce {
             Some(n) => n,
