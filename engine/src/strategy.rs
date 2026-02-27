@@ -22,10 +22,11 @@ use crate::pool_cache::PoolCache;
 const MIN_V3_LIQUIDITY: u128 = 1_000_000_000; // 10^9
 
 /// Max calls per Multicall3 batch.
-/// 20 keeps each batch under ~30M gas (Alchemy eth_call limit) even with expensive
-/// V3 quoteExactInputSingle calls (~1-2M gas each). Larger chunks caused the batch
-/// to exceed the gas limit → silent fallback to 100 individual eth_calls per chunk.
-const MULTICALL_CHUNK_SIZE: usize = 20;
+/// 10 keeps each batch well under ~30M gas (Alchemy eth_call limit) even with expensive
+/// V3 quoteExactInputSingle calls that can reach 5M gas/call when tracing ticks.
+/// After pool-existence filtering (Changes 3 & 4) the V3/Solidly entry count drops
+/// dramatically, so chunk size primarily matters for SyncSwap batches now.
+const MULTICALL_CHUNK_SIZE: usize = 10;
 
 // ─── Opportunity ──────────────────────────────────────────────────────────────
 
@@ -988,6 +989,17 @@ impl Strategy {
                         .or(self.quoter_v2_address)?;
                     // Use first fee tier only (limits explosion; most liquid pool usually first)
                     let fee = router.fee_tiers.first().copied().unwrap_or(500);
+                    // Skip pools not discovered at startup — almost certainly don't exist.
+                    // Prevents QuoterV2 calls (expensive gas, may fail multicall chunks) on
+                    // non-configured triplet pairs (e.g. WBTC→USDT has no V3 pool on Linea).
+                    // Key format matches pool_cache.rs insert_v3(): "router_id:t0:t1:fee"
+                    let t_in = format!("{:?}", token_in).to_lowercase();
+                    let t_out = format!("{:?}", token_out).to_lowercase();
+                    if !self.pool_cache.v3_by_key.contains_key(
+                        &format!("{}:{}:{}:{}", router.id, t_in, t_out, fee)
+                    ) {
+                        return None;
+                    }
                     // Depth check: skip dead/empty pools (avoids wasted QuoterV2 calls)
                     if let Some((_spot, liquidity)) = self.pool_cache.quote_v3_spot(
                         &router.id, token_in, token_out, fee, amount,
@@ -1010,6 +1022,17 @@ impl Strategy {
                 RouterType::Solidly => {
                     // Only use volatile pool (fee=0) for triangular to limit explosion.
                     // Stable pools are designed for stablecoin pairs, not cross-asset loops.
+                    // Skip if volatile pool not discovered at startup — avoids Solidly echo
+                    // responses (amountIn=amountOut) for non-existent pairs that waste batch slots.
+                    // Key format matches chain.rs discover_pools + pool_cache insert():
+                    // "router_id::volatile:token_in:token_out"
+                    let t_in = format!("{:?}", token_in).to_lowercase();
+                    let t_out = format!("{:?}", token_out).to_lowercase();
+                    if !self.pool_cache.by_key.contains_key(
+                        &format!("{}::volatile:{}:{}", router.id, t_in, t_out)
+                    ) {
+                        return None;
+                    }
                     let cd = ISolidlyRouter::getAmountsOutCall {
                         amountIn: amount,
                         routes: vec![ISolidlyRouter::Route {

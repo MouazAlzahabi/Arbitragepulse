@@ -45,7 +45,7 @@ pub struct V3PoolState {
 /// How long a V3 pool state is considered fresh.
 /// If no Swap event arrives within this window, the cached L and sqrtP may have
 /// drifted — skip trading that pool to avoid stale-capacity reverts.
-pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(30);
+pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// Price impact factor per fee tier (numerator; denominator = 10_000).
 /// Limits ΔsqrtP/sqrtP to stay within the active tick cluster without

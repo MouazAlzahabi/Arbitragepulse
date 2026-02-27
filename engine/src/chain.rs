@@ -414,6 +414,14 @@ pub async fn run_chain(
 
             // ── Periodic fallback scan (safety net if block subscription is down) ──
             _ = poll_tick.tick() => {
+                // True fallback: skip if the block subscription fired a scan recently.
+                // Without this guard, poll_tick fires every 4s independently, doubling
+                // the scan rate to 45/min (30 block + 15 poll) instead of the intended 30.
+                if last_scan_at.elapsed() < poll_interval {
+                    debug!("[{}] poll_tick skipped — block scan {}ms ago", cfg.name,
+                           last_scan_at.elapsed().as_millis());
+                    continue;
+                }
                 let state = shared_state.read().await;
                 let chain_paused = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                 if state.paused || chain_paused { continue; }
