@@ -5,7 +5,6 @@ use serde::Deserialize;
 // ─── Raw YAML config structures ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct ChainConfig {
     pub id: u64,
     pub name: String,
@@ -76,7 +75,6 @@ impl Default for RouterType {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct RouterConfig {
     pub id: String,
     pub name: String,
@@ -102,7 +100,6 @@ pub struct RouterConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct PairConfig {
     pub id: String,
     pub chain_id: u64,

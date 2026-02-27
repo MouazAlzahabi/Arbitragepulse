@@ -31,7 +31,6 @@ const MULTICALL_CHUNK_SIZE: usize = 10;
 // ─── Opportunity ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ArbOpportunity {
     pub chain_id: u64,
     pub pair_id: String,
@@ -51,7 +50,6 @@ pub struct ArbOpportunity {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TriangularOpportunity {
     pub chain_id: u64,
     pub triplet_id: String, // "USDC-WETH-OP"

@@ -15,7 +15,6 @@ use crate::pool_cache::PoolCache;
 // ─── Swap event (generic across V2 + V3) ─────────────────────────────────────
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SwapEvent {
     pub chain_id: u64,
     pub pool: Address,

@@ -36,7 +36,6 @@ pub struct ExecutorStats {
 
 // ─── Executor ─────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 pub struct Executor {
     pub chain_id: u64,
     pub chain_name: String,
@@ -501,75 +500,6 @@ impl Executor {
                 Err(anyhow!("Triangular send failed: {}", e))
             }
         }
-    }
-
-    /// Whitelist a router on the contract (onlyOwner call).
-    #[allow(dead_code)]
-    pub async fn whitelist_router<P: Provider>(
-        &self,
-        provider: &P,
-        router: Address,
-        is_v3: bool,
-    ) -> Result<()> {
-        // setAllowedRouter
-        let calldata = ArbitrageExecutor::setAllowedRouterCall {
-            router,
-            approved: true,
-        }
-        .abi_encode();
-
-        let tx = TransactionRequest::default()
-            .to(self.contract_address)
-            .input(calldata.into());
-
-        provider
-            .send_transaction(tx)
-            .await?
-            .get_receipt()
-            .await?;
-
-        if is_v3 {
-            // setRouterType(router, 1) — 1 = RouterType.V3
-            let calldata = ArbitrageExecutor::setRouterTypeCall {
-                router,
-                rtype: 1,
-            }
-            .abi_encode();
-
-            let tx = TransactionRequest::default()
-                .to(self.contract_address)
-                .input(calldata.into());
-
-            provider
-                .send_transaction(tx)
-                .await?
-                .get_receipt()
-                .await?;
-        }
-
-        info!(
-            "[{}] Whitelisted router {:?} (v3={})",
-            self.chain_name, router, is_v3
-        );
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn pause(&mut self) {
-        self.paused = true;
-        warn!("[{}] Executor paused", self.chain_name);
-    }
-
-    #[allow(dead_code)]
-    pub fn resume(&mut self) {
-        self.paused = false;
-        info!("[{}] Executor resumed", self.chain_name);
-    }
-
-    #[allow(dead_code)]
-    pub fn set_dry_run(&mut self, dry_run: bool) {
-        self.dry_run = dry_run;
-        info!("[{}] Dry-run = {}", self.chain_name, dry_run);
     }
 
     fn deadline(&self) -> U256 {
