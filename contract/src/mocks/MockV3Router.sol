@@ -24,7 +24,6 @@ contract MockV3Router {
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -34,7 +33,6 @@ contract MockV3Router {
         external
         returns (uint256 amountOut)
     {
-        require(block.timestamp <= params.deadline, "Deadline expired");
 
         // Pull tokenIn from caller
         IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);

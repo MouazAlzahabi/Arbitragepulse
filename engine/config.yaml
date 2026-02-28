@@ -100,7 +100,7 @@ chains:
     native_currency: "ETH"
     wrapped_native: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"
     block_time_ms: 2000  # 2 second blocks
-    contract_address: "0xF962fF73082509A2A9EED572e24E13D567419C9d"
+    contract_address: "0xb4DA83518bc53c54482ccFacAC7D9c828869829b"
     min_native_balance: 0.01
     min_profit_usd: 0.30    # Minimum NET profit after gas. Triangular gas ~$0.09–0.88 at Linea prices.
     deadline_seconds: 120

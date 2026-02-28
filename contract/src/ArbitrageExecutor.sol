@@ -30,7 +30,6 @@ interface ISwapRouterV3 {
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -589,7 +588,6 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
                 tokenOut: tokenOut,
                 fee: fee,
                 recipient: address(this),
-                deadline: deadline,
                 amountIn: amountIn,
                 amountOutMinimum: amountOutMin,
                 sqrtPriceLimitX96: 0
