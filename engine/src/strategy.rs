@@ -1628,11 +1628,26 @@ impl Strategy {
             return opp.clone();
         }
 
+        // ── Resolve per-router QuoterV2 addresses ────────────────────────────
+        // RouterConfig.quoter_address overrides the chain-level quoter_v2_address.
+        // PancakeV3 and UniswapV3 have different QuoterV2 contracts on Linea.
+        let quoter_a: Option<Address> = self.routers.iter()
+            .find(|r| r.id == opp.router_a_id)
+            .and_then(|r| r.quoter_address.as_deref())
+            .and_then(|s| s.parse().ok())
+            .or(self.quoter_v2_address);
+        let quoter_b: Option<Address> = self.routers.iter()
+            .find(|r| r.id == opp.router_b_id)
+            .and_then(|r| r.quoter_address.as_deref())
+            .and_then(|s| s.parse().ok())
+            .or(self.quoter_v2_address);
+
         // ── Round 1: Coarse scan across full range ────────────────────────────
         let coarse_winner = probe_range(
             opp,
             provider,
-            self.quoter_v2_address,
+            quoter_a,
+            quoter_b,
             min_amount,
             max_amount,
             COARSE,
@@ -1651,7 +1666,8 @@ impl Strategy {
         let fine_winner = probe_range(
             opp,
             provider,
-            self.quoter_v2_address,
+            quoter_a,
+            quoter_b,
             fine_min,
             fine_max,
             FINE,
@@ -1783,7 +1799,8 @@ async fn run_multicall<P: Provider + Clone>(
 async fn probe_range<P: Provider + Clone + 'static>(
     opp: &ArbOpportunity,
     provider: &P,
-    quoter: Option<Address>,
+    quoter_a: Option<Address>, // QuoterV2 for router A (leg 1 — token_in → token_out)
+    quoter_b: Option<Address>, // QuoterV2 for router B (leg 2 — token_out → token_in)
     min_amount: U256,
     max_amount: U256,
     steps: usize,
@@ -1818,7 +1835,7 @@ async fn probe_range<P: Provider + Clone + 'static>(
         futs.push(Box::pin(async move {
             let mid = match ra_t {
                 RouterType::V2 => quote_v2(&p, ra, probe_amount, token_in, token_out).await,
-                RouterType::V3 => match quoter {
+                RouterType::V3 => match quoter_a {
                     Some(q) => quote_v3(&p, q, probe_amount, token_in, token_out, fa).await,
                     None => None,
                 },
@@ -1831,7 +1848,7 @@ async fn probe_range<P: Provider + Clone + 'static>(
 
             let back = match rb_t {
                 RouterType::V2 => quote_v2(&p, rb, mid, token_out, token_in).await,
-                RouterType::V3 => match quoter {
+                RouterType::V3 => match quoter_b {
                     Some(q) => quote_v3(&p, q, mid, token_out, token_in, fb).await,
                     None => None,
                 },

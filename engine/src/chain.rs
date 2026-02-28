@@ -703,6 +703,15 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         ).await;
                     }
                     Ok(prep) => {
+                        // Pre-flight simulation: verifies profitability on-chain before
+                        // spending Linea gas. Catches phantom arbs from V3 virtual-reserve
+                        // approximation. Does NOT hold the executor mutex.
+                        if let Err(e) = provider.call(prep.tx.clone()).await {
+                            { let mut exec = executor.lock().await; exec.record_failed(); }
+                            pending_pairs.remove(&fingerprint);
+                            warn!("[{}] Pre-flight rejected phantom arb: {}", cfg.name, e);
+                            return;
+                        }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
                             Ok(pending) => {
@@ -865,6 +874,13 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         ).await;
                     }
                     Ok(prep) => {
+                        // Pre-flight simulation: same gate as 2-hop path.
+                        if let Err(e) = provider.call(prep.tx.clone()).await {
+                            { let mut exec = executor.lock().await; exec.record_failed(); }
+                            pending_pairs.remove(&fingerprint);
+                            warn!("[{}] Pre-flight rejected triangular phantom arb: {}", cfg.name, e);
+                            return;
+                        }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
                             Ok(pending) => {
