@@ -21,6 +21,42 @@ const GAS_LIMIT: u64 = 300_000;
 // Triangular arb gas limit — 450k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
 const GAS_LIMIT_TRIANGULAR: u64 = 450_000;
 
+// ─── TxPrep ───────────────────────────────────────────────────────────────────
+
+/// Prepared transaction data returned by `prepare_2hop()` / `prepare_triangular()`
+/// before the executor mutex is released.
+///
+/// The caller pattern:
+/// 1. Acquire executor lock → call `prepare_*()` → release lock.
+/// 2. Call `provider.send_transaction(prep.tx)` with NO lock held.
+/// 3. Acquire executor lock briefly → call `record_sent()` or `record_failed()`.
+/// 4. Spawn receipt task using the cloned `prep` fields.
+pub struct TxPrep {
+    /// Ready-to-send transaction (nonce already pre-allocated and incremented).
+    pub tx: TransactionRequest,
+    /// Pre-allocated nonce. If `record_failed()` is called, executor resets its
+    /// nonce counter to `None` so it re-fetches from chain.
+    pub nonce: u64,
+    pub net_profit_usd: f64,
+    pub gas_cost_usd: f64,
+    // ── Fields cloned for the receipt background task ──
+    pub chain_name: String,
+    pub chain_id: u64,
+    pub db: Option<Arc<Database>>,
+    /// pair_id for 2-hop, triplet_id for triangular.
+    pub opp_id: String,
+    pub router_a: String,
+    pub router_b: String,
+    pub router_c: Option<String>,
+    pub profit_usd: f64,
+    pub dry_run: bool,
+    pub confirmed_success: Arc<AtomicU64>,
+    pub confirmed_failed: Arc<AtomicU64>,
+    pub confirmed_profit_bits: Arc<AtomicU64>,
+    pub contract_addr: Address,
+    pub contract_balances: Option<Arc<RwLock<HashMap<Address, U256>>>>,
+}
+
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
@@ -139,6 +175,161 @@ impl Executor {
             self.chain_name, gas_price, self.gas_price_cache_ttl
         );
         gas_price
+    }
+
+    // ── Split-lock execution helpers ───────────────────────────────────────────
+    // These three methods implement the "prepare / send / record" pattern that
+    // releases the executor mutex before the slow send_transaction network call.
+
+    /// Phase 1 of the split-lock pattern for 2-hop arbs.
+    ///
+    /// Call while holding the executor lock. Returns a `TxPrep` with the
+    /// ready-to-send transaction and receipt-task data. Drop the lock before
+    /// calling `provider.send_transaction(prep.tx)`.
+    ///
+    /// The nonce is pre-incremented inside this call so that back-to-back
+    /// preparations allocate distinct nonces without a chain round-trip.
+    pub async fn prepare_2hop<P: Provider>(
+        &mut self,
+        provider: &P,
+        opp: &ArbOpportunity,
+    ) -> Result<TxPrep> {
+        if self.paused {
+            return Err(anyhow!("Executor paused"));
+        }
+        let gas_price = self.get_gas_price(provider).await;
+        let gas_cost_usd = {
+            let cost_wei = gas_price * GAS_LIMIT as u128;
+            cost_wei as f64 / 1e18 * self.native_price_usd
+        };
+        let net_profit_usd = opp.profit_usd - gas_cost_usd;
+        if net_profit_usd < self.min_profit_usd {
+            return Err(anyhow!(
+                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) below threshold ${:.2}",
+                net_profit_usd, opp.profit_usd, gas_cost_usd, self.min_profit_usd,
+            ));
+        }
+        let deadline = self.deadline();
+        let calldata = self.build_calldata(opp, deadline);
+        let mut tx_base = TransactionRequest::default()
+            .to(self.contract_address)
+            .input(calldata.into());
+        tx_base.gas = Some(GAS_LIMIT);
+        self.stats.total_attempts += 1;
+        let nonce = match self.nonce {
+            Some(n) => n,
+            None => provider
+                .get_transaction_count(self.signer_address)
+                .await
+                .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
+        };
+        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let tx = tx_base
+            .nonce(nonce)
+            .max_priority_fee_per_gas(priority_fee)
+            .max_fee_per_gas(gas_price + priority_fee);
+        // Pre-increment nonce BEFORE releasing the lock so concurrent prepares
+        // allocate distinct nonces without a chain round-trip.
+        self.nonce = Some(nonce + 1);
+        Ok(TxPrep {
+            tx,
+            nonce,
+            net_profit_usd,
+            gas_cost_usd,
+            chain_name: self.chain_name.clone(),
+            chain_id: self.chain_id,
+            db: self.db.clone(),
+            opp_id: opp.pair_id.clone(),
+            router_a: opp.router_a_id.clone(),
+            router_b: opp.router_b_id.clone(),
+            router_c: None,
+            profit_usd: opp.profit_usd,
+            dry_run: self.dry_run,
+            confirmed_success: self.confirmed_success.clone(),
+            confirmed_failed: self.confirmed_failed.clone(),
+            confirmed_profit_bits: self.confirmed_profit_usd_bits.clone(),
+            contract_addr: self.contract_address,
+            contract_balances: self.contract_balances.clone(),
+        })
+    }
+
+    /// Phase 1 of the split-lock pattern for triangular arbs.
+    pub async fn prepare_triangular<P: Provider>(
+        &mut self,
+        provider: &P,
+        opp: &TriangularOpportunity,
+    ) -> Result<TxPrep> {
+        if self.paused {
+            return Err(anyhow!("Executor paused"));
+        }
+        let gas_price = self.get_gas_price(provider).await;
+        let gas_cost_usd = {
+            let cost_wei = gas_price * GAS_LIMIT_TRIANGULAR as u128;
+            cost_wei as f64 / 1e18 * self.native_price_usd
+        };
+        let net_profit_usd = opp.profit_usd - gas_cost_usd;
+        if net_profit_usd < self.min_profit_usd {
+            return Err(anyhow!(
+                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) below threshold ${:.2}",
+                net_profit_usd, opp.profit_usd, gas_cost_usd, self.min_profit_usd,
+            ));
+        }
+        let deadline = self.deadline();
+        let calldata = self.build_triangular_calldata(opp, deadline);
+        let mut tx_base = TransactionRequest::default()
+            .to(self.contract_address)
+            .input(calldata.into());
+        tx_base.gas = Some(GAS_LIMIT_TRIANGULAR);
+        self.stats.total_attempts += 1;
+        let nonce = match self.nonce {
+            Some(n) => n,
+            None => provider
+                .get_transaction_count(self.signer_address)
+                .await
+                .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
+        };
+        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let tx = tx_base
+            .nonce(nonce)
+            .max_priority_fee_per_gas(priority_fee)
+            .max_fee_per_gas(gas_price + priority_fee);
+        self.nonce = Some(nonce + 1);
+        Ok(TxPrep {
+            tx,
+            nonce,
+            net_profit_usd,
+            gas_cost_usd,
+            chain_name: self.chain_name.clone(),
+            chain_id: self.chain_id,
+            db: self.db.clone(),
+            opp_id: opp.triplet_id.clone(),
+            router_a: opp.router_ab_id.clone(),
+            router_b: opp.router_bc_id.clone(),
+            router_c: Some(opp.router_ca_id.clone()),
+            profit_usd: opp.profit_usd,
+            dry_run: self.dry_run,
+            confirmed_success: self.confirmed_success.clone(),
+            confirmed_failed: self.confirmed_failed.clone(),
+            confirmed_profit_bits: self.confirmed_profit_usd_bits.clone(),
+            contract_addr: self.contract_address,
+            contract_balances: self.contract_balances.clone(),
+        })
+    }
+
+    /// Phase 3 (success): update executor stats after `send_transaction` succeeds.
+    /// Call while briefly re-holding the executor lock (after the send completes).
+    pub fn record_sent(&mut self, tx_hash: &str, elapsed_ms: u64) {
+        self.stats.total_sent += 1;
+        self.stats.last_tx_hash = Some(tx_hash.to_string());
+        self.stats.last_execution_ms = Some(elapsed_ms);
+    }
+
+    /// Phase 3 (failure): reset nonce and update stats after `send_transaction` fails.
+    /// The nonce was pre-incremented in prepare_*() but the send failed — it was
+    /// NOT consumed. Reset to None so the next prepare re-fetches from chain.
+    pub fn record_failed(&mut self) {
+        self.nonce = None;
+        self.stats.total_failed += 1;
     }
 
     /// Execute (or simulate) the arb. Returns the tx hash string.

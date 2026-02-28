@@ -17,10 +17,10 @@ use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory,
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
-use crate::executor::Executor;
+use crate::executor::{Executor, TxPrep};
 use crate::listener::{Listener, SwapEvent};
 use crate::metrics::Metrics;
-use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState, V3_STATE_MAX_AGE};
+use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
 use crate::strategy::{Opportunity, Strategy};
 
 const COOLDOWN_SECS: u64 = 15;
@@ -660,48 +660,141 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             pending_pairs.insert(fingerprint.clone());
 
             let dry_run = shared_state.read().await.dry_run;
-            let mut exec = executor.lock().await;
-            exec.dry_run = dry_run;
-
             let exec_start = std::time::Instant::now();
             let router_ids = vec![optimized.router_a_id.clone(), optimized.router_b_id.clone()];
 
-            match exec.execute(provider.as_ref(), &optimized).await {
-                Ok(tx_hash) => {
-                    let exec_time_ms = exec_start.elapsed().as_millis() as u64;
-                    handle_execution_success(
-                        &tx_hash,
-                        &fingerprint,
-                        optimized.profit_usd,
-                        &optimized.pair_id,
-                        &router_ids,
-                        pending_pairs,
-                        consecutive_failures,
-                        dry_run,
-                        cfg,
-                        shared_state,
-                        log_tx,
-                        metrics,
-                        &router_monitor,
-                        exec_time_ms,
-                    )
-                    .await;
+            if dry_run {
+                // Dry-run: simulate with lock held (test mode, latency not critical)
+                let mut exec = executor.lock().await;
+                exec.dry_run = true;
+                match exec.execute(provider.as_ref(), &optimized).await {
+                    Ok(tx_hash) => {
+                        let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                        drop(exec);
+                        handle_execution_success(
+                            &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
+                            &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
+                            shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                        ).await;
+                    }
+                    Err(e) => {
+                        drop(exec);
+                        handle_execution_failure(
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                        ).await;
+                    }
                 }
-                Err(e) => {
-                    handle_execution_failure(
-                        e,
-                        &fingerprint,
-                        &router_ids,
-                        pending_pairs,
-                        cooldowns,
-                        consecutive_failures,
-                        cfg,
-                        shared_state,
-                        metrics,
-                        log_tx,
-                        &router_monitor,
-                    )
-                    .await;
+            } else {
+                // Live: prepare (nonce + tx build) with brief lock, release, then send
+                // without holding the mutex. Prevents blocking the select! loop for
+                // the 500ms–2s it takes send_transaction to complete on Linea.
+                let prep_result: Result<TxPrep> = {
+                    let mut exec = executor.lock().await;
+                    exec.dry_run = false;
+                    exec.prepare_2hop(provider.as_ref(), &optimized).await
+                    // lock drops here
+                };
+                match prep_result {
+                    Err(e) => {
+                        handle_execution_failure(
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                        ).await;
+                    }
+                    Ok(prep) => {
+                        let send_start = std::time::Instant::now();
+                        match provider.send_transaction(prep.tx.clone()).await {
+                            Ok(pending) => {
+                                let tx_hash = format!("{:?}", pending.tx_hash());
+                                let elapsed_send = send_start.elapsed().as_millis() as u64;
+                                info!(
+                                    "[{}] Arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={}",
+                                    cfg.name, elapsed_send, prep.profit_usd, prep.net_profit_usd,
+                                    &tx_hash[..10.min(tx_hash.len())],
+                                );
+                                { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
+
+                                // Fire-and-forget receipt task using cloned prep fields
+                                let tx_hash_bg = tx_hash.clone();
+                                let provider_bg = provider.clone();
+                                let confirmed_success_bg = prep.confirmed_success.clone();
+                                let confirmed_failed_bg = prep.confirmed_failed.clone();
+                                let confirmed_profit_bg = prep.confirmed_profit_bits.clone();
+                                let chain_name_bg = prep.chain_name.clone();
+                                let db_bg = prep.db.clone();
+                                let chain_id_bg = prep.chain_id;
+                                let opp_id_bg = prep.opp_id.clone();
+                                let router_a_bg = prep.router_a.clone();
+                                let router_b_bg = prep.router_b.clone();
+                                let profit_bg = prep.profit_usd;
+                                let contract_addr_bg = prep.contract_addr;
+                                let contract_balances_bg = prep.contract_balances.clone();
+                                tokio::spawn(async move {
+                                    match pending.get_receipt().await {
+                                        Ok(receipt) => {
+                                            if receipt.status() {
+                                                confirmed_success_bg.fetch_add(1, Ordering::Relaxed);
+                                                confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                                                    Some((f64::from_bits(bits) + profit_bg).to_bits())
+                                                }).ok();
+                                                info!("[{}] ✓ confirmed | gas={} | tx={}", chain_name_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                if let Some(bals) = contract_balances_bg {
+                                                    let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
+                                                    for token in token_addrs {
+                                                        if let Ok(bal) = IERC20::new(token, &provider_bg).balanceOf(contract_addr_bg).call().await {
+                                                            let mut b = bals.write().await;
+                                                            b.insert(token, bal);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                warn!("[{}] ✗ reverted | tx={}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                            }
+                                            if let Some(db) = db_bg {
+                                                let success = receipt.status();
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    let _ = db.insert_trade(chain_id_bg, &chain_name_bg, &opp_id_bg, &router_a_bg, &router_b_bg, None, profit_bg, success, &tx_hash_bg, false);
+                                                }).await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                            warn!("[{}] Receipt error for {}: {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                        }
+                                    }
+                                    drop(provider_bg);
+                                });
+
+                                let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                                handle_execution_success(
+                                    &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
+                                    &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
+                                    shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                                ).await;
+                            }
+                            Err(e) => {
+                                { let mut exec = executor.lock().await; exec.record_failed(); }
+                                if let Some(db) = prep.db.clone() {
+                                    let cn = prep.chain_name.clone();
+                                    let cid = prep.chain_id;
+                                    let oid = prep.opp_id.clone();
+                                    let ra = prep.router_a.clone();
+                                    let rb = prep.router_b.clone();
+                                    let p = prep.profit_usd;
+                                    tokio::task::spawn_blocking(move || {
+                                        let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, None, p, false, "", false);
+                                    });
+                                }
+                                handle_execution_failure(
+                                    anyhow::anyhow!("Send failed: {}", e),
+                                    &fingerprint, &router_ids, pending_pairs, cooldowns,
+                                    consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                                ).await;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -727,9 +820,6 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             pending_pairs.insert(fingerprint.clone());
 
             let dry_run = shared_state.read().await.dry_run;
-            let mut exec = executor.lock().await;
-            exec.dry_run = dry_run;
-
             let exec_start = std::time::Instant::now();
             let router_ids = vec![
                 opp.router_ab_id.clone(),
@@ -737,42 +827,138 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 opp.router_ca_id.clone(),
             ];
 
-            match exec.execute_triangular(provider.as_ref(), opp).await {
-                Ok(tx_hash) => {
-                    let exec_time_ms = exec_start.elapsed().as_millis() as u64;
-                    handle_execution_success(
-                        &tx_hash,
-                        &fingerprint,
-                        opp.profit_usd,
-                        &opp.triplet_id,
-                        &router_ids,
-                        pending_pairs,
-                        consecutive_failures,
-                        dry_run,
-                        cfg,
-                        shared_state,
-                        log_tx,
-                        metrics,
-                        &router_monitor,
-                        exec_time_ms,
-                    )
-                    .await;
+            if dry_run {
+                // Dry-run: simulate with lock held (test mode, latency not critical)
+                let mut exec = executor.lock().await;
+                exec.dry_run = true;
+                match exec.execute_triangular(provider.as_ref(), opp).await {
+                    Ok(tx_hash) => {
+                        let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                        drop(exec);
+                        handle_execution_success(
+                            &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
+                            &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
+                            shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                        ).await;
+                    }
+                    Err(e) => {
+                        drop(exec);
+                        handle_execution_failure(
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                        ).await;
+                    }
                 }
-                Err(e) => {
-                    handle_execution_failure(
-                        e,
-                        &fingerprint,
-                        &router_ids,
-                        pending_pairs,
-                        cooldowns,
-                        consecutive_failures,
-                        cfg,
-                        shared_state,
-                        metrics,
-                        log_tx,
-                        &router_monitor,
-                    )
-                    .await;
+            } else {
+                // Live: prepare with brief lock, release, then send without holding mutex
+                let prep_result: Result<TxPrep> = {
+                    let mut exec = executor.lock().await;
+                    exec.dry_run = false;
+                    exec.prepare_triangular(provider.as_ref(), opp).await
+                    // lock drops here
+                };
+                match prep_result {
+                    Err(e) => {
+                        handle_execution_failure(
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                        ).await;
+                    }
+                    Ok(prep) => {
+                        let send_start = std::time::Instant::now();
+                        match provider.send_transaction(prep.tx.clone()).await {
+                            Ok(pending) => {
+                                let tx_hash = format!("{:?}", pending.tx_hash());
+                                let elapsed_send = send_start.elapsed().as_millis() as u64;
+                                info!(
+                                    "[{}] Triangular arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={}",
+                                    cfg.name, elapsed_send, prep.profit_usd, prep.net_profit_usd,
+                                    &tx_hash[..10.min(tx_hash.len())],
+                                );
+                                { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
+
+                                // Fire-and-forget receipt task
+                                let tx_hash_bg = tx_hash.clone();
+                                let provider_bg = provider.clone();
+                                let confirmed_success_bg = prep.confirmed_success.clone();
+                                let confirmed_failed_bg = prep.confirmed_failed.clone();
+                                let confirmed_profit_bg = prep.confirmed_profit_bits.clone();
+                                let chain_name_bg = prep.chain_name.clone();
+                                let db_bg = prep.db.clone();
+                                let chain_id_bg = prep.chain_id;
+                                let opp_id_bg = prep.opp_id.clone();
+                                let router_a_bg = prep.router_a.clone();
+                                let router_b_bg = prep.router_b.clone();
+                                let router_c_bg = prep.router_c.clone();
+                                let profit_bg = prep.profit_usd;
+                                let contract_addr_bg = prep.contract_addr;
+                                let contract_balances_bg = prep.contract_balances.clone();
+                                tokio::spawn(async move {
+                                    match pending.get_receipt().await {
+                                        Ok(receipt) => {
+                                            if receipt.status() {
+                                                confirmed_success_bg.fetch_add(1, Ordering::Relaxed);
+                                                confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                                                    Some((f64::from_bits(bits) + profit_bg).to_bits())
+                                                }).ok();
+                                                info!("[{}] ✓ triangular confirmed | gas={} | tx={}", chain_name_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                if let Some(bals) = contract_balances_bg {
+                                                    let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
+                                                    for token in token_addrs {
+                                                        if let Ok(bal) = IERC20::new(token, &provider_bg).balanceOf(contract_addr_bg).call().await {
+                                                            let mut b = bals.write().await;
+                                                            b.insert(token, bal);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                warn!("[{}] ✗ triangular reverted | tx={}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                            }
+                                            if let Some(db) = db_bg {
+                                                let success = receipt.status();
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    let _ = db.insert_trade(chain_id_bg, &chain_name_bg, &opp_id_bg, &router_a_bg, &router_b_bg, router_c_bg.as_deref(), profit_bg, success, &tx_hash_bg, false);
+                                                }).await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                            warn!("[{}] Triangular receipt error for {}: {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                        }
+                                    }
+                                    drop(provider_bg);
+                                });
+
+                                let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                                handle_execution_success(
+                                    &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
+                                    &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
+                                    shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                                ).await;
+                            }
+                            Err(e) => {
+                                { let mut exec = executor.lock().await; exec.record_failed(); }
+                                if let Some(db) = prep.db.clone() {
+                                    let cn = prep.chain_name.clone();
+                                    let cid = prep.chain_id;
+                                    let oid = prep.opp_id.clone();
+                                    let ra = prep.router_a.clone();
+                                    let rb = prep.router_b.clone();
+                                    let rc = prep.router_c.clone();
+                                    let p = prep.profit_usd;
+                                    tokio::task::spawn_blocking(move || {
+                                        let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, rc.as_deref(), p, false, "", false);
+                                    });
+                                }
+                                handle_execution_failure(
+                                    anyhow::anyhow!("Triangular send failed: {}", e),
+                                    &fingerprint, &router_ids, pending_pairs, cooldowns,
+                                    consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                                ).await;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1397,13 +1583,10 @@ async fn discover_v3_pools<P: Provider>(
         // In V3 pools, token0 is always the lower address
         let (token0, token1) = if sq.ta < sq.tb { (sq.ta, sq.tb) } else { (sq.tb, sq.ta) };
 
-        // Mark V3 state as stale at startup so quote_v3_spot() skips it until
-        // the first real Swap event arrives. The sqrtPriceX96 snapshot from the
-        // multicall is valid for the pool address lookup but the single-tick
-        // approximation is unreliable until confirmed by a live event.
-        let stale = Instant::now()
-            .checked_sub(V3_STATE_MAX_AGE + Duration::from_secs(1))
-            .unwrap_or_else(Instant::now);
+        // slot0 data was just fetched from chain — it IS the current on-chain state.
+        // Mark as fresh so quote_v3_spot() works immediately at startup without
+        // waiting for the first Swap event. The same-router V3 filter in strategy.rs
+        // already prevents cross-fee-tier phantom arbs that motivated stale init.
         pool_cache.insert_v3(sq.pool, V3PoolState {
             token0,
             token1,
@@ -1411,7 +1594,7 @@ async fn discover_v3_pools<P: Provider>(
             sqrt_price_x96,
             liquidity: liquidity.into(),
             router_id: sq.router_id.clone(),
-            last_updated: stale,
+            last_updated: Instant::now(),
         });
     }
 }

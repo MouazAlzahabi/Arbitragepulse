@@ -136,7 +136,12 @@ struct ForwardTask {
     router_addr: Address,
     router_type: RouterType,
     fee: u32,
+    /// After the forward quote, this field is REPURPOSED to carry the token_out amount.
     amount_in: U256,
+    /// The actual input amount used for the forward quote (may be capped for V3 via
+    /// estimate_safe_v3_capacity to ensure the trade stays within one tick).
+    /// Used as the reference amount for spread and profit calculations.
+    capped_amount_in: U256,
     token_in: Address,
     token_out: Address,
     /// V3 only: the QuoterV2 address used for this task's quote.
@@ -304,12 +309,16 @@ impl Strategy {
             self.syncswap_pool_cache.insert(key_rev, pool_opt);
 
             // Seed this pool into pool_cache for local computation (0 multicall detection).
-            // Stable/classic determined by router_id suffix matching "stable".
             if let Some(pool_addr) = pool_opt {
                 if seen_pools.insert(pool_addr) {
+                    // SyncSwap Stable pools use Curve StableSwap (An^n Σxi + D = const),
+                    // NOT Solidly x³y+xy³=k. The Solidly Newton-Raphson solver produces
+                    // wildly wrong outputs for Curve pools → phantom profitable quotes.
+                    // Exclude stable pools until a Curve StableSwap solver is implemented.
+                    if router_id.contains("stable") { continue; }
                     let token_in: Address = match token_in_lower.parse() { Ok(a) => a, Err(_) => continue };
                     let token_out: Address = match token_out_lower.parse() { Ok(a) => a, Err(_) => continue };
-                    let is_stable = router_id.contains("stable");
+                    let is_stable = false; // SyncSwap classic only (volatile xy=k)
                     rv_calls.push((pool_addr, IUniswapV2Pair::token0Call {}.abi_encode()));
                     rv_calls.push((pool_addr, IUniswapV2Pair::getReservesCall {}.abi_encode()));
                     rv_calls.push((token_in, IERC20::decimalsCall {}.abi_encode()));
@@ -454,6 +463,7 @@ impl Strategy {
                                 router_type: RouterType::V2,
                                 fee: 0,
                                 amount_in: out, // repurposed: carries token_out amount
+                                capped_amount_in: amount_in,
                                 token_in,
                                 token_out,
                                 quoter_addr: None,
@@ -472,6 +482,7 @@ impl Strategy {
                                 router_type: RouterType::V2,
                                 fee: 0,
                                 amount_in,
+                                capped_amount_in: amount_in,
                                 token_in,
                                 token_out,
                                 quoter_addr: None,
@@ -498,20 +509,27 @@ impl Strategy {
                             router.fee_tiers.clone()
                         };
                         for fee in tiers {
-                            // ── V3 cache-first: use sqrtPriceX96 spot if fresh (0 HTTP) ──
-                            // quote_v3_spot() returns None only when the pool state is stale
-                            // (no Swap event in the last 30s) — at startup before the listener
-                            // has seen any Swap events.
+                            // ── V3 cache-first: use sqrtPriceX96 virtual-reserve spot ──
+                            // Cap the input to a single-tick safe amount so the xy=k formula
+                            // is exact. Without the cap, a trade crossing into a tick with
+                            // L=0 would cause the formula to overestimate output.
+                            let t_in_s = format!("{:?}", token_in).to_lowercase();
+                            let t_out_s = format!("{:?}", token_out).to_lowercase();
+                            let v3_key = format!("{}:{}:{}:{}", router.id, t_in_s, t_out_s, fee);
+                            let pool_addr = match self.pool_cache.v3_by_key.get(&v3_key) {
+                                Some(a) => *a,
+                                None => { v3_no_cache += 1; continue; }
+                            };
+                            let safe_cap = self.pool_cache.estimate_safe_v3_capacity(pool_addr, token_in);
+                            let capped_in = if !safe_cap.is_zero() { amount_in.min(safe_cap) } else { amount_in };
+
                             if let Some((spot_out, liquidity)) = self.pool_cache.quote_v3_spot(
-                                &router.id, token_in, token_out, fee, amount_in,
+                                &router.id, token_in, token_out, fee, capped_in,
                             ) {
                                 if liquidity < MIN_V3_LIQUIDITY {
                                     v3_cached += 1;
                                     continue;
                                 }
-                                // Cache is fresh — use spot price directly (same as V2 local path).
-                                // The spot is a single-tick approximation; the optimizer and
-                                // pre-flight simulation will catch any inaccuracy before execution.
                                 pair_quotes.entry(pi).or_default().push(ForwardTask {
                                     pair_idx: pi,
                                     router_id: router.id.clone(),
@@ -519,15 +537,14 @@ impl Strategy {
                                     router_type: RouterType::V3,
                                     fee,
                                     amount_in: spot_out, // repurposed: carries token_out amount
+                                    capped_amount_in: capped_in,
                                     token_in,
                                     token_out,
-                                    quoter_addr: Some(quoter), // preserve for reverse pass
+                                    quoter_addr: Some(quoter),
                                 });
                                 v3_cached += 1;
                             } else {
-                                // V3 state stale (no recent Swap event) = pool likely inactive.
-                                // Skip rather than fall back to QuoterV2 multicall — stale means
-                                // no on-chain swap activity → no arb opportunity to detect.
+                                // V3 state stale or pool not found — skip (no QuoterV2 fallback).
                                 v3_no_cache += 1;
                                 continue;
                             }
@@ -552,6 +569,7 @@ impl Strategy {
                                     router_type: RouterType::Solidly,
                                     fee,
                                     amount_in: out, // repurposed: carries token_out amount
+                                    capped_amount_in: amount_in,
                                     token_in,
                                     token_out,
                                     quoter_addr: None,
@@ -573,6 +591,7 @@ impl Strategy {
                                 router_type: RouterType::SyncSwap,
                                 fee: 0,
                                 amount_in: out, // repurposed: carries token_out amount
+                                capped_amount_in: amount_in,
                                 token_in,
                                 token_out,
                                 quoter_addr: None,
@@ -648,7 +667,7 @@ impl Strategy {
                 continue;
             }
             let pair = &self.pairs[*pi];
-            let original_amount_in = match parse_amount_capped(
+            let _original_amount_in = match parse_amount_capped(
                 &pair.trade_amount,
                 pair.max_trade.as_deref(),
                 pair.token_in_decimals,
@@ -721,7 +740,9 @@ impl Strategy {
                         router_a_addr: q_a.router_addr,
                         router_a_type: q_a.router_type.clone(),
                         fee_a: q_a.fee,
-                        amount_in: original_amount_in,
+                        // Use the capped amount so spread/profit is relative to what was
+                        // actually quoted (V3 may have been capped to single-tick capacity).
+                        amount_in: q_a.capped_amount_in,
                         router_b_id: q_b.router_id.clone(),
                         router_b_addr: rb_addr,
                         router_b_type: q_b.router_type.clone(),

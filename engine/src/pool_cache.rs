@@ -52,10 +52,10 @@ pub struct V3PoolState {
     pub last_updated: Instant,
 }
 
-/// How long a V3 pool state is considered fresh.
-/// V3 sqrtPriceX96 and liquidity are deterministic — they only change on Swap events.
-/// If no swap happened in the last 300s, the cached values are still exactly correct.
-/// Matching VOLATILE_MAX_AGE so V3 detection stays active during quiet Linea periods.
+/// Retained for external reference; no longer used as a staleness gate in
+/// `quote_v3_spot`. V3 state is deterministic (only Swap events change it),
+/// so time-based expiry causes false blindness and has been removed.
+#[allow(dead_code)]
 pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
@@ -231,11 +231,16 @@ impl PoolCache {
     ///
     /// Returns `Some((estimated_amount_out, current_liquidity))` when:
     ///   - Pool is in cache
-    ///   - Cache is fresh (< V3_STATE_MAX_AGE since last Swap event)
     ///   - sqrtPriceX96 is non-zero
     ///
     /// The amount_out is an *approximation* valid within the current tick only.
     /// Use it as a fast directional screen; confirm with QuoterV2 before execution.
+    ///
+    /// **No time-based staleness check**: V3 sqrtPriceX96 and liquidity are
+    /// deterministic — they only change when a Swap event fires. Once we have a
+    /// valid state (from startup slot0 discovery or a Swap event), the values
+    /// remain exactly correct until the next Swap event updates them. A time-based
+    /// TTL causes false blindness on quiet pools and serves no accuracy purpose.
     pub fn quote_v3_spot(
         &self,
         router_id: &str,
@@ -250,11 +255,6 @@ impl PoolCache {
         let pool_addr = *self.v3_by_key.get(&key)?;
 
         let state = self.v3_by_address.get(&pool_addr)?;
-
-        // Staleness check: skip if no Swap event recently
-        if state.last_updated.elapsed() > V3_STATE_MAX_AGE {
-            return None;
-        }
 
         let sqrtp = state.sqrt_price_x96;
         if sqrtp.is_zero() {
