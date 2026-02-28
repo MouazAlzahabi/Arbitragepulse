@@ -374,19 +374,32 @@ pub async fn run_chain(
                         .find(|c| c.id == cfg.id)
                         .map(|c| c.min_profit_usd)
                         .unwrap_or(cfg.min_profit_usd);
+
                     {
                         let mut strat = strategy.write().await;
+
+                        // Only trigger the network call if pairs/routers actually changed
+                        let structure_changed = strat.pairs.len() != new_pairs.len()
+                            || strat.routers.len() != new_routers.len();
+
                         strat.pairs = new_pairs;
                         strat.routers = new_routers;
-                        strat.min_profit_usd = new_min_profit;
-                        // Refresh SyncSwap pool cache after router/pair changes
-                        strat.populate_syncswap_pools(provider.as_ref()).await;
-                    }
+
+                        if structure_changed {
+                            info!("[{}] Config structure changed — refreshing SyncSwap cache", cfg.name);
+                            strat.populate_syncswap_pools(provider.as_ref()).await;
+                        }
+
+                        if strat.min_profit_usd != new_min_profit {
+                            strat.min_profit_usd = new_min_profit;
+                            info!("[{}] Config hot-reloaded (min_profit=${:.2})", cfg.name, new_min_profit);
+                        }
+                    } // strategy write lock released here — before acquiring executor lock
+
                     {
                         let mut exec = executor.lock().await;
                         exec.min_profit_usd = new_min_profit;
                     }
-                    info!("[{}] Config hot-reloaded (min_profit=${:.2})", cfg.name, new_min_profit);
                 }
             }
 
