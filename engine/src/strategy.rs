@@ -417,8 +417,8 @@ impl Strategy {
         let mut pair_quotes: std::collections::HashMap<usize, Vec<ForwardTask>> =
             std::collections::HashMap::new();
 
-        let mut fwd_tasks: Vec<ForwardTask> = Vec::new();
-        let mut fwd_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        let fwd_tasks: Vec<ForwardTask> = Vec::new();
+        let fwd_mc: Vec<(Address, Vec<u8>)> = Vec::new();
         // V3 scan diagnostic counters: cached=used spot (0 HTTP), no_cache=QuoterV2 needed.
         let mut v3_cached: usize = 0;
         let mut v3_no_cache: usize = 0;
@@ -468,26 +468,8 @@ impl Strategy {
                                 token_out,
                                 quoter_addr: None,
                             });
-                        } else {
-                            let calldata = IUniswapV2Router02::getAmountsOutCall {
-                                amountIn: amount_in,
-                                path: vec![token_in, token_out],
-                            }
-                            .abi_encode();
-                            fwd_mc.push((router_addr, calldata));
-                            fwd_tasks.push(ForwardTask {
-                                pair_idx: pi,
-                                router_id: router.id.clone(),
-                                router_addr,
-                                router_type: RouterType::V2,
-                                fee: 0,
-                                amount_in,
-                                capped_amount_in: amount_in,
-                                token_in,
-                                token_out,
-                                quoter_addr: None,
-                            });
                         }
+                        // Cache miss = pool not discovered at startup = doesn't exist → skip
                     }
                     RouterType::V3 => {
                         // Per-router quoter takes priority; fall back to chain-level.
@@ -757,12 +739,9 @@ impl Strategy {
                     if local_back.is_none() {
                         let mc_entry = match q_b.router_type {
                             RouterType::V2 => {
-                                let cd = IUniswapV2Router02::getAmountsOutCall {
-                                    amountIn: token_out_amount,
-                                    path: vec![token_out, token_in],
-                                }
-                                .abi_encode();
-                                Some((rb_addr, cd))
+                                // Cache miss = pool absent → skip, same as Solidly
+                                rev_tasks.pop();
+                                continue;
                             }
                             RouterType::V3 => {
                                 let quoter = match q_b.quoter_addr.or(self.quoter_v2_address) {
@@ -792,21 +771,9 @@ impl Strategy {
                                 continue;
                             }
                             RouterType::SyncSwap => {
-                                match q_b.quoter_addr {
-                                    Some(pool_addr) => {
-                                        let cd = ISyncSwapPool::getAmountOutCall {
-                                            tokenIn: token_out,
-                                            amountIn: token_out_amount,
-                                            sender: Address::ZERO,
-                                        }
-                                        .abi_encode();
-                                        Some((pool_addr, cd))
-                                    }
-                                    None => {
-                                        rev_tasks.pop();
-                                        continue;
-                                    }
-                                }
+                                // Cache miss = pool stale/absent → skip
+                                rev_tasks.pop();
+                                continue;
                             }
                         };
                         if let Some(entry) = mc_entry {
