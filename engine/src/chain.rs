@@ -20,7 +20,7 @@ use crate::db::Database;
 use crate::executor::Executor;
 use crate::listener::{Listener, SwapEvent};
 use crate::metrics::Metrics;
-use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
+use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState, V3_STATE_MAX_AGE};
 use crate::strategy::{Opportunity, Strategy};
 
 const COOLDOWN_SECS: u64 = 15;
@@ -1397,6 +1397,13 @@ async fn discover_v3_pools<P: Provider>(
         // In V3 pools, token0 is always the lower address
         let (token0, token1) = if sq.ta < sq.tb { (sq.ta, sq.tb) } else { (sq.tb, sq.ta) };
 
+        // Mark V3 state as stale at startup so quote_v3_spot() skips it until
+        // the first real Swap event arrives. The sqrtPriceX96 snapshot from the
+        // multicall is valid for the pool address lookup but the single-tick
+        // approximation is unreliable until confirmed by a live event.
+        let stale = Instant::now()
+            .checked_sub(V3_STATE_MAX_AGE + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
         pool_cache.insert_v3(sq.pool, V3PoolState {
             token0,
             token1,
@@ -1404,7 +1411,7 @@ async fn discover_v3_pools<P: Provider>(
             sqrt_price_x96,
             liquidity: liquidity.into(),
             router_id: sq.router_id.clone(),
-            last_updated: Instant::now(),
+            last_updated: stale,
         });
     }
 }

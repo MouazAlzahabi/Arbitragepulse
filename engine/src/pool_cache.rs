@@ -260,29 +260,56 @@ impl PoolCache {
             return None;
         }
 
-        // Spot-price formula (single-tick approximation, integer arithmetic):
-        //   price = (sqrtPriceX96 / 2^96)^2
-        //   token0→token1: amount_out ≈ amount_in × sqrtp² / 2^192 × (1_000_000 - fee) / 1_000_000
-        //   token1→token0: amount_out ≈ amount_in × 2^192 / sqrtp² × (1_000_000 - fee) / 1_000_000
-        let fee_num = U256::from(1_000_000u64 - fee as u64);
-        let q192 = U256::from(1u8) << 192u32;
+        let l = U256::from(state.liquidity);
+        if l.is_zero() {
+            return None;
+        }
 
-        let amount_out = if token_in == state.token0 {
-            let sqrtp_sq = sqrtp.checked_mul(sqrtp)?; // may overflow for extreme prices
-            amount_in
-                .checked_mul(sqrtp_sq)?
-                .checked_div(q192)?
-                .checked_mul(fee_num)?
-                / U256::from(1_000_000u64)
+        // Virtual-reserve constant-product formula (exact within one tick).
+        //
+        // Within a single V3 tick, the pool behaves identically to a V2 xy=k pool
+        // whose reserves are the "virtual reserves" derived from L and sqrtPriceX96:
+        //   vr_token0 = L × 2^96 / sqrtP     (virtual reserve of token0)
+        //   vr_token1 = L × sqrtP / 2^96     (virtual reserve of token1)
+        //
+        // Applying the standard xy=k fee formula to these virtual reserves gives the
+        // same output as the V3 contract for single-tick trades — including the
+        // price-impact term that the old marginal-rate formula completely missed.
+        //
+        // The old formula: amount_out = amount_in × price × fee_factor
+        //   → ignores the denominator's amount_in term → overestimates for large trades
+        //
+        // This formula: amount_out = amount_in × (1M-fee) × vr_out
+        //                           / (vr_in × 1M + amount_in × (1M-fee))
+        //   → exact for single-tick; underestimates when trade spans multiple ticks
+        //   → conservative: never produces phantom profits
+
+        let q96 = U256::from(1u128) << 96u32;
+        let fee_denom = U256::from(1_000_000u64);
+        let fee_num  = U256::from(1_000_000u64 - state.fee as u64);
+
+        // vr0 = L × Q96 / sqrtP,  vr1 = L × sqrtP >> 96
+        let vr0 = l.saturating_mul(q96).checked_div(sqrtp)?;
+        let vr1 = l.saturating_mul(sqrtp) >> 96u32;
+
+        if vr0.is_zero() || vr1.is_zero() {
+            return None;
+        }
+
+        let (vr_in, vr_out) = if token_in == state.token0 {
+            (vr0, vr1)
         } else {
-            // token1 → token0: invert price
-            let sqrtp_sq = sqrtp.checked_mul(sqrtp)?;
-            amount_in
-                .checked_mul(q192)?
-                .checked_div(sqrtp_sq)?
-                .checked_mul(fee_num)?
-                / U256::from(1_000_000u64)
+            (vr1, vr0)
         };
+
+        // xy=k with ppm fee:  out = ai×(1M-fee)×vr_out / (vr_in×1M + ai×(1M-fee))
+        let ai_fee = amount_in.checked_mul(fee_num)?;
+        let num    = ai_fee.checked_mul(vr_out)?;
+        let den    = vr_in.checked_mul(fee_denom)?.checked_add(ai_fee)?;
+        if den.is_zero() {
+            return None;
+        }
+        let amount_out = num / den;
 
         Some((amount_out, state.liquidity))
     }

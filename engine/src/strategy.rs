@@ -665,13 +665,16 @@ impl Strategy {
                         continue;
                     }
 
-                    // Skip cross-fee-tier V3 within the same router.
-                    // The single-tick spot-price approximation diverges between fee tiers,
-                    // producing phantom arbs (e.g. fee=500 vs fee=3000 on PancakeV3)
-                    // that consistently fail on-chain. Real arbs cross DEX boundaries.
+                    // Skip same-router V3 combinations entirely.
+                    // The single-tick sqrtPriceX96 approximation is only reliable for
+                    // cross-DEX comparisons. Within the same router, fee-tier pools share
+                    // the same overall market price — spot divergences between fee=500 and
+                    // fee=3000 (or even same fee with integer rounding) produce phantom arbs
+                    // that consistently fail on-chain. Real arbs always cross DEX/router
+                    // boundaries; same-router V3 × V3 is never reliably detectable with
+                    // local spot math.
                     if q_a.router_id == q_b.router_id
                         && matches!(q_a.router_type, RouterType::V3)
-                        && q_a.fee != q_b.fee
                     {
                         continue;
                     }
