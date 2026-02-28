@@ -665,6 +665,17 @@ impl Strategy {
                         continue;
                     }
 
+                    // Skip cross-fee-tier V3 within the same router.
+                    // The single-tick spot-price approximation diverges between fee tiers,
+                    // producing phantom arbs (e.g. fee=500 vs fee=3000 on PancakeV3)
+                    // that consistently fail on-chain. Real arbs cross DEX boundaries.
+                    if q_a.router_id == q_b.router_id
+                        && matches!(q_a.router_type, RouterType::V3)
+                        && q_a.fee != q_b.fee
+                    {
+                        continue;
+                    }
+
                     let token_in = q_a.token_in;
                     let token_out = q_a.token_out;
                     let rb_addr = q_b.router_addr;
