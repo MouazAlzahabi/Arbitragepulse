@@ -53,9 +53,10 @@ pub struct V3PoolState {
 }
 
 /// How long a V3 pool state is considered fresh.
-/// If no Swap event arrives within this window, the cached L and sqrtP may have
-/// drifted — skip trading that pool to avoid stale-capacity reverts.
-pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(120);
+/// V3 sqrtPriceX96 and liquidity are deterministic — they only change on Swap events.
+/// If no swap happened in the last 300s, the cached values are still exactly correct.
+/// Matching VOLATILE_MAX_AGE so V3 detection stays active during quiet Linea periods.
+pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
 /// 300s (5 min): covers pools that swap every few minutes (typical on Linea).
