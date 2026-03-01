@@ -213,7 +213,8 @@ impl Executor {
         let calldata = self.build_calldata(opp, deadline);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
-            .input(calldata.into());
+            .input(calldata.into())
+            .from(self.signer_address);
         tx_base.gas = Some(GAS_LIMIT);
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
@@ -278,7 +279,8 @@ impl Executor {
         let calldata = self.build_triangular_calldata(opp, deadline);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
-            .input(calldata.into());
+            .input(calldata.into())
+            .from(self.signer_address);
         tx_base.gas = Some(GAS_LIMIT_TRIANGULAR);
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
@@ -362,7 +364,8 @@ impl Executor {
         let calldata = self.build_calldata(opp, deadline);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
-            .input(calldata.into());
+            .input(calldata.into())
+            .from(self.signer_address);
         tx_base.gas = Some(GAS_LIMIT);
 
         self.stats.total_attempts += 1;
@@ -540,7 +543,8 @@ impl Executor {
         let calldata = self.build_triangular_calldata(opp, deadline);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
-            .input(calldata.into());
+            .input(calldata.into())
+            .from(self.signer_address);
         tx_base.gas = Some(GAS_LIMIT_TRIANGULAR);
 
         self.stats.total_attempts += 1;
