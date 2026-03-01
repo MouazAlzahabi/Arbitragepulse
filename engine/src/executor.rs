@@ -14,12 +14,12 @@ use crate::abi::{ArbitrageExecutor, IERC20};
 use crate::db::Database;
 use crate::strategy::{ArbOpportunity, TriangularOpportunity};
 
-// Hardcoded gas limit — 300k covers any 2-hop arb (V2+V2, V2+V3, V3+V3).
+// Hardcoded gas limit — 500k covers any 2-hop arb (V2+V2, V2+V3, V3+V3).
 // We skip eth_estimateGas to save one RPC round-trip per execution.
-const GAS_LIMIT: u64 = 300_000;
+const GAS_LIMIT: u64 = 500_000;
 
-// Triangular arb gas limit — 450k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
-const GAS_LIMIT_TRIANGULAR: u64 = 450_000;
+// Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
+const GAS_LIMIT_TRIANGULAR: u64 = 900_000;
 
 // ─── TxPrep ───────────────────────────────────────────────────────────────────
 
