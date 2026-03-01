@@ -203,10 +203,10 @@ impl Executor {
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
-        if net_profit_usd < self.min_profit_usd {
+        if net_profit_usd < 0.0 {
             return Err(anyhow!(
-                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) below threshold ${:.2}",
-                net_profit_usd, opp.profit_usd, gas_cost_usd, self.min_profit_usd,
+                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) is negative after gas — skipping",
+                net_profit_usd, opp.profit_usd, gas_cost_usd,
             ));
         }
         let deadline = self.deadline();
@@ -268,10 +268,10 @@ impl Executor {
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
-        if net_profit_usd < self.min_profit_usd {
+        if net_profit_usd < 0.0 {
             return Err(anyhow!(
-                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) below threshold ${:.2}",
-                net_profit_usd, opp.profit_usd, gas_cost_usd, self.min_profit_usd,
+                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) is negative after gas — skipping",
+                net_profit_usd, opp.profit_usd, gas_cost_usd,
             ));
         }
         let deadline = self.deadline();
@@ -351,10 +351,10 @@ impl Executor {
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
-        if net_profit_usd < self.min_profit_usd {
+        if net_profit_usd < 0.0 {
             return Err(anyhow!(
-                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) below threshold ${:.2}",
-                net_profit_usd, opp.profit_usd, gas_cost_usd, self.min_profit_usd,
+                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) is negative after gas — skipping",
+                net_profit_usd, opp.profit_usd, gas_cost_usd,
             ));
         }
 
@@ -529,10 +529,10 @@ impl Executor {
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
-        if net_profit_usd < self.min_profit_usd {
+        if net_profit_usd < 0.0 {
             return Err(anyhow!(
-                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) below threshold ${:.2}",
-                net_profit_usd, opp.profit_usd, gas_cost_usd, self.min_profit_usd,
+                "Net profit ${:.4} (gross ${:.4} - gas ${:.4}) is negative after gas — skipping",
+                net_profit_usd, opp.profit_usd, gas_cost_usd,
             ));
         }
 

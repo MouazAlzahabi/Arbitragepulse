@@ -684,6 +684,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(tx_hash) => {
                         let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                         drop(exec);
+                        cooldowns.insert(fingerprint.clone(), Instant::now());
                         handle_execution_success(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -722,6 +723,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if let Err(e) = provider.call(prep.tx.clone()).await {
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
+                            cooldowns.insert(fingerprint.clone(), Instant::now());
                             warn!("[{}] Pre-flight rejected phantom arb: {}", cfg.name, e);
                             return;
                         }
@@ -736,6 +738,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
+                                cooldowns.insert(fingerprint.clone(), Instant::now());
 
                                 // Fire-and-forget receipt task using cloned prep fields
                                 let tx_hash_bg = tx_hash.clone();
@@ -857,6 +860,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(tx_hash) => {
                         let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                         drop(exec);
+                        cooldowns.insert(fingerprint.clone(), Instant::now());
                         handle_execution_success(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -891,6 +895,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if let Err(e) = provider.call(prep.tx.clone()).await {
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
+                            cooldowns.insert(fingerprint.clone(), Instant::now());
                             warn!("[{}] Pre-flight rejected triangular phantom arb: {}", cfg.name, e);
                             return;
                         }
@@ -905,6 +910,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
+                                cooldowns.insert(fingerprint.clone(), Instant::now());
 
                                 // Fire-and-forget receipt task
                                 let tx_hash_bg = tx_hash.clone();
