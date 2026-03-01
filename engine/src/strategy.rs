@@ -760,6 +760,11 @@ impl Strategy {
         // Negative = below break-even; positive = profitable.
         let mut best_spread_pct: f64 = f64::NEG_INFINITY;
 
+        // Phase 1.5 gate: collect V3 tick-capped forward tasks that show real cross-DEX
+        // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
+        const P15_GATE_SPREAD: f64 = 0.003; // 0.3% — fires QuoterV2 only on real divergence
+        let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
+
         for (task, raw_opt) in rev_tasks.iter().zip(rev_raw_by_task.into_iter()) {
             let amount_back_opt: Option<U256> = if let Some(local) = task.local_back {
                 Some(local)
@@ -806,6 +811,18 @@ impl Strategy {
                     if spread > best_spread_pct {
                         best_spread_pct = spread;
                     }
+
+                    // Phase 1.5 gate: local cross-DEX spread is promising AND forward was V3 tick-capped.
+                    if spread > P15_GATE_SPREAD && matches!(task.router_a_type, RouterType::V3) {
+                        let pair = &self.pairs[task.pair_idx];
+                        if let Some(full) = parse_amount_capped(
+                            &pair.trade_amount, pair.max_trade.as_deref(), pair.token_in_decimals,
+                        ) {
+                            if task.amount_in < full {
+                                p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                            }
+                        }
+                    }
                 }
 
                 if amount_back > task.amount_in {
@@ -848,6 +865,131 @@ impl Strategy {
                             router_a_id: task.router_a_id.clone(),
                             router_b_id: task.router_b_id.clone(),
                         });
+                    }
+                }
+            }
+        }
+
+        // ── Phase 1.5: Gated V3 QuoterV2 upgrade ─────────────────────────────────────
+        // Fires only when Phase 2 local data showed cross-DEX spread > P15_GATE_SPREAD
+        // on a V3-tick-capped forward task. One batched multicall for all candidates.
+        if !p15_gate.is_empty() {
+            let mut p15_list: Vec<(usize, String, u32, Address, Address, Address, U256)> = Vec::new();
+            let mut p15_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+
+            for (pi, router_a_id, fee_a) in &p15_gate {
+                let pair = &self.pairs[*pi];
+                let full_amount = match parse_amount_capped(
+                    &pair.trade_amount, pair.max_trade.as_deref(), pair.token_in_decimals,
+                ) {
+                    Some(a) => a, None => continue,
+                };
+                let fwd_task = match pair_quotes.get(pi)
+                    .and_then(|ts| ts.iter().find(|t| &t.router_id == router_a_id && t.fee == *fee_a))
+                {
+                    Some(t) => t.clone(), None => continue,
+                };
+                let quoter = match fwd_task.quoter_addr { Some(q) => q, None => continue };
+
+                let cd = IQuoterV2::quoteExactInputSingleCall {
+                    params: IQuoterV2::QuoteExactInputSingleParams {
+                        tokenIn: fwd_task.token_in,
+                        tokenOut: fwd_task.token_out,
+                        amountIn: full_amount,
+                        fee: Uint::from(*fee_a),
+                        sqrtPriceLimitX96: Uint::ZERO,
+                    },
+                }.abi_encode();
+
+                p15_list.push((*pi, router_a_id.clone(), *fee_a, fwd_task.router_addr,
+                               fwd_task.token_in, fwd_task.token_out, full_amount));
+                p15_mc.push((quoter, cd));
+            }
+
+            if !p15_mc.is_empty() {
+                debug!(
+                    "[chain={}] Phase 1.5 (gated): {} V3 upgrade(s) — local spread > {:.1}%",
+                    self.chain_id, p15_mc.len(), P15_GATE_SPREAD * 100.0
+                );
+                let p15_raw = run_multicall(provider, p15_mc, self.rpc_concurrency).await;
+
+                for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount), raw_opt)
+                    in p15_list.into_iter().zip(p15_raw.into_iter())
+                {
+                    let raw = match raw_opt { Some(r) => r, None => continue };
+                    let quoter_out = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw) {
+                        Ok(r) if !r.amountOut.is_zero() => r.amountOut,
+                        _ => continue,
+                    };
+
+                    let pair = &self.pairs[pi];
+                    let q_b_list: Vec<ForwardTask> = match pair_quotes.get(&pi) {
+                        Some(ts) => ts.iter()
+                            .filter(|t| t.router_id != router_a_id)
+                            .cloned()
+                            .collect(),
+                        None => continue,
+                    };
+
+                    for q_b in q_b_list {
+                        let fee_b = q_b.fee;
+                        let local_back = match q_b.router_type {
+                            RouterType::V2 => self.pool_cache.get_amount_out_by_key(
+                                &q_b.router_id, token_out, token_in, quoter_out,
+                            ),
+                            RouterType::Solidly => {
+                                let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
+                                self.pool_cache.get_amount_out_by_key_fresh(
+                                    &q_b.router_id, token_out, token_in, quoter_out, max_age,
+                                )
+                            }
+                            RouterType::V3 => self.pool_cache.quote_v3_spot(
+                                &q_b.router_id, token_out, token_in, fee_b, quoter_out,
+                            ).map(|(out, _)| out),
+                            RouterType::SyncSwap => self.pool_cache.get_amount_out_by_key_fresh(
+                                &q_b.router_id, token_out, token_in, quoter_out, VOLATILE_MAX_AGE,
+                            ),
+                        };
+                        let amount_back = match local_back.filter(|b| !b.is_zero()) {
+                            Some(b) => b, None => continue,
+                        };
+                        if amount_back <= full_amount { continue; }
+
+                        if (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount {
+                            warn!("[{}] Phase 1.5 phantom: {} | {}/{}", self.chain_id, pair.id,
+                                  router_a_id, q_b.router_id);
+                            continue;
+                        }
+                        let profit = amount_back - full_amount;
+                        let profit_usd = token_amount_to_usd(
+                            profit, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd,
+                        );
+
+                        let spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
+                        if spread > best_spread_pct { best_spread_pct = spread; }
+                        if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
+
+                        if profit_usd >= self.min_profit_usd {
+                            debug!("[{}] Phase 1.5 arb: {} | profit=${:.4} | {}/{}",
+                                   self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
+                            opportunities.push(ArbOpportunity {
+                                chain_id: self.chain_id,
+                                pair_id: pair.id.clone(),
+                                token_in,
+                                token_out,
+                                amount_in: full_amount,
+                                router_a: router_a_addr,
+                                router_b: q_b.router_addr,
+                                router_a_type: RouterType::V3,
+                                router_b_type: q_b.router_type.clone(),
+                                fee_a,
+                                fee_b,
+                                expected_profit: profit,
+                                profit_usd,
+                                router_a_id: router_a_id.clone(),
+                                router_b_id: q_b.router_id.clone(),
+                            });
+                        }
                     }
                 }
             }
