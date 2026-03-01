@@ -102,7 +102,7 @@ chains:
     block_time_ms: 2000  # 2 second blocks
     contract_address: "0xb4DA83518bc53c54482ccFacAC7D9c828869829b"
     min_native_balance: 0.01
-    min_profit_usd: 0.30    # Minimum NET profit after gas. Triangular gas ~$0.09–0.88 at Linea prices.
+    min_profit_usd: 0.05    # Minimum NET profit after gas. Linea 2-hop gas ~$0.05–0.10.
     deadline_seconds: 120
     min_swap_amount_filter: 10000000  # 10 USDC minimum (reduced to catch more opportunities)
     # Chain-level fallback quoter — used for routers that don't have their own quoter_address.
@@ -597,8 +597,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "80"   # $80 of $101 balance — at 0.073% spread: $0.058 gross > $0.022 gas
-    max_trade: "80"
+    trade_amount: "100"
+    max_trade: "100"
     min_swap_size: "5"
     watch_pools: []
 
@@ -623,8 +623,8 @@ pairs:
     token_out_symbol: "USDT"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "80"
-    max_trade: "80"
+    trade_amount: "100"
+    max_trade: "100"
     min_swap_size: "10"
     watch_pools: []
 
@@ -636,8 +636,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "80"
-    max_trade: "80"
+    trade_amount: "100"
+    max_trade: "100"
     min_swap_size: "5"
     watch_pools: []
 
