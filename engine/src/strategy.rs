@@ -640,9 +640,9 @@ impl Strategy {
         // SyncSwap and Solidly-stable still need multicall.
 
         let mut rev_tasks: Vec<ReverseTask> = Vec::new();
-        let mut rev_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        let rev_mc: Vec<(Address, Vec<u8>)> = Vec::new();
         // Maps rev_mc[i] → rev_tasks[j] so we can write results back after multicall.
-        let mut rev_mc_task_idx: Vec<usize> = Vec::new();
+        let rev_mc_task_idx: Vec<usize> = Vec::new();
 
         for (pi, quotes) in &pair_quotes {
             if quotes.len() < 2 {
@@ -712,7 +712,6 @@ impl Strategy {
                         }
                     };
 
-                    let task_idx = rev_tasks.len();
                     rev_tasks.push(ReverseTask {
                         pair_idx: *pi,
                         pair_id: pair.id.clone(),
@@ -735,51 +734,10 @@ impl Strategy {
                         local_back,
                     });
 
-                    // Only add to multicall if no local result
+                    // All DEX types: stale/absent cache = no recent activity = no arb → skip.
                     if local_back.is_none() {
-                        let mc_entry = match q_b.router_type {
-                            RouterType::V2 => {
-                                // Cache miss = pool absent → skip, same as Solidly
-                                rev_tasks.pop();
-                                continue;
-                            }
-                            RouterType::V3 => {
-                                let quoter = match q_b.quoter_addr.or(self.quoter_v2_address) {
-                                    Some(q) => q,
-                                    None => {
-                                        // No quoter: remove the task we just pushed
-                                        rev_tasks.pop();
-                                        continue;
-                                    }
-                                };
-                                let cd = IQuoterV2::quoteExactInputSingleCall {
-                                    params: IQuoterV2::QuoteExactInputSingleParams {
-                                        tokenIn: token_out,
-                                        tokenOut: token_in,
-                                        amountIn: token_out_amount,
-                                        fee: Uint::from(fee_b),
-                                        sqrtPriceLimitX96: Uint::ZERO,
-                                    },
-                                }
-                                .abi_encode();
-                                Some((quoter, cd))
-                            }
-                            RouterType::Solidly => {
-                                // local_back returned None = stale reserves = no recent activity.
-                                // Skip rather than multicall: stale pool has no arb opportunity.
-                                rev_tasks.pop();
-                                continue;
-                            }
-                            RouterType::SyncSwap => {
-                                // Cache miss = pool stale/absent → skip
-                                rev_tasks.pop();
-                                continue;
-                            }
-                        };
-                        if let Some(entry) = mc_entry {
-                            rev_mc_task_idx.push(task_idx);
-                            rev_mc.push(entry);
-                        }
+                        rev_tasks.pop();
+                        continue;
                     }
                 }
             }

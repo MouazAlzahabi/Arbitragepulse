@@ -227,7 +227,7 @@ impl Executor {
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
-            .max_fee_per_gas(gas_price + priority_fee);
+            .max_fee_per_gas((gas_price * 2) + priority_fee);
         // Pre-increment nonce BEFORE releasing the lock so concurrent prepares
         // allocate distinct nonces without a chain round-trip.
         self.nonce = Some(nonce + 1);
@@ -292,7 +292,7 @@ impl Executor {
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
-            .max_fee_per_gas(gas_price + priority_fee);
+            .max_fee_per_gas((gas_price * 2) + priority_fee);
         self.nonce = Some(nonce + 1);
         Ok(TxPrep {
             tx,

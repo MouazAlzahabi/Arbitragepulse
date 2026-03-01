@@ -1186,6 +1186,7 @@ async fn update_native_price<P: Provider>(
     // Quoting 1 full ETH on a low-TVL pool shifts the price significantly (~$200 off).
     let probe_amount = U256::from(10_000_000_000_000_000u128); // 0.01 ETH (1e16 wei)
     let probe_scale = 100_u128; // multiply back to get per-1-ETH price
+    let decimal_scale = 10_f64.powi(stable_pair.token_out_decimals as i32);
 
     // ── Try V3 QuoterV2 first (more accurate on chains with thin V2 pools) ──
     // Iterate ALL V3 routers, each using its own quoter (per-router takes priority
@@ -1216,7 +1217,7 @@ async fn update_native_price<P: Provider>(
                     .await
                 {
                     if !r.amountOut.is_zero() {
-                        let price = r.amountOut.to::<u128>() as f64 * probe_scale as f64 / 1_000_000.0;
+                        let price = r.amountOut.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
                         debug!("[{}] {} price V3 router={} fee={} → ${:.2}", cfg.name, cfg.native_currency, router.id, fee, price);
                         if price > best_v3_price { best_v3_price = price; }
                     }
@@ -1242,7 +1243,7 @@ async fn update_native_price<P: Provider>(
         {
             if let Some(&out) = amounts.last() {
                 if !out.is_zero() {
-                    let price = out.to::<u128>() as f64 * probe_scale as f64 / 1_000_000.0;
+                    let price = out.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
                     debug!("[{}] {} price (V2 fallback) updated: ${:.2}", cfg.name, cfg.native_currency, price);
                     { let mut strat = strategy.write().await; strat.update_native_price(price); }
                     { let mut exec = executor.lock().await; exec.update_native_price(price); }
