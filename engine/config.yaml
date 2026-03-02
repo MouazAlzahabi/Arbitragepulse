@@ -261,7 +261,7 @@ routers:
   - id: "uniswap-v3-linea"
     name: "Uniswap V3 (Linea)"
     chain_id: 59144
-    address: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"  # SwapRouter02
+    address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # SwapRouter02 (Linea-specific address; 0x68b3465... is NOT SwapRouter02 on Linea)
     type: "v3"
     fee_bps: 0
     fee_tiers: [500, 3000, 10000]
