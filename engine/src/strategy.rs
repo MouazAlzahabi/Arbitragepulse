@@ -829,7 +829,7 @@ impl Strategy {
                                 let mut on_cooldown = false;
                                 if let Ok(mut guard) = self.p15_cooldowns.lock() {
                                     if let Some(&cooled_at) = guard.get(&p15_key) {
-                                        if cooled_at.elapsed().as_secs() < 15 {
+                                        if cooled_at.elapsed().as_secs() < 2 {
                                             on_cooldown = true;
                                         }
                                     }
