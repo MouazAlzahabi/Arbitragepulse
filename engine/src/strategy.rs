@@ -7,7 +7,8 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::abi::{IERC20, IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Pair, IUniswapV2Router02};
@@ -194,6 +195,10 @@ pub struct Strategy {
     /// When populated, forward and reverse quotes for V2/Solidly-volatile routers are
     /// computed locally (zero eth_call) instead of via multicall.
     pub pool_cache: Arc<PoolCache>,
+    /// Per-(pair_idx|router_a_id|fee_a) cooldown for Phase 1.5 QuoterV2 upgrades.
+    /// Prevents firing the same QuoterV2 RPC on every consecutive scan when a spread persists.
+    /// Eagerly claimed (before the multicall) so concurrent scan cycles skip immediately.
+    p15_cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl Strategy {
@@ -216,6 +221,7 @@ impl Strategy {
             syncswap_pool_cache: HashMap::new(),
             pool_cache,
             rpc_concurrency,
+            p15_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -819,7 +825,23 @@ impl Strategy {
                             &pair.trade_amount, pair.max_trade.as_deref(), pair.token_in_decimals,
                         ) {
                             if task.amount_in < full {
-                                p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                                let p15_key = format!("{}|{}|{}", task.pair_idx, task.router_a_id, task.fee_a);
+                                let mut on_cooldown = false;
+                                if let Ok(mut guard) = self.p15_cooldowns.lock() {
+                                    if let Some(&cooled_at) = guard.get(&p15_key) {
+                                        if cooled_at.elapsed().as_secs() < 15 {
+                                            on_cooldown = true;
+                                        }
+                                    }
+                                    // Eager claim: insert before releasing the lock so any
+                                    // concurrent scan cycle sees the cooldown immediately.
+                                    if !on_cooldown {
+                                        guard.insert(p15_key, Instant::now());
+                                    }
+                                }
+                                if !on_cooldown {
+                                    p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                                }
                             }
                         }
                     }
