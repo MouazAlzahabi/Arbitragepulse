@@ -1073,10 +1073,12 @@ async fn handle_execution_failure(
     pending_pairs.remove(pair_id);
     cooldowns.insert(pair_id.to_string(), Instant::now());
 
-    // Gas-profitability rejects ("below threshold") are pre-execution profit checks —
+    // Gas-profitability rejects are pre-execution profit checks —
     // not real execution failures. Skip circuit-breaker accounting entirely.
+    // Covers both the old "below threshold" message and the current
+    // "negative after gas" message from prepare_2hop.
     let err_str = error.to_string();
-    if err_str.contains("below threshold") {
+    if err_str.contains("below threshold") || err_str.contains("negative after gas") {
         debug!("[{}] Skipped (unprofitable after gas): {}", cfg.name, err_str);
         return;
     }
