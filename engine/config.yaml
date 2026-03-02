@@ -102,7 +102,7 @@ chains:
     block_time_ms: 2000  # 2 second blocks
     contract_address: "0xb4DA83518bc53c54482ccFacAC7D9c828869829b"
     min_native_balance: 0.01
-    min_profit_usd: 0.05    # Minimum NET profit after gas. Linea 2-hop gas ~$0.05–0.10.
+    min_profit_usd: 0.001   # Minimum NET profit after gas. Lowered for testing; raise once confirmed working.
     deadline_seconds: 120
     min_swap_amount_filter: 10000000  # 10 USDC minimum (reduced to catch more opportunities)
     # Chain-level fallback quoter — used for routers that don't have their own quoter_address.
@@ -638,6 +638,51 @@ pairs:
     token_out_decimals: 18
     trade_amount: "100"
     max_trade: "100"
+    min_swap_size: "5"
+    watch_pools: []
+
+  # Reverse of linea-usdc-usdt: uses USDT as capital, routes USDT→USDC→USDT.
+  # Required because each pair only covers one base-capital direction.
+  - id: "linea-usdt-usdc"
+    chain_id: 59144
+    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
+    token_out: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"  # USDC
+    token_in_symbol: "USDT"
+    token_out_symbol: "USDC"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "100"
+    max_trade: "100"
+    min_swap_size: "10"
+    watch_pools: []
+
+  # USDC→WBTC→USDC: different asset class, different pool dynamics.
+  # PancakeV3 fee=500 and UniswapV3 fee=500/3000 both have WBTC/USDC pools on Linea.
+  # Trade size kept lower (~$50) due to shallower WBTC pool depth vs ETH.
+  - id: "linea-usdc-wbtc"
+    chain_id: 59144
+    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"  # USDC
+    token_out: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
+    token_in_symbol: "USDC"
+    token_out_symbol: "WBTC"
+    token_in_decimals: 6
+    token_out_decimals: 8
+    trade_amount: "50"
+    max_trade: "50"
+    min_swap_size: "5"
+    watch_pools: []
+
+  # USDT→WBTC→USDT: same as above but with USDT capital.
+  - id: "linea-usdt-wbtc"
+    chain_id: 59144
+    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
+    token_out: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
+    token_in_symbol: "USDT"
+    token_out_symbol: "WBTC"
+    token_in_decimals: 6
+    token_out_decimals: 8
+    trade_amount: "50"
+    max_trade: "50"
     min_swap_size: "5"
     watch_pools: []
 
