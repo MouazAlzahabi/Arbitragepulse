@@ -602,6 +602,9 @@ pairs:
     min_swap_size: "5"
     watch_pools: []
 
+  # linea-weth-usdc DISABLED: contract holds no WETH — every execution attempt
+  # causes V3 router to call safeTransferFrom(WETH, contract, pool, amt) → STF revert.
+  # Re-enable only if the contract is funded with WETH.
   # - id: "linea-weth-usdc"
   #   chain_id: 59144
   #   token_in: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
@@ -686,6 +689,8 @@ pairs:
     min_swap_size: "5"
     watch_pools: []
 
+  # linea-wbtc-weth DISABLED: contract holds no WBTC — STF on every execution.
+  # Re-enable only if the contract is funded with WBTC.
   # - id: "linea-wbtc-weth"
   #   chain_id: 59144
   #   token_in: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
@@ -699,6 +704,8 @@ pairs:
   #   min_swap_size: "0.0001"
   #   watch_pools: []
 
+  # linea-wsteth-weth DISABLED: contract holds no wstETH — STF on every execution.
+  # Re-enable only if the contract is funded with wstETH.
   # - id: "linea-wsteth-weth"
   #   chain_id: 59144
   #   token_in: "0xB5beDd42000b71FddE22D3eF8173158d76a5094B"  # wstETH

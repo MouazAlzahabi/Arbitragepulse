@@ -664,6 +664,18 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 strat.optimize(opp, provider.as_ref(), max_bal).await
             };
 
+            // Guard: cached balance (refreshed every 30s) must cover amount_in.
+            // Prevents sending txs that will STF when contract has no token_in.
+            if let Some(bal) = max_bal {
+                if bal < optimized.amount_in {
+                    warn!(
+                        "[{}] Skipping {} — insufficient token_in balance (have {}, need {})",
+                        cfg.name, optimized.pair_id, bal, optimized.amount_in
+                    );
+                    return;
+                }
+            }
+
             broadcast_log(
                 log_tx,
                 "opportunity",
@@ -838,6 +850,24 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         }
 
         Opportunity::Triangular(opp) => {
+            // Guard: check cached token_a balance (the starting capital) before executing.
+            // Triangular arb starting with an unfunded token (e.g. WETH) will STF on Leg 1.
+            {
+                let bal = {
+                    let bals = contract_balances.read().await;
+                    bals.get(&opp.token_a).copied()
+                };
+                if let Some(b) = bal {
+                    if b < opp.amount_in {
+                        warn!(
+                            "[{}] Skipping triangular {} — insufficient token_a balance (have {}, need {})",
+                            cfg.name, opp.triplet_id, b, opp.amount_in
+                        );
+                        return;
+                    }
+                }
+            }
+
             broadcast_log(
                 log_tx,
                 "opportunity",
