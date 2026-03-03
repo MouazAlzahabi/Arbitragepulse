@@ -23,7 +23,12 @@ use crate::metrics::Metrics;
 use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
 use crate::strategy::{Opportunity, Strategy};
 
+/// Cooldown after pre-flight rejection or dry-run (no gas spent — fast retry is fine).
 const COOLDOWN_SECS: u64 = 15;
+/// Cooldown after a tx is actually sent to chain (gas spent, pool needs time to settle
+/// and emit new Sync events so the local cache converges). Prevents repeated phantom
+/// arb attempts on the same fingerprint after a successful or reverted on-chain tx.
+const SEND_COOLDOWN_SECS: u64 = 60;
 /// Only count real execution failures (simulation reverts, send errors).
 /// Gas-profitability rejects ("below threshold") do NOT count — they're pre-flight skips.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
@@ -611,14 +616,15 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     let fingerprint = best_opp.fingerprint();
     let display_id = best_opp.pair_id();
 
-    // Full opportunity cooldown (pair + routers + amount)
-    if let Some(&cooled_at) = cooldowns.get(&fingerprint) {
-        if cooled_at.elapsed().as_secs() < COOLDOWN_SECS {
+    // Full opportunity cooldown (pair + routers + amount).
+    // The stored value is the EXPIRY instant (deadline style), so different events
+    // can set different cooldown durations without changing the HashMap type.
+    if let Some(&expire_at) = cooldowns.get(&fingerprint) {
+        if expire_at > Instant::now() {
+            let remaining = expire_at.duration_since(Instant::now()).as_secs();
             debug!("[{}] {} in cooldown, skipping", cfg.name, display_id);
             broadcast_log(log_tx, "info",
-                &format!("[{}] Skipped {} — cooldown ({}s remaining)",
-                    cfg.name, display_id,
-                    COOLDOWN_SECS.saturating_sub(cooled_at.elapsed().as_secs())),
+                &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, display_id, remaining),
                 None);
             return;
         }
@@ -714,7 +720,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(tx_hash) => {
                         let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                         drop(exec);
-                        cooldowns.insert(fingerprint.clone(), Instant::now());
+                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         handle_execution_success(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -755,7 +761,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if let Err(e) = provider.call(prep.tx.clone()).await {
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
-                            cooldowns.insert(fingerprint.clone(), Instant::now());
+                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                             let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
@@ -772,9 +778,10 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
-                                cooldowns.insert(fingerprint.clone(), Instant::now());
+                                cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
 
                                 // Fire-and-forget receipt task using cloned prep fields
+                                let log_tx_bg = log_tx.clone();
                                 let tx_hash_bg = tx_hash.clone();
                                 let provider_bg = provider.clone();
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -809,7 +816,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                                warn!("[{}] ✗ reverted | tx={}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                let msg = format!("[{}] ✗ tx reverted | pair={} | tx={}", chain_name_bg, opp_id_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                warn!("{}", msg);
+                                                broadcast_log(&log_tx_bg, "error", &msg, None);
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -913,7 +922,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(tx_hash) => {
                         let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                         drop(exec);
-                        cooldowns.insert(fingerprint.clone(), Instant::now());
+                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         handle_execution_success(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -950,7 +959,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if let Err(e) = provider.call(prep.tx.clone()).await {
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
-                            cooldowns.insert(fingerprint.clone(), Instant::now());
+                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                             let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
@@ -967,9 +976,10 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
-                                cooldowns.insert(fingerprint.clone(), Instant::now());
+                                cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
 
                                 // Fire-and-forget receipt task
+                                let log_tx_bg = log_tx.clone();
                                 let tx_hash_bg = tx_hash.clone();
                                 let provider_bg = provider.clone();
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -1005,7 +1015,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                                warn!("[{}] ✗ triangular reverted | tx={}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                let msg = format!("[{}] ✗ triangular reverted | pair={} | tx={}", chain_name_bg, opp_id_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                warn!("{}", msg);
+                                                broadcast_log(&log_tx_bg, "error", &msg, None);
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -1131,7 +1143,7 @@ async fn handle_execution_failure(
     opportunity_profit_usd: f64,
 ) {
     pending_pairs.remove(pair_id);
-    cooldowns.insert(pair_id.to_string(), Instant::now());
+    cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
 
     // Gas-profitability rejects are pre-execution profit checks —
     // not real execution failures. Skip circuit-breaker accounting entirely.
