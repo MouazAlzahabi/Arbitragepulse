@@ -615,6 +615,11 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     if let Some(&cooled_at) = cooldowns.get(&fingerprint) {
         if cooled_at.elapsed().as_secs() < COOLDOWN_SECS {
             debug!("[{}] {} in cooldown, skipping", cfg.name, display_id);
+            broadcast_log(log_tx, "info",
+                &format!("[{}] Skipped {} — cooldown ({}s remaining)",
+                    cfg.name, display_id,
+                    COOLDOWN_SECS.saturating_sub(cooled_at.elapsed().as_secs())),
+                None);
             return;
         }
         cooldowns.remove(&fingerprint);
@@ -623,6 +628,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Pending tx dedup (full fingerprint prevents duplicate identical opportunities)
     if pending_pairs.contains(&fingerprint) {
         debug!("[{}] {} tx already in-flight, skipping", cfg.name, display_id);
+        broadcast_log(log_tx, "info",
+            &format!("[{}] Skipped {} — tx already in-flight", cfg.name, display_id),
+            None);
         return;
     }
 
@@ -748,7 +756,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
                             cooldowns.insert(fingerprint.clone(), Instant::now());
-                            warn!("[{}] Pre-flight rejected phantom arb: {}", cfg.name, e);
+                            let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
+                            warn!("{}", msg);
+                            broadcast_log(log_tx, "warn", &msg, None);
                             return;
                         }
                         let send_start = std::time::Instant::now();
@@ -941,7 +951,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
                             cooldowns.insert(fingerprint.clone(), Instant::now());
-                            warn!("[{}] Pre-flight rejected triangular phantom arb: {}", cfg.name, e);
+                            let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
+                            warn!("{}", msg);
+                            broadcast_log(log_tx, "warn", &msg, None);
                             return;
                         }
                         let send_start = std::time::Instant::now();
