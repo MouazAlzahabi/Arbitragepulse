@@ -155,6 +155,8 @@ pub async fn run_chain(
                 total_success: 0,
                 total_failed: 0,
                 total_profit_usd: 0.0,
+                ghost_profit_usd: 0.0,
+                base_fee_gwei: 0.0,
                 dry_run: true,
                 paused: false,
                 rpc_ok: true,   // we just connected successfully
@@ -280,6 +282,7 @@ pub async fn run_chain(
                     let ok = exec.confirmed_success.load(Ordering::Relaxed);
                     let fail = exec.confirmed_failed.load(Ordering::Relaxed);
                     let profit = f64::from_bits(exec.confirmed_profit_usd_bits.load(Ordering::Relaxed));
+                    let ghost = f64::from_bits(exec.ghost_profit_usd_bits.load(Ordering::Relaxed));
                     drop(exec);
                     // Sync confirmed counts from executor atomics → shared_state
                     let mut state = shared_state.write().await;
@@ -287,6 +290,7 @@ pub async fn run_chain(
                         chain.total_success = ok;
                         chain.total_failed = fail;
                         chain.total_profit_usd = profit;
+                        chain.ghost_profit_usd = ghost;
                     }
                     ok
                 };
@@ -410,11 +414,13 @@ pub async fn run_chain(
 
                 // Update RPC health + block number in shared state, count each block as a scan
                 {
+                    let base_fee_gwei = base_fee as f64 / 1e9;
                     let mut state = shared_state.write().await;
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
                         chain.rpc_ok = true;
                         chain.last_block = block_num;
                         chain.total_scans += 1;
+                        chain.base_fee_gwei = base_fee_gwei;
                     }
                 }
                 metrics.last_block.with_label_values(&[&cfg.name]).set(block_num as f64);
@@ -545,6 +551,10 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
     targeted: Option<(HashSet<usize>, Vec<Address>)>,
 ) {
+    // Clone ghost_profit_bits from executor once — passed to handle_execution_failure
+    // at each callsite so gas-rejected opportunities accumulate into the metric.
+    let ghost_profit_bits = executor.lock().await.ghost_profit_usd_bits.clone();
+
     // ── Parallel detection: 2-hop + triangular ────────────────────────────────
 
     let all_opportunities = {
@@ -696,6 +706,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                            &ghost_profit_bits, optimized.profit_usd,
                         ).await;
                     }
                 }
@@ -714,6 +725,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                            &ghost_profit_bits, optimized.profit_usd,
                         ).await;
                     }
                     Ok(prep) => {
@@ -816,6 +828,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     anyhow::anyhow!("Send failed: {}", e),
                                     &fingerprint, &router_ids, pending_pairs, cooldowns,
                                     consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                                    &ghost_profit_bits, prep.profit_usd,
                                 ).await;
                             }
                         }
@@ -872,6 +885,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                            &ghost_profit_bits, opp.profit_usd,
                         ).await;
                     }
                 }
@@ -888,6 +902,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                            &ghost_profit_bits, opp.profit_usd,
                         ).await;
                     }
                     Ok(prep) => {
@@ -990,6 +1005,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     anyhow::anyhow!("Triangular send failed: {}", e),
                                     &fingerprint, &router_ids, pending_pairs, cooldowns,
                                     consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
+                                    &ghost_profit_bits, prep.profit_usd,
                                 ).await;
                             }
                         }
@@ -1069,6 +1085,8 @@ async fn handle_execution_failure(
     metrics: &Arc<Metrics>,
     log_tx: &LogBroadcaster,
     router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
+    ghost_profit_bits: &Arc<AtomicU64>,
+    opportunity_profit_usd: f64,
 ) {
     pending_pairs.remove(pair_id);
     cooldowns.insert(pair_id.to_string(), Instant::now());
@@ -1079,6 +1097,10 @@ async fn handle_execution_failure(
     // "negative after gas" message from prepare_2hop.
     let err_str = error.to_string();
     if err_str.contains("below threshold") || err_str.contains("negative after gas") {
+        // Accumulate ghost profit: gross USD that was left on the table due to gas cost.
+        ghost_profit_bits.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+            Some((f64::from_bits(bits) + opportunity_profit_usd).to_bits())
+        }).ok();
         debug!("[{}] Skipped (unprofitable after gas): {}", cfg.name, err_str);
         return;
     }

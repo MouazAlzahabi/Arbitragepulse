@@ -54,6 +54,10 @@ pub struct ChainStats {
     pub total_success: u64,
     pub total_failed: u64,
     pub total_profit_usd: f64,
+    /// Sum of gross profit_usd from opportunities rejected due to negative net profit after gas.
+    pub ghost_profit_usd: f64,
+    /// Latest base fee in gwei from the most recent block header.
+    pub base_fee_gwei: f64,
     pub dry_run: bool,
     pub paused: bool,
     /// True if the chain's RPC connection was healthy at last check.

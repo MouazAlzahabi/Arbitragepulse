@@ -99,6 +99,9 @@ pub struct Executor {
     pub confirmed_failed: Arc<AtomicU64>,
     /// Confirmed profit in USD (stored as f64 bits in AtomicU64 for lock-free access).
     pub confirmed_profit_usd_bits: Arc<AtomicU64>,
+    /// Sum of gross profit_usd from opportunities rejected by the "negative after gas" gate.
+    /// Represents money left on the table due to gas cost outweighing gross profit.
+    pub ghost_profit_usd_bits: Arc<AtomicU64>,
     /// Shared contract balance cache. Set by chain.rs after construction.
     /// After a confirmed trade, the receipt spawn refreshes this cache so
     /// the next optimize() call sees the updated balance without waiting for
@@ -136,6 +139,7 @@ impl Executor {
             confirmed_success: Arc::new(AtomicU64::new(0)),
             confirmed_failed: Arc::new(AtomicU64::new(0)),
             confirmed_profit_usd_bits: Arc::new(AtomicU64::new(0u64)),
+            ghost_profit_usd_bits: Arc::new(AtomicU64::new(0u64)),
             contract_balances: None,
         }
     }

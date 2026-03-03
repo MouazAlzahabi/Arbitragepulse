@@ -265,6 +265,7 @@ function StatsRow({ stats, logs, engineState, apiStats }) {
   const uptime = apiStats?.uptime_seconds != null ? formatUptime(apiStats.uptime_seconds * 1000) : "—";
   const dryRun = apiStats?.dry_run ?? engineState?.dryRun ?? true;
   const paused = apiStats?.paused ?? engineState?.paused ?? false;
+  const ghostProfit = allChains.reduce((s, c) => s + (c.ghost_profit_usd || 0), 0);
 
   const items = [
     { l: "UPTIME", v: uptime, c: "#94a3b8" },
@@ -272,13 +273,14 @@ function StatsRow({ stats, logs, engineState, apiStats }) {
     { l: "OPPORTUNITIES", v: opps, c: "#818cf8" },
     { l: "TRADES", v: trades, c: "#34d399" },
     { l: "ERRORS", v: errors, c: errors > 0 ? "#f87171" : "#334155" },
-    { l: "MODE", v: paused ? "⏸ PAUSED" : dryRun ? "?? DRY RUN" : "?? LIVE", c: paused ? "#f87171" : dryRun ? "#fbbf24" : "#ef4444" },
+    { l: "GHOST PROFIT", v: `$${ghostProfit.toFixed(2)}`, c: "#64748b", title: "Sum of gross profit from trades rejected due to gas cost" },
+    { l: "MODE", v: paused ? "⏸ PAUSED" : dryRun ? "DRY RUN" : "⚡ LIVE", c: paused ? "#f87171" : dryRun ? "#fbbf24" : "#ef4444" },
   ];
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 1, background: "#1e293b" }}>
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 1, background: "#1e293b" }}>
       {items.map((i) => (
-        <div key={i.l} style={{ background: "#0f172a", padding: "12px 14px" }}>
+        <div key={i.l} style={{ background: "#0f172a", padding: "12px 14px" }} title={i.title}>
           <div style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700, marginBottom: 3 }}>{i.l}</div>
           <div style={{ fontSize: 18, color: i.c, fontWeight: 700, fontFamily: "inherit" }}>{i.v}</div>
         </div>
@@ -314,92 +316,80 @@ function ChainCards({ apiStats }) {
   );
 }
 
-// ─── 1. Earnings chart with chain filter ──────────────────
-function ProfitChart({ logs }) {
-  const [chainFilter, setChainFilter] = useState("all");
+function GasLatencyBar({ apiStats, apiLatency }) {
+  const baseFee = apiStats?.chains?.reduce((best, c) => c.base_fee_gwei > 0 ? c.base_fee_gwei : best, null);
+  if (!baseFee && apiLatency == null) return null;
+  return (
+    <div style={{ display: "flex", gap: 24, padding: "4px 16px", background: "#0a0f1a", borderBottom: "1px solid #1e293b", fontSize: 11 }}>
+      {baseFee != null && (
+        <span style={{ color: "#475569" }}>⛽ Base Fee: <span style={{ color: "#94a3b8" }}>{baseFee.toFixed(4)} gwei</span></span>
+      )}
+      {apiLatency != null && (
+        <span style={{ color: "#475569" }}>🌐 API: <span style={{ color: apiLatency < 100 ? "#34d399" : apiLatency < 500 ? "#fbbf24" : "#f87171" }}>{apiLatency}ms</span></span>
+      )}
+    </div>
+  );
+}
 
-  // Collect all unique chains seen in logs
-  const availableChains = useMemo(() => {
-    const s = new Set();
-    logs.forEach((l) => {
-      const c = l.data?.chain || extractChain(l.message);
-      if (c) s.add(c);
+// ─── 1. 24h PnL chart (DB-backed, live WS appends) ────────
+function ProfitChart({ fetchTrades, wsLogs }) {
+  const [series, setSeries] = useState([{ time: "start", profit: 0 }]);
+  const [total, setTotal] = useState(0);
+  const loadedRef = useRef(false);
+  const appendedRef = useRef(0);
+
+  // Load historical trades from DB on mount (survives restarts)
+  useEffect(() => {
+    if (loadedRef.current || !fetchTrades) return;
+    loadedRef.current = true;
+    fetchTrades(2000).then((d) => {
+      if (!d?.trades) return;
+      const cutoff = Date.now() / 1000 - 86400;
+      const recent = d.trades
+        .filter((t) => t.ts >= cutoff && t.success && !t.dry_run)
+        .sort((a, b) => a.ts - b.ts);
+      let cum = 0;
+      const pts = [{ time: "start", profit: 0 }];
+      recent.forEach((t) => {
+        cum += t.profit_usd;
+        pts.push({ time: ts(t.ts * 1000), profit: parseFloat(cum.toFixed(4)) });
+      });
+      setSeries(pts);
+      setTotal(parseFloat(cum.toFixed(4)));
     });
-    return [...s].sort();
-  }, [logs]);
+  }, [fetchTrades]);
 
-  // Filter logs by chain then build cumulative P&L series
-  const { data, total, perChain } = useMemo(() => {
-    const profitLogs = logs.filter((l) => {
-      const t = l.type;
-      return (t === "trade" || t === "opportunity") && l.data?.profit_usd != null;
+  // Append new live WS trades
+  useEffect(() => {
+    const liveTrades = wsLogs.filter((l) => l.type === "trade" && l.data?.profit_usd != null && !l._historical);
+    const newTrades = liveTrades.slice(appendedRef.current);
+    if (newTrades.length === 0) return;
+    appendedRef.current = liveTrades.length;
+    setSeries((prev) => {
+      const last = prev[prev.length - 1] || { profit: 0 };
+      let cum = last.profit;
+      const pts = [...prev];
+      newTrades.forEach((l) => {
+        cum += parseFloat(l.data.profit_usd || 0);
+        pts.push({ time: ts(l.timestamp * 1000), profit: parseFloat(cum.toFixed(4)) });
+      });
+      setTotal(parseFloat(cum.toFixed(4)));
+      return pts;
     });
-
-    // Per-chain totals for the mini-legend
-    const perChain = {};
-    profitLogs.forEach((l) => {
-      const c = l.data?.chain || extractChain(l.message) || "Unknown";
-      perChain[c] = (perChain[c] || 0) + parseFloat(l.data.profit_usd || 0);
-    });
-
-    // Chart data filtered by selected chain
-    const filtered = chainFilter === "all" ? profitLogs : profitLogs.filter((l) => {
-      const c = l.data?.chain || extractChain(l.message);
-      return c === chainFilter;
-    });
-
-    let cum = 0;
-    const pts = [{ time: "start", profit: 0 }];
-    filtered.forEach((l) => {
-      cum += parseFloat(l.data.profit_usd || 0);
-      pts.push({ time: ts(l.timestamp * 1000), profit: parseFloat(cum.toFixed(4)) });
-    });
-
-    return { data: pts, total: pts.length > 1 ? pts[pts.length - 1].profit : 0, perChain };
-  }, [logs, chainFilter]);
+  }, [wsLogs]);
 
   return (
     <div style={{ background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b", overflow: "hidden" }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderBottom: "1px solid #1e293b", gap: 8, flexWrap: "wrap" }}>
-        <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>CUMULATIVE P&L</span>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {/* Chain filter dropdown */}
-          {availableChains.length > 0 && (
-            <select
-              value={chainFilter}
-              onChange={(e) => setChainFilter(e.target.value)}
-              style={{ ...select, width: "auto", fontSize: 10, padding: "3px 8px" }}
-            >
-              <option value="all">All Chains</option>
-              {availableChains.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-          )}
-          <span style={{ fontSize: 14, color: total >= 0 ? "#34d399" : "#f87171", fontWeight: 700 }}>${total.toFixed(4)}</span>
-        </div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderBottom: "1px solid #1e293b" }}>
+        <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>24h PnL</span>
+        <span style={{ fontSize: 14, color: total >= 0 ? "#34d399" : "#f87171", fontWeight: 700 }}>${total.toFixed(4)}</span>
       </div>
-
-      {/* Per-chain mini breakdown */}
-      {Object.keys(perChain).length > 1 && (
-        <div style={{ display: "flex", gap: 12, padding: "6px 14px", borderBottom: "1px solid #0a0f1a", flexWrap: "wrap" }}>
-          {Object.entries(perChain).sort((a, b) => b[1] - a[1]).map(([c, v]) => (
-            <div key={c} style={{ fontSize: 10, color: "#475569" }}>
-              <span style={{ color: chainFilter === c ? "#a78bfa" : "#64748b", cursor: "pointer", fontWeight: chainFilter === c ? 700 : 400 }}
-                onClick={() => setChainFilter(chainFilter === c ? "all" : c)}>
-                {c}
-              </span>
-              {" "}<span style={{ color: v >= 0 ? "#34d399" : "#f87171" }}>${v.toFixed(2)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-
       <div style={{ height: 160, padding: "4px 0" }}>
-        {data.length < 2 ? (
+        {series.length < 2 ? (
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#1e293b", fontSize: 12, fontStyle: "italic" }}>Awaiting trade data…</div>
         ) : (
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+            <AreaChart data={series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
               <defs><linearGradient id="pg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#34d399" stopOpacity={0.25} /><stop offset="100%" stopColor="#34d399" stopOpacity={0} /></linearGradient></defs>
               <XAxis dataKey="time" tick={{ fill: "#334155", fontSize: 9 }} axisLine={{ stroke: "#1e293b" }} tickLine={false} />
               <YAxis tick={{ fill: "#334155", fontSize: 9 }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v}`} />
@@ -450,99 +440,52 @@ function OpportunityTable({ logs }) {
   );
 }
 
-// ─── 3. Pair profit leaderboard ───────────────────────────
-function PairProfitTable({ logs }) {
-  const [chainFilter, setChainFilter] = useState("all");
-
-  const { rows, chains } = useMemo(() => {
-    const profitLogs = logs.filter((l) =>
-      (l.type === "trade" || l.type === "opportunity") && l.data?.profit_usd != null
-    );
-
-    // Collect unique chains
-    const chainSet = new Set();
-    profitLogs.forEach((l) => {
-      const c = l.data?.chain || extractChain(l.message);
-      if (c) chainSet.add(c);
+// ─── 3. Pair leaderboard (DB-backed via /stats/pairs + live OPP! counting) ────
+function PairLeaderboard({ pairStats, wsLogs }) {
+  // Count OPP! alerts per pair_id from live WS logs
+  const oppCounts = useMemo(() => {
+    const counts = {};
+    wsLogs.forEach((l) => {
+      if (l.type === "opportunity" && l.data?.pair_id) {
+        counts[l.data.pair_id] = (counts[l.data.pair_id] || 0) + 1;
+      }
     });
+    return counts;
+  }, [wsLogs]);
 
-    // Group by pair_id + chain
-    const map = {};
-    profitLogs.forEach((l) => {
-      const c = l.data?.chain || extractChain(l.message) || "Unknown";
-      if (chainFilter !== "all" && c !== chainFilter) return;
-      const pair = l.data?.pair_id || l.data?.pair || "unknown";
-      const key = `${c}::${pair}`;
-      if (!map[key]) map[key] = { chain: c, pair, total: 0, count: 0, best: 0 };
-      const p = parseFloat(l.data.profit_usd || 0);
-      map[key].total += p;
-      map[key].count++;
-      if (p > map[key].best) map[key].best = p;
-    });
-
-    const rows = Object.values(map).sort((a, b) => b.total - a.total);
-    return { rows, chains: [...chainSet].sort() };
-  }, [logs, chainFilter]);
-
-  const grandTotal = rows.reduce((s, r) => s + r.total, 0);
+  const rows = useMemo(() =>
+    [...(pairStats || [])].sort((a, b) => b.profit_usd - a.profit_usd),
+  [pairStats]);
 
   return (
     <div style={{ background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b", overflow: "hidden" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderBottom: "1px solid #1e293b", gap: 8, flexWrap: "wrap" }}>
-        <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>PAIR PROFIT LEADERBOARD</span>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {chains.length > 0 && (
-            <select
-              value={chainFilter}
-              onChange={(e) => setChainFilter(e.target.value)}
-              style={{ ...select, width: "auto", fontSize: 10, padding: "3px 8px" }}
-            >
-              <option value="all">All Chains</option>
-              {chains.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-          )}
-          <span style={{ fontSize: 12, color: "#34d399", fontWeight: 700 }}>${grandTotal.toFixed(4)} total</span>
-        </div>
+      <div style={{ padding: "10px 14px", borderBottom: "1px solid #1e293b" }}>
+        <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>PAIR LEADERBOARD</span>
       </div>
-
       {rows.length === 0 ? (
-        <div style={{ color: "#1e293b", textAlign: "center", padding: 24, fontSize: 12, fontStyle: "italic" }}>
-          No pair data yet — waiting for opportunities…
-        </div>
+        <div style={{ color: "#1e293b", textAlign: "center", padding: 24, fontSize: 12, fontStyle: "italic" }}>No pair data yet…</div>
       ) : (
         <div style={{ overflow: "auto", maxHeight: 240 }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
             <thead>
               <tr style={{ borderBottom: "1px solid #1e293b" }}>
-                {["#", "Pair", "Chain", "Events", "Best Single", "Total Profit"].map((h) => (
-                  <th key={h} style={{ textAlign: h === "#" ? "center" : "left", padding: "6px 8px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#0f172a" }}>{h}</th>
+                {["Pair", "OPP! Alerts", "Executions", "Net Profit", "Win Rate"].map((h) => (
+                  <th key={h} style={{ textAlign: "left", padding: "6px 10px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#0f172a" }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {rows.map((r, i) => {
-                const share = grandTotal > 0 ? (r.total / grandTotal) * 100 : 0;
+              {rows.map((r) => {
+                const winRate = r.attempts > 0 ? ((r.successes / r.attempts) * 100).toFixed(0) + "%" : "0%";
+                const isZero = (r.profit_usd || 0) <= 0;
+                const oppCount = oppCounts[r.pair_id] || 0;
                 return (
-                  <tr key={`${r.chain}::${r.pair}`} style={{ borderBottom: "1px solid #0a0f1a" }}>
-                    <td style={{ padding: "6px 8px", color: i === 0 ? "#fbbf24" : i === 1 ? "#94a3b8" : i === 2 ? "#c2956e" : "#334155", textAlign: "center", fontWeight: 700, fontSize: 12 }}>
-                      {i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : i + 1}
-                    </td>
-                    <td style={{ padding: "6px 8px", color: "#e2e8f0", fontWeight: 600 }}>{r.pair}</td>
-                    <td style={{ padding: "6px 8px" }}>
-                      <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 10, background: "#1e1b4b", color: "#a78bfa" }}>{r.chain}</span>
-                    </td>
-                    <td style={{ padding: "6px 8px", color: "#475569" }}>{r.count}</td>
-                    <td style={{ padding: "6px 8px", color: "#34d399" }}>${r.best.toFixed(4)}</td>
-                    <td style={{ padding: "6px 8px" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ color: "#34d399", fontWeight: 700 }}>${r.total.toFixed(4)}</span>
-                        {/* Share bar */}
-                        <div style={{ flex: 1, height: 4, background: "#1e293b", borderRadius: 2, minWidth: 40, maxWidth: 80 }}>
-                          <div style={{ width: `${share}%`, height: "100%", background: "#34d399", borderRadius: 2, opacity: 0.7 }} />
-                        </div>
-                        <span style={{ color: "#334155", fontSize: 9 }}>{share.toFixed(0)}%</span>
-                      </div>
-                    </td>
+                  <tr key={r.pair_id} style={{ borderBottom: "1px solid #0a0f1a" }}>
+                    <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#e2e8f0", fontWeight: 600 }}>{r.pair_id}</td>
+                    <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#a78bfa" }}>{oppCount}</td>
+                    <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#94a3b8" }}>{r.attempts}</td>
+                    <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#34d399", fontWeight: 600 }}>${(r.profit_usd || 0).toFixed(4)}</td>
+                    <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#fbbf24" }}>{winRate}</td>
                   </tr>
                 );
               })}
@@ -554,19 +497,49 @@ function PairProfitTable({ logs }) {
   );
 }
 
-function LogFeed({ logs, filter, setFilter }) {
+function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
   const ref = useRef(null);
   const [auto, setAuto] = useState(true);
   useEffect(() => { if (auto && ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [logs, auto]);
 
-  const filtered = filter === "all" ? logs : logs.filter((l) => l.type === filter);
-  const filters = ["all", "trade", "opportunity", "error", "warn", "info"];
+  const isSkipped = (l) =>
+    (l.type === "info" || l.type === "debug") &&
+    (l.message?.includes("negative after gas") || l.message?.includes("Skipped") || l.message?.includes("skipped"));
+
+  const filtered = logs.filter((l) => {
+    if (isSkipped(l)) return enabledTypes.has("skipped");
+    if (l.type === "trade") return enabledTypes.has("trade");
+    if (l.type === "opportunity") return enabledTypes.has("opportunity");
+    if (l.type === "error" || l.type === "warn") return enabledTypes.has("errors");
+    return false;
+  });
+
+  const toggle = (key) => setEnabledTypes((prev) => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+
+  const checkboxes = [
+    { key: "trade", label: "TRDE", color: "#34d399" },
+    { key: "opportunity", label: "OPP!", color: "#a78bfa" },
+    { key: "skipped", label: "Skipped", color: "#475569" },
+    { key: "errors", label: "Errors/Warn", color: "#f87171" },
+  ];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
-      <div style={{ display: "flex", gap: 2, padding: "6px 10px", background: "#0f172a", borderBottom: "1px solid #1e293b", flexShrink: 0, flexWrap: "wrap" }}>
-        {filters.map((f) => (
-          <button key={f} onClick={() => setFilter(f)} style={{ ...btn, fontSize: 9, padding: "2px 8px", letterSpacing: 1, textTransform: "uppercase", background: filter === f ? "#1e293b" : "transparent", color: filter === f ? "#e2e8f0" : "#475569", borderBottom: filter === f ? "2px solid #a78bfa" : "2px solid transparent" }}>{f}</button>
+      <div style={{ display: "flex", gap: 12, padding: "6px 10px", background: "#0f172a", borderBottom: "1px solid #1e293b", flexShrink: 0, flexWrap: "wrap", alignItems: "center" }}>
+        {checkboxes.map(({ key, label, color }) => (
+          <label key={key} style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}>
+            <input
+              type="checkbox"
+              checked={enabledTypes.has(key)}
+              onChange={() => toggle(key)}
+              style={{ accentColor: color, width: 12, height: 12, cursor: "pointer" }}
+            />
+            <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1, color: enabledTypes.has(key) ? color : "#334155" }}>{label}</span>
+          </label>
         ))}
         <span style={{ flex: 1 }} />
         <button onClick={() => setAuto(!auto)} style={{ ...btn, fontSize: 9, padding: "2px 8px", color: auto ? "#34d399" : "#475569" }}>{auto ? "⬇ AUTO" : "⏸ STOP"}</button>
@@ -577,7 +550,7 @@ function LogFeed({ logs, filter, setFilter }) {
         if (!atBot && auto) setAuto(false);
         if (atBot && !auto) setAuto(true);
       }} style={{ flex: 1, overflow: "auto", padding: "6px 10px", fontSize: 11, lineHeight: 1.8, background: "#020617" }}>
-        {filtered.length === 0 && <div style={{ color: "#1e293b", fontStyle: "italic", paddingTop: 16, textAlign: "center" }}>{logs.length === 0 ? "Connecting…" : `No ${filter} logs`}</div>}
+        {filtered.length === 0 && <div style={{ color: "#1e293b", fontStyle: "italic", paddingTop: 16, textAlign: "center" }}>{logs.length === 0 ? "Connecting…" : "No matching logs"}</div>}
         {filtered.map((l) => {
           const [clr, badge] = TYPE[l.type] || TYPE.info;
           return (
@@ -810,49 +783,45 @@ export default function Dashboard() {
   const ws = useWebSocket(url, apiKey);
   const api = useApi(apiUrl, apiKey);
   const [tab, setTab] = useState("monitor");
-  const [logFilter, setLogFilter] = useState("all");
-
-  // Historical trades fetched from /trades on connect
-  const [historicalLogs, setHistoricalLogs] = useState([]);
-  useEffect(() => {
-    if (!authenticated) return;
-    api.fetchTrades(1000).then((d) => {
-      if (!d?.trades) return;
-      const entries = d.trades.map((r) => ({
-        type: r.success ? "trade" : "error",
-        level: r.success ? "trade" : "error",
-        message: `[${r.chain_name}] tx=${r.tx_hash.slice(0, 10)} | pair=${r.pair_id} | profit=$${r.profit_usd.toFixed(4)}${r.dry_run ? " (dry)" : ""}`,
-        timestamp: r.ts,
-        _id: `hist-${r.id}`,
-        _historical: true,
-        data: {
-          chain: r.chain_name,
-          pair_id: r.pair_id,
-          profit_usd: r.profit_usd,
-          router_a: r.router_a,
-          router_b: r.router_b,
-        },
-      }));
-      // Oldest first so they appear before live logs in time order
-      setHistoricalLogs(entries.reverse());
-    });
-  }, [authenticated]);
-
-  // Merged view: historical records + live websocket logs
-  const allLogs = useMemo(() => [...historicalLogs, ...ws.logs], [historicalLogs, ws.logs]);
+  const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors"]));
 
   // Clear all monitoring state for fresh tracking
-  const clearAll = () => { ws.clearLogs(); setHistoricalLogs([]); };
+  const clearAll = () => { ws.clearLogs(); };
 
-  // Poll /stats via HTTP every 3s to keep pause/dry-run state accurate
+  // Poll /stats via HTTP every 3s to keep pause/dry-run state accurate.
+  // Measure API latency from each poll.
   const [apiStats, setApiStats] = useState(null);
+  const [apiLatency, setApiLatency] = useState(null);
   useEffect(() => {
     if (!authenticated) return;
-    const poll = async () => { const d = await api.fetchStats(); if (d && !d._authError) setApiStats(d); };
+    const poll = async () => {
+      const t0 = Date.now();
+      const d = await api.fetchStats();
+      if (d && !d._authError) {
+        setApiLatency(Date.now() - t0);
+        setApiStats(d);
+      }
+    };
     poll();
     const iv = setInterval(poll, 3000);
     return () => clearInterval(iv);
   }, [authenticated]);
+
+  // Poll /stats/pairs every 5s for the pair leaderboard
+  const [pairStats, setPairStats] = useState([]);
+  useEffect(() => {
+    if (!authenticated) return;
+    const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+    const poll = async () => {
+      try {
+        const r = await fetch(`${apiUrl}/stats/pairs`, { headers });
+        if (r.ok) { const d = await r.json(); setPairStats(d.pairs || []); }
+      } catch {}
+    };
+    poll();
+    const iv = setInterval(poll, 5000);
+    return () => clearInterval(iv);
+  }, [authenticated, apiUrl, apiKey]);
 
   useEffect(() => { if (ws.status === "connected") setAuthenticated(true); }, [ws.status]);
 
@@ -880,14 +849,15 @@ export default function Dashboard() {
 
       <Header tab={tab} setTab={setTab} status={ws.status} engineUrl={url} apiKey={apiKey} onLogout={handleLogout} />
       <StatsRow stats={ws.stats} logs={ws.logs} engineState={ws.engineState} apiStats={apiStats} />
+      <GasLatencyBar apiStats={apiStats} apiLatency={apiLatency} />
 
       {tab === "monitor" && (
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <ChainCards apiStats={apiStats} />
 
-          {/* Row 1: Earnings chart (with chain filter) + Opportunities */}
+          {/* Row 1: 24h PnL chart + Opportunities */}
           <div style={{ padding: "0 14px 10px 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            <ProfitChart logs={allLogs} />
+            <ProfitChart fetchTrades={api.fetchTrades} wsLogs={ws.logs} />
             <div style={{ background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b", overflow: "hidden" }}>
               <div style={{ padding: "10px 14px", borderBottom: "1px solid #1e293b" }}>
                 <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>OPPORTUNITIES</span>
@@ -896,9 +866,9 @@ export default function Dashboard() {
             </div>
           </div>
 
-          {/* Row 2: Pair profit leaderboard (full width) */}
+          {/* Row 2: Pair leaderboard (full width) */}
           <div style={{ padding: "0 14px 10px 14px" }}>
-            <PairProfitTable logs={allLogs} />
+            <PairLeaderboard pairStats={pairStats} wsLogs={ws.logs} />
           </div>
 
           {/* Row 3: Live feed */}
@@ -908,7 +878,7 @@ export default function Dashboard() {
               <button onClick={ws.clearLogs} style={{ ...btn, fontSize: 9, padding: "2px 8px" }}>Clear</button>
             </div>
             <div style={{ flex: 1, minHeight: 0 }}>
-              <LogFeed logs={ws.logs} filter={logFilter} setFilter={setLogFilter} />
+              <LogFeed logs={ws.logs} enabledTypes={enabledTypes} setEnabledTypes={setEnabledTypes} />
             </div>
           </div>
         </div>

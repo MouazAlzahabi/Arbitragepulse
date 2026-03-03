@@ -90,6 +90,8 @@ async fn main() -> Result<()> {
                         total_success: successes,
                         total_failed: 0,
                         total_profit_usd: profit,
+                        ghost_profit_usd: 0.0,
+                        base_fee_gwei: 0.0,
                         dry_run: true,
                         paused: false,
                         rpc_ok: false,
