@@ -231,6 +231,7 @@ pub async fn run_chain(
     // ── Safety / efficiency state ──
     let mut pending_pairs: HashSet<String> = HashSet::new();
     let mut cooldowns: HashMap<String, Instant> = HashMap::new();
+    let mut cooldown_logged: HashMap<String, Instant> = HashMap::new();
     let mut consecutive_failures: u32 = 0;
 
     // ── Best-seen profit tracker (f64 stored as bits in AtomicU64) ────────────
@@ -438,7 +439,7 @@ pub async fn run_chain(
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &contract_balances, None,
                 ).await;
@@ -462,7 +463,7 @@ pub async fn run_chain(
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &contract_balances, None,
                 ).await;
@@ -522,7 +523,7 @@ pub async fn run_chain(
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &contract_balances, Some((pair_mask, token_filter)),
                 ).await;
@@ -545,6 +546,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     metrics: &Arc<Metrics>,
     pending_pairs: &mut HashSet<String>,
     cooldowns: &mut HashMap<String, Instant>,
+    cooldown_logged: &mut HashMap<String, Instant>,
     consecutive_failures: &mut u32,
     router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
     best_raw_profit: &Arc<AtomicU64>,
@@ -623,9 +625,15 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         if expire_at > Instant::now() {
             let remaining = expire_at.duration_since(Instant::now()).as_secs();
             debug!("[{}] {} in cooldown, skipping", cfg.name, display_id);
-            broadcast_log(log_tx, "info",
-                &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, display_id, remaining),
-                None);
+            let should_log = cooldown_logged
+                .get(&fingerprint)
+                .map_or(true, |t| t.elapsed().as_secs() >= 10);
+            if should_log {
+                cooldown_logged.insert(fingerprint.clone(), Instant::now());
+                broadcast_log(log_tx, "info",
+                    &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, display_id, remaining),
+                    None);
+            }
             return;
         }
         cooldowns.remove(&fingerprint);
@@ -730,7 +738,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Err(e) => {
                         drop(exec);
                         handle_execution_failure(
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                             &ghost_profit_bits, optimized.profit_usd,
                         ).await;
@@ -749,7 +757,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 match prep_result {
                     Err(e) => {
                         handle_execution_failure(
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                             &ghost_profit_bits, optimized.profit_usd,
                         ).await;
@@ -857,7 +865,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 }
                                 handle_execution_failure(
                                     anyhow::anyhow!("Send failed: {}", e),
-                                    &fingerprint, &router_ids, pending_pairs, cooldowns,
+                                    &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
                                     consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                                     &ghost_profit_bits, prep.profit_usd,
                                 ).await;
@@ -932,7 +940,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Err(e) => {
                         drop(exec);
                         handle_execution_failure(
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                             &ghost_profit_bits, opp.profit_usd,
                         ).await;
@@ -949,7 +957,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 match prep_result {
                     Err(e) => {
                         handle_execution_failure(
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                             &ghost_profit_bits, opp.profit_usd,
                         ).await;
@@ -1057,7 +1065,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 }
                                 handle_execution_failure(
                                     anyhow::anyhow!("Triangular send failed: {}", e),
-                                    &fingerprint, &router_ids, pending_pairs, cooldowns,
+                                    &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
                                     consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                                     &ghost_profit_bits, prep.profit_usd,
                                 ).await;
@@ -1133,6 +1141,7 @@ async fn handle_execution_failure(
     router_ids: &[String],
     pending_pairs: &mut HashSet<String>,
     cooldowns: &mut HashMap<String, Instant>,
+    cooldown_secs: u64,
     consecutive_failures: &mut u32,
     cfg: &ChainConfig,
     shared_state: &SharedState,
@@ -1143,7 +1152,7 @@ async fn handle_execution_failure(
     opportunity_profit_usd: f64,
 ) {
     pending_pairs.remove(pair_id);
-    cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+    cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs));
 
     // Gas-profitability rejects are pre-execution profit checks —
     // not real execution failures. Skip circuit-breaker accounting entirely.
