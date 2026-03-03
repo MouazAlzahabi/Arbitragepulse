@@ -708,7 +708,7 @@ pairs:
   # Re-enable only if the contract is funded with wstETH.
   # - id: "linea-wsteth-weth"
   #   chain_id: 59144
-  #   token_in: "0xB5beDd42000b71FddE22D3eF8173158d76a5094B"  # wstETH
+  #   token_in: "0xB5beDd42000b71FddE22D3eE8a79Bd49A568fC8F"  # wstETH
   #   token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
   #   token_in_symbol: "WSTETH"
   #   token_out_symbol: "WETH"
@@ -718,3 +718,72 @@ pairs:
   #   max_trade: "0.048"
   #   min_swap_size: "0.005"
   #   watch_pools: []
+
+  # ── Linea new asset pairs (USDC/USDT capital only) ──────────────────────────
+
+  - id: "linea-usdc-wsteth"
+    chain_id: 59144
+    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
+    token_out: "0xB5beDd42000b71FddE22D3eE8a79Bd49A568fC8F"  # wstETH
+    token_in_symbol: "USDC"
+    token_out_symbol: "WSTETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"
+    max_trade: "200"
+    min_swap_size: "10"
+    watch_pools: []
+
+  - id: "linea-usdt-ezeth"
+    chain_id: 59144
+    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"   # USDT
+    token_out: "0x2416092f143378750bb29b79eD961ab195CcEea5"  # ezETH (Renzo)
+    token_in_symbol: "USDT"
+    token_out_symbol: "EZETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"
+    max_trade: "200"
+    min_swap_size: "10"
+    watch_pools: []
+
+  # LYNX is the Lynex DEX governance token — low liquidity, small trade size.
+  - id: "linea-usdc-lynx"
+    chain_id: 59144
+    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
+    token_out: "0x1a51b19ce03dbe0cb44c1528e34a7edd7771e9af"  # LYNX
+    token_in_symbol: "USDC"
+    token_out_symbol: "LYNX"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "50"
+    max_trade: "50"
+    min_swap_size: "2"
+    watch_pools: []
+
+  - id: "linea-usdt-weeth"
+    chain_id: 59144
+    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"   # USDT
+    token_out: "0x1Bf74C010E6320bAB11e2e5A532b5aC15e0b8aA6"  # weETH (EtherFi)
+    token_in_symbol: "USDT"
+    token_out_symbol: "WEETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"
+    max_trade: "200"
+    min_swap_size: "10"
+    watch_pools: []
+
+  # USDe is Ethena's synthetic dollar — stablecoin pair, tighter spreads, larger max.
+  - id: "linea-usdc-usde"
+    chain_id: 59144
+    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
+    token_out: "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"  # USDe (Ethena)
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDE"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "100"
+    max_trade: "500"
+    min_swap_size: "10"
+    watch_pools: []
