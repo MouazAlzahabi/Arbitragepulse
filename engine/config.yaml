@@ -602,18 +602,18 @@ pairs:
     min_swap_size: "5"
     watch_pools: []
 
-  # - id: "linea-weth-usdc"
-  #   chain_id: 59144
-  #   token_in: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-  #   token_out: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-  #   token_in_symbol: "WETH"
-  #   token_out_symbol: "USDC"
-  #   token_in_decimals: 18
-  #   token_out_decimals: 6
-  #   trade_amount: "0.048"   # ~$79 at current price
-  #   max_trade: "0.048"
-  #   min_swap_size: "0.003"
-  #   watch_pools: []
+  - id: "linea-weth-usdc"
+    chain_id: 59144
+    token_in: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    token_out: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
+    token_in_symbol: "WETH"
+    token_out_symbol: "USDC"
+    token_in_decimals: 18
+    token_out_decimals: 6
+    trade_amount: "0.048"   # ~$79 at current price
+    max_trade: "0.048"
+    min_swap_size: "0.003"
+    watch_pools: []
 
   - id: "linea-usdc-usdt"
     chain_id: 59144
@@ -686,28 +686,28 @@ pairs:
     min_swap_size: "5"
     watch_pools: []
 
-  # - id: "linea-wbtc-weth"
-  #   chain_id: 59144
-  #   token_in: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
-  #   token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-  #   token_in_symbol: "WBTC"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 8
-  #   token_out_decimals: 18
-  #   trade_amount: "0.0005"   # ~$45 at current price
-  #   max_trade: "0.0005"
-  #   min_swap_size: "0.0001"
-  #   watch_pools: []
+  - id: "linea-wbtc-weth"
+    chain_id: 59144
+    token_in: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
+    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    token_in_symbol: "WBTC"
+    token_out_symbol: "WETH"
+    token_in_decimals: 8
+    token_out_decimals: 18
+    trade_amount: "0.0005"   # ~$45 at current price
+    max_trade: "0.0005"
+    min_swap_size: "0.0001"
+    watch_pools: []
 
-  # - id: "linea-wsteth-weth"
-  #   chain_id: 59144
-  #   token_in: "0xB5beDd42000b71FddE22D3eF8173158d76a5094B"  # wstETH
-  #   token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-  #   token_in_symbol: "WSTETH"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 18
-  #   token_out_decimals: 18
-  #   trade_amount: "0.048"   # ~$79 at current price
-  #   max_trade: "0.048"
-  #   min_swap_size: "0.005"
-  #   watch_pools: []
+  - id: "linea-wsteth-weth"
+    chain_id: 59144
+    token_in: "0xB5beDd42000b71FddE22D3eF8173158d76a5094B"  # wstETH
+    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
+    token_in_symbol: "WSTETH"
+    token_out_symbol: "WETH"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "0.048"   # ~$79 at current price
+    max_trade: "0.048"
+    min_swap_size: "0.005"
+    watch_pools: []
