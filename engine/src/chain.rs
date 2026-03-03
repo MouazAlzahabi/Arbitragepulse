@@ -614,39 +614,50 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     metrics.opportunities.with_label_values(&[&cfg.name]).inc();
 
-    let best_opp = &all_opportunities[0];
+    // Pick the highest-ranked opportunity not blocked by cooldown or a pending tx.
+    // Iterating the sorted list means a cooling-down pair no longer starves every
+    // other opportunity — the engine falls through to the next-best pair instead.
+    let mut chosen_idx: Option<usize> = None;
+    for (i, opp) in all_opportunities.iter().enumerate() {
+        let fp = opp.fingerprint();
+
+        // Cooldown check (deadline style)
+        let expire_at_opt = cooldowns.get(&fp).copied();
+        if let Some(expire_at) = expire_at_opt {
+            if expire_at > Instant::now() {
+                let remaining = expire_at.duration_since(Instant::now()).as_secs();
+                debug!("[{}] {} in cooldown, skipping", cfg.name, opp.pair_id());
+                let should_log = cooldown_logged
+                    .get(&fp)
+                    .map_or(true, |t| t.elapsed().as_secs() >= 10);
+                if should_log {
+                    cooldown_logged.insert(fp, Instant::now());
+                    broadcast_log(log_tx, "info",
+                        &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, opp.pair_id(), remaining),
+                        None);
+                }
+                continue;
+            }
+            cooldowns.remove(&fp); // expired entry — clean up
+        }
+
+        // Pending tx dedup
+        if pending_pairs.contains(&fp) {
+            debug!("[{}] {} tx already in-flight, skipping", cfg.name, opp.pair_id());
+            broadcast_log(log_tx, "info",
+                &format!("[{}] Skipped {} — tx already in-flight", cfg.name, opp.pair_id()),
+                None);
+            continue;
+        }
+
+        chosen_idx = Some(i);
+        break;
+    }
+
+    let Some(idx) = chosen_idx else { return; };
+    let best_opp = &all_opportunities[idx];
     let fingerprint = best_opp.fingerprint();
     let display_id = best_opp.pair_id();
-
-    // Full opportunity cooldown (pair + routers + amount).
-    // The stored value is the EXPIRY instant (deadline style), so different events
-    // can set different cooldown durations without changing the HashMap type.
-    if let Some(&expire_at) = cooldowns.get(&fingerprint) {
-        if expire_at > Instant::now() {
-            let remaining = expire_at.duration_since(Instant::now()).as_secs();
-            debug!("[{}] {} in cooldown, skipping", cfg.name, display_id);
-            let should_log = cooldown_logged
-                .get(&fingerprint)
-                .map_or(true, |t| t.elapsed().as_secs() >= 10);
-            if should_log {
-                cooldown_logged.insert(fingerprint.clone(), Instant::now());
-                broadcast_log(log_tx, "info",
-                    &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, display_id, remaining),
-                    None);
-            }
-            return;
-        }
-        cooldowns.remove(&fingerprint);
-    }
-
-    // Pending tx dedup (full fingerprint prevents duplicate identical opportunities)
-    if pending_pairs.contains(&fingerprint) {
-        debug!("[{}] {} tx already in-flight, skipping", cfg.name, display_id);
-        broadcast_log(log_tx, "info",
-            &format!("[{}] Skipped {} — tx already in-flight", cfg.name, display_id),
-            None);
-        return;
-    }
 
     // ── SyncSwap detect-only check ────────────────────────────────────────────
     // SyncSwap opportunities are broadcast to the live feed but never sent to
@@ -1165,6 +1176,9 @@ async fn handle_execution_failure(
             Some((f64::from_bits(bits) + opportunity_profit_usd).to_bits())
         }).ok();
         debug!("[{}] Skipped (unprofitable after gas): {}", cfg.name, err_str);
+        broadcast_log(log_tx, "info",
+            &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4})", cfg.name, pair_id, opportunity_profit_usd),
+            None);
         return;
     }
 
