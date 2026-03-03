@@ -839,7 +839,13 @@ impl Strategy {
                         best_raw_usd = profit_usd;
                     }
 
-                    if profit_usd >= self.min_profit_usd {
+                    // Cross-router V3×V3: local sqrtPriceX96 comparison is unreliable —
+                    // per-DEX state divergence creates phantom spreads. Phase 1.5 (p15_gate
+                    // above) handles these via QuoterV2 in the same scan cycle.
+                    let is_v3_x_v3 = matches!(task.router_a_type, RouterType::V3)
+                        && matches!(task.router_b_type, RouterType::V3);
+
+                    if profit_usd >= self.min_profit_usd && !is_v3_x_v3 {
                         debug!(
                             "[{}] Arb: {} | profit=${:.4} | {}/{}",
                             self.chain_id,
@@ -1665,18 +1671,18 @@ impl Strategy {
         // Lower bound: 10% of configured trade amount
         let min_amount = opp.amount_in / U256::from(10u32);
 
-        // Upper bound: 2× amount_in, capped by max_trade when configured
+        // Upper bound: use max_trade if configured, otherwise trade_amount.
+        // Previously used double_amount.min(cap) which capped at 2× the tick-capped
+        // amount_in ($6 → $12), blocking the optimizer from probing up to $100.
         let double_amount = opp.amount_in * U256::from(2u32);
         let max_amount = self
             .pairs
             .iter()
             .find(|p| p.id == opp.pair_id)
-            .and_then(|p| p.max_trade.as_deref())
-            .and_then(|s| {
-                let pair = self.pairs.iter().find(|p| p.id == opp.pair_id)?;
-                parse_amount_capped(s, None, pair.token_in_decimals)
+            .and_then(|p| {
+                let cap_str = p.max_trade.as_deref().unwrap_or(&p.trade_amount);
+                parse_amount_capped(cap_str, None, p.token_in_decimals)
             })
-            .map(|cap| double_amount.min(cap))
             .unwrap_or(double_amount);
 
         // Also cap by the contract's known token_in balance (from periodic refresh).
