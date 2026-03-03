@@ -327,30 +327,26 @@ pub async fn run_chain(
                 let multi_dex = last_multi_count.load(Ordering::Relaxed);
                 let active_pairs = last_active_count.load(Ordering::Relaxed);
                 let total_pairs = chain_pairs.len() as u64;
-                broadcast_log(
-                    &log_tx,
-                    "info",
-                    &format!(
-                        "[{}] Scanning | scans={} executions={} success={} ETH=${:.0} | best_seen={} spread={} fwd_quotes={} active_pairs={}/{} cross_dex_pairs={}",
-                        cfg.name, scans, attempts, success, native_price, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex,
-                    ),
-                    None,
+                let heartbeat_msg = format!(
+                    "[{}] Scanning | scans={} executions={} success={} ETH=${:.0} | best_seen={} spread={} fwd_quotes={} active_pairs={}/{} cross_dex_pairs={}",
+                    cfg.name, scans, attempts, success, native_price, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex,
                 );
+                // Mirror to server terminal so it's visible even when WS is disconnected.
+                info!("{}", heartbeat_msg);
+                broadcast_log(&log_tx, "info", &heartbeat_msg, None);
+
                 // Broadcast a live-feed warn if no cross-DEX coverage (actionable).
                 // Require 3 consecutive zero-fwd heartbeats before warning to suppress
                 // startup false-positives and transient single-scan RPC blips.
                 if fwd_ok == 0 {
                     consecutive_zero_fwd += 1;
                     if consecutive_zero_fwd >= 3 {
-                        broadcast_log(
-                            &log_tx,
-                            "warn",
-                            &format!(
-                                "[{}] WARN: ALL forward quotes returned 0 for {}+ minutes — check QuoterV2 addresses and fee tiers in config.yaml",
-                                cfg.name, consecutive_zero_fwd
-                            ),
-                            None,
+                        let msg = format!(
+                            "[{}] WARN: ALL forward quotes returned 0 for {}+ minutes — check QuoterV2 addresses and fee tiers in config.yaml",
+                            cfg.name, consecutive_zero_fwd
                         );
+                        warn!("{}", msg);
+                        broadcast_log(&log_tx, "warn", &msg, None);
                     }
                 } else {
                     consecutive_zero_fwd = 0;
@@ -654,7 +650,25 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         break;
     }
 
-    let Some(idx) = chosen_idx else { return; };
+    let Some(idx) = chosen_idx else {
+        // All opportunities are blocked (cooldown/pending). Log once per 30s so the
+        // dashboard shows the engine is scanning but waiting — distinct from "no arb found".
+        if !all_opportunities.is_empty() {
+            let blocked_key = "__all_blocked__".to_string();
+            let should_log = cooldown_logged
+                .get(&blocked_key)
+                .map_or(true, |t| t.elapsed().as_secs() >= 30);
+            if should_log {
+                cooldown_logged.insert(blocked_key, Instant::now());
+                broadcast_log(log_tx, "info",
+                    &format!("[{}] {} opp{} found — all in cooldown/pending",
+                        cfg.name, all_opportunities.len(),
+                        if all_opportunities.len() == 1 { "" } else { "s" }),
+                    None);
+            }
+        }
+        return;
+    };
     let best_opp = &all_opportunities[idx];
     let fingerprint = best_opp.fingerprint();
     let display_id = best_opp.pair_id();
