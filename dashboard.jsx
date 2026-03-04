@@ -777,9 +777,11 @@ function PairManager({ api }) {
   }, []);
 
   const activeChain = selectedChain ?? chainIds[0] ?? null;
-  const rows = activeChain != null ? (api.pairScan[activeChain] ?? []) : [];
-  const enabledCount = rows.filter((r) => !r.disabled).length;
-  const quotedCount = rows.filter((r) => r.was_quoted).length;
+  const allRows = activeChain != null ? (api.pairScan[activeChain] ?? []) : [];
+  const twoHopRows = allRows.filter((r) => !r.display_name.startsWith("▲"));
+  const triRows = allRows.filter((r) => r.display_name.startsWith("▲"));
+  const enabledCount = twoHopRows.filter((r) => !r.disabled).length;
+  const quotedCount = allRows.filter((r) => r.was_quoted).length;
 
   const handleToggle = async (pair) => {
     setToggling((p) => ({ ...p, [pair.pair_id]: true }));
@@ -787,6 +789,74 @@ function PairManager({ api }) {
     await api.fetchPairScan();
     setToggling((p) => ({ ...p, [pair.pair_id]: false }));
   };
+
+  const TH = ({ children }) => (
+    <th style={{ textAlign: "left", padding: "7px 8px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#020617" }}>{children}</th>
+  );
+
+  const renderRows = (rows, isTri) => rows.map((p) => (
+    <tr key={p.pair_id} style={{ borderBottom: "1px solid #0a0f1a", opacity: p.disabled ? 0.45 : 1 }}>
+      {/* Pair name */}
+      <td style={{ padding: "7px 8px", fontWeight: 600, whiteSpace: "nowrap" }}>
+        {isTri ? (
+          <span style={{ color: p.was_quoted ? "#fb923c" : "#475569" }}>{p.display_name}</span>
+        ) : (
+          <>
+            <span style={{ color: p.disabled ? "#334155" : "#e2e8f0" }}>{p.display_name}</span>
+            <span style={{ marginLeft: 6, fontSize: 9, color: "#334155" }}>{p.pair_id.replace(/^[^-]+-/, "")}</span>
+          </>
+        )}
+      </td>
+      {/* DEXes active */}
+      <td style={{ padding: "7px 8px" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+          {p.dex_ids.length === 0 ? (
+            <span style={{ fontSize: 9, color: "#334155" }}>—</span>
+          ) : p.dex_ids.map((d) => (
+            <span key={d} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 3,
+              background: isTri ? "#431407" : "#1e1b4b",
+              color: isTri ? "#fb923c" : "#a78bfa",
+              border: `1px solid ${isTri ? "#7c2d12" : "#312e81"}` }}>{d}</span>
+          ))}
+        </div>
+      </td>
+      {/* Paths / Cross count */}
+      <td style={{ padding: "7px 8px", color: p.cross_count >= 1 ? (isTri ? "#fb923c" : "#34d399") : "#475569", fontWeight: p.cross_count >= 1 ? 600 : 400 }}>
+        {p.cross_count || "—"}
+      </td>
+      {/* Was quoted badge */}
+      <td style={{ padding: "7px 8px" }}>
+        <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 8,
+          background: p.was_quoted ? (isTri ? "#431407" : "#052e16") : "#1e293b",
+          color: p.was_quoted ? (isTri ? "#fb923c" : "#34d399") : "#334155",
+          border: `1px solid ${p.was_quoted ? (isTri ? "#7c2d12" : "#166534") : "#1e293b"}` }}>
+          {p.was_quoted ? "✓" : "—"}
+        </span>
+      </td>
+      {/* Opp count */}
+      <td style={{ padding: "7px 8px", color: p.opp_count > 0 ? "#fbbf24" : "#334155", fontWeight: p.opp_count > 0 ? 600 : 400 }}>
+        {p.opp_count > 0 ? p.opp_count : "—"}
+      </td>
+      {/* Enable/disable toggle (2-hop only) */}
+      <td style={{ padding: "7px 8px" }}>
+        {isTri ? (
+          <span style={{ fontSize: 9, color: "#334155" }}>auto</span>
+        ) : (
+          <button
+            onClick={() => handleToggle(p)}
+            disabled={toggling[p.pair_id]}
+            style={{ ...btn, fontSize: 9, padding: "3px 10px",
+              background: p.disabled ? "#1e293b" : "#052e16",
+              color: p.disabled ? "#475569" : "#34d399",
+              border: `1px solid ${p.disabled ? "#1e293b" : "#166534"}`,
+              opacity: toggling[p.pair_id] ? 0.5 : 1 }}
+          >
+            {p.disabled ? "Disabled" : "Enabled"}
+          </button>
+        )}
+      </td>
+    </tr>
+  ));
 
   return (
     <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
@@ -807,7 +877,7 @@ function PairManager({ api }) {
         <span style={{ flex: 1 }} />
         {activeChain != null && (
           <span style={{ fontSize: 11, color: "#475569" }}>
-            {enabledCount}/{rows.length} enabled · {quotedCount} quoted last scan
+            {enabledCount}/{twoHopRows.length} pairs enabled · {triRows.length} triplets · {quotedCount} quoted last scan
           </span>
         )}
         <button onClick={() => api.fetchPairScan()} style={{ ...btn, fontSize: 10, padding: "4px 10px", color: "#a78bfa" }}>↺ Refresh</button>
@@ -823,71 +893,34 @@ function PairManager({ api }) {
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead>
               <tr style={{ borderBottom: "1px solid #1e293b" }}>
-                {["Pair", "DEXes active", "Cross", "Quoted", "Opps", "Scan"].map((h) => (
-                  <th key={h} style={{ textAlign: "left", padding: "7px 8px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#020617" }}>{h}</th>
-                ))}
+                <TH>Pair</TH><TH>DEXes active</TH><TH>Cross/Paths</TH><TH>Quoted</TH><TH>Opps</TH><TH>Scan</TH>
               </tr>
             </thead>
             <tbody>
-              {rows.length === 0 ? (
+              {twoHopRows.length === 0 && triRows.length === 0 ? (
                 <tr><td colSpan={6} style={{ padding: "20px 8px", color: "#334155", fontSize: 11, textAlign: "center" }}>No pairs — engine may still be starting up</td></tr>
-              ) : rows.map((p) => (
-                <tr key={p.pair_id} style={{ borderBottom: "1px solid #0a0f1a", opacity: p.disabled ? 0.45 : 1 }}>
-                  {/* Pair name */}
-                  <td style={{ padding: "7px 8px", fontWeight: 600, whiteSpace: "nowrap" }}>
-                    <span style={{ color: p.disabled ? "#334155" : "#e2e8f0" }}>{p.display_name}</span>
-                    <span style={{ marginLeft: 6, fontSize: 9, color: "#334155" }}>{p.pair_id.replace(/^[^-]+-/, "")}</span>
-                  </td>
-                  {/* DEXes active */}
-                  <td style={{ padding: "7px 8px" }}>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
-                      {p.dex_ids.length === 0 ? (
-                        <span style={{ fontSize: 9, color: "#334155" }}>—</span>
-                      ) : p.dex_ids.map((d) => (
-                        <span key={d} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 3, background: "#1e1b4b", color: "#a78bfa", border: "1px solid #312e81" }}>{d}</span>
-                      ))}
-                    </div>
-                  </td>
-                  {/* Cross count */}
-                  <td style={{ padding: "7px 8px", color: p.cross_count >= 2 ? "#34d399" : "#475569", fontWeight: p.cross_count >= 2 ? 600 : 400 }}>
-                    {p.cross_count || "—"}
-                  </td>
-                  {/* Was quoted badge */}
-                  <td style={{ padding: "7px 8px" }}>
-                    <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 8,
-                      background: p.was_quoted ? "#052e16" : "#1e293b",
-                      color: p.was_quoted ? "#34d399" : "#334155",
-                      border: `1px solid ${p.was_quoted ? "#166534" : "#1e293b"}` }}>
-                      {p.was_quoted ? "✓" : "—"}
-                    </span>
-                  </td>
-                  {/* Opp count */}
-                  <td style={{ padding: "7px 8px", color: p.opp_count > 0 ? "#fbbf24" : "#334155", fontWeight: p.opp_count > 0 ? 600 : 400 }}>
-                    {p.opp_count > 0 ? p.opp_count : "—"}
-                  </td>
-                  {/* Enable/disable toggle */}
-                  <td style={{ padding: "7px 8px" }}>
-                    <button
-                      onClick={() => handleToggle(p)}
-                      disabled={toggling[p.pair_id]}
-                      style={{ ...btn, fontSize: 9, padding: "3px 10px",
-                        background: p.disabled ? "#1e293b" : "#052e16",
-                        color: p.disabled ? "#475569" : "#34d399",
-                        border: `1px solid ${p.disabled ? "#1e293b" : "#166534"}`,
-                        opacity: toggling[p.pair_id] ? 0.5 : 1 }}
-                    >
-                      {p.disabled ? "Disabled" : "Enabled"}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              ) : (
+                <>
+                  {renderRows(twoHopRows, false)}
+                  {triRows.length > 0 && (
+                    <>
+                      <tr>
+                        <td colSpan={6} style={{ padding: "6px 8px 3px 8px", fontSize: 9, color: "#475569", letterSpacing: 1.2, fontWeight: 700, borderTop: "1px solid #1e293b", background: "#020617" }}>
+                          TRIANGULAR ({triRows.length})
+                        </td>
+                      </tr>
+                      {renderRows(triRows, true)}
+                    </>
+                  )}
+                </>
+              )}
             </tbody>
           </table>
         </div>
       )}
 
       <div style={{ fontSize: 10, color: "#334155", marginTop: 4 }}>
-        Scan data updates every heartbeat (~60s). Toggle disables the pair from future scans — takes effect on the next scan cycle.
+        Scan data updates every heartbeat (~60s). Toggle disables a pair from future scans — takes effect on the next cycle. Triangular triplets are auto-detected and cannot be individually disabled yet.
       </div>
     </div>
   );

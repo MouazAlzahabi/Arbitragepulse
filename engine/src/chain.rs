@@ -352,6 +352,7 @@ pub async fn run_chain(
                 broadcast_log(&log_tx, "heartbeat", &heartbeat_msg, None);
 
                 // Publish per-pair scan snapshot to shared_state (read by dashboard /pair-scan).
+                // Merges 2-hop pairs (from evaluate) and triangular triplets (from detect_triangular).
                 {
                     let disabled_set = {
                         let st = shared_state.read().await;
@@ -359,10 +360,13 @@ pub async fn run_chain(
                     };
                     let strat = strategy.read().await;
                     let mut scan_info = strat.pair_scan.lock().unwrap().clone();
+                    let tri_info = strat.tri_scan.lock().unwrap().clone();
+                    drop(strat);
+                    // Append triangular entries (they have no config-level disable toggle yet)
+                    scan_info.extend(tri_info);
                     for info in &mut scan_info {
                         info.disabled = disabled_set.contains(&info.pair_id);
                     }
-                    drop(strat);
                     let mut st = shared_state.write().await;
                     st.pair_scan.insert(cfg.id, scan_info);
                 }

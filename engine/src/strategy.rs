@@ -219,10 +219,13 @@ pub struct Strategy {
     /// When populated, forward and reverse quotes for V2/Solidly-volatile routers are
     /// computed locally (zero eth_call) instead of via multicall.
     pub pool_cache: Arc<PoolCache>,
-    /// Per-pair scan snapshot from the last evaluate() call.
+    /// Per-pair scan snapshot from the last evaluate() call (2-hop pairs).
     /// Updated atomically at the end of each evaluate(); read by chain.rs for heartbeat publishing.
     pub pair_scan: Mutex<Vec<PairScanInfo>>,
-    /// Running count of opportunities found per pair this session.
+    /// Per-triplet scan snapshot from the last detect_triangular() call.
+    /// Updated atomically at the end of each detect_triangular(); merged with pair_scan at heartbeat.
+    pub tri_scan: Mutex<Vec<PairScanInfo>>,
+    /// Running count of opportunities found per pair/triplet this session.
     pub opp_session_counts: Mutex<HashMap<String, u64>>,
 }
 
@@ -247,6 +250,7 @@ impl Strategy {
             pool_cache,
             rpc_concurrency,
             pair_scan: Mutex::new(Vec::new()),
+            tri_scan: Mutex::new(Vec::new()),
             opp_session_counts: Mutex::new(HashMap::new()),
         }
     }
@@ -1714,6 +1718,60 @@ impl Strategy {
             format!("{}|{}|{}|{}", o.triplet_id, o.router_ab_id, o.router_bc_id, o.router_ca_id)
         });
         opportunities.truncate(max_opportunities);
+
+        // ── Update triangular scan snapshot ──────────────────────────────────────
+        // Build per-triplet stats from p1_entries (represents all triplets that had
+        // at least one router with a local cache hit in phase 1 = "was scanned").
+        {
+            let mut opp_counts = self.opp_session_counts.lock().unwrap();
+            for opp in &opportunities {
+                *opp_counts.entry(opp.triplet_id.clone()).or_insert(0) += 1;
+            }
+
+            // Group p1_entries by triplet_id to get per-triplet DEX coverage.
+            // p1_entries has one entry per (triplet, router) combination — filter to those
+            // that succeeded (local_result.is_some() means the pool was in cache).
+            let mut tri_dex_map: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            for p1e in &p1_entries {
+                if p1e.local_result.is_some() {
+                    let trip_id = &triplets[p1e.triplet_idx].triplet_id;
+                    tri_dex_map.entry(trip_id.clone()).or_default().insert(p1e.router_id.clone());
+                }
+            }
+            // Count complete 3-leg paths per triplet (from p3_entries)
+            let mut tri_path_count: HashMap<String, usize> = HashMap::new();
+            for p3e in &p3_entries {
+                let trip_id = &triplets[p3e.triplet_idx].triplet_id;
+                *tri_path_count.entry(trip_id.clone()).or_insert(0) += 1;
+            }
+
+            let mut tri = self.tri_scan.lock().unwrap();
+            tri.clear();
+            // All evaluated triplets (including those that found no profit)
+            for triplet in &triplets {
+                let dex_ids: Vec<String> = tri_dex_map.get(&triplet.triplet_id)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                let dex_count = dex_ids.len();
+                let cross_count = tri_path_count.get(&triplet.triplet_id).copied().unwrap_or(0);
+                let was_quoted = dex_count > 0;
+                let display_name = format!("▲ {}", triplet.triplet_id);
+                tri.push(PairScanInfo {
+                    pair_id: triplet.triplet_id.clone(),
+                    chain_id: self.chain_id,
+                    display_name,
+                    dex_count,
+                    dex_ids,
+                    cross_count,
+                    was_quoted,
+                    opp_count: *opp_counts.get(&triplet.triplet_id).unwrap_or(&0),
+                    disabled: false,
+                });
+            }
+            // Deduplicate: keep only unique triplet_id entries
+            tri.dedup_by_key(|t| t.pair_id.clone());
+        }
+
         (opportunities, best_raw_usd)
     }
 
