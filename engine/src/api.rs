@@ -481,15 +481,18 @@ async fn token_remove(
 
 /// GET /pair-scan — returns all pair scan info grouped by chain_id.
 async fn pair_scan_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let engine = state.engine.read().await;
-    let disabled = &engine.disabled_pairs;
-    // Return each chain's pairs with the disabled flag filled in from EngineState.
+    // Clone data inside the read lock (fast), then serialize outside the lock
+    // so JSON serialization does not hold up other readers (e.g., /stats polls).
+    let (pair_scan_snapshot, disabled_snapshot) = {
+        let engine = state.engine.read().await;
+        (engine.pair_scan.clone(), engine.disabled_pairs.clone())
+    };
     let mut result: Vec<serde_json::Value> = Vec::new();
-    for (chain_id, pairs) in &engine.pair_scan {
+    for (chain_id, pairs) in &pair_scan_snapshot {
         let enriched: Vec<serde_json::Value> = pairs.iter().map(|p| {
             let mut v = serde_json::to_value(p).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
-                obj.insert("disabled".into(), serde_json::Value::Bool(disabled.contains(&p.pair_id)));
+                obj.insert("disabled".into(), serde_json::Value::Bool(disabled_snapshot.contains(&p.pair_id)));
             }
             v
         }).collect();

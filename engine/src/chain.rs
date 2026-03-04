@@ -464,16 +464,19 @@ pub async fn run_chain(
                 metrics.last_block.with_label_values(&[&cfg.name]).set(block_num as f64);
                 metrics.rpc_connected.with_label_values(&[&cfg.name]).set(1.0);
 
-                let state = shared_state.read().await;
-                let chain_paused = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
-                if state.paused || chain_paused { continue; }
-                drop(state);
+                // Read paused state and disabled pairs in one lock acquisition.
+                let (global_paused, chain_paused, disabled_set) = {
+                    let state = shared_state.read().await;
+                    let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
+                    (state.paused, cp, state.disabled_pairs.clone())
+                };
+                if global_paused || chain_paused { continue; }
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None,
+                    &last_opp_count, &contract_balances, None, disabled_set,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -488,16 +491,18 @@ pub async fn run_chain(
                            last_scan_at.elapsed().as_millis());
                     continue;
                 }
-                let state = shared_state.read().await;
-                let chain_paused = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
-                if state.paused || chain_paused { continue; }
-                drop(state);
+                let (global_paused, chain_paused, disabled_set) = {
+                    let state = shared_state.read().await;
+                    let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
+                    (state.paused, cp, state.disabled_pairs.clone())
+                };
+                if global_paused || chain_paused { continue; }
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None,
+                    &last_opp_count, &contract_balances, None, disabled_set,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -536,17 +541,16 @@ pub async fn run_chain(
                 };
                 if pair_mask.is_empty() { continue; }
 
-                let state = shared_state.read().await;
-                let chain_paused = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
-                if state.paused || chain_paused { continue; }
-                drop(state);
-
-                {
+                // Read paused + disabled in one lock; also increment total_scans.
+                let (global_paused, chain_paused, disabled_set) = {
                     let mut state = shared_state.write().await;
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
                         chain.total_scans += 1;
                     }
-                }
+                    let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
+                    (state.paused, cp, state.disabled_pairs.clone())
+                };
+                if global_paused || chain_paused { continue; }
 
                 debug!(
                     "[{}] Swap on {:?} — targeted scan ({} pairs)",
@@ -557,7 +561,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, Some((pair_mask, token_filter)),
+                    &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
             }
@@ -590,19 +594,13 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
     // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
     targeted: Option<(HashSet<usize>, Vec<Address>)>,
+    // Pre-read from shared_state by the caller (alongside the paused check) to avoid
+    // an extra shared_state.read().await here on every scan.
+    disabled_set: HashSet<String>,
 ) {
     // Clone ghost_profit_bits from executor once — passed to handle_execution_failure
     // at each callsite so gas-rejected opportunities accumulate into the metric.
     let ghost_profit_bits = executor.lock().await.ghost_profit_usd_bits.clone();
-
-    // ── Parallel detection: 2-hop + triangular ────────────────────────────────
-
-    // Build a pair mask that excludes pairs disabled via the dashboard toggle.
-    // Read disabled_pairs before acquiring strategy lock to avoid lock ordering issues.
-    let disabled_set = {
-        let st = shared_state.read().await;
-        st.disabled_pairs.clone()
-    };
 
     let all_opportunities = {
         let strat = strategy.read().await;

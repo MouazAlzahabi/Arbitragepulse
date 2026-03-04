@@ -1040,57 +1040,62 @@ impl Strategy {
         opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
 
         // ── Update session opp counts and pair scan snapshot ─────────────────────
+        // Only update pair_scan on full scans (pair_mask is None).
+        // Targeted swap-event scans only evaluate 1-2 pairs, so rebuilding the full
+        // snapshot would mark every other pair as "not quoted" — corrupting the data.
         {
             let mut opp_counts = self.opp_session_counts.lock().unwrap();
             for opp in &opportunities {
                 *opp_counts.entry(opp.pair_id.clone()).or_insert(0) += 1;
             }
 
-            let mut scan = self.pair_scan.lock().unwrap();
-            scan.clear();
+            if pair_mask.is_none() {
+                let mut scan = self.pair_scan.lock().unwrap();
+                scan.clear();
 
-            // Pairs with at least one forward quote
-            let mut seen_pis = std::collections::HashSet::new();
-            for (pi, quotes) in &pair_quotes {
-                seen_pis.insert(*pi);
-                let pair = &self.pairs[*pi];
-                let mut dex_set = std::collections::HashSet::new();
-                for q in quotes { dex_set.insert(q.router_id.clone()); }
-                let dex_ids: Vec<String> = dex_set.into_iter().collect();
-                let dex_count = dex_ids.len();
-                // cross_count = number of ordered (A,B) pairs where A≠B, i.e. k*(k-1)
-                let cross_count = if dex_count >= 2 { dex_count * (dex_count - 1) } else { 0 };
-                let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
-                scan.push(PairScanInfo {
-                    pair_id: pair.id.clone(),
-                    chain_id: pair.chain_id,
-                    display_name,
-                    dex_count,
-                    dex_ids,
-                    cross_count,
-                    was_quoted: true,
-                    opp_count: *opp_counts.get(&pair.id).unwrap_or(&0),
-                    disabled: false,
-                });
-            }
+                // Pairs with at least one forward quote
+                let mut seen_pis = std::collections::HashSet::new();
+                for (pi, quotes) in &pair_quotes {
+                    seen_pis.insert(*pi);
+                    let pair = &self.pairs[*pi];
+                    let mut dex_set = std::collections::HashSet::new();
+                    for q in quotes { dex_set.insert(q.router_id.clone()); }
+                    let dex_ids: Vec<String> = dex_set.into_iter().collect();
+                    let dex_count = dex_ids.len();
+                    // cross_count = number of ordered (A,B) pairs where A≠B, i.e. k*(k-1)
+                    let cross_count = if dex_count >= 2 { dex_count * (dex_count - 1) } else { 0 };
+                    let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
+                    scan.push(PairScanInfo {
+                        pair_id: pair.id.clone(),
+                        chain_id: pair.chain_id,
+                        display_name,
+                        dex_count,
+                        dex_ids,
+                        cross_count,
+                        was_quoted: true,
+                        opp_count: *opp_counts.get(&pair.id).unwrap_or(&0),
+                        disabled: false,
+                    });
+                }
 
-            // Pairs with no quote this scan (cache miss or disabled)
-            for (pi, pair) in self.pairs.iter().enumerate()
-                .filter(|(_, p)| p.chain_id == self.chain_id)
-            {
-                if seen_pis.contains(&pi) { continue; }
-                let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
-                scan.push(PairScanInfo {
-                    pair_id: pair.id.clone(),
-                    chain_id: pair.chain_id,
-                    display_name,
-                    dex_count: 0,
-                    dex_ids: vec![],
-                    cross_count: 0,
-                    was_quoted: false,
-                    opp_count: *opp_counts.get(&pair.id).unwrap_or(&0),
-                    disabled: false,
-                });
+                // Pairs with no quote this scan (cache miss or disabled)
+                for (pi, pair) in self.pairs.iter().enumerate()
+                    .filter(|(_, p)| p.chain_id == self.chain_id)
+                {
+                    if seen_pis.contains(&pi) { continue; }
+                    let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
+                    scan.push(PairScanInfo {
+                        pair_id: pair.id.clone(),
+                        chain_id: pair.chain_id,
+                        display_name,
+                        dex_count: 0,
+                        dex_ids: vec![],
+                        cross_count: 0,
+                        was_quoted: false,
+                        opp_count: *opp_counts.get(&pair.id).unwrap_or(&0),
+                        disabled: false,
+                    });
+                }
             }
         }
 
@@ -1225,24 +1230,35 @@ impl Strategy {
             false
         };
 
-        // Save all displayable triplets (post token-filter, pre-disable-filter) so
-        // tri_scan can show disabled triplets as dimmed rather than making them disappear.
-        let all_displayable: Vec<(String, Address, Address, Address)> = triplets.iter()
-            .map(|t| (t.triplet_id.clone(), t.token_a, t.token_b, t.token_c))
-            .collect();
-        let disabled_triplet_ids: std::collections::HashSet<String> = triplets.iter()
-            .filter(|t| is_triplet_disabled(t))
-            .map(|t| t.triplet_id.clone())
-            .collect();
+        // Only save all_displayable / disabled_triplet_ids on full scans — they're only
+        // needed for tri_scan dashboard updates, which we skip on targeted swap scans.
+        // Targeted scans (token_filter is Some) evaluate only 1-2 triplets, so rebuilding
+        // the full tri_scan snapshot would mark all others as "not quoted" — corrupting data.
+        let is_full_scan = token_filter.is_none();
+        let all_displayable: Vec<(String, Address, Address, Address)> = if is_full_scan {
+            triplets.iter()
+                .map(|t| (t.triplet_id.clone(), t.token_a, t.token_b, t.token_c))
+                .collect()
+        } else {
+            vec![]
+        };
+        let disabled_triplet_ids: std::collections::HashSet<String> = if is_full_scan {
+            triplets.iter()
+                .filter(|t| is_triplet_disabled(t))
+                .map(|t| t.triplet_id.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
 
         // Remove disabled entries from the scan (they stay in all_displayable for the UI).
         if !disabled_triplets.is_empty() {
             triplets.retain(|t| !is_triplet_disabled(t));
         }
 
-        if triplets.is_empty() && all_displayable.iter().all(|(id, ..)| disabled_triplet_ids.contains(id)) {
+        if is_full_scan && triplets.is_empty() && all_displayable.iter().all(|(id, ..)| disabled_triplet_ids.contains(id)) {
             // Nothing to scan; still need to update tri_scan with disabled markers.
-            let mut opp_counts = self.opp_session_counts.lock().unwrap();
+            let opp_counts = self.opp_session_counts.lock().unwrap();
             let mut tri = self.tri_scan.lock().unwrap();
             tri.clear();
             for (triplet_id, ..) in &all_displayable {
@@ -1788,61 +1804,71 @@ impl Strategy {
         // Build per-triplet stats from p1_entries (represents all triplets that had
         // at least one router with a local cache hit in phase 1 = "was scanned").
         {
-            let mut opp_counts = self.opp_session_counts.lock().unwrap();
-            for opp in &opportunities {
-                *opp_counts.entry(opp.triplet_id.clone()).or_insert(0) += 1;
-            }
-
-            // Group p1_entries by triplet_id to get per-triplet DEX coverage.
-            // p1_entries has one entry per (triplet, router) combination — filter to those
-            // that succeeded (local_result.is_some() means the pool was in cache).
-            let mut tri_dex_map: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-            for p1e in &p1_entries {
-                if p1e.local_result.is_some() {
-                    let trip_id = &triplets[p1e.triplet_idx].triplet_id;
-                    tri_dex_map.entry(trip_id.clone()).or_default().insert(p1e.router_id.clone());
+            // Update session opp counts (happens on every scan including targeted).
+            {
+                let mut opp_counts = self.opp_session_counts.lock().unwrap();
+                for opp in &opportunities {
+                    *opp_counts.entry(opp.triplet_id.clone()).or_insert(0) += 1;
                 }
-            }
-            // Count complete 3-leg paths per triplet (from p3_entries)
-            let mut tri_path_count: HashMap<String, usize> = HashMap::new();
-            for p3e in &p3_entries {
-                let trip_id = &triplets[p3e.triplet_idx].triplet_id;
-                *tri_path_count.entry(trip_id.clone()).or_insert(0) += 1;
-            }
+            } // opp_counts lock released here
 
-            let mut tri = self.tri_scan.lock().unwrap();
-            tri.clear();
-            // Use all_displayable so disabled triplets still appear in the dashboard (dimmed).
-            // Active triplets get live DEX/path stats; disabled ones show zeros.
-            for (triplet_id, ..) in &all_displayable {
-                let is_disabled = disabled_triplet_ids.contains(triplet_id);
-                let dex_ids: Vec<String> = if is_disabled {
-                    vec![]
-                } else {
-                    tri_dex_map.get(triplet_id)
-                        .map(|s| s.iter().cloned().collect())
-                        .unwrap_or_default()
-                };
-                let dex_count = dex_ids.len();
-                let cross_count = if is_disabled { 0 } else {
-                    tri_path_count.get(triplet_id).copied().unwrap_or(0)
-                };
-                let was_quoted = !is_disabled && dex_count > 0;
-                let display_name = format!("▲ {}", triplet_id);
-                tri.push(PairScanInfo {
-                    pair_id: triplet_id.clone(),
-                    chain_id: self.chain_id,
-                    display_name,
-                    dex_count,
-                    dex_ids,
-                    cross_count,
-                    was_quoted,
-                    opp_count: *opp_counts.get(triplet_id).unwrap_or(&0),
-                    disabled: is_disabled,
-                });
+            // Only rebuild tri_scan on full scans. Targeted swap-event scans evaluate
+            // only 1-2 triplets and would corrupt the snapshot for all other triplets.
+            if is_full_scan {
+                // Re-acquire for read access in the snapshot build.
+                let opp_counts = self.opp_session_counts.lock().unwrap();
+
+                // Group p1_entries by triplet_id to get per-triplet DEX coverage.
+                // p1_entries has one entry per (triplet, router) combination — filter to those
+                // that succeeded (local_result.is_some() means the pool was in cache).
+                let mut tri_dex_map: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+                for p1e in &p1_entries {
+                    if p1e.local_result.is_some() {
+                        let trip_id = &triplets[p1e.triplet_idx].triplet_id;
+                        tri_dex_map.entry(trip_id.clone()).or_default().insert(p1e.router_id.clone());
+                    }
+                }
+                // Count complete 3-leg paths per triplet (from p3_entries)
+                let mut tri_path_count: HashMap<String, usize> = HashMap::new();
+                for p3e in &p3_entries {
+                    let trip_id = &triplets[p3e.triplet_idx].triplet_id;
+                    *tri_path_count.entry(trip_id.clone()).or_insert(0) += 1;
+                }
+
+                let mut tri = self.tri_scan.lock().unwrap();
+                tri.clear();
+                // Use all_displayable so disabled triplets still appear in the dashboard (dimmed).
+                // Active triplets get live DEX/path stats; disabled ones show zeros.
+                for (triplet_id, ..) in &all_displayable {
+                    let is_disabled = disabled_triplet_ids.contains(triplet_id);
+                    let dex_ids: Vec<String> = if is_disabled {
+                        vec![]
+                    } else {
+                        tri_dex_map.get(triplet_id)
+                            .map(|s| s.iter().cloned().collect())
+                            .unwrap_or_default()
+                    };
+                    let dex_count = dex_ids.len();
+                    let cross_count = if is_disabled { 0 } else {
+                        tri_path_count.get(triplet_id).copied().unwrap_or(0)
+                    };
+                    let was_quoted = !is_disabled && dex_count > 0;
+                    let display_name = format!("▲ {}", triplet_id);
+                    tri.push(PairScanInfo {
+                        pair_id: triplet_id.clone(),
+                        chain_id: self.chain_id,
+                        display_name,
+                        dex_count,
+                        dex_ids,
+                        cross_count,
+                        was_quoted,
+                        opp_count: *opp_counts.get(triplet_id).unwrap_or(&0),
+                        disabled: is_disabled,
+                    });
+                }
+                // Deduplicate: keep only unique triplet_id entries
+                tri.dedup_by_key(|t| t.pair_id.clone());
             }
-            // Deduplicate: keep only unique triplet_id entries
-            tri.dedup_by_key(|t| t.pair_id.clone());
         }
 
         (opportunities, best_raw_usd)
