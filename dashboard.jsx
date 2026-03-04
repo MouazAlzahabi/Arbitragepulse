@@ -837,19 +837,23 @@ function PairManager({ api }) {
       <td style={{ padding: "7px 8px", color: p.opp_count > 0 ? "#fbbf24" : "#334155", fontWeight: p.opp_count > 0 ? 600 : 400 }}>
         {p.opp_count > 0 ? p.opp_count : "—"}
       </td>
-      {/* Enable/disable toggle */}
+      {/* Enable/disable toggle (2-hop only; triangular is auto-managed by pool cache) */}
       <td style={{ padding: "7px 8px" }}>
-        <button
-          onClick={() => handleToggle(p)}
-          disabled={toggling[p.pair_id]}
-          style={{ ...btn, fontSize: 9, padding: "3px 10px",
-            background: p.disabled ? "#1e293b" : "#052e16",
-            color: p.disabled ? "#475569" : "#34d399",
-            border: `1px solid ${p.disabled ? "#1e293b" : "#166534"}`,
-            opacity: toggling[p.pair_id] ? 0.5 : 1 }}
-        >
-          {p.disabled ? "Disabled" : "Enabled"}
-        </button>
+        {isTri ? (
+          <span style={{ fontSize: 9, color: "#334155" }}>auto</span>
+        ) : (
+          <button
+            onClick={() => handleToggle(p)}
+            disabled={toggling[p.pair_id]}
+            style={{ ...btn, fontSize: 9, padding: "3px 10px",
+              background: p.disabled ? "#1e293b" : "#052e16",
+              color: p.disabled ? "#475569" : "#34d399",
+              border: `1px solid ${p.disabled ? "#1e293b" : "#166534"}`,
+              opacity: toggling[p.pair_id] ? 0.5 : 1 }}
+          >
+            {p.disabled ? "Disabled" : "Enabled"}
+          </button>
+        )}
       </td>
     </tr>
   ));
