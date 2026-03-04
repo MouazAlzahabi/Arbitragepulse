@@ -1116,6 +1116,7 @@ impl Strategy {
         provider: &P,
         max_opportunities: usize,
         token_filter: Option<&[Address]>,
+        disabled_triplets: &std::collections::HashSet<String>,
     ) -> (Vec<TriangularOpportunity>, f64) {
         use std::collections::HashMap;
 
@@ -1197,6 +1198,11 @@ impl Strategy {
             triplets.retain(|t| {
                 filter.iter().any(|f| *f == t.token_a || *f == t.token_b || *f == t.token_c)
             });
+        }
+
+        // Remove triplets that have been disabled via the dashboard toggle.
+        if !disabled_triplets.is_empty() {
+            triplets.retain(|t| !disabled_triplets.contains(&t.triplet_id));
         }
 
         if triplets.is_empty() {

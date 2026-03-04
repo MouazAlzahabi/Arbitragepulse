@@ -628,7 +628,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
         let ((opps_2hop, best_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
             strat.evaluate(provider.as_ref(), final_mask.as_ref()),
-            strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice())),
+            strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice()), &disabled_set),
         );
 
         // Update quote diagnostic counters (last scan — overwrites on every call)

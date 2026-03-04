@@ -837,23 +837,19 @@ function PairManager({ api }) {
       <td style={{ padding: "7px 8px", color: p.opp_count > 0 ? "#fbbf24" : "#334155", fontWeight: p.opp_count > 0 ? 600 : 400 }}>
         {p.opp_count > 0 ? p.opp_count : "—"}
       </td>
-      {/* Enable/disable toggle (2-hop only) */}
+      {/* Enable/disable toggle */}
       <td style={{ padding: "7px 8px" }}>
-        {isTri ? (
-          <span style={{ fontSize: 9, color: "#334155" }}>auto</span>
-        ) : (
-          <button
-            onClick={() => handleToggle(p)}
-            disabled={toggling[p.pair_id]}
-            style={{ ...btn, fontSize: 9, padding: "3px 10px",
-              background: p.disabled ? "#1e293b" : "#052e16",
-              color: p.disabled ? "#475569" : "#34d399",
-              border: `1px solid ${p.disabled ? "#1e293b" : "#166534"}`,
-              opacity: toggling[p.pair_id] ? 0.5 : 1 }}
-          >
-            {p.disabled ? "Disabled" : "Enabled"}
-          </button>
-        )}
+        <button
+          onClick={() => handleToggle(p)}
+          disabled={toggling[p.pair_id]}
+          style={{ ...btn, fontSize: 9, padding: "3px 10px",
+            background: p.disabled ? "#1e293b" : "#052e16",
+            color: p.disabled ? "#475569" : "#34d399",
+            border: `1px solid ${p.disabled ? "#1e293b" : "#166534"}`,
+            opacity: toggling[p.pair_id] ? 0.5 : 1 }}
+        >
+          {p.disabled ? "Disabled" : "Enabled"}
+        </button>
       </td>
     </tr>
   ));
@@ -920,7 +916,7 @@ function PairManager({ api }) {
       )}
 
       <div style={{ fontSize: 10, color: "#334155", marginTop: 4 }}>
-        Scan data updates every heartbeat (~60s). Toggle disables a pair from future scans — takes effect on the next cycle. Triangular triplets are auto-detected and cannot be individually disabled yet.
+        Scan data updates every heartbeat (~60s). Toggle disables a pair or triplet from future scans — takes effect on the next cycle.
       </div>
     </div>
   );
