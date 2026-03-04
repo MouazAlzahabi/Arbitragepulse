@@ -136,6 +136,7 @@ impl ApiServer {
             .route("/engine/pause", post(engine_pause))
             .route("/engine/resume", post(engine_resume))
             .route("/engine/dry-run", post(engine_dry_run))
+            .route("/engine/restart", post(engine_restart))
             .route("/tokens", get(tokens_list).post(token_add))
             .route("/tokens/pairs", get(tokens_pairs))
             .route("/tokens/{chain_id}/{address}", patch(token_trust).delete(token_remove))
@@ -345,6 +346,18 @@ async fn engine_dry_run(
     let mut engine = state.engine.write().await;
     engine.dry_run = body.enabled;
     Json(serde_json::json!({ "dry_run": body.enabled }))
+}
+
+async fn engine_restart(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let log_tx = state.log_tx.clone();
+    tokio::spawn(async move {
+        // Give the HTTP response time to reach the client before exiting.
+        // The process manager (systemd/supervisor) will restart the engine.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        broadcast_log(&log_tx, "info", "[ENGINE] Restarting — process exit requested via API", None);
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "restarting": true }))
 }
 
 // ─── Token endpoints ──────────────────────────────────────────────────────────

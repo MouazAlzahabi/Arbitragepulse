@@ -249,6 +249,8 @@ pub async fn run_chain(
     let last_fwd_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     let last_multi_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     let last_active_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
+    // last_opp_count: how many profitable opportunities were found in the last scan
+    let last_opp_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     // Count of consecutive heartbeats with zero forward quotes.
     // Warning only fires at 3+ to suppress startup false-positives and transient RPC blips.
     let mut consecutive_zero_fwd: u32 = 0;
@@ -327,13 +329,14 @@ pub async fn run_chain(
                 let multi_dex = last_multi_count.load(Ordering::Relaxed);
                 let active_pairs = last_active_count.load(Ordering::Relaxed);
                 let total_pairs = chain_pairs.len() as u64;
+                let opp_count = last_opp_count.load(Ordering::Relaxed);
                 let heartbeat_msg = format!(
-                    "[{}] Scanning | scans={} executions={} success={} ETH=${:.0} | best_seen={} spread={} fwd_quotes={} active_pairs={}/{} cross_dex_pairs={}",
-                    cfg.name, scans, attempts, success, native_price, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex,
+                    "[{}] ♥ scans={} execs={} ok={} {}=${:.0} | best={} spread={} | quotes={} active={}/{} cross={} | opps={}",
+                    cfg.name, scans, attempts, success, cfg.native_currency, native_price, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 info!("{}", heartbeat_msg);
-                broadcast_log(&log_tx, "info", &heartbeat_msg, None);
+                broadcast_log(&log_tx, "heartbeat", &heartbeat_msg, None);
 
                 // Broadcast a live-feed warn if no cross-DEX coverage (actionable).
                 // Require 3 consecutive zero-fwd heartbeats before warning to suppress
@@ -437,7 +440,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &contract_balances, None,
+                    &last_opp_count, &contract_balances, None,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -461,7 +464,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &contract_balances, None,
+                    &last_opp_count, &contract_balances, None,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -521,7 +524,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &contract_balances, Some((pair_mask, token_filter)),
+                    &last_opp_count, &contract_balances, Some((pair_mask, token_filter)),
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
             }
@@ -550,6 +553,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     last_fwd_count: &Arc<AtomicU64>,
     last_multi_count: &Arc<AtomicU64>,
     last_active_count: &Arc<AtomicU64>,
+    last_opp_count: &Arc<AtomicU64>,
     contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
     // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
     targeted: Option<(HashSet<usize>, Vec<Address>)>,
@@ -603,6 +607,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
         merged
     };
+
+    // Track opp count for heartbeat display
+    last_opp_count.store(all_opportunities.len() as u64, Ordering::Relaxed);
 
     if all_opportunities.is_empty() {
         return;
@@ -929,6 +936,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 ),
                 Some(serde_json::json!({
                     "chain":        cfg.name,
+                    "pair_id":      opp.triplet_id,
                     "triplet_id":   opp.triplet_id,
                     "profit_usd":   opp.profit_usd,
                     "router_ab":    opp.router_ab_id,
@@ -1147,7 +1155,7 @@ async fn handle_execution_success(
         &format!(
             "[{}] tx={} | pair={} | profit=${:.4}",
             cfg.name,
-            &tx_hash[..10.min(tx_hash.len())],
+            tx_hash,
             display_id,
             profit_usd
         ),
@@ -1155,6 +1163,7 @@ async fn handle_execution_success(
             "chain":      cfg.name,
             "pair_id":    display_id,
             "profit_usd": profit_usd,
+            "tx_hash":    tx_hash,
         })),
     );
 }

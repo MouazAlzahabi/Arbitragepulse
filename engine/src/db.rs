@@ -26,6 +26,7 @@ pub struct TradeRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PairStat {
+    pub chain_name: String,
     pub pair_id: String,
     pub attempts: u64,
     pub successes: u64,
@@ -140,21 +141,22 @@ impl Database {
     pub fn get_pair_stats(&self) -> Result<Vec<PairStat>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT pair_id,
+            "SELECT chain_name, pair_id,
                     COUNT(*) as attempts,
                     SUM(success) as successes,
                     SUM(CASE WHEN success=1 THEN profit_usd ELSE 0.0 END) as profit
              FROM trades WHERE dry_run=0
-             GROUP BY pair_id
+             GROUP BY chain_name, pair_id
              ORDER BY profit DESC",
         )?;
         let records = stmt
             .query_map([], |row| {
                 Ok(PairStat {
-                    pair_id: row.get(0)?,
-                    attempts: row.get::<_, i64>(1)? as u64,
-                    successes: row.get::<_, i64>(2)? as u64,
-                    profit_usd: row.get(3)?,
+                    chain_name: row.get(0)?,
+                    pair_id: row.get(1)?,
+                    attempts: row.get::<_, i64>(2)? as u64,
+                    successes: row.get::<_, i64>(3)? as u64,
+                    profit_usd: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -142,6 +142,7 @@ function useApi(baseUrl, apiKey) {
     pauseEngine: (cid) => f("/engine/pause", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cid ? { chain_id: cid } : {}) }),
     resumeEngine: (cid) => f("/engine/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cid ? { chain_id: cid } : {}) }),
     setDryRun: (enabled) => f("/engine/dry-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }),
+    restartEngine: () => f("/engine/restart", { method: "POST", headers: { "Content-Type": "application/json" } }),
     fetchStats: () => f("/stats"),
     fetchState: () => f("/engine/state"),
     fetchTrades: (limit) => f(`/trades?limit=${limit || 500}`),
@@ -207,7 +208,7 @@ function playBeep() {
 // ═══════════════════════════════════════════════════════════
 // STYLES
 // ═══════════════════════════════════════════════════════════
-const TYPE = { info: ["#94a3b8", "INFO"], debug: ["#475569", "DBUG"], warn: ["#fbbf24", "WARN"], error: ["#f87171", "ERR!"], trade: ["#34d399", "TRDE"], opportunity: ["#a78bfa", "OPP!"] };
+const TYPE = { heartbeat: ["#334155", "♥ HB"], info: ["#94a3b8", "INFO"], debug: ["#475569", "DBUG"], warn: ["#fbbf24", "WARN"], error: ["#f87171", "ERR!"], trade: ["#34d399", "TRDE"], opportunity: ["#a78bfa", "OPP!"] };
 const CAT_C = { stable: "#22d3ee", blue_chip: "#a78bfa", defi: "#34d399", meme: "#fbbf24", other: "#64748b" };
 const btn = { background: "#1e293b", border: "none", borderRadius: 4, padding: "6px 14px", color: "#94a3b8", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace", fontSize: 12 };
 const input = { background: "#020617", border: "1px solid #1e293b", borderRadius: 4, padding: "6px 10px", color: "#e2e8f0", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, width: "100%" };
@@ -316,16 +317,26 @@ function ChainCards({ apiStats }) {
   );
 }
 
+function formatGwei(v) {
+  if (v == null) return null;
+  if (v >= 1) return `${v.toFixed(3)} gwei`;
+  if (v >= 0.001) return `${v.toFixed(4)} gwei`;
+  if (v > 0) return `${(v * 1000).toFixed(3)} mwei`;
+  return "0 gwei";
+}
+
 function GasLatencyBar({ apiStats, apiLatency }) {
-  const baseFee = apiStats?.chains?.reduce((best, c) => c.base_fee_gwei > 0 ? c.base_fee_gwei : best, null);
-  if (!baseFee && apiLatency == null) return null;
+  // Show the max base fee across chains (picks up the one that's actually non-zero)
+  const baseFeeChain = apiStats?.chains?.find((c) => c.base_fee_gwei > 0);
+  const baseFee = baseFeeChain?.base_fee_gwei ?? null;
+  if (baseFee == null && apiLatency == null) return null;
   return (
     <div style={{ display: "flex", gap: 24, padding: "4px 16px", background: "#0a0f1a", borderBottom: "1px solid #1e293b", fontSize: 11 }}>
       {baseFee != null && (
-        <span style={{ color: "#475569" }}>⛽ Base Fee: <span style={{ color: "#94a3b8" }}>{baseFee.toFixed(4)} gwei</span></span>
+        <span style={{ color: "#475569" }}>⛽ Base Fee: <span style={{ color: "#94a3b8" }}>{formatGwei(baseFee)}</span></span>
       )}
       {apiLatency != null && (
-        <span style={{ color: "#475569" }}>🌐 API: <span style={{ color: apiLatency < 100 ? "#34d399" : apiLatency < 500 ? "#fbbf24" : "#f87171" }}>{apiLatency}ms</span></span>
+        <span style={{ color: "#475569" }}>🏓 Ping: <span style={{ color: apiLatency < 100 ? "#34d399" : apiLatency < 500 ? "#fbbf24" : "#f87171" }}>{apiLatency}ms</span></span>
       )}
     </div>
   );
@@ -423,11 +434,15 @@ function OpportunityTable({ logs }) {
             <tr key={o._id} style={{ borderBottom: "1px solid #0a0f1a" }}>
               <td style={{ padding: "5px 8px", color: "#475569" }}>{ts(o.timestamp * 1000)}</td>
               <td style={{ padding: "5px 8px", color: "#a78bfa" }}>{o.data.chain || extractChain(o.message) || "—"}</td>
-              <td style={{ padding: "5px 8px", color: "#e2e8f0", fontWeight: 600 }}>{o.data.pair_id || o.data.pair || "—"}</td>
+              <td style={{ padding: "5px 8px", color: "#e2e8f0", fontWeight: 600 }}>{o.data.pair_id || o.data.triplet_id || o.data.pair || "—"}</td>
               <td style={{ padding: "5px 8px", color: "#94a3b8", fontSize: 10 }}>
-                <span style={{ color: "#22d3ee" }}>{o.data.router_a || "—"}</span>
-                <span style={{ color: "#475569" }}> → </span>
-                <span style={{ color: "#fb923c" }}>{o.data.router_b || "—"}</span>
+                {o.data.router_ab ? (
+                  // Triangular: A→B, B→C, C→A
+                  <span><span style={{ color: "#22d3ee" }}>{o.data.router_ab}</span><span style={{ color: "#475569" }}>→</span><span style={{ color: "#fb923c" }}>{o.data.router_bc}</span><span style={{ color: "#475569" }}>→</span><span style={{ color: "#a78bfa" }}>{o.data.router_ca}</span></span>
+                ) : (
+                  // 2-hop: A → B
+                  <span><span style={{ color: "#22d3ee" }}>{o.data.router_a || "—"}</span><span style={{ color: "#475569" }}> → </span><span style={{ color: "#fb923c" }}>{o.data.router_b || "—"}</span></span>
+                )}
               </td>
               <td style={{ padding: "5px 8px", color: "#34d399", fontWeight: 600 }}>
                 ${parseFloat(o.data.profit_usd || o.data.profit || 0).toFixed(4)}
@@ -440,10 +455,10 @@ function OpportunityTable({ logs }) {
   );
 }
 
-// ─── 3. Pair leaderboard (DB-backed via /stats/pairs + live OPP! counting) ────
+// ─── 3. Pair leaderboard (DB-backed via /stats/pairs + live OPP! detection counting) ────
 function PairLeaderboard({ pairStats, wsLogs }) {
-  // Count OPP! alerts per pair_id from live WS logs
-  const oppCounts = useMemo(() => {
+  // Count live OPP! detections per pair_id from WS logs (this session only, not executions)
+  const detectedCounts = useMemo(() => {
     const counts = {};
     wsLogs.forEach((l) => {
       if (l.type === "opportunity" && l.data?.pair_id) {
@@ -461,15 +476,16 @@ function PairLeaderboard({ pairStats, wsLogs }) {
     <div style={{ background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b", overflow: "hidden" }}>
       <div style={{ padding: "10px 14px", borderBottom: "1px solid #1e293b" }}>
         <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>PAIR LEADERBOARD</span>
+        <span style={{ fontSize: 9, color: "#1e293b", marginLeft: 8 }}>(DB-backed — executed trades only)</span>
       </div>
       {rows.length === 0 ? (
-        <div style={{ color: "#1e293b", textAlign: "center", padding: 24, fontSize: 12, fontStyle: "italic" }}>No pair data yet…</div>
+        <div style={{ color: "#1e293b", textAlign: "center", padding: 24, fontSize: 12, fontStyle: "italic" }}>No executed trade data yet…</div>
       ) : (
         <div style={{ overflow: "auto", maxHeight: 240 }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
             <thead>
               <tr style={{ borderBottom: "1px solid #1e293b" }}>
-                {["Pair", "OPP! Alerts", "Executions", "Net Profit", "Win Rate"].map((h) => (
+                {["Chain", "Pair", "Detected", "Executed", "Net Profit", "Win Rate"].map((h) => (
                   <th key={h} style={{ textAlign: "left", padding: "6px 10px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#0f172a" }}>{h}</th>
                 ))}
               </tr>
@@ -478,11 +494,13 @@ function PairLeaderboard({ pairStats, wsLogs }) {
               {rows.map((r) => {
                 const winRate = r.attempts > 0 ? ((r.successes / r.attempts) * 100).toFixed(0) + "%" : "0%";
                 const isZero = (r.profit_usd || 0) <= 0;
-                const oppCount = oppCounts[r.pair_id] || 0;
+                const detected = detectedCounts[r.pair_id] || 0;
+                const rowKey = `${r.chain_name || ""}:${r.pair_id}`;
                 return (
-                  <tr key={r.pair_id} style={{ borderBottom: "1px solid #0a0f1a" }}>
+                  <tr key={rowKey} style={{ borderBottom: "1px solid #0a0f1a" }}>
+                    <td style={{ padding: "6px 10px", color: "#a78bfa", fontSize: 10 }}>{r.chain_name || "—"}</td>
                     <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#e2e8f0", fontWeight: 600 }}>{r.pair_id}</td>
-                    <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#a78bfa" }}>{oppCount}</td>
+                    <td style={{ padding: "6px 10px", color: detected > 0 ? "#64748b" : "#1e293b" }} title="OPP! detections this session (not executions)">{detected}</td>
                     <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#94a3b8" }}>{r.attempts}</td>
                     <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#34d399", fontWeight: 600 }}>${(r.profit_usd || 0).toFixed(4)}</td>
                     <td style={{ padding: "6px 10px", color: isZero ? "#334155" : "#fbbf24" }}>{winRate}</td>
@@ -507,6 +525,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
     (l.message?.includes("negative after gas") || l.message?.includes("Skipped") || l.message?.includes("skipped"));
 
   const filtered = logs.filter((l) => {
+    if (l.type === "heartbeat") return enabledTypes.has("heartbeat");
     if (isSkipped(l)) return enabledTypes.has("skipped");
     if (l.type === "trade") return enabledTypes.has("trade");
     if (l.type === "opportunity") return enabledTypes.has("opportunity");
@@ -525,6 +544,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
     { key: "trade", label: "TRDE", color: "#34d399" },
     { key: "opportunity", label: "OPP!", color: "#a78bfa" },
     { key: "info", label: "Info", color: "#94a3b8" },
+    { key: "heartbeat", label: "♥ HB", color: "#334155" },
     { key: "skipped", label: "Skipped", color: "#475569" },
     { key: "errors", label: "Errors/Warn", color: "#f87171" },
   ];
@@ -573,6 +593,8 @@ function ControlPanel({ ws, api, apiStats, clearAll }) {
   const dryRun = apiStats?.dry_run ?? true;
   const paused = apiStats?.paused ?? false;
   const [soundOn, setSoundOn] = useState(true);
+  const [confirmRestart, setConfirmRestart] = useState(false);
+  const [restarting, setRestarting] = useState(false);
 
   // Sound on trade
   useEffect(() => {
@@ -594,6 +616,15 @@ function ControlPanel({ ws, api, apiStats, clearAll }) {
 
   const handlePause = () => api.pauseEngine();
   const handleResume = () => api.resumeEngine();
+
+  const handleRestart = async () => {
+    if (!confirmRestart) { setConfirmRestart(true); return; }
+    setRestarting(true);
+    setConfirmRestart(false);
+    await api.restartEngine();
+    // Give process time to exit and restart before re-enabling button
+    setTimeout(() => setRestarting(false), 5000);
+  };
 
   return (
     <div style={{ padding: 20, maxWidth: 700 }}>
@@ -657,11 +688,30 @@ function ControlPanel({ ws, api, apiStats, clearAll }) {
         </button>
       </div>
 
+      {/* Restart Engine */}
+      <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div>
+          <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, fontWeight: 700 }}>RESTART ENGINE</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Send SIGTERM — systemd/supervisor will restart the process</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {confirmRestart && <span style={{ color: "#fbbf24", fontSize: 12, fontWeight: 600 }}>Confirm restart?</span>}
+          <button
+            onClick={handleRestart}
+            disabled={restarting}
+            style={{ ...btn, background: confirmRestart ? "#422006" : "#1e293b", color: confirmRestart ? "#fbbf24" : "#94a3b8", padding: "8px 20px", opacity: restarting ? 0.5 : 1 }}
+          >
+            {restarting ? "↺ Restarting…" : confirmRestart ? "⚠ Confirm" : "↺ Restart"}
+          </button>
+          {confirmRestart && <button onClick={() => setConfirmRestart(false)} style={{ ...btn, fontSize: 11 }}>Cancel</button>}
+        </div>
+      </div>
+
       {/* Clear Monitor */}
       <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div>
           <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, fontWeight: 700 }}>MONITOR</div>
-          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Clear all logs and trade history for fresh monitoring</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Clear logs + leaderboard display for fresh monitoring (does not affect DB)</div>
         </div>
         <button onClick={clearAll} style={{ ...btn, background: "#1e293b", color: "#94a3b8", padding: "8px 20px" }}>
           ✕ Clear
@@ -785,10 +835,14 @@ export default function Dashboard() {
   const ws = useWebSocket(url, apiKey);
   const api = useApi(apiUrl, apiKey);
   const [tab, setTab] = useState("monitor");
-  const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info"]));
+  const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info", "heartbeat"]));
 
-  // Clear all monitoring state for fresh tracking
-  const clearAll = () => { ws.clearLogs(); };
+  // Clear all monitoring state for fresh tracking (logs + leaderboard display)
+  const clearAll = () => {
+    ws.clearLogs();
+    setPairStats([]);
+    setApiStats(null);
+  };
 
   // Poll /stats via HTTP every 3s to keep pause/dry-run state accurate.
   // Measure API latency from each poll.
