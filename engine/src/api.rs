@@ -16,6 +16,7 @@ use tracing::info;
 
 use crate::db::Database;
 use crate::metrics::Metrics;
+use crate::strategy::PairScanInfo;
 
 // ─── Log entry (broadcasted to WS clients, mirrors TS engine) ─────────────────
 
@@ -77,6 +78,12 @@ pub struct EngineState {
     pub tokens: Vec<Token>,
     /// Pairs stored as (id, path) for the dashboard's /tokens/pairs endpoint
     pub pairs: Vec<(String, String)>,
+    /// Per-pair scan info published by each chain heartbeat.
+    /// Key = chain_id, Value = list of pairs and their last-scan stats.
+    pub pair_scan: std::collections::HashMap<u64, Vec<PairScanInfo>>,
+    /// Pair IDs disabled via POST /pair-scan/{id}/toggle.
+    /// Evaluated pairs in this set are skipped during each scan cycle.
+    pub disabled_pairs: std::collections::HashSet<String>,
 }
 
 pub type SharedState = Arc<RwLock<EngineState>>;
@@ -143,6 +150,8 @@ impl ApiServer {
             .route("/tokens", get(tokens_list).post(token_add))
             .route("/tokens/pairs", get(tokens_pairs))
             .route("/tokens/{chain_id}/{address}", patch(token_trust).delete(token_remove))
+            .route("/pair-scan", get(pair_scan_list))
+            .route("/pair-scan/{pair_id}/toggle", post(pair_scan_toggle))
             .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
             .fallback_service(ServeDir::new("dist").append_index_html_on_directories(true))
             .layer(CorsLayer::permissive())
@@ -466,6 +475,43 @@ async fn token_remove(
     let mut engine = state.engine.write().await;
     engine.tokens.retain(|t| !(t.chain_id == chain_id && t.address.to_lowercase() == address.to_lowercase()));
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+// ─── Pair scan endpoints ───────────────────────────────────────────────────────
+
+/// GET /pair-scan — returns all pair scan info grouped by chain_id.
+async fn pair_scan_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let engine = state.engine.read().await;
+    let disabled = &engine.disabled_pairs;
+    // Return each chain's pairs with the disabled flag filled in from EngineState.
+    let mut result: Vec<serde_json::Value> = Vec::new();
+    for (chain_id, pairs) in &engine.pair_scan {
+        let enriched: Vec<serde_json::Value> = pairs.iter().map(|p| {
+            let mut v = serde_json::to_value(p).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("disabled".into(), serde_json::Value::Bool(disabled.contains(&p.pair_id)));
+            }
+            v
+        }).collect();
+        result.push(serde_json::json!({ "chain_id": chain_id, "pairs": enriched }));
+    }
+    Json(serde_json::json!({ "chains": result }))
+}
+
+/// POST /pair-scan/{pair_id}/toggle — toggle enabled/disabled for a pair.
+async fn pair_scan_toggle(
+    State(state): State<Arc<AppState>>,
+    Path(pair_id): Path<String>,
+) -> impl IntoResponse {
+    let mut engine = state.engine.write().await;
+    let now_disabled = if engine.disabled_pairs.contains(&pair_id) {
+        engine.disabled_pairs.remove(&pair_id);
+        false
+    } else {
+        engine.disabled_pairs.insert(pair_id.clone());
+        true
+    };
+    Json(serde_json::json!({ "pair_id": pair_id, "disabled": now_disabled }))
 }
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────

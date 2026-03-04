@@ -351,6 +351,22 @@ pub async fn run_chain(
                 info!("{}", heartbeat_msg);
                 broadcast_log(&log_tx, "heartbeat", &heartbeat_msg, None);
 
+                // Publish per-pair scan snapshot to shared_state (read by dashboard /pair-scan).
+                {
+                    let disabled_set = {
+                        let st = shared_state.read().await;
+                        st.disabled_pairs.clone()
+                    };
+                    let strat = strategy.read().await;
+                    let mut scan_info = strat.pair_scan.lock().unwrap().clone();
+                    for info in &mut scan_info {
+                        info.disabled = disabled_set.contains(&info.pair_id);
+                    }
+                    drop(strat);
+                    let mut st = shared_state.write().await;
+                    st.pair_scan.insert(cfg.id, scan_info);
+                }
+
                 // Broadcast a live-feed warn if no cross-DEX coverage (actionable).
                 // Require 3 consecutive zero-fwd heartbeats before warning to suppress
                 // startup false-positives and transient single-scan RPC blips.
@@ -577,10 +593,37 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     // ── Parallel detection: 2-hop + triangular ────────────────────────────────
 
+    // Build a pair mask that excludes pairs disabled via the dashboard toggle.
+    // Read disabled_pairs before acquiring strategy lock to avoid lock ordering issues.
+    let disabled_set = {
+        let st = shared_state.read().await;
+        st.disabled_pairs.clone()
+    };
+
     let all_opportunities = {
         let strat = strategy.read().await;
+
+        // Merge targeted mask with disabled-pairs exclusion mask.
+        let final_mask: Option<HashSet<usize>> = {
+            let disabled_mask: Option<HashSet<usize>> = if disabled_set.is_empty() {
+                None
+            } else {
+                let enabled: HashSet<usize> = strat.pairs.iter().enumerate()
+                    .filter(|(_, p)| p.chain_id == cfg.id && !disabled_set.contains(&p.id))
+                    .map(|(i, _)| i)
+                    .collect();
+                Some(enabled)
+            };
+            match (targeted.as_ref().map(|(m, _)| m), disabled_mask) {
+                (None, None) => None,
+                (Some(t), None) => Some(t.clone()),
+                (None, Some(d)) => Some(d),
+                (Some(t), Some(d)) => Some(t.intersection(&d).copied().collect()),
+            }
+        };
+
         let ((opps_2hop, best_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
-            strat.evaluate(provider.as_ref(), targeted.as_ref().map(|(m, _)| m)),
+            strat.evaluate(provider.as_ref(), final_mask.as_ref()),
             strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice())),
         );
 

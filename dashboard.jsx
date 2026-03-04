@@ -122,6 +122,7 @@ function useWebSocket(url, apiKey) {
 function useApi(baseUrl, apiKey) {
   const [tokens, setTokens] = useState([]);
   const [pairs, setPairs] = useState([]);
+  const [pairScan, setPairScan] = useState({});  // chain_id → [{pair_id, display_name, ...}]
   const [loading, setLoading] = useState(false);
   const headers = useMemo(() => {
     const h = { "Content-Type": "application/json" };
@@ -133,9 +134,17 @@ function useApi(baseUrl, apiKey) {
   }, [baseUrl, headers]);
 
   return {
-    tokens, pairs, loading,
+    tokens, pairs, pairScan, loading,
     fetchTokens: async (cid) => { setLoading(true); const d = await f(`/tokens${cid ? `?chain_id=${cid}` : ""}`); setTokens(d?.tokens || []); setLoading(false); },
     fetchPairs: async (cid) => { const d = await f(`/tokens/pairs${cid ? `?chain_id=${cid}` : ""}`); setPairs(d?.pairs || []); },
+    fetchPairScan: async () => {
+      const d = await f("/pair-scan");
+      if (!d?.chains) return;
+      const m = {};
+      for (const c of d.chains) m[c.chain_id] = c.pairs;
+      setPairScan(m);
+    },
+    togglePair: async (pairId) => { await f(`/pair-scan/${encodeURIComponent(pairId)}/toggle`, { method: "POST" }); },
     toggleTrust: async (cid, addr, trusted) => { await f(`/tokens/${cid}/${addr}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trusted }) }); },
     addToken: async (t) => { const r = await fetch(`${baseUrl}/tokens`, { method: "POST", headers, body: JSON.stringify(t) }); return r?.ok; },
     removeToken: async (cid, addr) => { await f(`/tokens/${cid}/${addr}`, { method: "DELETE" }); },
@@ -210,10 +219,7 @@ function playBeep() {
 // STYLES
 // ═══════════════════════════════════════════════════════════
 const TYPE = { heartbeat: ["#334155", "♥ HB"], info: ["#94a3b8", "INFO"], debug: ["#475569", "DBUG"], warn: ["#fbbf24", "WARN"], error: ["#f87171", "ERR!"], trade: ["#34d399", "TRDE"], opportunity: ["#a78bfa", "OPP!"] };
-const CAT_C = { stable: "#22d3ee", blue_chip: "#a78bfa", defi: "#34d399", meme: "#fbbf24", other: "#64748b" };
 const btn = { background: "#1e293b", border: "none", borderRadius: 4, padding: "6px 14px", color: "#94a3b8", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace", fontSize: 12 };
-const input = { background: "#020617", border: "1px solid #1e293b", borderRadius: 4, padding: "6px 10px", color: "#e2e8f0", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, width: "100%" };
-const select = { ...input, cursor: "pointer" };
 
 // ═══════════════════════════════════════════════════════════
 // COMPONENTS
@@ -752,101 +758,137 @@ function ControlPanel({ ws, api, apiStats, clearAll }) {
   );
 }
 
-// ─── 1. Token manager with chain name in DDL ──────────────
-function TokenManager({ api }) {
-  const [chainFilter, setChainFilter] = useState("");
-  const [showAdd, setShowAdd] = useState(false);
-  const [newTk, setNew] = useState({ symbol: "", address: "", decimals: 18, chain_id: 10, category: "other" });
-  // Cache all known chain IDs so the dropdown stays populated when a chain filter is active
-  const [knownChainIds, setKnownChainIds] = useState([]);
+// ─── Pair Manager (replaces TokenManager) ─────────────────
+function PairManager({ api }) {
+  const chainIds = Object.keys(api.pairScan).map(Number).sort();
+  const [selectedChain, setSelectedChain] = useState(null);
+  const [toggling, setToggling] = useState({});
 
-  useEffect(() => { api.fetchTokens(chainFilter || undefined); }, [chainFilter]);
-
-  // When we have the full token list (no filter active), refresh known chain IDs
-  // API returns chainId (camelCase) due to #[serde(rename = "chainId")] in Rust Token struct
+  // Auto-select first chain when data arrives
   useEffect(() => {
-    if (!chainFilter && api.tokens.length > 0) {
-      const ids = [...new Set(api.tokens.map((t) => t.chainId))].filter(Boolean);
-      if (ids.length > 0) setKnownChainIds(ids);
-    }
-  }, [api.tokens, chainFilter]);
+    if (chainIds.length > 0 && selectedChain === null) setSelectedChain(chainIds[0]);
+  }, [chainIds.length]);
 
-  const handleAdd = async () => {
-    if (await api.addToken(newTk)) { setShowAdd(false); setNew({ symbol: "", address: "", decimals: 18, chain_id: 10, category: "other" }); api.fetchTokens(chainFilter || undefined); }
+  // Poll pair scan every 30s
+  useEffect(() => {
+    api.fetchPairScan();
+    const t = setInterval(() => api.fetchPairScan(), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const activeChain = selectedChain ?? chainIds[0] ?? null;
+  const rows = activeChain != null ? (api.pairScan[activeChain] ?? []) : [];
+  const enabledCount = rows.filter((r) => !r.disabled).length;
+  const quotedCount = rows.filter((r) => r.was_quoted).length;
+
+  const handleToggle = async (pair) => {
+    setToggling((p) => ({ ...p, [pair.pair_id]: true }));
+    await api.togglePair(pair.pair_id);
+    await api.fetchPairScan();
+    setToggling((p) => ({ ...p, [pair.pair_id]: false }));
   };
 
-  const handleToggle = async (t) => { await api.toggleTrust(t.chainId, t.address, !t.trusted); api.fetchTokens(chainFilter || undefined); };
-  const handleRemove = async (t) => { await api.removeToken(t.chainId, t.address); api.fetchTokens(chainFilter || undefined); };
-
-  const chainIds = knownChainIds.length > 0 ? knownChainIds : [...new Set(api.tokens.map((t) => t.chainId))].filter(Boolean);
-
   return (
-    <div style={{ padding: 16 }}>
-      <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
-        {/* ① Chain name instead of ID in the dropdown */}
-        <select value={chainFilter} onChange={(e) => setChainFilter(e.target.value)} style={{ ...input, width: "auto" }}>
-          <option value="">All Chains</option>
-          {chainIds.map((id) => (
-            <option key={id} value={id}>{chainName(id)}</option>
-          ))}
-        </select>
-        <button onClick={() => api.fetchPairs(chainFilter || undefined)} style={{ ...btn, background: "#1e1b4b", color: "#a78bfa" }}>Preview Pairs ({api.pairs.length})</button>
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
+      {/* Chain tabs */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+        {chainIds.map((cid) => (
+          <button
+            key={cid}
+            onClick={() => setSelectedChain(cid)}
+            style={{ ...btn, padding: "5px 14px", fontSize: 11,
+              background: activeChain === cid ? "#1e1b4b" : "#0f172a",
+              color: activeChain === cid ? "#a78bfa" : "#475569",
+              border: `1px solid ${activeChain === cid ? "#4c1d95" : "#1e293b"}` }}
+          >
+            {chainName(cid)}
+          </button>
+        ))}
         <span style={{ flex: 1 }} />
-        <span style={{ fontSize: 11, color: "#475569" }}>{api.tokens.filter((t) => t.trusted).length} trusted / {api.tokens.length} total</span>
-        <button onClick={() => setShowAdd(!showAdd)} style={{ ...btn, background: "#052e16", color: "#34d399" }}>+ Add Token</button>
+        {activeChain != null && (
+          <span style={{ fontSize: 11, color: "#475569" }}>
+            {enabledCount}/{rows.length} enabled · {quotedCount} quoted last scan
+          </span>
+        )}
+        <button onClick={() => api.fetchPairScan()} style={{ ...btn, fontSize: 10, padding: "4px 10px", color: "#a78bfa" }}>↺ Refresh</button>
       </div>
 
-      {showAdd && (
-        <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 14, marginBottom: 12, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
-          <input placeholder="Symbol" value={newTk.symbol} onChange={(e) => setNew({ ...newTk, symbol: e.target.value })} style={input} />
-          <input placeholder="0x..." value={newTk.address} onChange={(e) => setNew({ ...newTk, address: e.target.value })} style={{ ...input, gridColumn: "span 2" }} />
-          <input type="number" placeholder="Decimals" value={newTk.decimals} onChange={(e) => setNew({ ...newTk, decimals: +e.target.value })} style={input} />
-          <input type="number" placeholder="Chain ID" value={newTk.chain_id} onChange={(e) => setNew({ ...newTk, chain_id: +e.target.value })} style={input} />
-          <select value={newTk.category} onChange={(e) => setNew({ ...newTk, category: e.target.value })} style={input}>
-            {["stable", "blue_chip", "defi", "meme", "other"].map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-          <div style={{ gridColumn: "span 3", display: "flex", gap: 8, justifyContent: "flex-end" }}>
-            <button onClick={() => setShowAdd(false)} style={btn}>Cancel</button>
-            <button onClick={handleAdd} style={{ ...btn, background: "#052e16", color: "#34d399" }}>Add (untrusted)</button>
-          </div>
+      {/* Pair table */}
+      {activeChain == null ? (
+        <div style={{ color: "#334155", fontSize: 12, padding: 24, textAlign: "center" }}>
+          No pair scan data yet — data appears after the first heartbeat (~60s after engine start)
+        </div>
+      ) : (
+        <div style={{ overflow: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #1e293b" }}>
+                {["Pair", "DEXes active", "Cross", "Quoted", "Opps", "Scan"].map((h) => (
+                  <th key={h} style={{ textAlign: "left", padding: "7px 8px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#020617" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 ? (
+                <tr><td colSpan={6} style={{ padding: "20px 8px", color: "#334155", fontSize: 11, textAlign: "center" }}>No pairs — engine may still be starting up</td></tr>
+              ) : rows.map((p) => (
+                <tr key={p.pair_id} style={{ borderBottom: "1px solid #0a0f1a", opacity: p.disabled ? 0.45 : 1 }}>
+                  {/* Pair name */}
+                  <td style={{ padding: "7px 8px", fontWeight: 600, whiteSpace: "nowrap" }}>
+                    <span style={{ color: p.disabled ? "#334155" : "#e2e8f0" }}>{p.display_name}</span>
+                    <span style={{ marginLeft: 6, fontSize: 9, color: "#334155" }}>{p.pair_id.replace(/^[^-]+-/, "")}</span>
+                  </td>
+                  {/* DEXes active */}
+                  <td style={{ padding: "7px 8px" }}>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+                      {p.dex_ids.length === 0 ? (
+                        <span style={{ fontSize: 9, color: "#334155" }}>—</span>
+                      ) : p.dex_ids.map((d) => (
+                        <span key={d} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 3, background: "#1e1b4b", color: "#a78bfa", border: "1px solid #312e81" }}>{d}</span>
+                      ))}
+                    </div>
+                  </td>
+                  {/* Cross count */}
+                  <td style={{ padding: "7px 8px", color: p.cross_count >= 2 ? "#34d399" : "#475569", fontWeight: p.cross_count >= 2 ? 600 : 400 }}>
+                    {p.cross_count || "—"}
+                  </td>
+                  {/* Was quoted badge */}
+                  <td style={{ padding: "7px 8px" }}>
+                    <span style={{ fontSize: 9, padding: "2px 7px", borderRadius: 8,
+                      background: p.was_quoted ? "#052e16" : "#1e293b",
+                      color: p.was_quoted ? "#34d399" : "#334155",
+                      border: `1px solid ${p.was_quoted ? "#166534" : "#1e293b"}` }}>
+                      {p.was_quoted ? "✓" : "—"}
+                    </span>
+                  </td>
+                  {/* Opp count */}
+                  <td style={{ padding: "7px 8px", color: p.opp_count > 0 ? "#fbbf24" : "#334155", fontWeight: p.opp_count > 0 ? 600 : 400 }}>
+                    {p.opp_count > 0 ? p.opp_count : "—"}
+                  </td>
+                  {/* Enable/disable toggle */}
+                  <td style={{ padding: "7px 8px" }}>
+                    <button
+                      onClick={() => handleToggle(p)}
+                      disabled={toggling[p.pair_id]}
+                      style={{ ...btn, fontSize: 9, padding: "3px 10px",
+                        background: p.disabled ? "#1e293b" : "#052e16",
+                        color: p.disabled ? "#475569" : "#34d399",
+                        border: `1px solid ${p.disabled ? "#1e293b" : "#166534"}`,
+                        opacity: toggling[p.pair_id] ? 0.5 : 1 }}
+                    >
+                      {p.disabled ? "Disabled" : "Enabled"}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
 
-      <div style={{ overflow: "auto", maxHeight: 400 }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-          <thead><tr style={{ borderBottom: "1px solid #1e293b" }}>
-            {["Symbol", "Chain", "Category", "Status", "Address", ""].map((h) => (
-              <th key={h} style={{ textAlign: "left", padding: "7px 8px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#020617" }}>{h}</th>
-            ))}
-          </tr></thead>
-          <tbody>{api.tokens.map((t) => (
-            <tr key={`${t.chainId}-${t.address}`} style={{ borderBottom: "1px solid #0a0f1a" }}>
-              <td style={{ padding: "7px 8px", fontWeight: 600 }}>{t.symbol}</td>
-              {/* Show chain name, not raw ID */}
-              <td style={{ padding: "7px 8px", color: "#a78bfa" }}>{chainName(t.chainId)}</td>
-              <td style={{ padding: "7px 8px" }}><span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 10, background: `${CAT_C[t.category] || CAT_C.other}18`, color: CAT_C[t.category] || CAT_C.other }}>{t.category}</span></td>
-              <td style={{ padding: "7px 8px" }}>
-                <button onClick={() => handleToggle(t)} style={{ ...btn, fontSize: 10, padding: "3px 10px", background: t.trusted ? "#052e16" : "#1e293b", color: t.trusted ? "#34d399" : "#475569", border: `1px solid ${t.trusted ? "#166534" : "#1e293b"}` }}>
-                  {t.trusted ? "✓ TRUSTED" : "UNTRUSTED"}
-                </button>
-              </td>
-              <td style={{ padding: "7px 8px", color: "#1e293b", fontSize: 10 }}>{t.address.slice(0, 8)}…{t.address.slice(-4)}</td>
-              <td style={{ padding: "7px 8px" }}><button onClick={() => handleRemove(t)} style={{ ...btn, fontSize: 10, color: "#334155", padding: "2px 6px" }}>✕</button></td>
-            </tr>
-          ))}</tbody>
-        </table>
+      <div style={{ fontSize: 10, color: "#334155", marginTop: 4 }}>
+        Scan data updates every heartbeat (~60s). Toggle disables the pair from future scans — takes effect on the next scan cycle.
       </div>
-
-      {api.pairs.length > 0 && (
-        <div style={{ marginTop: 12, background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 12, maxHeight: 180, overflow: "auto" }}>
-          <div style={{ fontSize: 9, color: "#475569", marginBottom: 6, letterSpacing: 1, fontWeight: 700 }}>AUTO-GENERATED PAIRS ({api.pairs.length})</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-            {api.pairs.map((p) => (
-              <span key={p.id} style={{ fontSize: 10, padding: "3px 8px", borderRadius: 3, background: "#1e1b4b", color: "#a78bfa", border: "1px solid #312e81" }}>{p.path}</span>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -975,7 +1017,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {tab === "tokens" && <div style={{ flex: 1, overflow: "auto" }}><TokenManager api={api} /></div>}
+      {tab === "tokens" && <div style={{ flex: 1, overflow: "auto" }}><PairManager api={api} /></div>}
       {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} /></div>}
     </div>
   );

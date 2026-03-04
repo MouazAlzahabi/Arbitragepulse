@@ -4,10 +4,11 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use futures::future::join_all;
 use futures::StreamExt;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 use crate::abi::{IERC20, IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Pair, IUniswapV2Router02};
@@ -173,6 +174,30 @@ struct ReverseTask {
 }
 
 
+// ─── Per-pair scan snapshot ───────────────────────────────────────────────────
+
+/// Statistics for a single configured pair from the last evaluate() call.
+/// Exposed via the /pair-scan API endpoint and the dashboard Pairs tab.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairScanInfo {
+    pub pair_id: String,
+    pub chain_id: u64,
+    /// Display name without chain prefix, e.g. "USDC→WETH"
+    pub display_name: String,
+    /// Number of distinct DEXes (router IDs) that produced a non-zero forward quote.
+    pub dex_count: usize,
+    /// Router IDs that produced a non-zero forward quote.
+    pub dex_ids: Vec<String>,
+    /// Number of cross-DEX arb combinations examined in reverse phase (≥2 DEXes).
+    pub cross_count: usize,
+    /// Whether any DEX quoted this pair in the last scan.
+    pub was_quoted: bool,
+    /// Number of profitable opportunities found for this pair this session.
+    pub opp_count: u64,
+    /// Whether this pair is disabled via the dashboard toggle.
+    pub disabled: bool,
+}
+
 // ─── Strategy ─────────────────────────────────────────────────────────────────
 
 pub struct Strategy {
@@ -194,6 +219,11 @@ pub struct Strategy {
     /// When populated, forward and reverse quotes for V2/Solidly-volatile routers are
     /// computed locally (zero eth_call) instead of via multicall.
     pub pool_cache: Arc<PoolCache>,
+    /// Per-pair scan snapshot from the last evaluate() call.
+    /// Updated atomically at the end of each evaluate(); read by chain.rs for heartbeat publishing.
+    pub pair_scan: Mutex<Vec<PairScanInfo>>,
+    /// Running count of opportunities found per pair this session.
+    pub opp_session_counts: Mutex<HashMap<String, u64>>,
 }
 
 impl Strategy {
@@ -216,6 +246,8 @@ impl Strategy {
             syncswap_pool_cache: HashMap::new(),
             pool_cache,
             rpc_concurrency,
+            pair_scan: Mutex::new(Vec::new()),
+            opp_session_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1002,6 +1034,62 @@ impl Strategy {
         }
 
         opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
+
+        // ── Update session opp counts and pair scan snapshot ─────────────────────
+        {
+            let mut opp_counts = self.opp_session_counts.lock().unwrap();
+            for opp in &opportunities {
+                *opp_counts.entry(opp.pair_id.clone()).or_insert(0) += 1;
+            }
+
+            let mut scan = self.pair_scan.lock().unwrap();
+            scan.clear();
+
+            // Pairs with at least one forward quote
+            let mut seen_pis = std::collections::HashSet::new();
+            for (pi, quotes) in &pair_quotes {
+                seen_pis.insert(*pi);
+                let pair = &self.pairs[*pi];
+                let mut dex_set = std::collections::HashSet::new();
+                for q in quotes { dex_set.insert(q.router_id.clone()); }
+                let dex_ids: Vec<String> = dex_set.into_iter().collect();
+                let dex_count = dex_ids.len();
+                // cross_count = number of ordered (A,B) pairs where A≠B, i.e. k*(k-1)
+                let cross_count = if dex_count >= 2 { dex_count * (dex_count - 1) } else { 0 };
+                let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
+                scan.push(PairScanInfo {
+                    pair_id: pair.id.clone(),
+                    chain_id: pair.chain_id,
+                    display_name,
+                    dex_count,
+                    dex_ids,
+                    cross_count,
+                    was_quoted: true,
+                    opp_count: *opp_counts.get(&pair.id).unwrap_or(&0),
+                    disabled: false,
+                });
+            }
+
+            // Pairs with no quote this scan (cache miss or disabled)
+            for (pi, pair) in self.pairs.iter().enumerate()
+                .filter(|(_, p)| p.chain_id == self.chain_id)
+            {
+                if seen_pis.contains(&pi) { continue; }
+                let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
+                scan.push(PairScanInfo {
+                    pair_id: pair.id.clone(),
+                    chain_id: pair.chain_id,
+                    display_name,
+                    dex_count: 0,
+                    dex_ids: vec![],
+                    cross_count: 0,
+                    was_quoted: false,
+                    opp_count: *opp_counts.get(&pair.id).unwrap_or(&0),
+                    disabled: false,
+                });
+            }
+        }
+
         (opportunities, best_raw_usd, total_fwd_ok, pairs_with_multi, best_spread_pct, pairs_with_any)
     }
 
