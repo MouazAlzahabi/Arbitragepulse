@@ -456,7 +456,7 @@ function OpportunityTable({ logs }) {
 }
 
 // ─── 3. Pair leaderboard (DB-backed via /stats/pairs + live OPP! detection counting) ────
-function PairLeaderboard({ pairStats, wsLogs }) {
+function PairLeaderboard({ pairStats, wsLogs, onReload }) {
   // Count live OPP! detections per pair_id from WS logs (this session only, not executions)
   const detectedCounts = useMemo(() => {
     const counts = {};
@@ -474,9 +474,14 @@ function PairLeaderboard({ pairStats, wsLogs }) {
 
   return (
     <div style={{ background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b", overflow: "hidden" }}>
-      <div style={{ padding: "10px 14px", borderBottom: "1px solid #1e293b" }}>
-        <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>PAIR LEADERBOARD</span>
-        <span style={{ fontSize: 9, color: "#1e293b", marginLeft: 8 }}>(DB-backed — executed trades only)</span>
+      <div style={{ padding: "10px 14px", borderBottom: "1px solid #1e293b", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>PAIR LEADERBOARD</span>
+          <span style={{ fontSize: 9, color: "#1e293b", marginLeft: 8 }}>(DB-backed — executed trades only)</span>
+        </div>
+        {onReload && rows.length === 0 && (
+          <button onClick={onReload} style={{ background: "#1e293b", border: "none", color: "#64748b", fontSize: 10, padding: "3px 8px", borderRadius: 4, cursor: "pointer" }}>↺ Reload</button>
+        )}
       </div>
       {rows.length === 0 ? (
         <div style={{ color: "#1e293b", textAlign: "center", padding: 24, fontSize: 12, fontStyle: "italic" }}>No executed trade data yet…</div>
@@ -837,13 +842,6 @@ export default function Dashboard() {
   const [tab, setTab] = useState("monitor");
   const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info", "heartbeat"]));
 
-  // Clear all monitoring state for fresh tracking (logs + leaderboard display)
-  const clearAll = () => {
-    ws.clearLogs();
-    setPairStats([]);
-    setApiStats(null);
-  };
-
   // Poll /stats via HTTP every 3s to keep pause/dry-run state accurate.
   // Measure API latency from each poll.
   const [apiStats, setApiStats] = useState(null);
@@ -863,21 +861,32 @@ export default function Dashboard() {
     return () => clearInterval(iv);
   }, [authenticated]);
 
-  // Poll /stats/pairs every 5s for the pair leaderboard
-  const [pairStats, setPairStats] = useState([]);
+  // Poll /stats/pairs every 5s for the pair leaderboard.
+  // pairStatsCleared: when true, show empty until user clicks Reload.
+  // The poll always updates pairStatsLive so data is ready the moment they reload.
+  const [pairStatsLive, setPairStatsLive] = useState([]);
+  const [pairStatsCleared, setPairStatsCleared] = useState(false);
+  const pairStats = pairStatsCleared ? [] : pairStatsLive;
   useEffect(() => {
     if (!authenticated) return;
     const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
     const poll = async () => {
       try {
         const r = await fetch(`${apiUrl}/stats/pairs`, { headers });
-        if (r.ok) { const d = await r.json(); setPairStats(d.pairs || []); }
+        if (r.ok) { const d = await r.json(); setPairStatsLive(d.pairs || []); }
       } catch {}
     };
     poll();
     const iv = setInterval(poll, 5000);
     return () => clearInterval(iv);
   }, [authenticated, apiUrl, apiKey]);
+
+  // Clear all monitoring state for fresh tracking (logs + leaderboard display).
+  // apiStats is intentionally kept live — it holds engine state (pause/dry_run/base_fee).
+  const clearAll = () => {
+    ws.clearLogs();
+    setPairStatsCleared(true);
+  };
 
   useEffect(() => { if (ws.status === "connected") setAuthenticated(true); }, [ws.status]);
 
@@ -924,7 +933,7 @@ export default function Dashboard() {
 
           {/* Row 2: Pair leaderboard (full width) */}
           <div style={{ padding: "0 14px 10px 14px" }}>
-            <PairLeaderboard pairStats={pairStats} wsLogs={ws.logs} />
+            <PairLeaderboard pairStats={pairStats} wsLogs={ws.logs} onReload={() => setPairStatsCleared(false)} />
           </div>
 
           {/* Row 3: Live feed */}
