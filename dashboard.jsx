@@ -511,6 +511,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
     if (l.type === "trade") return enabledTypes.has("trade");
     if (l.type === "opportunity") return enabledTypes.has("opportunity");
     if (l.type === "error" || l.type === "warn") return enabledTypes.has("errors");
+    if (l.type === "info") return enabledTypes.has("info");
     return false;
   });
 
@@ -523,6 +524,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
   const checkboxes = [
     { key: "trade", label: "TRDE", color: "#34d399" },
     { key: "opportunity", label: "OPP!", color: "#a78bfa" },
+    { key: "info", label: "Info", color: "#94a3b8" },
     { key: "skipped", label: "Skipped", color: "#475569" },
     { key: "errors", label: "Errors/Warn", color: "#f87171" },
   ];
@@ -783,7 +785,7 @@ export default function Dashboard() {
   const ws = useWebSocket(url, apiKey);
   const api = useApi(apiUrl, apiKey);
   const [tab, setTab] = useState("monitor");
-  const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors"]));
+  const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info"]));
 
   // Clear all monitoring state for fresh tracking
   const clearAll = () => { ws.clearLogs(); };
