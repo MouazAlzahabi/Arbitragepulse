@@ -1200,9 +1200,68 @@ impl Strategy {
             });
         }
 
-        // Remove triplets that have been disabled via the dashboard toggle.
+        // Compute disabled directed token pairs from config — used both to filter the scan
+        // and to mark blocked triplets in tri_scan (so they stay visible in the dashboard).
+        let disabled_legs: std::collections::HashSet<(Address, Address)> =
+            if disabled_triplets.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                self.pairs.iter()
+                    .filter(|p| p.chain_id == self.chain_id && disabled_triplets.contains(&p.id))
+                    .filter_map(|p| {
+                        let ti: Address = p.token_in.parse().ok()?;
+                        let to: Address = p.token_out.parse().ok()?;
+                        Some((ti, to))
+                    })
+                    .collect()
+            };
+
+        // Helper: is this triplet blocked by any disabled rule?
+        let is_triplet_disabled = |t: &Triplet| -> bool {
+            if disabled_triplets.contains(&t.triplet_id) { return true; }
+            if disabled_legs.contains(&(t.token_a, t.token_b)) { return true; }
+            if disabled_legs.contains(&(t.token_b, t.token_c)) { return true; }
+            if disabled_legs.contains(&(t.token_c, t.token_a)) { return true; }
+            false
+        };
+
+        // Save all displayable triplets (post token-filter, pre-disable-filter) so
+        // tri_scan can show disabled triplets as dimmed rather than making them disappear.
+        let all_displayable: Vec<(String, Address, Address, Address)> = triplets.iter()
+            .map(|t| (t.triplet_id.clone(), t.token_a, t.token_b, t.token_c))
+            .collect();
+        let disabled_triplet_ids: std::collections::HashSet<String> = triplets.iter()
+            .filter(|t| is_triplet_disabled(t))
+            .map(|t| t.triplet_id.clone())
+            .collect();
+
+        // Remove disabled entries from the scan (they stay in all_displayable for the UI).
         if !disabled_triplets.is_empty() {
-            triplets.retain(|t| !disabled_triplets.contains(&t.triplet_id));
+            triplets.retain(|t| !is_triplet_disabled(t));
+        }
+
+        if triplets.is_empty() && all_displayable.iter().all(|(id, ..)| disabled_triplet_ids.contains(id)) {
+            // Nothing to scan; still need to update tri_scan with disabled markers.
+            let mut opp_counts = self.opp_session_counts.lock().unwrap();
+            let mut tri = self.tri_scan.lock().unwrap();
+            tri.clear();
+            for (triplet_id, ..) in &all_displayable {
+                let display_name = format!("▲ {}", triplet_id);
+                tri.push(PairScanInfo {
+                    pair_id: triplet_id.clone(),
+                    chain_id: self.chain_id,
+                    display_name,
+                    dex_count: 0,
+                    dex_ids: vec![],
+                    cross_count: 0,
+                    was_quoted: false,
+                    opp_count: *opp_counts.get(triplet_id).unwrap_or(&0),
+                    disabled: true,
+                });
+            }
+            tri.dedup_by_key(|t| t.pair_id.clone());
+            drop(opp_counts);
+            return (vec![], 0.0);
         }
 
         if triplets.is_empty() {
@@ -1753,25 +1812,33 @@ impl Strategy {
 
             let mut tri = self.tri_scan.lock().unwrap();
             tri.clear();
-            // All evaluated triplets (including those that found no profit)
-            for triplet in &triplets {
-                let dex_ids: Vec<String> = tri_dex_map.get(&triplet.triplet_id)
-                    .map(|s| s.iter().cloned().collect())
-                    .unwrap_or_default();
+            // Use all_displayable so disabled triplets still appear in the dashboard (dimmed).
+            // Active triplets get live DEX/path stats; disabled ones show zeros.
+            for (triplet_id, ..) in &all_displayable {
+                let is_disabled = disabled_triplet_ids.contains(triplet_id);
+                let dex_ids: Vec<String> = if is_disabled {
+                    vec![]
+                } else {
+                    tri_dex_map.get(triplet_id)
+                        .map(|s| s.iter().cloned().collect())
+                        .unwrap_or_default()
+                };
                 let dex_count = dex_ids.len();
-                let cross_count = tri_path_count.get(&triplet.triplet_id).copied().unwrap_or(0);
-                let was_quoted = dex_count > 0;
-                let display_name = format!("▲ {}", triplet.triplet_id);
+                let cross_count = if is_disabled { 0 } else {
+                    tri_path_count.get(triplet_id).copied().unwrap_or(0)
+                };
+                let was_quoted = !is_disabled && dex_count > 0;
+                let display_name = format!("▲ {}", triplet_id);
                 tri.push(PairScanInfo {
-                    pair_id: triplet.triplet_id.clone(),
+                    pair_id: triplet_id.clone(),
                     chain_id: self.chain_id,
                     display_name,
                     dex_count,
                     dex_ids,
                     cross_count,
                     was_quoted,
-                    opp_count: *opp_counts.get(&triplet.triplet_id).unwrap_or(&0),
-                    disabled: false,
+                    opp_count: *opp_counts.get(triplet_id).unwrap_or(&0),
+                    disabled: is_disabled,
                 });
             }
             // Deduplicate: keep only unique triplet_id entries
