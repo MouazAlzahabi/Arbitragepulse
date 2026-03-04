@@ -318,26 +318,13 @@ function ChainCards({ apiStats }) {
   );
 }
 
-function formatGwei(v) {
-  if (v == null) return null;
-  if (v >= 1) return `${v.toFixed(3)} gwei`;
-  if (v >= 0.001) return `${v.toFixed(4)} gwei`;
-  if (v > 0) return `${(v * 1000).toFixed(3)} mwei`;
-  return "0 gwei";
-}
 
 function GasLatencyBar({ apiStats, apiLatency }) {
-  // Show the max base fee across chains (picks up the one that's actually non-zero)
-  const baseFeeChain = apiStats?.chains?.find((c) => c.base_fee_gwei > 0);
-  const baseFee = baseFeeChain?.base_fee_gwei ?? null;
   // Show RPC latency per chain (only chains that have a measurement)
   const rpcChains = (apiStats?.chains || []).filter((c) => c.rpc_latency_ms > 0);
-  if (baseFee == null && apiLatency == null && rpcChains.length === 0) return null;
+  if (apiLatency == null && rpcChains.length === 0) return null;
   return (
     <div style={{ display: "flex", gap: 24, padding: "4px 16px", background: "#0a0f1a", borderBottom: "1px solid #1e293b", fontSize: 11 }}>
-      {baseFee != null && (
-        <span style={{ color: "#475569" }}>⛽ Base Fee: <span style={{ color: "#94a3b8" }}>{formatGwei(baseFee)}</span></span>
-      )}
       {rpcChains.map((c) => {
         const ms = Math.round(c.rpc_latency_ms);
         const col = ms < 100 ? "#34d399" : ms < 300 ? "#fbbf24" : "#f87171";

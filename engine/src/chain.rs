@@ -255,6 +255,8 @@ pub async fn run_chain(
     // Count of consecutive heartbeats with zero forward quotes.
     // Warning only fires at 3+ to suppress startup false-positives and transient RPC blips.
     let mut consecutive_zero_fwd: u32 = 0;
+    // Scans at the previous heartbeat — used to show per-beat delta instead of cumulative.
+    let mut last_hb_scans: u64 = 0;
 
     // ── Main loop ──
     // Tracks when the last full evaluate ran — used to gate the poll_tick fallback.
@@ -312,14 +314,15 @@ pub async fn run_chain(
                     }
                     ok
                 };
-                let (scans, attempts, success) = {
+                let (total_scans, attempts, success) = {
                     let state = shared_state.read().await;
                     state.chains.iter()
                         .find(|c| c.chain_id == cfg.id)
                         .map(|c| (c.total_scans, c.total_attempts, c.total_success))
                         .unwrap_or((0, 0, confirmed_ok))
                 };
-                let native_price = { strategy.read().await.native_price_usd };
+                let scans = total_scans.saturating_sub(last_hb_scans);
+                last_hb_scans = total_scans;
                 // Read and reset the best raw profit seen since last tick
                 let best_seen_usd = f64::from_bits(best_raw_profit.swap(0u64, Ordering::Relaxed));
                 let best_seen_str = if best_seen_usd > 0.0 {
@@ -341,8 +344,8 @@ pub async fn run_chain(
                 let total_pairs = chain_pairs.len() as u64;
                 let opp_count = last_opp_count.load(Ordering::Relaxed);
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} {}=${:.0} | best={} spread={} | quotes={} active={}/{} cross={} | opps={} | rpc={}ms",
-                    cfg.name, scans, attempts, success, cfg.native_currency, native_price, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, rpc_latency_ms as u64,
+                    "[{}] ♥ scans={} execs={} ok={} | best={} spread={} | quotes={} active={}/{} cross={} | opps={}",
+                    cfg.name, scans, attempts, success, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 info!("{}", heartbeat_msg);
