@@ -163,6 +163,13 @@ impl Database {
         Ok(records)
     }
 
+    /// Delete all trade records from the database (irreversible).
+    pub fn clear_all_trades(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM trades", [])?;
+        Ok(deleted)
+    }
+
     /// Per-chain cumulative stats for seeding ChainStats on restart (live trades only).
     pub fn get_chain_stats(&self) -> Result<Vec<(u64, String, u64, u64, f64)>> {
         let conn = self.conn.lock().unwrap();

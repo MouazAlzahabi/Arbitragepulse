@@ -143,6 +143,7 @@ function useApi(baseUrl, apiKey) {
     resumeEngine: (cid) => f("/engine/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cid ? { chain_id: cid } : {}) }),
     setDryRun: (enabled) => f("/engine/dry-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }),
     restartEngine: () => f("/engine/restart", { method: "POST", headers: { "Content-Type": "application/json" } }),
+    resetDb: () => f("/stats/reset", { method: "POST", headers: { "Content-Type": "application/json" } }),
     fetchStats: () => f("/stats"),
     fetchState: () => f("/engine/state"),
     fetchTrades: (limit) => f(`/trades?limit=${limit || 500}`),
@@ -600,6 +601,8 @@ function ControlPanel({ ws, api, apiStats, clearAll }) {
   const [soundOn, setSoundOn] = useState(true);
   const [confirmRestart, setConfirmRestart] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const [confirmDbReset, setConfirmDbReset] = useState(false);
+  const [dbResetting, setDbResetting] = useState(false);
 
   // Sound on trade
   useEffect(() => {
@@ -721,6 +724,31 @@ function ControlPanel({ ws, api, apiStats, clearAll }) {
         <button onClick={clearAll} style={{ ...btn, background: "#1e293b", color: "#94a3b8", padding: "8px 20px" }}>
           ✕ Clear
         </button>
+      </div>
+
+      {/* Reset Database */}
+      <div style={{ background: "#0f172a", border: "1px solid #450a0a", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 11, color: "#7f1d1d", letterSpacing: 1, fontWeight: 700 }}>RESET DATABASE</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Permanently delete all trade records from the database — irreversible</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button
+            onClick={async () => {
+              if (!confirmDbReset) { setConfirmDbReset(true); return; }
+              setDbResetting(true);
+              setConfirmDbReset(false);
+              await api.resetDb();
+              clearAll();
+              setDbResetting(false);
+            }}
+            disabled={dbResetting}
+            style={{ ...btn, background: confirmDbReset ? "#450a0a" : "#1e293b", color: confirmDbReset ? "#fca5a5" : "#94a3b8", padding: "8px 20px", opacity: dbResetting ? 0.5 : 1 }}
+          >
+            {dbResetting ? "Deleting…" : confirmDbReset ? "⚠ Confirm Delete" : "Delete DB"}
+          </button>
+          {confirmDbReset && <button onClick={() => setConfirmDbReset(false)} style={{ ...btn, fontSize: 11 }}>Cancel</button>}
+        </div>
       </div>
     </div>
   );

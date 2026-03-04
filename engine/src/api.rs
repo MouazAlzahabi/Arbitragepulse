@@ -131,6 +131,7 @@ impl ApiServer {
             .route("/metrics", get(metrics_handler))
             .route("/stats", get(stats))
             .route("/stats/pairs", get(pair_stats))
+            .route("/stats/reset", post(stats_reset))
             .route("/trades", get(trades_list))
             .route("/ws", get(ws_handler))
             .route("/engine/pause", post(engine_pause))
@@ -289,6 +290,24 @@ async fn pair_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     };
     match tokio::task::spawn_blocking(move || db.get_pair_stats()).await {
         Ok(Ok(records)) => Json(serde_json::json!({ "pairs": records })).into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "db error" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn stats_reset(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(db) = state.db.clone() else {
+        return Json(serde_json::json!({ "deleted": 0 })).into_response();
+    };
+    match tokio::task::spawn_blocking(move || db.clear_all_trades()).await {
+        Ok(Ok(deleted)) => {
+            broadcast_log(&state.log_tx, "info",
+                &format!("[ENGINE] DB reset — {} trade records deleted", deleted), None);
+            Json(serde_json::json!({ "deleted": deleted })).into_response()
+        }
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "db error" })),
