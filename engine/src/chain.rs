@@ -166,6 +166,7 @@ pub async fn run_chain(
                 paused: false,
                 rpc_ok: true,   // we just connected successfully
                 last_block: 0,
+                rpc_latency_ms: 0.0,
             });
         } else if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
             chain.rpc_ok = true;
@@ -281,6 +282,14 @@ pub async fn run_chain(
             // ── Periodic price update + cache cleanup + status log ────────────
             _ = price_tick.tick() => {
                 update_native_price(&strategy, &executor, &provider, &chain_routers, &chain_pairs, &cfg).await;
+
+                // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
+                let rpc_ping_start = Instant::now();
+                let rpc_latency_ms = match provider.get_block_number().await {
+                    Ok(_) => rpc_ping_start.elapsed().as_millis() as f64,
+                    Err(_) => 0.0,
+                };
+
                 // Broadcast a heartbeat log so the Live Feed shows the engine is active
                 // even when no opportunities are detected. Fires every ~60 seconds.
                 // Sync confirmed_success from executor atomics into shared_state
@@ -298,6 +307,7 @@ pub async fn run_chain(
                         chain.total_success = ok;
                         chain.total_failed = fail;
                         chain.total_profit_usd = profit;
+                        chain.rpc_latency_ms = rpc_latency_ms;
                         chain.ghost_profit_usd = ghost;
                     }
                     ok
@@ -331,8 +341,8 @@ pub async fn run_chain(
                 let total_pairs = chain_pairs.len() as u64;
                 let opp_count = last_opp_count.load(Ordering::Relaxed);
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} {}=${:.0} | best={} spread={} | quotes={} active={}/{} cross={} | opps={}",
-                    cfg.name, scans, attempts, success, cfg.native_currency, native_price, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
+                    "[{}] ♥ scans={} execs={} ok={} {}=${:.0} | best={} spread={} | quotes={} active={}/{} cross={} | opps={} | rpc={}ms",
+                    cfg.name, scans, attempts, success, cfg.native_currency, native_price, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, rpc_latency_ms as u64,
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 info!("{}", heartbeat_msg);

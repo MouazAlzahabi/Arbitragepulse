@@ -64,6 +64,8 @@ pub struct ChainStats {
     pub rpc_ok: bool,
     /// Last block number seen from the block-header subscription (0 = not yet seen).
     pub last_block: u64,
+    /// Latest eth_blockNumber round-trip latency in ms (measured once per heartbeat interval). 0 = not yet measured.
+    pub rpc_latency_ms: f64,
 }
 
 #[derive(Debug, Default)]
