@@ -876,13 +876,17 @@ impl Strategy {
                         best_raw_usd = profit_usd;
                     }
 
-                    // Cross-router V3×V3: local sqrtPriceX96 comparison is unreliable —
-                    // per-DEX state divergence creates phantom spreads. Phase 1.5 (p15_gate
-                    // above) handles these via QuoterV2 in the same scan cycle.
-                    let is_v3_x_v3 = matches!(task.router_a_type, RouterType::V3)
-                        && matches!(task.router_b_type, RouterType::V3);
+                    // Any route with a V3 forward leg: the sqrtPriceX96 virtual-reserve
+                    // approximation can overestimate by 0.01–0.1% (single-tick math vs
+                    // actual multi-tick execution + fee). This creates phantom spreads on
+                    // V3→V2 and V3→V3 routes that consistently fail pre-flight.
+                    // Phase 1.5 handles ALL V3-forward routes via QuoterV2, which gives
+                    // the exact on-chain output. Letting them through here creates a second
+                    // unverified entry alongside the Phase 1.5 verified one — causing double
+                    // pre-flight attempts and cooldown spam for the same conceptual route.
+                    let router_a_is_v3 = matches!(task.router_a_type, RouterType::V3);
 
-                    if profit_usd >= self.min_profit_usd && !is_v3_x_v3 {
+                    if profit_usd >= self.min_profit_usd && !router_a_is_v3 {
                         debug!(
                             "[{}] Arb: {} | profit=${:.4} | {}/{}",
                             self.chain_id,

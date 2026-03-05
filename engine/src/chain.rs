@@ -23,8 +23,12 @@ use crate::metrics::Metrics;
 use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
 use crate::strategy::{Opportunity, Strategy};
 
-/// Cooldown after pre-flight rejection or dry-run (no gas spent — fast retry is fine).
+/// Cooldown after a dry-run failure or balance-guard skip (cheap check, no RPC spent).
 const COOLDOWN_SECS: u64 = 15;
+/// Cooldown after pre-flight eth_call rejection. The simulation consumed an RPC call and
+/// confirmed the route is unprofitable at current on-chain prices. L2 pool prices don't
+/// shift enough in 15s to make a rejected route suddenly valid — retry in 60s.
+const PREFLIGHT_COOLDOWN_SECS: u64 = 60;
 /// Cooldown after a tx is actually sent to chain (gas spent, pool needs time to settle
 /// and emit new Sync events so the local cache converges). Prevents repeated phantom
 /// arb attempts on the same fingerprint after a successful or reverted on-chain tx.
@@ -868,7 +872,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if let Err(e) = provider.call(prep.tx.clone()).await {
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
-                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
                             let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
@@ -1072,7 +1076,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if let Err(e) = provider.call(prep.tx.clone()).await {
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
-                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
                             let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
