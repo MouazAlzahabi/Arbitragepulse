@@ -1308,8 +1308,7 @@ impl Strategy {
                     let quoter = router.quoter_address.as_deref()
                         .and_then(|s| s.parse::<Address>().ok())
                         .or(self.quoter_v2_address)?;
-                    // NOTE: _make_quote is dead code (mc_call is always None in triangular).
-                    // Using first fee tier here is harmless since this path is never called.
+                    // Use first fee tier only (limits explosion; most liquid pool usually first)
                     let fee = router.fee_tiers.first().copied().unwrap_or(500);
                     // Skip pools not discovered at startup — almost certainly don't exist.
                     // Prevents QuoterV2 calls (expensive gas, may fail multicall chunks) on
@@ -1415,18 +1414,6 @@ impl Strategy {
             effective_amount_in: U256,
         }
 
-        // Returns all configured fee tiers for V3 routers, or a single [0] for
-        // all other DEX types. Used in each phase loop to iterate over every fee
-        // tier rather than only .first(). Non-existent pools are filtered for free
-        // because quote_v3_spot returns None on a cache miss.
-        let v3_fees = |router: &RouterConfig| -> Vec<u32> {
-            if router.router_type == RouterType::V3 {
-                if router.fee_tiers.is_empty() { vec![500] } else { router.fee_tiers.clone() }
-            } else {
-                vec![0]
-            }
-        };
-
         let mut p1_entries: Vec<P1Entry> = Vec::new();
         let mut p1_mc: Vec<(Address, Vec<u8>)> = Vec::new();
         let mut p1_mc_entry_idx: Vec<usize> = Vec::new();
@@ -1436,13 +1423,12 @@ impl Strategy {
         for (ti, trip) in triplets.iter().enumerate() {
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
-                // Iterate over every configured fee tier for V3 routers (or a single
-                // dummy 0 for V2/Solidly/SyncSwap). Each fee tier maps to a distinct
-                // pool with its own liquidity depth — skipping to .first() was causing
-                // the bot to miss 0.3% (3000 bps) pools where deep liquidity lives.
-                // Pools that aren't seeded in the local cache produce None from
-                // quote_v3_spot, so absent tiers are skipped with zero cost.
-                for &fee in &v3_fees(router) {
+                let fee = match router.router_type {
+                    RouterType::V2 => 0,
+                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                    RouterType::Solidly => 0,
+                    RouterType::SyncSwap => 0,
+                };
 
                 // For V3 Phase 1: apply Smart Guesser capacity cap so the QuoterV2 query
                 // stays within the active tick. Capped amount = effective capital deployed.
@@ -1515,7 +1501,6 @@ impl Strategy {
                     p1_mc_entry_idx.push(entry_idx);
                     p1_mc.push(call);
                 }
-                } // end fee-tier loop (P1)
             }
         }
 
@@ -1555,7 +1540,12 @@ impl Strategy {
 
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
-                for &fee in &v3_fees(router) {
+                let fee = match router.router_type {
+                    RouterType::V2 => 0,
+                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                    RouterType::Solidly => 0,
+                    RouterType::SyncSwap => 0,
+                };
 
                 let local_bc = match router.router_type {
                     RouterType::V2 => self.pool_cache.get_amount_out_by_key(
@@ -1571,6 +1561,7 @@ impl Strategy {
                         ))
                     }
                     RouterType::V3 => {
+                        let fee = router.fee_tiers.first().copied().unwrap_or(500);
                         self.pool_cache.quote_v3_spot(
                             &router.id, trip.token_b, trip.token_c, fee, amount_b,
                         ).and_then(|(spot_out, liquidity)| {
@@ -1612,7 +1603,6 @@ impl Strategy {
                     p2_mc_entry_idx.push(entry_idx);
                     p2_mc.push(call);
                 }
-                } // end fee-tier loop (P2)
             }
         }
 
@@ -1654,7 +1644,12 @@ impl Strategy {
 
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
-                for &fee in &v3_fees(router) {
+                let fee = match router.router_type {
+                    RouterType::V2 => 0,
+                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
+                    RouterType::Solidly => 0,
+                    RouterType::SyncSwap => 0,
+                };
 
                 let local_ca = match router.router_type {
                     RouterType::V2 => self.pool_cache.get_amount_out_by_key(
@@ -1670,6 +1665,7 @@ impl Strategy {
                         ))
                     }
                     RouterType::V3 => {
+                        let fee = router.fee_tiers.first().copied().unwrap_or(500);
                         self.pool_cache.quote_v3_spot(
                             &router.id, trip.token_c, trip.token_a, fee, amount_c,
                         ).and_then(|(spot_out, liquidity)| {
@@ -1715,7 +1711,6 @@ impl Strategy {
                     p3_mc_entry_idx.push(entry_idx);
                     p3_mc.push(call);
                 }
-                } // end fee-tier loop (P3)
             }
         }
 
@@ -1806,15 +1801,9 @@ impl Strategy {
         }
 
         opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
-        // Deduplicate identical paths (same triplet + same 3 routers + same 3 fee tiers).
-        // Fee tiers are now part of the key because different fee tiers route through
-        // distinct pools — a 0.05% and 0.3% leg on the same router are not the same path.
+        // Deduplicate identical paths (same triplet + same 3 routers)
         opportunities.dedup_by_key(|o| {
-            format!("{}|{}:{}|{}:{}|{}:{}",
-                o.triplet_id,
-                o.router_ab_id, o.fee_ab,
-                o.router_bc_id, o.fee_bc,
-                o.router_ca_id, o.fee_ca)
+            format!("{}|{}|{}|{}", o.triplet_id, o.router_ab_id, o.router_bc_id, o.router_ca_id)
         });
         opportunities.truncate(max_opportunities);
 
@@ -2289,78 +2278,20 @@ async fn quote_solidly<P: Provider>(
 // ─── Utility ──────────────────────────────────────────────────────────────────
 
 /// Parse trade amount, capping at max_trade if set.
-/// Parse a human-readable token amount string into a raw `U256` wei/unit value,
-/// capping at `max_trade` if provided.
-///
-/// # Precision
-/// Uses pure integer arithmetic — no `f64` at any point. This is critical for
-/// 18-decimal tokens: `f64` has only 53 bits of mantissa, so multiplying a
-/// parsed float by 10^18 silently truncates the lower digits for amounts with
-/// more than ~15 significant figures. One wei of error is harmless in isolation,
-/// but it makes amount_in values non-reproducible and can cause `minProfit`
-/// checks to behave unexpectedly at the contract boundary.
-///
-/// # Algorithm
-/// 1. Split on `'.'` → integer part and fractional part (both as digit strings).
-/// 2. Pad the fractional part to exactly `decimals` digits (or truncate if
-///    the config value specifies more precision than the token supports —
-///    sub-unit precision is meaningless and silently dropped).
-/// 3. Compute `integer_part * 10^decimals + fractional_part` entirely in `U256`.
-///
-/// # Formats accepted
-/// - Whole amounts: `"100"`, `"1000000"`
-/// - Decimal amounts: `"1.5"`, `"0.001"`, `"0.123456789012345678"`
-/// - More fractional digits than `decimals`: truncated to `decimals` places
 pub(crate) fn parse_amount_capped(trade_amount: &str, max_trade: Option<&str>, decimals: u8) -> Option<U256> {
-    let amount = parse_decimal_str(trade_amount, decimals)?;
+    let parsed: f64 = trade_amount.parse().ok()?;
     let capped = if let Some(max_str) = max_trade {
-        let max = parse_decimal_str(max_str, decimals)?;
-        amount.min(max)
+        let max: f64 = max_str.parse().ok()?;
+        parsed.min(max)
     } else {
-        amount
+        parsed
     };
-    if capped.is_zero() {
+    let scale = 10_u128.pow(decimals as u32);
+    let raw = (capped * scale as f64) as u128;
+    if raw == 0 {
         return None;
     }
-    Some(capped)
-}
-
-/// Convert a decimal string (e.g. `"1.5"`) to a raw token unit count as `U256`,
-/// given the token's decimal places. Pure integer arithmetic — no `f64` involved.
-fn parse_decimal_str(s: &str, decimals: u8) -> Option<U256> {
-    let s = s.trim();
-    let scale = U256::from(10u64).pow(U256::from(decimals));
-
-    if let Some(dot) = s.find('.') {
-        let int_str  = &s[..dot];
-        let frac_str = &s[dot + 1..];
-
-        let int_part: U256 = if int_str.is_empty() {
-            U256::ZERO
-        } else {
-            int_str.parse().ok()?
-        };
-
-        // Pad fractional part to exactly `decimals` digits, or truncate if longer
-        // (sub-unit precision — e.g. more than 18 decimal places for WETH — is
-        // meaningless and dropped rather than rounded, matching EVM behaviour).
-        let frac_part: U256 = if frac_str.is_empty() {
-            U256::ZERO
-        } else if frac_str.len() <= decimals as usize {
-            // Pad right with zeros: "5" with decimals=18 → "500000000000000000"
-            let padded = format!("{:0<width$}", frac_str, width = decimals as usize);
-            padded.parse().ok()?
-        } else {
-            // Truncate: "123456789012345678901" with decimals=18 → "123456789012345678"
-            frac_str[..decimals as usize].parse().ok()?
-        };
-
-        Some(int_part * scale + frac_part)
-    } else {
-        // No decimal point — treat as a whole-unit count and scale up.
-        let int_part: U256 = s.parse().ok()?;
-        Some(int_part * scale)
-    }
+    Some(U256::from(raw))
 }
 
 fn token_amount_to_usd(amount: U256, decimals: u8, symbol: &str, native_price: f64) -> f64 {

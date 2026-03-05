@@ -193,14 +193,6 @@ impl Executor {
     ///
     /// The nonce is pre-incremented inside this call so that back-to-back
     /// preparations allocate distinct nonces without a chain round-trip.
-    ///
-    /// # Nonce safety invariant
-    /// This is safe because `chain.rs` processes the `'candidates` loop
-    /// **sequentially** inside a single `tokio::select!` arm — only one
-    /// `prepare_*` call can be in flight at a time per chain engine.
-    /// If that invariant ever changes (e.g. parallel candidate evaluation),
-    /// the load→increment pattern here would need to become a true CAS or
-    /// the nonce must be managed outside the executor.
     pub async fn prepare_2hop<P: Provider>(
         &mut self,
         provider: &P,
