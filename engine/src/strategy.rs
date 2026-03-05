@@ -852,16 +852,13 @@ impl Strategy {
                         best_spread_pct = spread;
                     }
 
-                    // Phase 1.5 gate: local cross-DEX spread is promising AND forward was V3 tick-capped.
+                    // Phase 1.5 gate: local cross-DEX spread is promising AND forward router is V3.
+                    // Fire for ALL V3 forwards with spread > threshold, not just tick-capped ones.
+                    // QuoterV2 verifies the actual on-chain amount at full trade size. Without this,
+                    // liquid pools (safe_cap >= trade_amount, task.amount_in == full) never trigger
+                    // Phase 1.5 and V3×V3 spreads are permanently blocked from all_opportunities.
                     if spread > P15_GATE_SPREAD && matches!(task.router_a_type, RouterType::V3) {
-                        let pair = &self.pairs[task.pair_idx];
-                        if let Some(full) = parse_amount_capped(
-                            &pair.trade_amount, pair.max_trade.as_deref(), pair.token_in_decimals,
-                        ) {
-                            if task.amount_in < full {
-                                p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
-                            }
-                        }
+                        p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
                     }
                 }
 

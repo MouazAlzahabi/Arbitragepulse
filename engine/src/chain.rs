@@ -29,6 +29,11 @@ const COOLDOWN_SECS: u64 = 15;
 /// and emit new Sync events so the local cache converges). Prevents repeated phantom
 /// arb attempts on the same fingerprint after a successful or reverted on-chain tx.
 const SEND_COOLDOWN_SECS: u64 = 60;
+/// Cooldown for routes rejected as unprofitable after gas. These routes have a real gross
+/// spread but the profit doesn't cover gas. Gas prices on L2s are stable minute-to-minute,
+/// so there is no value in retrying the same route every 15s — it wastes log space and
+/// prevents the engine from properly surfacing other opportunities.
+const GAS_REJECT_COOLDOWN_SECS: u64 = 60;
 /// Only count real execution failures (simulation reverts, send errors).
 /// Gas-profitability rejects ("below threshold") do NOT count — they're pre-flight skips.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
@@ -695,72 +700,51 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     metrics.opportunities.with_label_values(&[&cfg.name]).inc();
 
-    // Pick the highest-ranked opportunity not blocked by cooldown or a pending tx.
-    // Iterating the sorted list means a cooling-down pair no longer starves every
-    // other opportunity — the engine falls through to the next-best pair instead.
-    let mut chosen_idx: Option<usize> = None;
-    for (i, opp) in all_opportunities.iter().enumerate() {
-        let fp = opp.fingerprint();
+    // Try each opportunity in priority order (profit descending). On gas-rejection or
+    // pre-flight failure, fall through to the next candidate. On a successful send or
+    // dry-run, break. `continue 'candidates` is used for cheap skips (cooldown, balance
+    // guard, detect-only) so higher-ranked blocked pairs don't starve the rest.
+    let mut all_blocked = !all_opportunities.is_empty();
 
-        // Cooldown check (deadline style)
-        let expire_at_opt = cooldowns.get(&fp).copied();
-        if let Some(expire_at) = expire_at_opt {
-            if expire_at > Instant::now() {
-                let remaining = expire_at.duration_since(Instant::now()).as_secs();
-                debug!("[{}] {} in cooldown, skipping", cfg.name, opp.pair_id());
-                let should_log = cooldown_logged
-                    .get(&fp)
-                    .map_or(true, |t| t.elapsed().as_secs() >= 10);
-                if should_log {
-                    cooldown_logged.insert(fp, Instant::now());
-                    broadcast_log(log_tx, "info",
-                        &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, opp.pair_id(), remaining),
-                        None);
-                }
-                continue;
-            }
-            cooldowns.remove(&fp); // expired entry — clean up
-        }
-
-        // Pending tx dedup
-        if pending_pairs.contains(&fp) {
-            debug!("[{}] {} tx already in-flight, skipping", cfg.name, opp.pair_id());
-            broadcast_log(log_tx, "info",
-                &format!("[{}] Skipped {} — tx already in-flight", cfg.name, opp.pair_id()),
-                None);
-            continue;
-        }
-
-        chosen_idx = Some(i);
-        break;
-    }
-
-    let Some(idx) = chosen_idx else {
-        // All opportunities are blocked (cooldown/pending). Log once per 30s so the
-        // dashboard shows the engine is scanning but waiting — distinct from "no arb found".
-        if !all_opportunities.is_empty() {
-            let blocked_key = "__all_blocked__".to_string();
-            let should_log = cooldown_logged
-                .get(&blocked_key)
-                .map_or(true, |t| t.elapsed().as_secs() >= 30);
-            if should_log {
-                cooldown_logged.insert(blocked_key, Instant::now());
-                broadcast_log(log_tx, "info",
-                    &format!("[{}] {} opp{} found — all in cooldown/pending",
-                        cfg.name, all_opportunities.len(),
-                        if all_opportunities.len() == 1 { "" } else { "s" }),
-                    None);
-            }
-        }
-        return;
-    };
-    let best_opp = &all_opportunities[idx];
+    'candidates: for best_opp in &all_opportunities {
     let fingerprint = best_opp.fingerprint();
     let display_id = best_opp.pair_id();
 
+    // Cooldown check (deadline style)
+    let expire_at_opt = cooldowns.get(&fingerprint).copied();
+    if let Some(expire_at) = expire_at_opt {
+        if expire_at > Instant::now() {
+            let remaining = expire_at.duration_since(Instant::now()).as_secs();
+            debug!("[{}] {} in cooldown, skipping", cfg.name, best_opp.pair_id());
+            let should_log = cooldown_logged
+                .get(&fingerprint)
+                .map_or(true, |t| t.elapsed().as_secs() >= 10);
+            if should_log {
+                cooldown_logged.insert(fingerprint.clone(), Instant::now());
+                broadcast_log(log_tx, "info",
+                    &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, best_opp.pair_id(), remaining),
+                    None);
+            }
+            continue 'candidates;
+        }
+        cooldowns.remove(&fingerprint); // expired entry — clean up
+    }
+
+    // Pending tx dedup
+    if pending_pairs.contains(&fingerprint) {
+        debug!("[{}] {} tx already in-flight, skipping", cfg.name, best_opp.pair_id());
+        broadcast_log(log_tx, "info",
+            &format!("[{}] Skipped {} — tx already in-flight", cfg.name, best_opp.pair_id()),
+            None);
+        continue 'candidates;
+    }
+
+    all_blocked = false;
+
     // ── SyncSwap detect-only check ────────────────────────────────────────────
     // SyncSwap opportunities are broadcast to the live feed but never sent to
-    // the contract (no execution support yet). All other types proceed normally.
+    // the contract (no execution support yet). Continue to next candidate so an
+    // executable opportunity below it can still be attempted this scan.
 
     if !best_opp.is_executable() {
         broadcast_log(
@@ -779,7 +763,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 "detect_only": true,
             })),
         );
-        return;
+        continue 'candidates;
     }
 
     // ── Dispatch based on opportunity type ────────────────────────────────────
@@ -807,7 +791,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         cfg.name, optimized.pair_id, bal, optimized.amount_in
                     );
                     cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
-                    return;
+                    continue 'candidates;
                 }
             }
 
@@ -847,6 +831,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
                         ).await;
+                        break 'candidates;
                     }
                     Err(e) => {
                         drop(exec);
@@ -855,6 +840,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                             &ghost_profit_bits, optimized.profit_usd,
                         ).await;
+                        // fall through: try next candidate
                     }
                 }
             } else {
@@ -886,7 +872,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
-                            return;
+                            continue 'candidates;
                         }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
@@ -962,6 +948,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
                                 ).await;
+                                break 'candidates;
                             }
                             Err(e) => {
                                 { let mut exec = executor.lock().await; exec.record_failed(); }
@@ -982,6 +969,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                                     &ghost_profit_bits, prep.profit_usd,
                                 ).await;
+                                // fall through: try next candidate
                             }
                         }
                     }
@@ -1004,7 +992,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             cfg.name, opp.triplet_id, b, opp.amount_in
                         );
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
-                        return;
+                        continue 'candidates;
                     }
                 }
             }
@@ -1051,6 +1039,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
                         ).await;
+                        break 'candidates;
                     }
                     Err(e) => {
                         drop(exec);
@@ -1059,6 +1048,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                             &ghost_profit_bits, opp.profit_usd,
                         ).await;
+                        // fall through: try next candidate
                     }
                 }
             } else {
@@ -1086,7 +1076,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
-                            return;
+                            continue 'candidates;
                         }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
@@ -1163,6 +1153,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
                                 ).await;
+                                break 'candidates;
                             }
                             Err(e) => {
                                 { let mut exec = executor.lock().await; exec.record_failed(); }
@@ -1184,11 +1175,29 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     consecutive_failures, cfg, shared_state, metrics, log_tx, &router_monitor,
                                     &ghost_profit_bits, prep.profit_usd,
                                 ).await;
+                                // fall through: try next candidate
                             }
                         }
                     }
                 }
             }
+        }
+    } // end match best_opp
+    } // end 'candidates: for
+
+    // All opportunities were blocked by cooldown or pending tx. Log once per 30s.
+    if all_blocked {
+        let blocked_key = "__all_blocked__".to_string();
+        let should_log = cooldown_logged
+            .get(&blocked_key)
+            .map_or(true, |t| t.elapsed().as_secs() >= 30);
+        if should_log {
+            cooldown_logged.insert(blocked_key, Instant::now());
+            broadcast_log(log_tx, "info",
+                &format!("[{}] {} opp{} found — all in cooldown/pending",
+                    cfg.name, all_opportunities.len(),
+                    if all_opportunities.len() == 1 { "" } else { "s" }),
+                None);
         }
     }
 }
@@ -1268,21 +1277,24 @@ async fn handle_execution_failure(
     opportunity_profit_usd: f64,
 ) {
     pending_pairs.remove(pair_id);
-    cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs));
 
-    // Gas-profitability rejects are pre-execution profit checks —
-    // not real execution failures. Skip circuit-breaker accounting entirely.
-    // Covers both the old "below threshold" message and the current
-    // "negative after gas" message from prepare_2hop.
+    // Gas-profitability rejects: route has a real spread but profit < gas cost.
+    // Apply a much longer cooldown (GAS_REJECT_COOLDOWN_SECS=120s) so the same
+    // route doesn't spam the log every 15s. Gas prices are stable on L2s, and the
+    // spread is unlikely to change in 15s — there's no value in retrying sooner.
     let err_str = error.to_string();
-    if err_str.contains("below threshold") || err_str.contains("negative after gas") {
+    let is_gas_reject = err_str.contains("below threshold") || err_str.contains("negative after gas");
+    let effective_cooldown = if is_gas_reject { GAS_REJECT_COOLDOWN_SECS } else { cooldown_secs };
+    cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(effective_cooldown));
+
+    if is_gas_reject {
         // Accumulate ghost profit: gross USD that was left on the table due to gas cost.
         ghost_profit_bits.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
             Some((f64::from_bits(bits) + opportunity_profit_usd).to_bits())
         }).ok();
         debug!("[{}] Skipped (unprofitable after gas): {}", cfg.name, err_str);
         broadcast_log(log_tx, "info",
-            &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4})", cfg.name, pair_id, opportunity_profit_usd),
+            &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4}, cooldown={}s)", cfg.name, pair_id, opportunity_profit_usd, GAS_REJECT_COOLDOWN_SECS),
             None);
         return;
     }
