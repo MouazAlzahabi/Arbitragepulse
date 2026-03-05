@@ -778,12 +778,15 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
             // Guard: cached balance (refreshed every 30s) must cover amount_in.
             // Prevents sending txs that will STF when contract has no token_in.
+            // A cooldown is inserted so the pair doesn't re-dominate the sorted list on
+            // every subsequent scan (underfunded pairs have large USD values that rank high).
             if let Some(bal) = max_bal {
                 if bal < optimized.amount_in {
                     warn!(
                         "[{}] Skipping {} — insufficient token_in balance (have {}, need {})",
                         cfg.name, optimized.pair_id, bal, optimized.amount_in
                     );
+                    cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                     return;
                 }
             }
@@ -980,6 +983,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             "[{}] Skipping triangular {} — insufficient token_a balance (have {}, need {})",
                             cfg.name, opp.triplet_id, b, opp.amount_in
                         );
+                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         return;
                     }
                 }
