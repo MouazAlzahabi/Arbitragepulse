@@ -437,6 +437,10 @@ impl Strategy {
         &self,
         provider: &P,
         pair_mask: Option<&std::collections::HashSet<usize>>,
+        // True when called from a block/poll full scan — always rebuilds pair_scan.
+        // False when called from a swap-event targeted scan — pair_scan is left unchanged
+        // (a targeted scan only evaluates 1–2 pairs; rebuilding would mark all others stale).
+        is_full_scan: bool,
     ) -> (Vec<ArbOpportunity>, f64, usize, usize, f64, usize) {
         let chain_routers: Vec<&RouterConfig> = self
             .routers
@@ -1040,16 +1044,18 @@ impl Strategy {
         opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
 
         // ── Update session opp counts and pair scan snapshot ─────────────────────
-        // Only update pair_scan on full scans (pair_mask is None).
+        // Only update pair_scan on full scans (block/poll — not swap-event targeted scans).
         // Targeted swap-event scans only evaluate 1-2 pairs, so rebuilding the full
         // snapshot would mark every other pair as "not quoted" — corrupting the data.
+        // is_full_scan is passed explicitly so this works correctly even when pair_mask
+        // is Some() due to disabled-pair filtering (which must not suppress the rebuild).
         {
             let mut opp_counts = self.opp_session_counts.lock().unwrap();
             for opp in &opportunities {
                 *opp_counts.entry(opp.pair_id.clone()).or_insert(0) += 1;
             }
 
-            if pair_mask.is_none() {
+            if is_full_scan {
                 let mut scan = self.pair_scan.lock().unwrap();
                 scan.clear();
 

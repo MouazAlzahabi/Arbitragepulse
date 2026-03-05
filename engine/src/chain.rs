@@ -624,8 +624,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             }
         };
 
+        let is_full_scan = targeted.is_none();
         let ((opps_2hop, best_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
-            strat.evaluate(provider.as_ref(), final_mask.as_ref()),
+            strat.evaluate(provider.as_ref(), final_mask.as_ref(), is_full_scan),
             strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice()), &disabled_set),
         );
 
