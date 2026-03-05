@@ -492,7 +492,12 @@ pub async fn run_chain(
                     continue;
                 }
                 let (global_paused, chain_paused, disabled_set) = {
-                    let state = shared_state.read().await;
+                    let mut state = shared_state.write().await;
+                    // Count poll_tick scans too — block_rx misses during WS reconnects
+                    // are covered by poll_tick, so total_scans should include them.
+                    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
+                        chain.total_scans += 1;
+                    }
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
@@ -630,10 +635,14 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice()), &disabled_set),
         );
 
-        // Update quote diagnostic counters (last scan — overwrites on every call)
-        last_fwd_count.store(fwd_ok as u64, Ordering::Relaxed);
-        last_multi_count.store(multi_dex as u64, Ordering::Relaxed);
-        last_active_count.store(active_pairs as u64, Ordering::Relaxed);
+        // Update quote diagnostic counters only on full scans.
+        // Targeted swap-event scans evaluate 1-2 pairs → would make heartbeat show
+        // "active=1/13" right before the log fires, hiding real coverage data.
+        if is_full_scan {
+            last_fwd_count.store(fwd_ok as u64, Ordering::Relaxed);
+            last_multi_count.store(multi_dex as u64, Ordering::Relaxed);
+            last_active_count.store(active_pairs as u64, Ordering::Relaxed);
+        }
 
         // Update best-seen profit for the heartbeat log
         let best_raw = f64::max(best_2hop, best_tri);
@@ -669,6 +678,16 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     // Track opp count for heartbeat display
     last_opp_count.store(all_opportunities.len() as u64, Ordering::Relaxed);
+
+    // Log all opportunities found this scan so it's visible which pairs are generating them.
+    // This is key for diagnosing "single pair always" — it shows whether other pairs have
+    // spreads below threshold vs not being scanned at all.
+    if all_opportunities.len() > 1 {
+        let summary: Vec<String> = all_opportunities.iter()
+            .map(|o| format!("{}=${:.4}", o.pair_id(), o.profit_usd()))
+            .collect();
+        info!("[{}] {} opps this scan: {}", cfg.name, all_opportunities.len(), summary.join(", "));
+    }
 
     if all_opportunities.is_empty() {
         return;

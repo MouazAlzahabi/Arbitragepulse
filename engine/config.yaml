@@ -790,36 +790,6 @@ pairs:
 
   # LINEA token pairs — ~$50 trade sizes to stay within liquidity depth
 
-  # linea-weth-linea DISABLED: contract holds no WETH — STF on every execution.
-  # Re-enable only if the contract is funded with WETH.
-  # - id: "linea-weth-linea"
-  #   chain_id: 59144
-  #   token_in: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"   # WETH
-  #   token_out: "0x1789e0043623282d5dcc7f213d703c6d8bafbb04"  # LINEA
-  #   token_in_symbol: "WETH"
-  #   token_out_symbol: "LINEA"
-  #   token_in_decimals: 18
-  #   token_out_decimals: 18
-  #   trade_amount: "0.015"
-  #   max_trade: "0.015"
-  #   min_swap_size: "0.001"
-  #   watch_pools: []
-
-  # linea-linea-weth DISABLED: contract holds no LINEA — STF on every execution.
-  # Re-enable only if the contract is funded with LINEA.
-  # - id: "linea-linea-weth"
-  #   chain_id: 59144
-  #   token_in: "0x1789e0043623282d5dcc7f213d703c6d8bafbb04"   # LINEA
-  #   token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-  #   token_in_symbol: "LINEA"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 18
-  #   token_out_decimals: 18
-  #   trade_amount: "15000"
-  #   max_trade: "15000"
-  #   min_swap_size: "1000"
-  #   watch_pools: []
-
   - id: "linea-usdt-linea"
     chain_id: 59144
     token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"   # USDT
