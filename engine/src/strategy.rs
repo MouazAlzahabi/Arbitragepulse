@@ -493,8 +493,8 @@ impl Strategy {
                 match router.router_type {
                     RouterType::V2 => {
                         // Try local xy=k reserve cache first (no eth_call needed)
-                        if let Some(out) = self.pool_cache.get_amount_out_by_key(
-                            &router.id, token_in, token_out, amount_in,
+                        if let Some(out) = self.pool_cache.get_amount_out_by_key_fresh(
+                            &router.id, token_in, token_out, amount_in, VOLATILE_MAX_AGE,
                         ) {
                             pair_quotes.entry(pi).or_default().push(ForwardTask {
                                 pair_idx: pi,
@@ -729,8 +729,8 @@ impl Strategy {
                     // Solidly and SyncSwap now use pool_cache with freshness check;
                     // stale reserves (>VOLATILE/STABLE_MAX_AGE since last Sync event) → None → skip.
                     let local_back = match q_b.router_type {
-                        RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                            &q_b.router_id, token_out, token_in, token_out_amount,
+                        RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                            &q_b.router_id, token_out, token_in, token_out_amount, VOLATILE_MAX_AGE,
                         ),
                         RouterType::Solidly => {
                             // q_b.router_id is "router::volatile" or "router::stable"
@@ -981,8 +981,8 @@ impl Strategy {
                     for q_b in q_b_list {
                         let fee_b = q_b.fee;
                         let local_back = match q_b.router_type {
-                            RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                                &q_b.router_id, token_out, token_in, quoter_out,
+                            RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                                &q_b.router_id, token_out, token_in, quoter_out, VOLATILE_MAX_AGE,
                             ),
                             RouterType::Solidly => {
                                 let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
@@ -1449,8 +1449,8 @@ impl Strategy {
                 // SyncSwap: pool_cache seeded at startup by populate_syncswap_pools.
                 // V3: spot price from sqrtPriceX96; skip if stale (no QuoterV2 in triangular).
                 let local_ab = match router.router_type {
-                    RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_a, trip.token_b, effective_amount_in,
+                    RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                        &router.id, trip.token_a, trip.token_b, effective_amount_in, VOLATILE_MAX_AGE,
                     ),
                     RouterType::Solidly => {
                         let vol = format!("{}::volatile", router.id);
@@ -1548,8 +1548,8 @@ impl Strategy {
                 };
 
                 let local_bc = match router.router_type {
-                    RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_b, trip.token_c, amount_b,
+                    RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                        &router.id, trip.token_b, trip.token_c, amount_b, VOLATILE_MAX_AGE,
                     ),
                     RouterType::Solidly => {
                         let vol = format!("{}::volatile", router.id);
@@ -1652,8 +1652,8 @@ impl Strategy {
                 };
 
                 let local_ca = match router.router_type {
-                    RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_c, trip.token_a, amount_c,
+                    RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                        &router.id, trip.token_c, trip.token_a, amount_c, VOLATILE_MAX_AGE,
                     ),
                     RouterType::Solidly => {
                         let vol = format!("{}::volatile", router.id);

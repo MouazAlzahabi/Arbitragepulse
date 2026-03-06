@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
 use crate::abi::{PairSyncV2, PoolSwapV3};
+use crate::api::{broadcast_log, LogBroadcaster};
 use crate::pool_cache::PoolCache;
 
 // ─── Swap event (generic across V2 + V3) ─────────────────────────────────────
@@ -51,6 +52,7 @@ impl Listener {
         provider: P,
         tx: mpsc::Sender<SwapEvent>,
         pool_cache: Arc<PoolCache>,
+        log_tx: LogBroadcaster,
     ) -> Result<()> {
         let chain_id = self.chain_id;
         let chain_name = self.chain_name.clone();
@@ -68,6 +70,7 @@ impl Listener {
             let chain_name_s = chain_name.clone();
             let tx_s = tx.clone();
             let cache = pool_cache.clone();
+            let log_tx_s = log_tx.clone();
 
             tokio::spawn(async move {
                 let mut backoff = Duration::from_secs(1);
@@ -94,12 +97,21 @@ impl Listener {
                                 // Always send SwapEvent to trigger arb evaluation
                                 let _ = tx_s.send(SwapEvent { chain_id, pool, block_number: block }).await;
                             }
-                            warn!("[{}] Sync subscription stream ended, reconnecting in {:?}", chain_name_s, backoff);
+                            warn!("[{}] V2/Sync subscription stream ended, reconnecting in {:?}", chain_name_s, backoff);
                         }
                         Err(e) => {
-                            error!("[{}] Sync subscription error: {} — retrying in {:?}", chain_name_s, e, backoff);
+                            error!("[{}] V2/Sync subscription error: {} — retrying in {:?}", chain_name_s, e, backoff);
                         }
                     }
+                    // Invalidate all V2 pool reserves before sleeping — prevents stale
+                    // cached prices from generating phantom arbs during the dead window.
+                    let invalidated = cache.invalidate_v2_pools();
+                    let msg = format!(
+                        "[{}] V2/Sync WS dropped — {} V2 pool(s) invalidated, reconnecting in {:?}",
+                        chain_name_s, invalidated, backoff
+                    );
+                    warn!("{}", msg);
+                    broadcast_log(&log_tx_s, "system", &msg, None);
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
@@ -125,6 +137,7 @@ impl Listener {
             let chain_name_v3 = chain_name.clone();
             let tx_v3 = tx.clone();
             let cache_v3 = pool_cache.clone();
+            let log_tx_v3 = log_tx.clone();
 
             tokio::spawn(async move {
                 let mut backoff = Duration::from_secs(1);
@@ -152,12 +165,21 @@ impl Listener {
                                 // Trigger opportunity evaluation regardless of decode result
                                 let _ = tx_v3.send(SwapEvent { chain_id, pool, block_number: block }).await;
                             }
-                            warn!("[{}] V3-Swap subscription ended, reconnecting in {:?}", chain_name_v3, backoff);
+                            warn!("[{}] V3-Swap subscription stream ended, reconnecting in {:?}", chain_name_v3, backoff);
                         }
                         Err(e) => {
                             error!("[{}] V3-Swap subscription error: {} — retrying in {:?}", chain_name_v3, e, backoff);
                         }
                     }
+                    // Invalidate all V3 pool state before sleeping — quote_v3_spot will
+                    // return None until the first live Swap event refreshes last_updated.
+                    let invalidated = cache_v3.invalidate_v3_pools();
+                    let msg = format!(
+                        "[{}] V3-Swap WS dropped — {} V3 pool(s) invalidated, reconnecting in {:?}",
+                        chain_name_v3, invalidated, backoff
+                    );
+                    warn!("{}", msg);
+                    broadcast_log(&log_tx_v3, "system", &msg, None);
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }

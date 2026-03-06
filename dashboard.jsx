@@ -218,7 +218,7 @@ function playBeep() {
 // ═══════════════════════════════════════════════════════════
 // STYLES
 // ═══════════════════════════════════════════════════════════
-const TYPE = { heartbeat: ["#334155", "♥ HB"], info: ["#94a3b8", "INFO"], debug: ["#475569", "DBUG"], warn: ["#fbbf24", "WARN"], error: ["#f87171", "ERR!"], trade: ["#34d399", "TRDE"], opportunity: ["#a78bfa", "OPP!"] };
+const TYPE = { heartbeat: ["#334155", "♥ HB"], info: ["#94a3b8", "INFO"], debug: ["#475569", "DBUG"], warn: ["#fbbf24", "WARN"], error: ["#f87171", "ERR!"], trade: ["#34d399", "TRDE"], opportunity: ["#a78bfa", "OPP!"], system: ["#fb923c", "SYS "] };
 const btn = { background: "#1e293b", border: "none", borderRadius: 4, padding: "6px 14px", color: "#94a3b8", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace", fontSize: 12 };
 
 // ═══════════════════════════════════════════════════════════
@@ -539,6 +539,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
     if (isSkipped(l)) return enabledTypes.has("skipped");
     if (l.type === "trade") return enabledTypes.has("trade");
     if (l.type === "opportunity") return enabledTypes.has("opportunity");
+    if (l.type === "system") return enabledTypes.has("system");
     if (l.type === "error" || l.type === "warn") return enabledTypes.has("errors");
     if (l.type === "info") return enabledTypes.has("info");
     return false;
@@ -556,6 +557,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
     { key: "info", label: "Info", color: "#94a3b8" },
     { key: "heartbeat", label: "♥ HB", color: "#334155" },
     { key: "skipped", label: "Skipped", color: "#475569" },
+    { key: "system", label: "System", color: "#fb923c" },
     { key: "errors", label: "Errors/Warn", color: "#f87171" },
   ];
 
@@ -941,7 +943,7 @@ export default function Dashboard() {
   const ws = useWebSocket(url, apiKey);
   const api = useApi(apiUrl, apiKey);
   const [tab, setTab] = useState("monitor");
-  const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info", "heartbeat"]));
+  const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info", "heartbeat", "system"]));
 
   // Poll /stats via HTTP every 3s to keep pause/dry-run state accurate.
   // Measure API latency from each poll.

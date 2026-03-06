@@ -52,11 +52,15 @@ pub struct V3PoolState {
     pub last_updated: Instant,
 }
 
-/// Retained for external reference; no longer used as a staleness gate in
-/// `quote_v3_spot`. V3 state is deterministic (only Swap events change it),
-/// so time-based expiry causes false blindness and has been removed.
-#[allow(dead_code)]
-pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(300);
+/// Maximum age for V3 pool state before it is considered stale.
+/// Set very high (24 h) so it never triggers in normal operation — V3 state is
+/// deterministic (only Swap events change sqrtPriceX96/liquidity), so a pool
+/// that has not swapped in hours still has exactly correct prices.
+/// The only path that sets `last_updated` beyond this threshold is
+/// `invalidate_v3_pools()`, called by the listener when its WebSocket drops.
+/// This acts as a "down flag" sentinel: returns None until the first live Swap
+/// event after reconnect refreshes `last_updated`.
+pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(86_400); // 24 h
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
 /// 300s (5 min): covers pools that swap every few minutes (typical on Linea).
@@ -256,6 +260,13 @@ impl PoolCache {
 
         let state = self.v3_by_address.get(&pool_addr)?;
 
+        // Guard against explicitly-invalidated pools (listener was down).
+        // V3_STATE_MAX_AGE is 24 h — never reached in normal operation; only
+        // triggered when invalidate_v3_pools() stamps last_updated far in the past.
+        if state.last_updated.elapsed() > V3_STATE_MAX_AGE {
+            return None;
+        }
+
         let sqrtp = state.sqrt_price_x96;
         if sqrtp.is_zero() {
             return None;
@@ -349,6 +360,36 @@ impl PoolCache {
 
         let factor = U256::from(v3_impact_factor(state.fee));
         virtual_reserve * factor / U256::from(10_000u64)
+    }
+
+    /// Mark all V2/Solidly/SyncSwap pools as stale by stamping their
+    /// `last_sync` to just past VOLATILE_MAX_AGE ago.  Called by the listener
+    /// when its WebSocket subscription drops — prevents stale reserves from
+    /// generating phantom arb opportunities during the reconnect window.
+    /// Returns the number of pools invalidated.
+    pub fn invalidate_v2_pools(&self) -> usize {
+        let stale_at = Instant::now() - VOLATILE_MAX_AGE - Duration::from_secs(1);
+        let mut count = 0usize;
+        for mut e in self.by_address.iter_mut() {
+            e.last_sync = stale_at;
+            count += 1;
+        }
+        count
+    }
+
+    /// Mark all V3 pools as stale by stamping their `last_updated` to just
+    /// past V3_STATE_MAX_AGE ago.  Called by the listener when its WebSocket
+    /// subscription drops.  `quote_v3_spot` will return None until the first
+    /// live Swap event after reconnect refreshes `last_updated`.
+    /// Returns the number of pools invalidated.
+    pub fn invalidate_v3_pools(&self) -> usize {
+        let stale_at = Instant::now() - V3_STATE_MAX_AGE - Duration::from_secs(1);
+        let mut count = 0usize;
+        for mut e in self.v3_by_address.iter_mut() {
+            e.last_updated = stale_at;
+            count += 1;
+        }
+        count
     }
 }
 
