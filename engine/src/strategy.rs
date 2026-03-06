@@ -1423,68 +1423,55 @@ impl Strategy {
         for (ti, trip) in triplets.iter().enumerate() {
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
-                let fee = match router.router_type {
-                    RouterType::V2 => 0,
-                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
-                    RouterType::Solidly => 0,
-                    RouterType::SyncSwap => 0,
-                };
-
-                // For V3 Phase 1: apply Smart Guesser capacity cap so the QuoterV2 query
-                // stays within the active tick. Capped amount = effective capital deployed.
-                let effective_amount_in = if router.router_type == RouterType::V3 {
-                    let t_in_l = format!("{}", trip.token_a).to_lowercase();
-                    let t_out_l = format!("{}", trip.token_b).to_lowercase();
-                    let v3_key = format!("{}:{}:{}:{}", router.id, t_in_l, t_out_l, fee);
-                    let cap = self.pool_cache.v3_by_key.get(&v3_key)
-                        .map(|p| self.pool_cache.estimate_safe_v3_capacity(*p, trip.token_a))
-                        .unwrap_or(U256::ZERO);
-                    if cap.is_zero() { trip.amount_in } else { trip.amount_in.min(cap) }
-                } else {
-                    trip.amount_in
-                };
-
-                // All DEX types use local reserve cache (0 eth_call).
-                // Solidly: try volatile then stable, both with freshness check.
-                // SyncSwap: pool_cache seeded at startup by populate_syncswap_pools.
-                // V3: spot price from sqrtPriceX96; skip if stale (no QuoterV2 in triangular).
-                let local_ab = match router.router_type {
-                    RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
-                        &router.id, trip.token_a, trip.token_b, effective_amount_in, VOLATILE_MAX_AGE,
-                    ),
+                // For each DEX type, compute (fee, effective_amount_in, local_ab) together.
+                // For V3: iterate all fee tiers and pick the one yielding the highest output,
+                // applying per-pool capacity caps so the quote stays within the active tick.
+                // This ensures we use the deepest pool (e.g. 500ppm or 3000ppm), not the
+                // first-listed tier which may be a near-empty 100ppm pool.
+                let (fee, effective_amount_in, local_ab): (u32, U256, Option<U256>) = match router.router_type {
+                    RouterType::V3 => {
+                        let result = router.fee_tiers.iter().filter_map(|&f| {
+                            let t_in_l = format!("{}", trip.token_a).to_lowercase();
+                            let t_out_l = format!("{}", trip.token_b).to_lowercase();
+                            let v3_key = format!("{}:{}:{}:{}", router.id, t_in_l, t_out_l, f);
+                            let cap = self.pool_cache.v3_by_key.get(&v3_key)
+                                .map(|p| self.pool_cache.estimate_safe_v3_capacity(*p, trip.token_a))
+                                .unwrap_or(U256::ZERO);
+                            let eff = if cap.is_zero() { trip.amount_in } else { trip.amount_in.min(cap) };
+                            self.pool_cache.quote_v3_spot(&router.id, trip.token_a, trip.token_b, f, eff)
+                                .and_then(|(out, liq)| if liq < MIN_V3_LIQUIDITY { None } else { Some((out, f, eff)) })
+                        }).max_by_key(|(out, _, _)| *out);
+                        match result {
+                            Some((out, f, eff)) => (f, eff, Some(out)),
+                            None => continue,
+                        }
+                    }
+                    RouterType::V2 => (0, trip.amount_in, self.pool_cache.get_amount_out_by_key_fresh(
+                        &router.id, trip.token_a, trip.token_b, trip.amount_in, VOLATILE_MAX_AGE,
+                    )),
                     RouterType::Solidly => {
                         let vol = format!("{}::volatile", router.id);
                         let sta = format!("{}::stable", router.id);
-                        self.pool_cache.get_amount_out_by_key_fresh(
-                            &vol, trip.token_a, trip.token_b, effective_amount_in, VOLATILE_MAX_AGE,
+                        (0, trip.amount_in, self.pool_cache.get_amount_out_by_key_fresh(
+                            &vol, trip.token_a, trip.token_b, trip.amount_in, VOLATILE_MAX_AGE,
                         ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
-                            &sta, trip.token_a, trip.token_b, effective_amount_in, STABLE_MAX_AGE,
-                        ))
+                            &sta, trip.token_a, trip.token_b, trip.amount_in, STABLE_MAX_AGE,
+                        )))
                     }
-                    RouterType::V3 => {
-                        self.pool_cache.quote_v3_spot(
-                            &router.id, trip.token_a, trip.token_b, fee, effective_amount_in,
-                        ).and_then(|(spot_out, liquidity)| {
-                            if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
-                        })
-                    }
-                    RouterType::SyncSwap => {
-                        self.pool_cache.get_amount_out_by_key_fresh(
-                            &router.id, trip.token_a, trip.token_b, effective_amount_in, VOLATILE_MAX_AGE,
-                        )
-                    }
+                    RouterType::SyncSwap => (0, trip.amount_in, self.pool_cache.get_amount_out_by_key_fresh(
+                        &router.id, trip.token_a, trip.token_b, trip.amount_in, VOLATILE_MAX_AGE,
+                    )),
                 };
 
                 // No multicall fallback in triangular — local or skip.
                 let mc_call: Option<(Address, Vec<u8>)> = None;
 
-                // Skip router if no local quote available
                 if local_ab.is_none() {
                     continue;
                 }
 
                 if router.router_type == RouterType::V3 {
-                    if local_ab.is_some() { tri_v3_spot += 1; } // mc_call always None — no QuoterV2 in triangular
+                    tri_v3_spot += 1; // mc_call always None — no QuoterV2 in triangular
                 }
 
                 let entry_idx = p1_entries.len();
@@ -1540,39 +1527,32 @@ impl Strategy {
 
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
-                let fee = match router.router_type {
-                    RouterType::V2 => 0,
-                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
-                    RouterType::Solidly => 0,
-                    RouterType::SyncSwap => 0,
-                };
-
-                let local_bc = match router.router_type {
-                    RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                let (fee, local_bc): (u32, Option<U256>) = match router.router_type {
+                    RouterType::V3 => {
+                        let result = router.fee_tiers.iter().filter_map(|&f| {
+                            self.pool_cache.quote_v3_spot(&router.id, trip.token_b, trip.token_c, f, amount_b)
+                                .and_then(|(out, liq)| if liq < MIN_V3_LIQUIDITY { None } else { Some((out, f)) })
+                        }).max_by_key(|(out, _)| *out);
+                        match result {
+                            Some((out, f)) => (f, Some(out)),
+                            None => continue,
+                        }
+                    }
+                    RouterType::V2 => (0, self.pool_cache.get_amount_out_by_key_fresh(
                         &router.id, trip.token_b, trip.token_c, amount_b, VOLATILE_MAX_AGE,
-                    ),
+                    )),
                     RouterType::Solidly => {
                         let vol = format!("{}::volatile", router.id);
                         let sta = format!("{}::stable", router.id);
-                        self.pool_cache.get_amount_out_by_key_fresh(
+                        (0, self.pool_cache.get_amount_out_by_key_fresh(
                             &vol, trip.token_b, trip.token_c, amount_b, VOLATILE_MAX_AGE,
                         ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
                             &sta, trip.token_b, trip.token_c, amount_b, STABLE_MAX_AGE,
-                        ))
+                        )))
                     }
-                    RouterType::V3 => {
-                        let fee = router.fee_tiers.first().copied().unwrap_or(500);
-                        self.pool_cache.quote_v3_spot(
-                            &router.id, trip.token_b, trip.token_c, fee, amount_b,
-                        ).and_then(|(spot_out, liquidity)| {
-                            if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
-                        })
-                    }
-                    RouterType::SyncSwap => {
-                        self.pool_cache.get_amount_out_by_key_fresh(
-                            &router.id, trip.token_b, trip.token_c, amount_b, VOLATILE_MAX_AGE,
-                        )
-                    }
+                    RouterType::SyncSwap => (0, self.pool_cache.get_amount_out_by_key_fresh(
+                        &router.id, trip.token_b, trip.token_c, amount_b, VOLATILE_MAX_AGE,
+                    )),
                 };
 
                 let mc_call: Option<(Address, Vec<u8>)> = None;
@@ -1582,7 +1562,7 @@ impl Strategy {
                 }
 
                 if router.router_type == RouterType::V3 {
-                    if local_bc.is_some() { tri_v3_spot += 1; }
+                    tri_v3_spot += 1;
                 }
 
                 let entry_idx = p2_entries.len();
@@ -1644,39 +1624,32 @@ impl Strategy {
 
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
-                let fee = match router.router_type {
-                    RouterType::V2 => 0,
-                    RouterType::V3 => router.fee_tiers.first().copied().unwrap_or(500),
-                    RouterType::Solidly => 0,
-                    RouterType::SyncSwap => 0,
-                };
-
-                let local_ca = match router.router_type {
-                    RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                let (fee, local_ca): (u32, Option<U256>) = match router.router_type {
+                    RouterType::V3 => {
+                        let result = router.fee_tiers.iter().filter_map(|&f| {
+                            self.pool_cache.quote_v3_spot(&router.id, trip.token_c, trip.token_a, f, amount_c)
+                                .and_then(|(out, liq)| if liq < MIN_V3_LIQUIDITY { None } else { Some((out, f)) })
+                        }).max_by_key(|(out, _)| *out);
+                        match result {
+                            Some((out, f)) => (f, Some(out)),
+                            None => continue,
+                        }
+                    }
+                    RouterType::V2 => (0, self.pool_cache.get_amount_out_by_key_fresh(
                         &router.id, trip.token_c, trip.token_a, amount_c, VOLATILE_MAX_AGE,
-                    ),
+                    )),
                     RouterType::Solidly => {
                         let vol = format!("{}::volatile", router.id);
                         let sta = format!("{}::stable", router.id);
-                        self.pool_cache.get_amount_out_by_key_fresh(
+                        (0, self.pool_cache.get_amount_out_by_key_fresh(
                             &vol, trip.token_c, trip.token_a, amount_c, VOLATILE_MAX_AGE,
                         ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
                             &sta, trip.token_c, trip.token_a, amount_c, STABLE_MAX_AGE,
-                        ))
+                        )))
                     }
-                    RouterType::V3 => {
-                        let fee = router.fee_tiers.first().copied().unwrap_or(500);
-                        self.pool_cache.quote_v3_spot(
-                            &router.id, trip.token_c, trip.token_a, fee, amount_c,
-                        ).and_then(|(spot_out, liquidity)| {
-                            if liquidity < MIN_V3_LIQUIDITY { None } else { Some(spot_out) }
-                        })
-                    }
-                    RouterType::SyncSwap => {
-                        self.pool_cache.get_amount_out_by_key_fresh(
-                            &router.id, trip.token_c, trip.token_a, amount_c, VOLATILE_MAX_AGE,
-                        )
-                    }
+                    RouterType::SyncSwap => (0, self.pool_cache.get_amount_out_by_key_fresh(
+                        &router.id, trip.token_c, trip.token_a, amount_c, VOLATILE_MAX_AGE,
+                    )),
                 };
 
                 let mc_call: Option<(Address, Vec<u8>)> = None;
@@ -1686,7 +1659,7 @@ impl Strategy {
                 }
 
                 if router.router_type == RouterType::V3 {
-                    if local_ca.is_some() { tri_v3_spot += 1; }
+                    tri_v3_spot += 1;
                 }
 
                 let entry_idx = p3_entries.len();
