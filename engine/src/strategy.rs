@@ -1561,6 +1561,16 @@ impl Strategy {
 
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
+
+                // Skip same-router V3×V3: tick-spacing price differences create phantom arbs.
+                // Real triangular arbs always cross DEX boundaries.
+                if matches!(router.router_type, RouterType::V3)
+                    && matches!(p1e.router_type, RouterType::V3)
+                    && router.id == p1e.router_id
+                {
+                    continue;
+                }
+
                 let (fee, local_bc): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
                         let result = router.fee_tiers.iter().filter_map(|&f| {
@@ -1658,6 +1668,16 @@ impl Strategy {
 
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
+
+                // Skip same-router V3×V3 on any two legs.
+                if matches!(router.router_type, RouterType::V3) {
+                    if (matches!(p2e.router_ab_type, RouterType::V3) && router.id == p2e.router_ab_id)
+                        || (matches!(p2e.router_bc_type, RouterType::V3) && router.id == p2e.router_bc_id)
+                    {
+                        continue;
+                    }
+                }
+
                 let (fee, local_ca): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
                         let result = router.fee_tiers.iter().filter_map(|&f| {
@@ -1805,6 +1825,178 @@ impl Strategy {
                 router_bc_id: p3e.router_bc_id.clone(),
                 router_ca_id: p3e.router_ca_id.clone(),
             });
+        }
+
+        // ── Triangular Phase 1.5: QuoterV2 upgrade for V3-capped A→B legs ─────────
+        // When leg A→B was V3-capped below the full trade amount, the local heuristic
+        // may underestimate actual pool liquidity. Run QuoterV2 at full trade size and
+        // re-chain B→C and C→A locally to find real profit at the intended capital.
+        {
+            use std::collections::HashSet;
+            // Deduplicate by (triplet_idx, router_ab_id, fee_ab) — one QuoterV2 call per leg.
+            let mut seen: HashSet<(usize, String, u32)> = HashSet::new();
+            // (triplet_idx, router_ab_id, router_ab_addr, fee_ab)
+            let mut candidates: Vec<(usize, String, Address, u32)> = Vec::new();
+
+            for p3e in &p3_entries {
+                if !matches!(p3e.router_ab_type, RouterType::V3) { continue; }
+                let full_in = triplets[p3e.triplet_idx].amount_in;
+                if p3e.effective_amount_in >= full_in { continue; }
+                if seen.insert((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.fee_ab)) {
+                    candidates.push((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.router_ab_addr, p3e.fee_ab));
+                }
+            }
+
+            if !candidates.is_empty() {
+                let mut p15_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+                // Maps multicall index → candidates index
+                let mut p15_valid: Vec<usize> = Vec::new();
+
+                for (ci, (triplet_idx, router_ab_id, _router_ab_addr, fee_ab)) in candidates.iter().enumerate() {
+                    let trip = &triplets[*triplet_idx];
+                    let quoter = self.routers.iter()
+                        .find(|r| r.id == *router_ab_id)
+                        .and_then(|r| r.quoter_address.as_deref())
+                        .and_then(|s| s.parse::<Address>().ok())
+                        .or(self.quoter_v2_address);
+                    let Some(quoter) = quoter else { continue };
+
+                    let cd = IQuoterV2::quoteExactInputSingleCall {
+                        params: IQuoterV2::QuoteExactInputSingleParams {
+                            tokenIn: trip.token_a,
+                            tokenOut: trip.token_b,
+                            amountIn: trip.amount_in,
+                            fee: Uint::from(*fee_ab),
+                            sqrtPriceLimitX96: Uint::ZERO,
+                        },
+                    }.abi_encode();
+                    p15_mc.push((quoter, cd));
+                    p15_valid.push(ci);
+                }
+
+                if !p15_mc.is_empty() {
+                    debug!(
+                        "[{}] Triangular P1.5: {} QuoterV2 call(s) for V3-capped A→B legs",
+                        self.chain_id, p15_mc.len()
+                    );
+                    let p15_raw = run_multicall(provider, p15_mc, self.rpc_concurrency).await;
+
+                    for (mc_i, ci) in p15_valid.into_iter().enumerate() {
+                        let (triplet_idx, router_ab_id, _router_ab_addr, fee_ab) = &candidates[ci];
+                        let raw = match p15_raw.get(mc_i).and_then(|r| r.as_ref()) {
+                            Some(r) => r, None => continue,
+                        };
+                        let quoter_out = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw) {
+                            Ok(r) if !r.amountOut.is_zero() => r.amountOut,
+                            _ => continue,
+                        };
+                        let trip = &triplets[*triplet_idx];
+
+                        // Re-chain all P3 entries sharing (triplet, router_ab, fee_ab)
+                        // through B→C and C→A using the QuoterV2 full-size output.
+                        for p3e in p3_entries.iter().filter(|e| {
+                            e.triplet_idx == *triplet_idx
+                                && e.router_ab_id == *router_ab_id
+                                && e.fee_ab == *fee_ab
+                        }) {
+                            let local_bc_full: Option<U256> = match p3e.router_bc_type {
+                                RouterType::V3 => self.pool_cache.quote_v3_spot(
+                                    &p3e.router_bc_id, trip.token_b, trip.token_c, p3e.fee_bc, quoter_out,
+                                ).and_then(|(out, liq)| if liq >= MIN_V3_LIQUIDITY { Some(out) } else { None }),
+                                RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                                    &p3e.router_bc_id, trip.token_b, trip.token_c, quoter_out, VOLATILE_MAX_AGE,
+                                ),
+                                RouterType::Solidly => {
+                                    let vol = format!("{}::volatile", p3e.router_bc_id);
+                                    let sta = format!("{}::stable", p3e.router_bc_id);
+                                    self.pool_cache.get_amount_out_by_key_fresh(
+                                        &vol, trip.token_b, trip.token_c, quoter_out, VOLATILE_MAX_AGE,
+                                    ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
+                                        &sta, trip.token_b, trip.token_c, quoter_out, STABLE_MAX_AGE,
+                                    ))
+                                }
+                                RouterType::SyncSwap => self.pool_cache.get_amount_out_by_key_fresh(
+                                    &p3e.router_bc_id, trip.token_b, trip.token_c, quoter_out, VOLATILE_MAX_AGE,
+                                ),
+                            };
+                            let amount_c_full = match local_bc_full.filter(|c| !c.is_zero()) {
+                                Some(c) => c, None => continue,
+                            };
+
+                            let local_ca_full: Option<U256> = match p3e.router_ca_type {
+                                RouterType::V3 => self.pool_cache.quote_v3_spot(
+                                    &p3e.router_ca_id, trip.token_c, trip.token_a, p3e.fee_ca, amount_c_full,
+                                ).and_then(|(out, liq)| if liq >= MIN_V3_LIQUIDITY { Some(out) } else { None }),
+                                RouterType::V2 => self.pool_cache.get_amount_out_by_key_fresh(
+                                    &p3e.router_ca_id, trip.token_c, trip.token_a, amount_c_full, VOLATILE_MAX_AGE,
+                                ),
+                                RouterType::Solidly => {
+                                    let vol = format!("{}::volatile", p3e.router_ca_id);
+                                    let sta = format!("{}::stable", p3e.router_ca_id);
+                                    self.pool_cache.get_amount_out_by_key_fresh(
+                                        &vol, trip.token_c, trip.token_a, amount_c_full, VOLATILE_MAX_AGE,
+                                    ).or_else(|| self.pool_cache.get_amount_out_by_key_fresh(
+                                        &sta, trip.token_c, trip.token_a, amount_c_full, STABLE_MAX_AGE,
+                                    ))
+                                }
+                                RouterType::SyncSwap => self.pool_cache.get_amount_out_by_key_fresh(
+                                    &p3e.router_ca_id, trip.token_c, trip.token_a, amount_c_full, VOLATILE_MAX_AGE,
+                                ),
+                            };
+                            let amount_a_final = match local_ca_full.filter(|a| !a.is_zero()) {
+                                Some(a) => a, None => continue,
+                            };
+
+                            if amount_a_final <= trip.amount_in { continue; }
+                            // 5% phantom filter
+                            if (amount_a_final - trip.amount_in).saturating_mul(U256::from(20)) > trip.amount_in {
+                                warn!(
+                                    "[{}] Triangular P1.5 phantom: {} | {}/{}/{}",
+                                    self.chain_id, trip.triplet_id,
+                                    p3e.router_ab_id, p3e.router_bc_id, p3e.router_ca_id,
+                                );
+                                continue;
+                            }
+
+                            let profit = amount_a_final - trip.amount_in;
+                            let (sym_a, dec_a) = match token_info.get(&trip.key_a) {
+                                Some(info) => info, None => continue,
+                            };
+                            let profit_usd = token_amount_to_usd(profit, *dec_a, sym_a, self.native_price_usd);
+                            if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
+                            if profit_usd < self.min_profit_usd { continue; }
+
+                            debug!(
+                                "[{}] Triangular P1.5: {} | profit=${:.4} | {}/{}/{}",
+                                self.chain_id, trip.triplet_id, profit_usd,
+                                p3e.router_ab_id, p3e.router_bc_id, p3e.router_ca_id,
+                            );
+                            opportunities.push(TriangularOpportunity {
+                                chain_id: self.chain_id,
+                                triplet_id: trip.triplet_id.clone(),
+                                token_a: trip.token_a,
+                                token_b: trip.token_b,
+                                token_c: trip.token_c,
+                                amount_in: trip.amount_in,
+                                router_ab: p3e.router_ab_addr,
+                                router_bc: p3e.router_bc_addr,
+                                router_ca: p3e.router_ca_addr,
+                                router_ab_type: p3e.router_ab_type.clone(),
+                                router_bc_type: p3e.router_bc_type.clone(),
+                                router_ca_type: p3e.router_ca_type.clone(),
+                                fee_ab: p3e.fee_ab,
+                                fee_bc: p3e.fee_bc,
+                                fee_ca: p3e.fee_ca,
+                                expected_profit: profit,
+                                profit_usd,
+                                router_ab_id: p3e.router_ab_id.clone(),
+                                router_bc_id: p3e.router_bc_id.clone(),
+                                router_ca_id: p3e.router_ca_id.clone(),
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
