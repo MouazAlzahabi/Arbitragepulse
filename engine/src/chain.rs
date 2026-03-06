@@ -718,17 +718,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     let expire_at_opt = cooldowns.get(&fingerprint).copied();
     if let Some(expire_at) = expire_at_opt {
         if expire_at > Instant::now() {
-            let remaining = expire_at.duration_since(Instant::now()).as_secs();
             debug!("[{}] {} in cooldown, skipping", cfg.name, best_opp.pair_id());
-            let should_log = cooldown_logged
-                .get(&fingerprint)
-                .map_or(true, |t| t.elapsed().as_secs() >= 10);
-            if should_log {
-                cooldown_logged.insert(fingerprint.clone(), Instant::now());
-                broadcast_log(log_tx, "info",
-                    &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, best_opp.pair_id(), remaining),
-                    None);
-            }
             continue 'candidates;
         }
         cooldowns.remove(&fingerprint); // expired entry — clean up
@@ -737,9 +727,6 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Pending tx dedup
     if pending_pairs.contains(&fingerprint) {
         debug!("[{}] {} tx already in-flight, skipping", cfg.name, best_opp.pair_id());
-        broadcast_log(log_tx, "info",
-            &format!("[{}] Skipped {} — tx already in-flight", cfg.name, best_opp.pair_id()),
-            None);
         continue 'candidates;
     }
 
@@ -834,6 +821,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                            COOLDOWN_SECS,
                         ).await;
                         break 'candidates;
                     }
@@ -873,7 +861,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
                             cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
-                            let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
+                            let msg = format!("[{}] Pre-flight rejected {} — {} | cooldown={}s", cfg.name, display_id, e, PREFLIGHT_COOLDOWN_SECS);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
                             continue 'candidates;
@@ -951,6 +939,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                                    SEND_COOLDOWN_SECS,
                                 ).await;
                                 break 'candidates;
                             }
@@ -1042,6 +1031,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                            COOLDOWN_SECS,
                         ).await;
                         break 'candidates;
                     }
@@ -1077,7 +1067,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
                             cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
-                            let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
+                            let msg = format!("[{}] Pre-flight rejected {} — {} | cooldown={}s", cfg.name, display_id, e, PREFLIGHT_COOLDOWN_SECS);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
                             continue 'candidates;
@@ -1156,6 +1146,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                                    SEND_COOLDOWN_SECS,
                                 ).await;
                                 break 'candidates;
                             }
@@ -1222,6 +1213,7 @@ async fn handle_execution_success(
     metrics: &Arc<Metrics>,
     router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
     execution_time_ms: u64,
+    cooldown_secs: u64,
 ) {
     *consecutive_failures = 0;
     pending_pairs.remove(pair_id);
@@ -1248,11 +1240,12 @@ async fn handle_execution_success(
         log_tx,
         "trade",
         &format!(
-            "[{}] tx={} | pair={} | profit=${:.4}",
+            "[{}] tx={} | pair={} | profit=${:.4} | cooldown={}s",
             cfg.name,
             tx_hash,
             display_id,
-            profit_usd
+            profit_usd,
+            cooldown_secs
         ),
         Some(serde_json::json!({
             "chain":      cfg.name,
