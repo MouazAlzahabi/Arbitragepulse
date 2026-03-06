@@ -859,6 +859,29 @@ impl Strategy {
                     // Phase 1.5 and V3×V3 spreads are permanently blocked from all_opportunities.
                     if spread > P15_GATE_SPREAD && matches!(task.router_a_type, RouterType::V3) {
                         p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                        // If this V3 task was tick-capped to a tiny fraction of the full trade
+                        // (e.g. fee=100 pool with ~$0.007 cap showing phantom 2.86% spread),
+                        // also enqueue all other fee tiers of the same router for Phase 1.5.
+                        // The tiny-pool price divergence may reflect a real cross-DEX spread
+                        // that's better captured by the deeper fee=500/3000 pool at full size.
+                        let full_amount = parse_amount_capped(
+                            &self.pairs[task.pair_idx].trade_amount,
+                            self.pairs[task.pair_idx].max_trade.as_deref(),
+                            self.pairs[task.pair_idx].token_in_decimals,
+                        );
+                        if let Some(full) = full_amount {
+                            if task.amount_in < full / U256::from(10u64) {
+                                if let Some(tasks) = pair_quotes.get(&task.pair_idx) {
+                                    for t in tasks.iter().filter(|t| {
+                                        t.router_id == task.router_a_id
+                                            && t.fee != task.fee_a
+                                            && matches!(t.router_type, RouterType::V3)
+                                    }) {
+                                        p15_gate.insert((task.pair_idx, t.router_id.clone(), t.fee));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
