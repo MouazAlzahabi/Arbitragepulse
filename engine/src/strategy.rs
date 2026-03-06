@@ -1446,29 +1446,43 @@ impl Strategy {
         for (ti, trip) in triplets.iter().enumerate() {
             for router in &chain_routers {
                 let router_addr: Address = router.address.parse().unwrap_or_default();
-                // For each DEX type, compute (fee, effective_amount_in, local_ab) together.
-                // For V3: iterate all fee tiers and pick the one yielding the highest output,
-                // applying per-pool capacity caps so the quote stays within the active tick.
-                // This ensures we use the deepest pool (e.g. 500ppm or 3000ppm), not the
-                // first-listed tier which may be a near-empty 100ppm pool.
-                let (fee, effective_amount_in, local_ab): (u32, U256, Option<U256>) = match router.router_type {
-                    RouterType::V3 => {
-                        let result = router.fee_tiers.iter().filter_map(|&f| {
-                            let t_in_l = format!("{}", trip.token_a).to_lowercase();
-                            let t_out_l = format!("{}", trip.token_b).to_lowercase();
-                            let v3_key = format!("{}:{}:{}:{}", router.id, t_in_l, t_out_l, f);
-                            let cap = self.pool_cache.v3_by_key.get(&v3_key)
-                                .map(|p| self.pool_cache.estimate_safe_v3_capacity(*p, trip.token_a))
-                                .unwrap_or(U256::ZERO);
-                            let eff = if cap.is_zero() { trip.amount_in } else { trip.amount_in.min(cap) };
-                            self.pool_cache.quote_v3_spot(&router.id, trip.token_a, trip.token_b, f, eff)
-                                .and_then(|(out, liq)| if liq < MIN_V3_LIQUIDITY { None } else { Some((out, f, eff)) })
-                        }).max_by_key(|(out, _, _)| *out);
-                        match result {
-                            Some((out, f, eff)) => (f, eff, Some(out)),
-                            None => continue,
+
+                // V3: push one p1_entry per fee tier so every pool depth is explored.
+                // Collapsing to max-output-only would discard the fee=100 path (0.01% fee,
+                // tiny cap ~$0.97) which can be profitable at its scale since 3-leg fees
+                // are only 0.03% vs 0.15% for fee=500. Both paths must be evaluated.
+                if matches!(router.router_type, RouterType::V3) {
+                    let mut any_v3 = false;
+                    for &f in &router.fee_tiers {
+                        let t_in_l = format!("{}", trip.token_a).to_lowercase();
+                        let t_out_l = format!("{}", trip.token_b).to_lowercase();
+                        let v3_key = format!("{}:{}:{}:{}", router.id, t_in_l, t_out_l, f);
+                        let cap = self.pool_cache.v3_by_key.get(&v3_key)
+                            .map(|p| self.pool_cache.estimate_safe_v3_capacity(*p, trip.token_a))
+                            .unwrap_or(U256::ZERO);
+                        let eff = if cap.is_zero() { trip.amount_in } else { trip.amount_in.min(cap) };
+                        if let Some((out, liq)) = self.pool_cache.quote_v3_spot(
+                            &router.id, trip.token_a, trip.token_b, f, eff,
+                        ) {
+                            if liq < MIN_V3_LIQUIDITY { continue; }
+                            tri_v3_spot += 1;
+                            p1_entries.push(P1Entry {
+                                triplet_idx: ti,
+                                router_id: router.id.clone(),
+                                router_addr,
+                                router_type: RouterType::V3,
+                                fee: f,
+                                local_result: Some(out),
+                                effective_amount_in: eff,
+                            });
+                            any_v3 = true;
                         }
                     }
+                    let _ = any_v3; // unused but documents intent
+                    continue; // V3 fully handled above; skip generic push below
+                }
+
+                let (fee, effective_amount_in, local_ab): (u32, U256, Option<U256>) = match router.router_type {
                     RouterType::V2 => (0, trip.amount_in, self.pool_cache.get_amount_out_by_key_fresh(
                         &router.id, trip.token_a, trip.token_b, trip.amount_in, VOLATILE_MAX_AGE,
                     )),
@@ -1484,6 +1498,7 @@ impl Strategy {
                     RouterType::SyncSwap => (0, trip.amount_in, self.pool_cache.get_amount_out_by_key_fresh(
                         &router.id, trip.token_a, trip.token_b, trip.amount_in, VOLATILE_MAX_AGE,
                     )),
+                    RouterType::V3 => unreachable!(), // handled above
                 };
 
                 // No multicall fallback in triangular — local or skip.
@@ -1491,10 +1506,6 @@ impl Strategy {
 
                 if local_ab.is_none() {
                     continue;
-                }
-
-                if router.router_type == RouterType::V3 {
-                    tri_v3_spot += 1; // mc_call always None — no QuoterV2 in triangular
                 }
 
                 let entry_idx = p1_entries.len();
