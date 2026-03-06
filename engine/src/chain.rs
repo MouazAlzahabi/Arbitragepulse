@@ -861,6 +861,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
                             cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
+                            // Stale the V3 pools that produced the phantom spread so they
+                            // won't be re-detected until a new on-chain Swap event arrives.
+                            { strategy.read().await.invalidate_arb_v3_pools(&optimized); }
                             let msg = format!("[{}] Pre-flight rejected {} — {} | cooldown={}s", cfg.name, display_id, e, PREFLIGHT_COOLDOWN_SECS);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);
@@ -1067,6 +1070,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
                             cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
+                            // Stale V3 pools in this triangle so the phantom spread isn't
+                            // re-detected every 60s until VOLATILE_MAX_AGE expires.
+                            { strategy.read().await.invalidate_tri_v3_pools(opp); }
                             let msg = format!("[{}] Pre-flight rejected {} — {} | cooldown={}s", cfg.name, display_id, e, PREFLIGHT_COOLDOWN_SECS);
                             warn!("{}", msg);
                             broadcast_log(log_tx, "warn", &msg, None);

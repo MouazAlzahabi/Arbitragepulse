@@ -432,6 +432,46 @@ impl Strategy {
     /// - `pairs_with_any`: number of pairs with at least 1 non-zero quote (shows coverage)
     ///
     /// `pair_mask`: if Some, only evaluate pairs at those indices (targeted scan).
+    /// After a pre-flight rejection for a 2-hop opportunity, immediately stale every
+    /// pool involved (V3 and V2/Solidly) so detection stops until the next Swap event.
+    pub fn invalidate_arb_v3_pools(&self, opp: &ArbOpportunity) {
+        match opp.router_a_type {
+            RouterType::V3 => self.pool_cache.invalidate_v3_pool_by_key(
+                &opp.router_a_id, opp.token_in, opp.token_out, opp.fee_a),
+            _ => self.pool_cache.invalidate_v2_pool_by_key(
+                &opp.router_a_id, opp.token_in, opp.token_out),
+        }
+        match opp.router_b_type {
+            RouterType::V3 => self.pool_cache.invalidate_v3_pool_by_key(
+                &opp.router_b_id, opp.token_out, opp.token_in, opp.fee_b),
+            _ => self.pool_cache.invalidate_v2_pool_by_key(
+                &opp.router_b_id, opp.token_out, opp.token_in),
+        }
+    }
+
+    /// After a pre-flight rejection for a triangular opportunity, immediately stale
+    /// every pool involved (V3 and V2/Solidly) so detection stops until the next Swap event.
+    pub fn invalidate_tri_v3_pools(&self, opp: &TriangularOpportunity) {
+        match opp.router_ab_type {
+            RouterType::V3 => self.pool_cache.invalidate_v3_pool_by_key(
+                &opp.router_ab_id, opp.token_a, opp.token_b, opp.fee_ab),
+            _ => self.pool_cache.invalidate_v2_pool_by_key(
+                &opp.router_ab_id, opp.token_a, opp.token_b),
+        }
+        match opp.router_bc_type {
+            RouterType::V3 => self.pool_cache.invalidate_v3_pool_by_key(
+                &opp.router_bc_id, opp.token_b, opp.token_c, opp.fee_bc),
+            _ => self.pool_cache.invalidate_v2_pool_by_key(
+                &opp.router_bc_id, opp.token_b, opp.token_c),
+        }
+        match opp.router_ca_type {
+            RouterType::V3 => self.pool_cache.invalidate_v3_pool_by_key(
+                &opp.router_ca_id, opp.token_c, opp.token_a, opp.fee_ca),
+            _ => self.pool_cache.invalidate_v2_pool_by_key(
+                &opp.router_ca_id, opp.token_c, opp.token_a),
+        }
+    }
+
     /// Pass None for a full scan of all pairs.
     pub async fn evaluate<P: Provider + Clone>(
         &self,
