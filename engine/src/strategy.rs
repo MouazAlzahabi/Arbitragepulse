@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::abi::{IERC20, IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Pair, IUniswapV2Router02};
 use crate::config::{PairConfig, RouterConfig, RouterType};
@@ -1042,8 +1042,9 @@ impl Strategy {
             }
 
             if !p15_mc.is_empty() {
-                debug!(
-                    "[chain={}] Phase 1.5 (gated): {} V3 upgrade(s) — local spread > {:.1}%",
+                let opps_before_p15 = opportunities.len();
+                info!(
+                    "[{}] Phase 1.5: {} QuoterV2 call(s) — local spread > {:.1}% (verifying at full trade size)",
                     self.chain_id, p15_mc.len(), P15_GATE_SPREAD * 100.0
                 );
                 let p15_raw = run_multicall(provider, p15_mc, self.rpc_concurrency).await;
@@ -1126,6 +1127,18 @@ impl Strategy {
                             });
                         }
                     }
+                }
+                let p15_opps_found = opportunities.len().saturating_sub(opps_before_p15);
+                if p15_opps_found == 0 {
+                    info!(
+                        "[{}] Phase 1.5: 0 profitable opps at full scale — spread is phantom at trade size",
+                        self.chain_id
+                    );
+                } else {
+                    info!(
+                        "[{}] Phase 1.5: {} profitable opp(s) confirmed at full trade size",
+                        self.chain_id, p15_opps_found
+                    );
                 }
             }
         }

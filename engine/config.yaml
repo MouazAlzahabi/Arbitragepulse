@@ -113,9 +113,10 @@ chains:
     # Max concurrent Multicall3 chunks per scan.
     # Each chunk = 1 eth_call (26 CU). Free plan (330 CU/s): 3. Growth plan (3000 CU/s): 10.
     rpc_concurrency: 3
-    # How often to scan between blocks (milliseconds). Aligned with Linea 2s block cadence
-    # to prevent poll_tick from firing between blocks (which doubled scan rate to ~45/min).
-    scan_interval_ms: 2000
+    # How often the poll_tick fallback fires (milliseconds). At 1000ms, poll_tick
+    # alternates with 2s block scans → ~60 scans/min instead of ~30, and recovers
+    # faster when WS drops blocks at high Alchemy latency.
+    scan_interval_ms: 1000
 
 
 # ─── ROUTERS ──────────────────────────────────────────────

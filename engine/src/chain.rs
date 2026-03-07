@@ -261,6 +261,10 @@ pub async fn run_chain(
     let last_active_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     // last_opp_count: how many profitable opportunities were found in the last scan
     let last_opp_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
+    // best_opp_count: max opp count seen over the current heartbeat period (reset each HB).
+    // Prevents HB showing opps=0 when Phase 1.5 marginal opp oscillates in/out of threshold
+    // across scans — the HB shows the BEST seen in the period, not the last-scan snapshot.
+    let best_opp_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     // Count of consecutive heartbeats with zero forward quotes.
     // Warning only fires at 3+ to suppress startup false-positives and transient RPC blips.
     let mut consecutive_zero_fwd: u32 = 0;
@@ -351,7 +355,10 @@ pub async fn run_chain(
                 let multi_dex = last_multi_count.load(Ordering::Relaxed);
                 let active_pairs = last_active_count.load(Ordering::Relaxed);
                 let total_pairs = chain_pairs.len() as u64;
-                let opp_count = last_opp_count.load(Ordering::Relaxed);
+                // Use max opp count seen over the period (not last-scan snapshot).
+                // Prevents showing opps=0 when a marginal Phase 1.5 opp oscillates near
+                // the profit threshold between scans, yet was clearly found this period.
+                let opp_count = best_opp_count.swap(0u64, Ordering::Relaxed);
                 let heartbeat_msg = format!(
                     "[{}] ♥ scans={} execs={} ok={} | best={} spread={} | quotes={} active={}/{} cross={} | opps={}",
                     cfg.name, scans, attempts, success, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
@@ -485,7 +492,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None, disabled_set,
+                    &last_opp_count, &best_opp_count, &contract_balances, None, disabled_set,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -516,7 +523,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None, disabled_set,
+                    &last_opp_count, &best_opp_count, &contract_balances, None, disabled_set,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -575,7 +582,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
                     &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    &last_opp_count, &best_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
             }
@@ -605,6 +612,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     last_multi_count: &Arc<AtomicU64>,
     last_active_count: &Arc<AtomicU64>,
     last_opp_count: &Arc<AtomicU64>,
+    best_opp_count: &Arc<AtomicU64>,
     contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
     // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
     targeted: Option<(HashSet<usize>, Vec<Address>)>,
@@ -686,7 +694,12 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     };
 
     // Track opp count for heartbeat display
-    last_opp_count.store(all_opportunities.len() as u64, Ordering::Relaxed);
+    let cur_opp_count = all_opportunities.len() as u64;
+    last_opp_count.store(cur_opp_count, Ordering::Relaxed);
+    // Update running max for the current HB period (reset at each heartbeat).
+    let _ = best_opp_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        if cur_opp_count > prev { Some(cur_opp_count) } else { None }
+    });
 
     // Log all opportunities found this scan so it's visible which pairs are generating them.
     // This is key for diagnosing "single pair always" — it shows whether other pairs have
@@ -932,8 +945,10 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             }
                                         }
                                         Err(e) => {
-                                            confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                            let msg = format!("[{}] Receipt poll error | tx={} | {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                            // Network/timeout error — do NOT increment confirmed_failed.
+                                            // confirmed_failed is for on-chain reverts; a poll error
+                                            // means the receipt is unknown (tx may have succeeded).
+                                            let msg = format!("[{}] Receipt poll error (tx outcome unknown) | tx={} | {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
                                             warn!("{}", msg);
                                             broadcast_log(&log_tx_bg, "warn", &msg, None);
                                         }
@@ -1146,8 +1161,8 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             }
                                         }
                                         Err(e) => {
-                                            confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                            let msg = format!("[{}] Triangular receipt poll error | tx={} | {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                            // Network/timeout error — do NOT increment confirmed_failed.
+                                            let msg = format!("[{}] Triangular receipt poll error (tx outcome unknown) | tx={} | {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
                                             warn!("{}", msg);
                                             broadcast_log(&log_tx_bg, "warn", &msg, None);
                                         }

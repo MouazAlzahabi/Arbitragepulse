@@ -63,11 +63,13 @@ pub struct V3PoolState {
 pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(86_400); // 24 h
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
-/// 300s (5 min): covers pools that swap every few minutes (typical on Linea).
-pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(300);
+/// 600s (10 min): Linea V2/Solidly pools trade infrequently; 5-min TTL caused
+/// pools to go stale between trades, dropping active pair count from 13→11.
+pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(600);
 
 /// How long a Solidly-stable / SyncSwap-stable pool reserve is considered fresh.
-pub const STABLE_MAX_AGE: Duration = Duration::from_secs(120);
+/// 300s (5 min): stable pools trade even less frequently than volatile.
+pub const STABLE_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// Price impact factor per fee tier (numerator; denominator = 10_000).
 /// Limits ΔsqrtP/sqrtP to stay within the active tick cluster without
