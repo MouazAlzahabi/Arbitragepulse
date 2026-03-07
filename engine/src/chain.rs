@@ -906,7 +906,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                                                     Some((f64::from_bits(bits) + profit_bg).to_bits())
                                                 }).ok();
-                                                info!("[{}] ✓ confirmed | gas={} | tx={}", chain_name_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                let msg = format!("[{}] ✓ confirmed profit=${:.4} | gas={} | tx={}", chain_name_bg, profit_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                info!("{}", msg);
+                                                broadcast_log(&log_tx_bg, "info", &msg, None);
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
                                                     for token in token_addrs {
@@ -931,7 +933,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         }
                                         Err(e) => {
                                             confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                            warn!("[{}] Receipt error for {}: {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                            let msg = format!("[{}] Receipt poll error | tx={} | {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                            warn!("{}", msg);
+                                            broadcast_log(&log_tx_bg, "warn", &msg, None);
                                         }
                                     }
                                     drop(provider_bg);
@@ -1116,7 +1120,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                                                     Some((f64::from_bits(bits) + profit_bg).to_bits())
                                                 }).ok();
-                                                info!("[{}] ✓ triangular confirmed | gas={} | tx={}", chain_name_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                let msg = format!("[{}] ✓ triangular confirmed profit=${:.4} | gas={} | tx={}", chain_name_bg, profit_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                info!("{}", msg);
+                                                broadcast_log(&log_tx_bg, "info", &msg, None);
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
                                                     for token in token_addrs {
@@ -1141,7 +1147,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         }
                                         Err(e) => {
                                             confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                            warn!("[{}] Triangular receipt error for {}: {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                            let msg = format!("[{}] Triangular receipt poll error | tx={} | {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
+                                            warn!("{}", msg);
+                                            broadcast_log(&log_tx_bg, "warn", &msg, None);
                                         }
                                     }
                                     drop(provider_bg);
