@@ -1052,7 +1052,15 @@ impl Strategy {
                 for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount), raw_opt)
                     in p15_list.into_iter().zip(p15_raw.into_iter())
                 {
-                    let raw = match raw_opt { Some(r) => r, None => continue };
+                    let raw = match raw_opt {
+                        Some(r) => r,
+                        None => {
+                            // QuoterV2 reverted — pool can't handle full trade size.
+                            // Stale it so this phantom doesn't fire Phase 1.5 every scan.
+                            self.pool_cache.invalidate_v3_pool_by_key(&router_a_id, token_in, token_out, fee_a);
+                            continue;
+                        }
+                    };
                     let quoter_out = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw) {
                         Ok(r) if !r.amountOut.is_zero() => r.amountOut,
                         _ => continue,
@@ -1934,17 +1942,9 @@ impl Strategy {
                 if seen.insert((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.fee_ab)) {
                     candidates.push((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.router_ab_addr, p3e.fee_ab));
                 }
-                // Also try every other fee tier of the same router for this pair.
-                // Fee=100 often reverts at $100 (thin pool) — fee=500/2500 may be liquid.
-                if let Some(router) = self.routers.iter().find(|r| r.id == p3e.router_ab_id) {
-                    for &f in &router.fee_tiers {
-                        if f != p3e.fee_ab
-                            && seen.insert((p3e.triplet_idx, p3e.router_ab_id.clone(), f))
-                        {
-                            candidates.push((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.router_ab_addr, f));
-                        }
-                    }
-                }
+                // No expansion to other fee tiers: detect_triangular already iterates ALL
+                // fee tiers in Phase 1 (A→B). Each tier that is capped generates its own
+                // p3 entry and will appear here naturally — no redundant expansion needed.
             }
 
             if !candidates.is_empty() {
@@ -1984,7 +1984,14 @@ impl Strategy {
                     for (mc_i, ci) in p15_valid.into_iter().enumerate() {
                         let (triplet_idx, router_ab_id, _router_ab_addr, fee_ab) = &candidates[ci];
                         let raw = match p15_raw.get(mc_i).and_then(|r| r.as_ref()) {
-                            Some(r) => r, None => continue,
+                            Some(r) => r,
+                            None => {
+                                // QuoterV2 reverted — thin pool can't handle full trade size.
+                                // Stale it so this phantom doesn't fire Phase 1.5 every scan.
+                                let trip = &triplets[*triplet_idx];
+                                self.pool_cache.invalidate_v3_pool_by_key(router_ab_id, trip.token_a, trip.token_b, *fee_ab);
+                                continue;
+                            }
                         };
                         let quoter_out = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw) {
                             Ok(r) if !r.amountOut.is_zero() => r.amountOut,
