@@ -435,36 +435,65 @@ impl Strategy {
     /// After a pre-flight rejection for a 2-hop opportunity, immediately stale every
     /// pool involved (V3 and V2/Solidly) so detection stops until the next Swap event.
     pub fn invalidate_arb_v3_pools(&self, opp: &ArbOpportunity) {
-        // Only stale V3 pools — they have no time-based TTL so a phantom keeps
-        // re-appearing until the pool is explicitly marked stale.
-        // V2/Solidly pools expire naturally via VOLATILE_MAX_AGE (5 min) and
-        // must NOT be permanently staled here; doing so prevents them from being
-        // used as reverse legs for other routes until a Swap event arrives.
+        // Stale ALL fee tiers of a V3 pair — not just the one used in the opp.
+        // The pre-flight rejection means the market has no real spread for this pair;
+        // other fee tiers of the same pool would show the same stale phantom.
+        // V2/Solidly legs are left untouched (5-min natural TTL is acceptable).
         if matches!(opp.router_a_type, RouterType::V3) {
-            self.pool_cache.invalidate_v3_pool_by_key(
-                &opp.router_a_id, opp.token_in, opp.token_out, opp.fee_a);
+            let tiers: Vec<u32> = self.routers.iter()
+                .find(|r| r.id == opp.router_a_id)
+                .map(|r| r.fee_tiers.clone())
+                .unwrap_or_else(|| vec![opp.fee_a]);
+            for f in tiers {
+                self.pool_cache.invalidate_v3_pool_by_key(
+                    &opp.router_a_id, opp.token_in, opp.token_out, f);
+            }
         }
         if matches!(opp.router_b_type, RouterType::V3) {
-            self.pool_cache.invalidate_v3_pool_by_key(
-                &opp.router_b_id, opp.token_out, opp.token_in, opp.fee_b);
+            let tiers: Vec<u32> = self.routers.iter()
+                .find(|r| r.id == opp.router_b_id)
+                .map(|r| r.fee_tiers.clone())
+                .unwrap_or_else(|| vec![opp.fee_b]);
+            for f in tiers {
+                self.pool_cache.invalidate_v3_pool_by_key(
+                    &opp.router_b_id, opp.token_out, opp.token_in, f);
+            }
         }
     }
 
-    /// After a pre-flight rejection for a triangular opportunity, stale any V3
-    /// legs so the phantom spread is not re-detected until a new Swap event.
-    /// V2/Solidly legs are intentionally left untouched — they expire via VOLATILE_MAX_AGE.
+    /// After a pre-flight rejection for a triangular opportunity, stale ALL fee tiers
+    /// of every V3 leg so the same triangle is not re-detected via a different fee tier.
+    /// V2/Solidly legs are left untouched (they expire naturally via VOLATILE_MAX_AGE).
     pub fn invalidate_tri_v3_pools(&self, opp: &TriangularOpportunity) {
         if matches!(opp.router_ab_type, RouterType::V3) {
-            self.pool_cache.invalidate_v3_pool_by_key(
-                &opp.router_ab_id, opp.token_a, opp.token_b, opp.fee_ab);
+            let tiers: Vec<u32> = self.routers.iter()
+                .find(|r| r.id == opp.router_ab_id)
+                .map(|r| r.fee_tiers.clone())
+                .unwrap_or_else(|| vec![opp.fee_ab]);
+            for f in tiers {
+                self.pool_cache.invalidate_v3_pool_by_key(
+                    &opp.router_ab_id, opp.token_a, opp.token_b, f);
+            }
         }
         if matches!(opp.router_bc_type, RouterType::V3) {
-            self.pool_cache.invalidate_v3_pool_by_key(
-                &opp.router_bc_id, opp.token_b, opp.token_c, opp.fee_bc);
+            let tiers: Vec<u32> = self.routers.iter()
+                .find(|r| r.id == opp.router_bc_id)
+                .map(|r| r.fee_tiers.clone())
+                .unwrap_or_else(|| vec![opp.fee_bc]);
+            for f in tiers {
+                self.pool_cache.invalidate_v3_pool_by_key(
+                    &opp.router_bc_id, opp.token_b, opp.token_c, f);
+            }
         }
         if matches!(opp.router_ca_type, RouterType::V3) {
-            self.pool_cache.invalidate_v3_pool_by_key(
-                &opp.router_ca_id, opp.token_c, opp.token_a, opp.fee_ca);
+            let tiers: Vec<u32> = self.routers.iter()
+                .find(|r| r.id == opp.router_ca_id)
+                .map(|r| r.fee_tiers.clone())
+                .unwrap_or_else(|| vec![opp.fee_ca]);
+            for f in tiers {
+                self.pool_cache.invalidate_v3_pool_by_key(
+                    &opp.router_ca_id, opp.token_c, opp.token_a, f);
+            }
         }
     }
 
@@ -1833,6 +1862,16 @@ impl Strategy {
 
             if profit_usd < self.min_profit_usd { continue; }
 
+            // Skip V3-capped A→B legs — Phase 1.5 will call QuoterV2 at full trade size.
+            // Executing at capped scale (e.g. $0.12 when trade_amount=$100) wastes gas:
+            // the Solidly/V3 downstream leg estimates are overoptimistic at tiny amounts,
+            // causing consistent pre-flight "INSUFFICIENT_OUTPUT_AMOUNT" rejections.
+            if matches!(p3e.router_ab_type, RouterType::V3)
+                && p3e.effective_amount_in < triplets[p3e.triplet_idx].amount_in
+            {
+                continue;
+            }
+
             debug!(
                 "[{}] Triangular: {} | profit=${:.4} | {}/{}/{}",
                 self.chain_id, trip.triplet_id, profit_usd,
@@ -1878,8 +1917,20 @@ impl Strategy {
                 if !matches!(p3e.router_ab_type, RouterType::V3) { continue; }
                 let full_in = triplets[p3e.triplet_idx].amount_in;
                 if p3e.effective_amount_in >= full_in { continue; }
+                // Add the detected (capped) fee tier.
                 if seen.insert((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.fee_ab)) {
                     candidates.push((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.router_ab_addr, p3e.fee_ab));
+                }
+                // Also try every other fee tier of the same router for this pair.
+                // Fee=100 often reverts at $100 (thin pool) — fee=500/2500 may be liquid.
+                if let Some(router) = self.routers.iter().find(|r| r.id == p3e.router_ab_id) {
+                    for &f in &router.fee_tiers {
+                        if f != p3e.fee_ab
+                            && seen.insert((p3e.triplet_idx, p3e.router_ab_id.clone(), f))
+                        {
+                            candidates.push((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.router_ab_addr, f));
+                        }
+                    }
                 }
             }
 
