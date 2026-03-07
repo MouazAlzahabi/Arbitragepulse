@@ -377,28 +377,6 @@ impl PoolCache {
         count
     }
 
-    /// Stale a single V2/Solidly/SyncSwap pool by router key.
-    /// `get_amount_out_by_key_fresh` returns None until the next Sync event.
-    /// Called after a pre-flight rejection instead of waiting for VOLATILE_MAX_AGE.
-    pub fn invalidate_v2_pool_by_key(&self, router_id: &str, token_in: Address, token_out: Address) {
-        let t_in  = format!("{:?}", token_in).to_lowercase();
-        let t_out = format!("{:?}", token_out).to_lowercase();
-        let stale_at = Instant::now() - VOLATILE_MAX_AGE - Duration::from_secs(1);
-        // Try plain key and Solidly volatile/stable variants in both directions.
-        for prefix in &[router_id.to_string(),
-                         format!("{}::volatile", router_id),
-                         format!("{}::stable", router_id)] {
-            for key in &[format!("{}:{}:{}", prefix, t_in, t_out),
-                          format!("{}:{}:{}", prefix, t_out, t_in)] {
-                if let Some(pool_addr) = self.by_key.get(key.as_str()) {
-                    if let Some(mut e) = self.by_address.get_mut(&*pool_addr) {
-                        e.last_sync = stale_at;
-                    }
-                }
-            }
-        }
-    }
-
     /// Stale a single V3 pool by router/token/fee key.
     /// `quote_v3_spot` will return None until the next live Swap event updates
     /// `last_updated`. Called after a pre-flight rejection to stop re-detection

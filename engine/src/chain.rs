@@ -1070,8 +1070,8 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             { let mut exec = executor.lock().await; exec.record_failed(); }
                             pending_pairs.remove(&fingerprint);
                             cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
-                            // Stale V3 pools in this triangle so the phantom spread isn't
-                            // re-detected every 60s until VOLATILE_MAX_AGE expires.
+                            // Stale V3 pools in this triangle so the phantom V3 spread
+                            // is not re-detected until a new Swap event arrives.
                             { strategy.read().await.invalidate_tri_v3_pools(opp); }
                             let msg = format!("[{}] Pre-flight rejected {} — {} | cooldown={}s", cfg.name, display_id, e, PREFLIGHT_COOLDOWN_SECS);
                             warn!("{}", msg);
