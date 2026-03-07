@@ -227,6 +227,12 @@ pub struct Strategy {
     pub tri_scan: Mutex<Vec<PairScanInfo>>,
     /// Running count of opportunities found per pair/triplet this session.
     pub opp_session_counts: Mutex<HashMap<String, u64>>,
+    /// Phase 1.5 QuoterV2 per-pool cooldown.
+    /// After Phase 1.5 fires for a (pair/triplet, router, fee) and finds no profitable opp,
+    /// that entry is suppressed for 30 s to eliminate repeated Alchemy multicall overhead
+    /// from persistent near-miss or phantom pools. Each multicall costs ~150 ms regardless
+    /// of call count, so even 1 wasted call per scan kills throughput.
+    pub p15_cooldown: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl Strategy {
@@ -252,6 +258,7 @@ impl Strategy {
             pair_scan: Mutex::new(Vec::new()),
             tri_scan: Mutex::new(Vec::new()),
             opp_session_counts: Mutex::new(HashMap::new()),
+            p15_cooldown: Mutex::new(HashMap::new()),
         }
     }
 
@@ -936,7 +943,13 @@ impl Strategy {
                         let too_thin = full_amount
                             .map_or(false, |full| task.amount_in < full / U256::from(5u64));
                         if !too_thin {
-                            p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                            let cd_key = format!("2:{}:{}:{}", task.pair_idx, task.router_a_id, task.fee_a);
+                            let in_cooldown = self.p15_cooldown.lock().ok()
+                                .and_then(|cd| cd.get(&cd_key).map(|t| t.elapsed() < std::time::Duration::from_secs(30)))
+                                .unwrap_or(false);
+                            if !in_cooldown {
+                                p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                            }
                         }
                     }
                 }
@@ -1066,6 +1079,7 @@ impl Strategy {
                         None => continue,
                     };
 
+                    let mut p15_entry_found = false;
                     for q_b in q_b_list {
                         let fee_b = q_b.fee;
                         let local_back = match q_b.router_type {
@@ -1107,6 +1121,7 @@ impl Strategy {
                         if profit_usd >= self.min_profit_usd {
                             debug!("[{}] Phase 1.5 arb: {} | profit=${:.4} | {}/{}",
                                    self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
+                            p15_entry_found = true;
                             opportunities.push(ArbOpportunity {
                                 chain_id: self.chain_id,
                                 pair_id: pair.id.clone(),
@@ -1124,6 +1139,13 @@ impl Strategy {
                                 router_a_id: router_a_id.clone(),
                                 router_b_id: q_b.router_id.clone(),
                             });
+                        }
+                    }
+                    // No profitable opp for this pool — cool it down for 30 s.
+                    if !p15_entry_found {
+                        let cd_key = format!("2:{}:{}:{}", pi, router_a_id, fee_a);
+                        if let Ok(mut cd) = self.p15_cooldown.lock() {
+                            cd.insert(cd_key, std::time::Instant::now());
                         }
                     }
                 }
@@ -1933,8 +1955,12 @@ impl Strategy {
                 // nothing profitable every scan; each fee tier is detected independently).
                 if p3e.effective_amount_in >= full_in
                     || p3e.effective_amount_in < full_in / U256::from(5u64) { continue; }
-                // Add the detected (capped) fee tier.
-                if seen.insert((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.fee_ab)) {
+                // Add the detected (capped) fee tier — unless in cooldown.
+                let cd_key = format!("t:{}:{}:{}", p3e.triplet_idx, p3e.router_ab_id, p3e.fee_ab);
+                let in_cooldown = self.p15_cooldown.lock().ok()
+                    .and_then(|cd| cd.get(&cd_key).map(|t| t.elapsed() < std::time::Duration::from_secs(30)))
+                    .unwrap_or(false);
+                if !in_cooldown && seen.insert((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.fee_ab)) {
                     candidates.push((p3e.triplet_idx, p3e.router_ab_id.clone(), p3e.router_ab_addr, p3e.fee_ab));
                 }
                 // No expansion to other fee tiers: detect_triangular already iterates ALL
@@ -1996,6 +2022,7 @@ impl Strategy {
 
                         // Re-chain all P3 entries sharing (triplet, router_ab, fee_ab)
                         // through B→C and C→A using the QuoterV2 full-size output.
+                        let mut tri_p15_entry_found = false;
                         for p3e in p3_entries.iter().filter(|e| {
                             e.triplet_idx == *triplet_idx
                                 && e.router_ab_id == *router_ab_id
@@ -2073,6 +2100,7 @@ impl Strategy {
                                 self.chain_id, trip.triplet_id, profit_usd,
                                 p3e.router_ab_id, p3e.router_bc_id, p3e.router_ca_id,
                             );
+                            tri_p15_entry_found = true;
                             opportunities.push(TriangularOpportunity {
                                 chain_id: self.chain_id,
                                 triplet_id: trip.triplet_id.clone(),
@@ -2095,6 +2123,13 @@ impl Strategy {
                                 router_bc_id: p3e.router_bc_id.clone(),
                                 router_ca_id: p3e.router_ca_id.clone(),
                             });
+                        }
+                        // No profitable triangular opp — cool down this A→B pool for 30 s.
+                        if !tri_p15_entry_found {
+                            let cd_key = format!("t:{}:{}:{}", triplet_idx, router_ab_id, fee_ab);
+                            if let Ok(mut cd) = self.p15_cooldown.lock() {
+                                cd.insert(cd_key, std::time::Instant::now());
+                            }
                         }
                     }
                 }
