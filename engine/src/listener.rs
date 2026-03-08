@@ -90,6 +90,68 @@ impl Listener {
         info!("{}", diag);
         broadcast_log(&log_tx, "info", &diag, None);
 
+        // One-time diagnostic: query a single block with NO topic filter to check
+        // if these addresses emit ANY events at all.
+        {
+            let test_block = match provider.get_block_number().await {
+                Ok(b) => b,
+                Err(_) => 0,
+            };
+            if test_block > 0 {
+                // Test 1: address-only filter (no topics) — do these pools emit anything?
+                let test_filter_no_topic = Filter::new()
+                    .address(all_addrs.clone())
+                    .from_block(test_block.saturating_sub(5))
+                    .to_block(test_block);
+                match provider.get_logs(&test_filter_no_topic).await {
+                    Ok(logs) => {
+                        let msg = format!(
+                            "[{}] DIAG: no-topic filter blocks {}..{} → {} events from {} addrs",
+                            chain_name, test_block.saturating_sub(5), test_block, logs.len(), all_addrs.len()
+                        );
+                        info!("{}", msg);
+                        broadcast_log(&log_tx, "info", &msg, None);
+                        // Show first few event topic0 values
+                        for (i, log) in logs.iter().take(3).enumerate() {
+                            let t0 = log.topics().first().map(|h| format!("{:?}", h)).unwrap_or_default();
+                            let msg = format!(
+                                "[{}] DIAG event[{}]: addr={:?} topic0={} block={}",
+                                chain_name, i, log.address(), t0, log.block_number.unwrap_or(0)
+                            );
+                            info!("{}", msg);
+                            broadcast_log(&log_tx, "info", &msg, None);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("[{}] DIAG: no-topic filter failed: {}", chain_name, e);
+                        warn!("{}", msg);
+                        broadcast_log(&log_tx, "warn", &msg, None);
+                    }
+                }
+
+                // Test 2: Sync topic only, NO address filter, 1 block — do Sync events exist on-chain at all?
+                let test_filter_sync_only = Filter::new()
+                    .event_signature(Sync::SIGNATURE_HASH)
+                    .from_block(test_block)
+                    .to_block(test_block);
+                match provider.get_logs(&test_filter_sync_only).await {
+                    Ok(logs) => {
+                        let msg = format!(
+                            "[{}] DIAG: Sync-only (no addr) block {} → {} events",
+                            chain_name, test_block, logs.len()
+                        );
+                        info!("{}", msg);
+                        broadcast_log(&log_tx, "info", &msg, None);
+                    }
+                    Err(e) => {
+                        let msg = format!("[{}] DIAG: Sync-only filter failed: {}", chain_name, e);
+                        warn!("{}", msg);
+                        broadcast_log(&log_tx, "warn", &msg, None);
+                    }
+                }
+            }
+        }
+
         let sync_count = Arc::new(AtomicU64::new(0));
         let v3_count = Arc::new(AtomicU64::new(0));
 
