@@ -132,7 +132,15 @@ impl Listener {
                     continue;
                 }
 
-                let from = last_block + 1;
+                // Cap range to 5 blocks (Alchemy free tier allows max 10).
+                // If we've fallen behind, skip to recent blocks — stale events
+                // aren't useful; we just need fresh pool state.
+                const MAX_RANGE: u64 = 5;
+                let from = if current_block - last_block > MAX_RANGE {
+                    current_block - MAX_RANGE + 1
+                } else {
+                    last_block + 1
+                };
                 let to = current_block;
 
                 let filter = Filter::new()
