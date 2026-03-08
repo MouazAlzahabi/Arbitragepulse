@@ -106,6 +106,7 @@ impl Listener {
         let log_tx_poll = log_tx.clone();
         tokio::spawn(async move {
             let mut last_block: u64 = 0;
+            let mut poll_count: u64 = 0;
             let poll_interval = Duration::from_secs(2); // Linea ~2s block time
 
             loop {
@@ -151,6 +152,15 @@ impl Listener {
 
                 match provider.get_logs(&filter).await {
                     Ok(logs) => {
+                        // Log every poll to dashboard for diagnosis (temporary)
+                        if !logs.is_empty() || poll_count % 15 == 0 {
+                            let msg = format!(
+                                "[{}] get_logs blocks {}..{} → {} events ({} addrs watched)",
+                                chain_name, from, to, logs.len(), all_addrs.len()
+                            );
+                            info!("{}", msg);
+                            broadcast_log(&log_tx_poll, "info", &msg, None);
+                        }
                         for log in logs {
                             let pool = log.address();
                             let block = log.block_number.unwrap_or(current_block);
@@ -185,10 +195,17 @@ impl Listener {
                         last_block = to;
                     }
                     Err(e) => {
-                        error!("[{}] get_logs failed (blocks {}..{}): {}", chain_name, from, to, e);
-                        // On error, don't advance last_block — retry next iteration
+                        let msg = format!(
+                            "[{}] get_logs FAILED blocks {}..{}: {}",
+                            chain_name, from, to, e
+                        );
+                        error!("{}", msg);
+                        broadcast_log(&log_tx_poll, "error", &msg, None);
+                        // On error, skip ahead to avoid stuck range growing
+                        last_block = current_block;
                     }
                 }
+                poll_count += 1;
 
                 tokio::time::sleep(poll_interval).await;
             }
