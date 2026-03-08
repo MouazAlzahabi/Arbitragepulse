@@ -181,6 +181,7 @@ impl Listener {
         tokio::spawn(async move {
             let mut last_block: u64 = 0;
             let mut poll_count: u64 = 0;
+            let mut diag_done = false;
             let poll_interval = Duration::from_secs(2); // Linea ~2s block time
 
             loop {
@@ -195,10 +196,67 @@ impl Listener {
                 };
 
                 if last_block == 0 {
-                    // First poll: start from current block (don't replay history)
                     last_block = current_block;
                     tokio::time::sleep(poll_interval).await;
                     continue;
+                }
+
+                // Run diagnostic once after ~90s (poll_count ~45) so dashboard has connected
+                if !diag_done && poll_count >= 45 {
+                    diag_done = true;
+
+                    // DIAG: no-topic query — do these pool addrs emit ANY events?
+                    let diag_filter = Filter::new()
+                        .address(all_addrs.clone())
+                        .from_block(current_block.saturating_sub(5))
+                        .to_block(current_block);
+                    match provider.get_logs(&diag_filter).await {
+                        Ok(logs) => {
+                            let msg = format!(
+                                "[{}] DIAG no-topic: blocks {}..{} → {} events from {} addrs",
+                                chain_name, current_block.saturating_sub(5), current_block, logs.len(), all_addrs.len()
+                            );
+                            info!("{}", msg);
+                            broadcast_log(&log_tx_poll, "info", &msg, None);
+                            for (i, log) in logs.iter().take(5).enumerate() {
+                                let t0 = log.topics().first().map(|h| format!("{:?}", h)).unwrap_or_default();
+                                let msg = format!(
+                                    "[{}] DIAG evt[{}]: pool={:?} topic0={}", chain_name, i, log.address(), t0
+                                );
+                                info!("{}", msg);
+                                broadcast_log(&log_tx_poll, "info", &msg, None);
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("[{}] DIAG no-topic failed: {}", chain_name, e);
+                            warn!("{}", msg);
+                            broadcast_log(&log_tx_poll, "warn", &msg, None);
+                        }
+                    }
+
+                    // DIAG: Sync topic, no addr filter — do Sync events exist on-chain?
+                    let diag_sync = Filter::new()
+                        .event_signature(Sync::SIGNATURE_HASH)
+                        .from_block(current_block)
+                        .to_block(current_block);
+                    let sync_hash_msg = format!("[{}] DIAG Sync hash={:?}", chain_name, Sync::SIGNATURE_HASH);
+                    info!("{}", sync_hash_msg);
+                    broadcast_log(&log_tx_poll, "info", &sync_hash_msg, None);
+                    match provider.get_logs(&diag_sync).await {
+                        Ok(logs) => {
+                            let msg = format!(
+                                "[{}] DIAG Sync-only (no addr): block {} → {} events",
+                                chain_name, current_block, logs.len()
+                            );
+                            info!("{}", msg);
+                            broadcast_log(&log_tx_poll, "info", &msg, None);
+                        }
+                        Err(e) => {
+                            let msg = format!("[{}] DIAG Sync-only failed: {}", chain_name, e);
+                            warn!("{}", msg);
+                            broadcast_log(&log_tx_poll, "warn", &msg, None);
+                        }
+                    }
                 }
 
                 if current_block <= last_block {
