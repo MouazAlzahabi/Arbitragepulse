@@ -78,6 +78,18 @@ impl Listener {
             PoolSwapV3::SIGNATURE_HASH,
         ];
 
+        // One-time diagnostic: log signature hashes and sample addresses
+        let diag = format!(
+            "[{}] Sync sig={:?}, Swap sig={:?} | V2 sample={:?} | V3 sample={:?}",
+            chain_name,
+            PairSyncV2::SIGNATURE_HASH,
+            PoolSwapV3::SIGNATURE_HASH,
+            v2_pool_addrs.first(),
+            v3_pool_addrs.first(),
+        );
+        info!("{}", diag);
+        broadcast_log(&log_tx, "info", &diag, None);
+
         let sync_count = Arc::new(AtomicU64::new(0));
         let v3_count = Arc::new(AtomicU64::new(0));
 
