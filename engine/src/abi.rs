@@ -196,7 +196,9 @@ sol! {
 
     /// Emitted by every V2 and Solidly-volatile pair on every swap.
     /// reserve0/reserve1 are the NEW balances after the swap.
-    event PairSyncV2(uint112 reserve0, uint112 reserve1);
+    /// NOTE: Name MUST be "Sync" (not "PairSyncV2") — alloy computes SIGNATURE_HASH
+    /// from the event name, and on-chain pairs emit Sync(uint112,uint112).
+    event Sync(uint112 reserve0, uint112 reserve1);
 }
 
 // ─── Pool discovery (startup, one-time) ───────────────────────────────────────
@@ -251,7 +253,9 @@ sol! {
 // ─── V3 Pool (for swap event subscriptions + local state seeding) ─────────────
 
 sol! {
-    event PoolSwapV3(
+    /// NOTE: Name MUST be "Swap" (not "PoolSwapV3") — alloy computes SIGNATURE_HASH
+    /// from the event name, and on-chain V3 pools emit Swap(...).
+    event Swap(
         address indexed sender,
         address indexed recipient,
         int256 amount0,
@@ -279,7 +283,7 @@ sol! {
 
 // ─── Uniswap V3 Pool (state seeding + event subscriptions) ───────────────────
 // Used at startup to read initial sqrtPriceX96 and liquidity via slot0() + liquidity().
-// After startup, both fields are kept fresh from PoolSwapV3 events (zero RPC).
+// After startup, both fields are kept fresh from Swap events (zero RPC).
 
 sol! {
     #[sol(rpc)]

@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::{PairSyncV2, PoolSwapV3};
+use crate::abi::{Swap, Sync};
 use crate::api::{broadcast_log, LogBroadcaster};
 use crate::pool_cache::PoolCache;
 
@@ -74,16 +74,16 @@ impl Listener {
         all_addrs.extend_from_slice(&v3_pool_addrs);
 
         let event_sigs = vec![
-            PairSyncV2::SIGNATURE_HASH,
-            PoolSwapV3::SIGNATURE_HASH,
+            Sync::SIGNATURE_HASH,
+            Swap::SIGNATURE_HASH,
         ];
 
         // One-time diagnostic: log signature hashes and sample addresses
         let diag = format!(
             "[{}] Sync sig={:?}, Swap sig={:?} | V2 sample={:?} | V3 sample={:?}",
             chain_name,
-            PairSyncV2::SIGNATURE_HASH,
-            PoolSwapV3::SIGNATURE_HASH,
+            Sync::SIGNATURE_HASH,
+            Swap::SIGNATURE_HASH,
             v2_pool_addrs.first(),
             v3_pool_addrs.first(),
         );
@@ -178,9 +178,9 @@ impl Listener {
                             let block = log.block_number.unwrap_or(current_block);
                             let topic0 = log.topics().first().copied();
 
-                            if topic0 == Some(PairSyncV2::SIGNATURE_HASH) {
+                            if topic0 == Some(Sync::SIGNATURE_HASH) {
                                 sync_count.fetch_add(1, Ordering::Relaxed);
-                                if let Ok(decoded) = PairSyncV2::decode_log(log.as_ref()) {
+                                if let Ok(decoded) = Sync::decode_log(log.as_ref()) {
                                     let r0 = U256::from(decoded.reserve0);
                                     let r1 = U256::from(decoded.reserve1);
                                     cache.update_reserves(pool, r0, r1);
@@ -189,9 +189,9 @@ impl Listener {
                                         chain_name, pool, r0, r1, block
                                     );
                                 }
-                            } else if topic0 == Some(PoolSwapV3::SIGNATURE_HASH) {
+                            } else if topic0 == Some(Swap::SIGNATURE_HASH) {
                                 v3_count.fetch_add(1, Ordering::Relaxed);
-                                if let Ok(decoded) = PoolSwapV3::decode_log(log.as_ref()) {
+                                if let Ok(decoded) = Swap::decode_log(log.as_ref()) {
                                     let sqrtp = U256::from(decoded.sqrtPriceX96);
                                     let liq: u128 = decoded.liquidity.into();
                                     cache.update_v3_state(pool, sqrtp, liq);
