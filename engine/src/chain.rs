@@ -18,7 +18,7 @@ use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
 use crate::executor::{Executor, TxPrep};
-use crate::listener::{Listener, SwapEvent};
+use crate::listener::{Listener, SwapEvent, SwapMagnitude};
 use crate::metrics::Metrics;
 use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
 use crate::strategy::{Opportunity, Strategy};
@@ -184,7 +184,7 @@ pub async fn run_chain(
     metrics.rpc_connected.with_label_values(&[&cfg.name]).set(1.0);
 
     // ── Swap event listener ──
-    let listener = Listener::new(cfg.id, cfg.name.clone());
+    let listener = Listener::new(cfg.id, cfg.name.clone(), cfg.large_swap_threshold_bps, cfg.large_v3_threshold_bps);
     let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(256);
     {
         let provider_clone = (*provider).clone();
@@ -529,10 +529,14 @@ pub async fn run_chain(
             // last_scan_at is NOT updated — targeted scans must not suppress the
             // block-triggered full scan or the poll_tick fallback.
             Some(event) = swap_rx.recv() => {
-                // Per-pool burst protection
-                if let Some(&fired_at) = pool_last_scan.get(&event.pool) {
-                    if fired_at.elapsed() < Duration::from_millis(50) {
-                        continue;
+                let is_large = event.magnitude == SwapMagnitude::Large;
+
+                // Per-pool burst protection — skipped for large swaps
+                if !is_large {
+                    if let Some(&fired_at) = pool_last_scan.get(&event.pool) {
+                        if fired_at.elapsed() < Duration::from_millis(50) {
+                            continue;
+                        }
                     }
                 }
                 pool_last_scan.insert(event.pool, Instant::now());
@@ -546,6 +550,18 @@ pub async fn run_chain(
                     Some(t) => t,
                     None => continue, // Pool not in cache — block scan covers it
                 };
+
+                // Large swap: clear cooldowns for all fingerprints involving these tokens.
+                // A whale trade fundamentally changes pool state — previous pre-flight
+                // rejections are no longer valid at the new price.
+                if is_large {
+                    let ta_lower = format!("{:?}", tok_a).to_lowercase();
+                    let tb_lower = format!("{:?}", tok_b).to_lowercase();
+                    cooldowns.retain(|fingerprint, _| {
+                        let fp_lower = fingerprint.to_lowercase();
+                        !fp_lower.contains(&ta_lower) && !fp_lower.contains(&tb_lower)
+                    });
+                }
 
                 // Find which configured pairs involve these tokens
                 let (pair_mask, token_filter) = {
@@ -566,10 +582,19 @@ pub async fn run_chain(
                 };
                 if global_paused || chain_paused { continue; }
 
-                debug!(
-                    "[{}] Swap on {:?} — targeted scan ({} pairs)",
-                    cfg.name, event.pool, pair_mask.len()
-                );
+                if is_large {
+                    let msg = format!(
+                        "[{}] LARGE swap on {:?} — fast-track scan ({} pairs, cooldowns cleared)",
+                        cfg.name, event.pool, pair_mask.len()
+                    );
+                    info!("{}", msg);
+                    broadcast_log(&log_tx, "info", &msg, None);
+                } else {
+                    debug!(
+                        "[{}] Swap on {:?} — targeted scan ({} pairs)",
+                        cfg.name, event.pool, pair_mask.len()
+                    );
+                }
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,

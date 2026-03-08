@@ -799,7 +799,7 @@ impl Strategy {
 
         // Phase 1.5 gate: collect V3 tick-capped forward tasks that show real cross-DEX
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
-        const P15_GATE_SPREAD: f64 = 0.003; // 0.3% — fires QuoterV2 only on real divergence
+        const P15_GATE_SPREAD: f64 = 0.001; // 0.1% — fires QuoterV2 on borderline divergence
         let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
 
         for (task, raw_opt) in rev_tasks.iter().zip(rev_raw_by_task.into_iter()) {
@@ -1176,7 +1176,7 @@ impl Strategy {
             triplet_id: String,
         }
 
-        let max_tokens = 6usize;
+        let max_tokens = 25usize;
         let mut triplets: Vec<Triplet> = Vec::new();
 
         for &(token_a, ref key_a) in tokens.iter().take(max_tokens) {
@@ -2239,20 +2239,40 @@ async fn quote_solidly<P: Provider>(
 // ─── Utility ──────────────────────────────────────────────────────────────────
 
 /// Parse trade amount, capping at max_trade if set.
+/// Uses integer-only arithmetic to avoid f64 precision loss on 18-decimal tokens.
 pub(crate) fn parse_amount_capped(trade_amount: &str, max_trade: Option<&str>, decimals: u8) -> Option<U256> {
-    let parsed: f64 = trade_amount.parse().ok()?;
+    fn str_to_raw(s: &str, decimals: u8) -> Option<U256> {
+        let s = s.trim();
+        let (whole_str, frac_str) = match s.split_once('.') {
+            Some((w, f)) => (w, f),
+            None => (s, ""),
+        };
+        let whole: U256 = whole_str.parse().ok()?;
+        let dec = decimals as usize;
+        let scale = U256::from(10u64).pow(U256::from(dec));
+        if frac_str.is_empty() {
+            return Some(whole * scale);
+        }
+        // Truncate or pad fractional part to exactly `decimals` digits
+        let adj_frac = if frac_str.len() > dec {
+            &frac_str[..dec]
+        } else {
+            frac_str
+        };
+        let frac_val: U256 = adj_frac.parse().ok()?;
+        let frac_scale = U256::from(10u64).pow(U256::from(dec - adj_frac.len()));
+        Some(whole * scale + frac_val * frac_scale)
+    }
+
+    let parsed = str_to_raw(trade_amount, decimals)?;
     let capped = if let Some(max_str) = max_trade {
-        let max: f64 = max_str.parse().ok()?;
-        parsed.min(max)
+        let max_val = str_to_raw(max_str, decimals)?;
+        parsed.min(max_val)
     } else {
         parsed
     };
-    let scale = 10_u128.pow(decimals as u32);
-    let raw = (capped * scale as f64) as u128;
-    if raw == 0 {
-        return None;
-    }
-    Some(U256::from(raw))
+    if capped.is_zero() { return None; }
+    Some(capped)
 }
 
 fn token_amount_to_usd(amount: U256, decimals: u8, symbol: &str, native_price: f64) -> f64 {

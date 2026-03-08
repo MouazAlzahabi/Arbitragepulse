@@ -214,7 +214,8 @@ impl Executor {
             ));
         }
         let deadline = self.deadline();
-        let calldata = self.build_calldata(opp, deadline);
+        let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
+        let calldata = self.build_calldata(opp, deadline, min_profit);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
@@ -280,7 +281,8 @@ impl Executor {
             ));
         }
         let deadline = self.deadline();
-        let calldata = self.build_triangular_calldata(opp, deadline);
+        let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
+        let calldata = self.build_triangular_calldata(opp, deadline, min_profit);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
@@ -365,7 +367,8 @@ impl Executor {
         }
 
         let deadline = self.deadline();
-        let calldata = self.build_calldata(opp, deadline);
+        let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
+        let calldata = self.build_calldata(opp, deadline, min_profit);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
@@ -544,7 +547,8 @@ impl Executor {
         }
 
         let deadline = self.deadline();
-        let calldata = self.build_triangular_calldata(opp, deadline);
+        let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
+        let calldata = self.build_triangular_calldata(opp, deadline, min_profit);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
@@ -700,7 +704,21 @@ impl Executor {
         U256::from(now + 120) // 2 min default
     }
 
-    fn build_calldata(&self, opp: &ArbOpportunity, deadline: U256) -> Vec<u8> {
+    /// Convert gas cost from USD to token-in units using the same exchange rate
+    /// as expected_profit → profit_usd. This gives a token-denominated floor
+    /// for on-chain minProfit that covers gas regardless of token type or decimals.
+    fn gas_cost_to_token_floor(expected_profit: U256, profit_usd: f64, gas_cost_usd: f64) -> U256 {
+        if profit_usd <= 0.0 || expected_profit.is_zero() {
+            return U256::from(1);
+        }
+        // tokens_per_usd = expected_profit (raw) / profit_usd
+        let ep_f64 = expected_profit.to_string().parse::<f64>().unwrap_or(1.0);
+        let tokens_per_usd = ep_f64 / profit_usd;
+        let gas_tokens = (gas_cost_usd * tokens_per_usd) as u128;
+        U256::from(gas_tokens).max(U256::from(1))
+    }
+
+    fn build_calldata(&self, opp: &ArbOpportunity, deadline: U256, min_profit: U256) -> Vec<u8> {
         ArbitrageExecutor::executeArbitrageCall {
             tokenIn: opp.token_in,
             tokenOut: opp.token_out,
@@ -709,13 +727,13 @@ impl Executor {
             routerB: opp.router_b,
             feeA: Uint::<24, 1>::from(opp.fee_a),
             feeB: Uint::<24, 1>::from(opp.fee_b),
-            minProfit: opp.expected_profit / U256::from(2u32), // 50% slippage buffer
+            minProfit: min_profit,
             deadline,
         }
         .abi_encode()
     }
 
-    fn build_triangular_calldata(&self, opp: &TriangularOpportunity, deadline: U256) -> Vec<u8> {
+    fn build_triangular_calldata(&self, opp: &TriangularOpportunity, deadline: U256, min_profit: U256) -> Vec<u8> {
         ArbitrageExecutor::executeTriangularArbitrageCall {
             tokenA: opp.token_a,
             tokenB: opp.token_b,
@@ -727,7 +745,7 @@ impl Executor {
             feeAB: Uint::<24, 1>::from(opp.fee_ab),
             feeBC: Uint::<24, 1>::from(opp.fee_bc),
             feeCA: Uint::<24, 1>::from(opp.fee_ca),
-            minProfit: opp.expected_profit / U256::from(2u32), // 50% slippage buffer
+            minProfit: min_profit,
             deadline,
         }
         .abi_encode()

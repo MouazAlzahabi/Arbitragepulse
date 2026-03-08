@@ -39,6 +39,15 @@ pub struct ChainConfig {
     /// Default: 1000ms (60 scans/min). Must be ≤ block_time_ms for meaningful effect.
     #[serde(default = "default_scan_interval_ms")]
     pub scan_interval_ms: u64,
+    /// Reserve change threshold (basis points) to classify a V2/Solidly Sync event as "large".
+    /// A large swap bypasses the burst guard and clears cooldowns for affected tokens.
+    /// Default: 200 (2% reserve shift). Set to 0 to disable.
+    #[serde(default = "default_large_swap_threshold_bps")]
+    pub large_swap_threshold_bps: u32,
+    /// sqrtPriceX96 change threshold (basis points) for V3 Swap events.
+    /// 50 = 0.5% sqrtP change (~1% price impact). Set to 0 to disable.
+    #[serde(default = "default_large_v3_threshold_bps")]
+    pub large_v3_threshold_bps: u32,
 }
 
 fn default_rpc_concurrency() -> usize {
@@ -51,6 +60,14 @@ fn default_scan_interval_ms() -> u64 {
 
 fn default_min_swap_amount() -> u128 {
     100_000_000_000_000_000 // 1e17 = 0.1 ETH or 100k USDC (6 decimals)
+}
+
+fn default_large_swap_threshold_bps() -> u32 {
+    200 // 2% reserve shift
+}
+
+fn default_large_v3_threshold_bps() -> u32 {
+    50 // 0.5% sqrtP change (~1% price impact)
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

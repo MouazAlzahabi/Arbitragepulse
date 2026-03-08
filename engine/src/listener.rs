@@ -15,11 +15,20 @@ use crate::pool_cache::PoolCache;
 
 // ─── Swap event (generic across V2 + V3) ─────────────────────────────────────
 
+/// Whether a swap moved the pool price significantly.
+/// Large swaps create brief arbitrage windows and get fast-tracked in chain.rs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SwapMagnitude {
+    Normal,
+    Large,
+}
+
 #[derive(Debug, Clone)]
 pub struct SwapEvent {
     pub chain_id: u64,
     pub pool: Address,
     pub block_number: u64,
+    pub magnitude: SwapMagnitude,
 }
 
 // ─── Listener ─────────────────────────────────────────────────────────────────
@@ -27,11 +36,17 @@ pub struct SwapEvent {
 pub struct Listener {
     pub chain_id: u64,
     pub chain_name: String,
+    /// Reserve change threshold (basis points) to classify a V2/Solidly Sync as "large".
+    /// 200 = 2% reserve shift.
+    pub large_swap_bps: u32,
+    /// sqrtPriceX96 change threshold (basis points) for V3 Swap events.
+    /// 50 = 0.5% sqrtP change (~1% price impact).
+    pub large_v3_bps: u32,
 }
 
 impl Listener {
-    pub fn new(chain_id: u64, chain_name: String) -> Self {
-        Self { chain_id, chain_name }
+    pub fn new(chain_id: u64, chain_name: String, large_swap_bps: u32, large_v3_bps: u32) -> Self {
+        Self { chain_id, chain_name, large_swap_bps, large_v3_bps }
     }
 
     /// Poll on-chain events for all discovered pools using `eth_getLogs`.
@@ -78,110 +93,43 @@ impl Listener {
             Swap::SIGNATURE_HASH,
         ];
 
-        // One-time diagnostic: log signature hashes and sample addresses
-        let diag = format!(
-            "[{}] Sync sig={:?}, Swap sig={:?} | V2 sample={:?} | V3 sample={:?}",
-            chain_name,
-            Sync::SIGNATURE_HASH,
-            Swap::SIGNATURE_HASH,
-            v2_pool_addrs.first(),
-            v3_pool_addrs.first(),
-        );
-        info!("{}", diag);
-        broadcast_log(&log_tx, "info", &diag, None);
-
-        // One-time diagnostic: query a single block with NO topic filter to check
-        // if these addresses emit ANY events at all.
-        {
-            let test_block = match provider.get_block_number().await {
-                Ok(b) => b,
-                Err(_) => 0,
-            };
-            if test_block > 0 {
-                // Test 1: address-only filter (no topics) — do these pools emit anything?
-                let test_filter_no_topic = Filter::new()
-                    .address(all_addrs.clone())
-                    .from_block(test_block.saturating_sub(5))
-                    .to_block(test_block);
-                match provider.get_logs(&test_filter_no_topic).await {
-                    Ok(logs) => {
-                        let msg = format!(
-                            "[{}] DIAG: no-topic filter blocks {}..{} → {} events from {} addrs",
-                            chain_name, test_block.saturating_sub(5), test_block, logs.len(), all_addrs.len()
-                        );
-                        info!("{}", msg);
-                        broadcast_log(&log_tx, "info", &msg, None);
-                        // Show first few event topic0 values
-                        for (i, log) in logs.iter().take(3).enumerate() {
-                            let t0 = log.topics().first().map(|h| format!("{:?}", h)).unwrap_or_default();
-                            let msg = format!(
-                                "[{}] DIAG event[{}]: addr={:?} topic0={} block={}",
-                                chain_name, i, log.address(), t0, log.block_number.unwrap_or(0)
-                            );
-                            info!("{}", msg);
-                            broadcast_log(&log_tx, "info", &msg, None);
-                        }
-                    }
-                    Err(e) => {
-                        let msg = format!("[{}] DIAG: no-topic filter failed: {}", chain_name, e);
-                        warn!("{}", msg);
-                        broadcast_log(&log_tx, "warn", &msg, None);
-                    }
-                }
-
-                // Test 2: Sync topic only, NO address filter, 1 block — do Sync events exist on-chain at all?
-                let test_filter_sync_only = Filter::new()
-                    .event_signature(Sync::SIGNATURE_HASH)
-                    .from_block(test_block)
-                    .to_block(test_block);
-                match provider.get_logs(&test_filter_sync_only).await {
-                    Ok(logs) => {
-                        let msg = format!(
-                            "[{}] DIAG: Sync-only (no addr) block {} → {} events",
-                            chain_name, test_block, logs.len()
-                        );
-                        info!("{}", msg);
-                        broadcast_log(&log_tx, "info", &msg, None);
-                    }
-                    Err(e) => {
-                        let msg = format!("[{}] DIAG: Sync-only filter failed: {}", chain_name, e);
-                        warn!("{}", msg);
-                        broadcast_log(&log_tx, "warn", &msg, None);
-                    }
-                }
-            }
-        }
-
         let sync_count = Arc::new(AtomicU64::new(0));
         let v3_count = Arc::new(AtomicU64::new(0));
 
-        // Periodic counter log (every 60s)
+        // Periodic counter log: every 60s if events > 0, every 5 minutes if idle.
         let sync_count_log = sync_count.clone();
         let v3_count_log = v3_count.clone();
         let chain_name_c = chain_name.clone();
-        let log_tx_counter = log_tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut idle_ticks: u64 = 0;
             loop {
                 interval.tick().await;
                 let sc = sync_count_log.swap(0, Ordering::Relaxed);
                 let vc = v3_count_log.swap(0, Ordering::Relaxed);
-                let msg = format!(
-                    "[{}] Events polled: Sync={}, V3-Swap={} in last 60s",
-                    chain_name_c, sc, vc
-                );
-                info!("{}", msg);
-                broadcast_log(&log_tx_counter, "info", &msg, None);
+                if sc > 0 || vc > 0 {
+                    idle_ticks = 0;
+                    info!(
+                        "[{}] Events polled: Sync={}, V3-Swap={} in last 60s",
+                        chain_name_c, sc, vc
+                    );
+                } else {
+                    idle_ticks += 1;
+                    // Log every 5 minutes (5 ticks * 60s) when idle
+                    if idle_ticks % 5 == 0 {
+                        info!("[{}] No events in last {}s", chain_name_c, idle_ticks * 60);
+                    }
+                }
             }
         });
 
         // Main polling loop
         let cache = pool_cache.clone();
         let log_tx_poll = log_tx.clone();
+        let large_swap_bps = self.large_swap_bps;
+        let large_v3_bps = self.large_v3_bps;
         tokio::spawn(async move {
             let mut last_block: u64 = 0;
-            let mut poll_count: u64 = 0;
-            let mut diag_done = false;
             let poll_interval = Duration::from_secs(2); // Linea ~2s block time
 
             loop {
@@ -199,64 +147,6 @@ impl Listener {
                     last_block = current_block;
                     tokio::time::sleep(poll_interval).await;
                     continue;
-                }
-
-                // Run diagnostic once after ~90s (poll_count ~45) so dashboard has connected
-                if !diag_done && poll_count >= 45 {
-                    diag_done = true;
-
-                    // DIAG: no-topic query — do these pool addrs emit ANY events?
-                    let diag_filter = Filter::new()
-                        .address(all_addrs.clone())
-                        .from_block(current_block.saturating_sub(5))
-                        .to_block(current_block);
-                    match provider.get_logs(&diag_filter).await {
-                        Ok(logs) => {
-                            let msg = format!(
-                                "[{}] DIAG no-topic: blocks {}..{} → {} events from {} addrs",
-                                chain_name, current_block.saturating_sub(5), current_block, logs.len(), all_addrs.len()
-                            );
-                            info!("{}", msg);
-                            broadcast_log(&log_tx_poll, "info", &msg, None);
-                            for (i, log) in logs.iter().take(5).enumerate() {
-                                let t0 = log.topics().first().map(|h| format!("{:?}", h)).unwrap_or_default();
-                                let msg = format!(
-                                    "[{}] DIAG evt[{}]: pool={:?} topic0={}", chain_name, i, log.address(), t0
-                                );
-                                info!("{}", msg);
-                                broadcast_log(&log_tx_poll, "info", &msg, None);
-                            }
-                        }
-                        Err(e) => {
-                            let msg = format!("[{}] DIAG no-topic failed: {}", chain_name, e);
-                            warn!("{}", msg);
-                            broadcast_log(&log_tx_poll, "warn", &msg, None);
-                        }
-                    }
-
-                    // DIAG: Sync topic, no addr filter — do Sync events exist on-chain?
-                    let diag_sync = Filter::new()
-                        .event_signature(Sync::SIGNATURE_HASH)
-                        .from_block(current_block)
-                        .to_block(current_block);
-                    let sync_hash_msg = format!("[{}] DIAG Sync hash={:?}", chain_name, Sync::SIGNATURE_HASH);
-                    info!("{}", sync_hash_msg);
-                    broadcast_log(&log_tx_poll, "info", &sync_hash_msg, None);
-                    match provider.get_logs(&diag_sync).await {
-                        Ok(logs) => {
-                            let msg = format!(
-                                "[{}] DIAG Sync-only (no addr): block {} → {} events",
-                                chain_name, current_block, logs.len()
-                            );
-                            info!("{}", msg);
-                            broadcast_log(&log_tx_poll, "info", &msg, None);
-                        }
-                        Err(e) => {
-                            let msg = format!("[{}] DIAG Sync-only failed: {}", chain_name, e);
-                            warn!("{}", msg);
-                            broadcast_log(&log_tx_poll, "warn", &msg, None);
-                        }
-                    }
                 }
 
                 if current_block <= last_block {
@@ -284,45 +174,91 @@ impl Listener {
 
                 match provider.get_logs(&filter).await {
                     Ok(logs) => {
-                        // Log every poll to dashboard for diagnosis (temporary)
-                        if !logs.is_empty() || poll_count % 15 == 0 {
-                            let msg = format!(
-                                "[{}] get_logs blocks {}..{} → {} events ({} addrs watched)",
-                                chain_name, from, to, logs.len(), all_addrs.len()
-                            );
-                            info!("{}", msg);
-                            broadcast_log(&log_tx_poll, "info", &msg, None);
-                        }
                         for log in logs {
                             let pool = log.address();
                             let block = log.block_number.unwrap_or(current_block);
                             let topic0 = log.topics().first().copied();
+
+                            let mut magnitude = SwapMagnitude::Normal;
 
                             if topic0 == Some(Sync::SIGNATURE_HASH) {
                                 sync_count.fetch_add(1, Ordering::Relaxed);
                                 if let Ok(decoded) = Sync::decode_log(log.as_ref()) {
                                     let r0 = U256::from(decoded.reserve0);
                                     let r1 = U256::from(decoded.reserve1);
+
+                                    // Detect large reserve shift BEFORE updating cache
+                                    if large_swap_bps > 0 {
+                                        if let Some(old) = cache.by_address.get(&pool) {
+                                            let threshold = U256::from(large_swap_bps);
+                                            let bps_10k = U256::from(10_000u32);
+                                            // Check reserve0 delta
+                                            if !old.reserve0.is_zero() {
+                                                let delta0 = if r0 > old.reserve0 { r0 - old.reserve0 } else { old.reserve0 - r0 };
+                                                if delta0 * bps_10k >= old.reserve0 * threshold {
+                                                    magnitude = SwapMagnitude::Large;
+                                                }
+                                            }
+                                            // Check reserve1 delta (take the max)
+                                            if magnitude == SwapMagnitude::Normal && !old.reserve1.is_zero() {
+                                                let delta1 = if r1 > old.reserve1 { r1 - old.reserve1 } else { old.reserve1 - r1 };
+                                                if delta1 * bps_10k >= old.reserve1 * threshold {
+                                                    magnitude = SwapMagnitude::Large;
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     cache.update_reserves(pool, r0, r1);
-                                    debug!(
-                                        "[{}] Sync pool={:?} r0={} r1={} block={}",
-                                        chain_name, pool, r0, r1, block
-                                    );
+                                    if magnitude == SwapMagnitude::Large {
+                                        info!(
+                                            "[{}] LARGE Sync pool={:?} r0={} r1={} block={}",
+                                            chain_name, pool, r0, r1, block
+                                        );
+                                    } else {
+                                        debug!(
+                                            "[{}] Sync pool={:?} r0={} r1={} block={}",
+                                            chain_name, pool, r0, r1, block
+                                        );
+                                    }
                                 }
                             } else if topic0 == Some(Swap::SIGNATURE_HASH) {
                                 v3_count.fetch_add(1, Ordering::Relaxed);
                                 if let Ok(decoded) = Swap::decode_log(log.as_ref()) {
                                     let sqrtp = U256::from(decoded.sqrtPriceX96);
                                     let liq: u128 = decoded.liquidity.into();
+
+                                    // Detect large sqrtPriceX96 shift BEFORE updating cache
+                                    if large_v3_bps > 0 {
+                                        if let Some(old) = cache.v3_by_address.get(&pool) {
+                                            let old_sqrtp = old.sqrt_price_x96;
+                                            if !old_sqrtp.is_zero() {
+                                                let threshold = U256::from(large_v3_bps);
+                                                let bps_10k = U256::from(10_000u32);
+                                                let delta = if sqrtp > old_sqrtp { sqrtp - old_sqrtp } else { old_sqrtp - sqrtp };
+                                                if delta * bps_10k >= old_sqrtp * threshold {
+                                                    magnitude = SwapMagnitude::Large;
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     cache.update_v3_state(pool, sqrtp, liq);
-                                    debug!(
-                                        "[{}] V3 state pool={:?} sqrtp={} liq={} block={}",
-                                        chain_name, pool, sqrtp, liq, block
-                                    );
+                                    if magnitude == SwapMagnitude::Large {
+                                        info!(
+                                            "[{}] LARGE V3 swap pool={:?} sqrtp={} liq={} block={}",
+                                            chain_name, pool, sqrtp, liq, block
+                                        );
+                                    } else {
+                                        debug!(
+                                            "[{}] V3 state pool={:?} sqrtp={} liq={} block={}",
+                                            chain_name, pool, sqrtp, liq, block
+                                        );
+                                    }
                                 }
                             }
 
-                            let _ = tx.send(SwapEvent { chain_id, pool, block_number: block }).await;
+                            let _ = tx.send(SwapEvent { chain_id, pool, block_number: block, magnitude }).await;
                         }
                         last_block = to;
                     }
@@ -337,7 +273,6 @@ impl Listener {
                         last_block = current_block;
                     }
                 }
-                poll_count += 1;
 
                 tokio::time::sleep(poll_interval).await;
             }
