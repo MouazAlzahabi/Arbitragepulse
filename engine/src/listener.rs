@@ -7,7 +7,8 @@ use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{debug, error, info, warn};
 
 use crate::abi::{PairSyncV2, PoolSwapV3};
 use crate::pool_cache::PoolCache;
@@ -69,6 +70,17 @@ impl Listener {
             let tx_s = tx.clone();
             let cache = pool_cache.clone();
 
+            let sync_count = Arc::new(AtomicU64::new(0));
+            let sync_count_log = sync_count.clone();
+            let chain_name_sc = chain_name.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let c = sync_count_log.swap(0, Ordering::Relaxed);
+                    info!("[{}] Sync events received: {} in last 60s", chain_name_sc, c);
+                }
+            });
             tokio::spawn(async move {
                 let mut backoff = Duration::from_secs(1);
                 loop {
@@ -77,6 +89,7 @@ impl Listener {
                             backoff = Duration::from_secs(1);
                             let mut stream = sub.into_stream();
                             while let Some(log) = stream.next().await {
+                                sync_count.fetch_add(1, Ordering::Relaxed);
                                 let pool = log.address();
                                 let block = log.block_number.unwrap_or(0);
 
@@ -126,6 +139,17 @@ impl Listener {
             let tx_v3 = tx.clone();
             let cache_v3 = pool_cache.clone();
 
+            let v3_count = Arc::new(AtomicU64::new(0));
+            let v3_count_log = v3_count.clone();
+            let chain_name_v3c = chain_name.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let c = v3_count_log.swap(0, Ordering::Relaxed);
+                    info!("[{}] V3-Swap events received: {} in last 60s", chain_name_v3c, c);
+                }
+            });
             tokio::spawn(async move {
                 let mut backoff = Duration::from_secs(1);
                 loop {
@@ -134,6 +158,7 @@ impl Listener {
                             backoff = Duration::from_secs(1);
                             let mut stream = sub.into_stream();
                             while let Some(log) = stream.next().await {
+                                v3_count.fetch_add(1, Ordering::Relaxed);
                                 let pool = log.address();
                                 let block = log.block_number.unwrap_or(0);
 

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::abi::{IERC20, IMulticall3, IQuoterV2, ISolidlyRouter, ISyncSwapClassicPoolFactory, ISyncSwapPool, IUniswapV2Pair, IUniswapV2Router02};
 use crate::config::{PairConfig, RouterConfig, RouterType};
@@ -1665,13 +1665,15 @@ impl Strategy {
 
         // ── Calculate profits ─────────────────────────────────────────────────────
 
-        debug!(
-            "[{}] triangular scan: {} V3 spot (0 HTTP), {} triplets (no multicall)",
-            self.chain_id, tri_v3_spot, triplets.len()
+        info!(
+            "[{}] triangular scan: {} V3 spot, {} triplets, P1={} P2={} P3={} routes",
+            self.chain_id, tri_v3_spot, triplets.len(),
+            p1_entries.len(), p2_entries.len(), p3_entries.len()
         );
 
         let mut opportunities: Vec<TriangularOpportunity> = Vec::new();
         let mut best_raw_usd: f64 = 0.0;
+        let mut best_tri_spread: f64 = f64::NEG_INFINITY;
 
         for (p3e, raw_opt) in p3_entries.iter().zip(p3_results_by_entry.iter()) {
             let amount_a_final: U256 = if let Some(local) = p3e.local_result {
@@ -1683,6 +1685,15 @@ impl Strategy {
                 }
             };
             let trip = &triplets[p3e.triplet_idx];
+
+            // Track best triangular spread (even negative) for diagnostics
+            let tri_spread = if !p3e.effective_amount_in.is_zero() {
+                let final_f = amount_a_final.to::<u128>() as f64;
+                let input_f = p3e.effective_amount_in.to::<u128>() as f64;
+                (final_f / input_f) - 1.0
+            } else { 0.0 };
+            if tri_spread > best_tri_spread { best_tri_spread = tri_spread; }
+
             // Compare against effective_amount_in (may be < trip.amount_in if V3 leg was capped)
             if amount_a_final <= p3e.effective_amount_in { continue; }
 
@@ -1819,6 +1830,13 @@ impl Strategy {
                 // Deduplicate: keep only unique triplet_id entries
                 tri.dedup_by_key(|t| t.pair_id.clone());
             }
+        }
+
+        if best_tri_spread.is_finite() && !p3_entries.is_empty() {
+            info!(
+                "[{}] triangular best spread: {:+.3}% ({} routes evaluated)",
+                self.chain_id, best_tri_spread * 100.0, p3_entries.len()
+            );
         }
 
         (opportunities, best_raw_usd)
