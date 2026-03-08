@@ -59,6 +59,11 @@ impl Listener {
         // ── V2/Solidly pools: subscribe to Sync events ────────────────────────
         // These are the pools in pool_cache (discovered at startup).
         let v2_pool_addrs = pool_cache.pool_addresses();
+        let v3_count_at_entry = pool_cache.v3_pool_addresses().len();
+        info!(
+            "[{}] Listener::subscribe called — V2 pools: {}, V3 pools: {}",
+            chain_name, v2_pool_addrs.len(), v3_count_at_entry
+        );
 
         if !v2_pool_addrs.is_empty() {
             let sync_filter = Filter::new()
@@ -190,7 +195,7 @@ impl Listener {
         }
 
         if v3_pool_addrs_empty && v2_pool_addrs.is_empty() {
-            debug!("[{}] No pools configured — using periodic polling", chain_name);
+            warn!("[{}] No pools in cache at subscribe time — event subscriptions skipped", chain_name);
         }
 
         Ok(())
