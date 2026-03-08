@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
 
 use crate::abi::{PairSyncV2, PoolSwapV3};
+use crate::api::{broadcast_log, LogBroadcaster};
 use crate::pool_cache::PoolCache;
 
 // ─── Swap event (generic across V2 + V3) ─────────────────────────────────────
@@ -52,6 +53,7 @@ impl Listener {
         provider: P,
         tx: mpsc::Sender<SwapEvent>,
         pool_cache: Arc<PoolCache>,
+        log_tx: LogBroadcaster,
     ) -> Result<()> {
         let chain_id = self.chain_id;
         let chain_name = self.chain_name.clone();
@@ -60,10 +62,12 @@ impl Listener {
         // These are the pools in pool_cache (discovered at startup).
         let v2_pool_addrs = pool_cache.pool_addresses();
         let v3_count_at_entry = pool_cache.v3_pool_addresses().len();
-        info!(
-            "[{}] Listener::subscribe called — V2 pools: {}, V3 pools: {}",
+        let msg = format!(
+            "[{}] Listener: V2 pools={}, V3 pools={}",
             chain_name, v2_pool_addrs.len(), v3_count_at_entry
         );
+        info!("{}", msg);
+        broadcast_log(&log_tx, "info", &msg, None);
 
         if !v2_pool_addrs.is_empty() {
             let sync_filter = Filter::new()
@@ -78,12 +82,15 @@ impl Listener {
             let sync_count = Arc::new(AtomicU64::new(0));
             let sync_count_log = sync_count.clone();
             let chain_name_sc = chain_name.clone();
+            let log_tx_sync = log_tx.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
                     let c = sync_count_log.swap(0, Ordering::Relaxed);
-                    info!("[{}] Sync events received: {} in last 60s", chain_name_sc, c);
+                    let msg = format!("[{}] Sync events: {} in last 60s", chain_name_sc, c);
+                    info!("{}", msg);
+                    broadcast_log(&log_tx_sync, "info", &msg, None);
                 }
             });
             tokio::spawn(async move {
@@ -147,12 +154,15 @@ impl Listener {
             let v3_count = Arc::new(AtomicU64::new(0));
             let v3_count_log = v3_count.clone();
             let chain_name_v3c = chain_name.clone();
+            let log_tx_v3 = log_tx.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
                     let c = v3_count_log.swap(0, Ordering::Relaxed);
-                    info!("[{}] V3-Swap events received: {} in last 60s", chain_name_v3c, c);
+                    let msg = format!("[{}] V3-Swap events: {} in last 60s", chain_name_v3c, c);
+                    info!("{}", msg);
+                    broadcast_log(&log_tx_v3, "info", &msg, None);
                 }
             });
             tokio::spawn(async move {
@@ -195,7 +205,9 @@ impl Listener {
         }
 
         if v3_pool_addrs_empty && v2_pool_addrs.is_empty() {
-            warn!("[{}] No pools in cache at subscribe time — event subscriptions skipped", chain_name);
+            let msg = format!("[{}] No pools in cache — event subscriptions skipped", chain_name);
+            warn!("{}", msg);
+            broadcast_log(&log_tx, "warn", &msg, None);
         }
 
         Ok(())

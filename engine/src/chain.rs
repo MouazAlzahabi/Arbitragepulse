@@ -188,7 +188,7 @@ pub async fn run_chain(
     let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(256);
     {
         let provider_clone = (*provider).clone();
-        listener.subscribe(provider_clone, swap_tx, pool_cache.clone()).await?;
+        listener.subscribe(provider_clone, swap_tx, pool_cache.clone(), log_tx.clone()).await?;
     }
 
     // ── Block-header subscription (drives immediate scanning on each new block) ──
