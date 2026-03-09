@@ -799,7 +799,7 @@ impl Strategy {
 
         // Phase 1.5 gate: collect V3 tick-capped forward tasks that show real cross-DEX
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
-        const P15_GATE_SPREAD: f64 = 0.001; // 0.1% — fires QuoterV2 on borderline divergence
+        const P15_GATE_SPREAD: f64 = 0.0001; // 0.01% — fires QuoterV2 for any detectable spread
         let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
 
         for (task, raw_opt) in rev_tasks.iter().zip(rev_raw_by_task.into_iter()) {
