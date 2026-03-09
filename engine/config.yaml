@@ -26,17 +26,19 @@ chains:
 
   - id: 8453
     name: "Base"
-    enabled: false
+    enabled: true
     ws_rpc: "wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
     http_rpc: "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
     native_currency: "ETH"
     wrapped_native: "0x4200000000000000000000000000000000000006"
     block_time_ms: 2000
-    contract_address: "0xYOUR_CONTRACT_ON_BASE"
+    contract_address: "0xFC11784BD8BFD4B38fC4859c6115e16eD1cA8EE2"
     min_native_balance: 0.005
-    min_profit_usd: 0.30
+    min_profit_usd: 0.001  # Low for monitoring — raise once live trading confirmed
     deadline_seconds: 120
-    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+    quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
+    scan_interval_ms: 2000
+    rpc_concurrency: 3
 
   - id: 42161
     name: "Arbitrum"
@@ -94,7 +96,7 @@ chains:
 
   - id: 59144
     name: "Linea"
-    enabled: true
+    enabled: false  # Switched to Base — re-enable after bridging back if needed
     ws_rpc: "wss://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
     http_rpc: "https://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
     native_currency: "ETH"
@@ -164,17 +166,45 @@ routers:
   - id: "uniswap-v3-base"
     name: "Uniswap V3 (Base)"
     chain_id: 8453
-    address: "0x2626664c2603336E57B271c5C0b26F421741e481"
+    address: "0x2626664c2603336E57B271c5C0b26F421741e481"  # SwapRouter02
     type: "v3"
     fee_tiers: [100, 500, 3000, 10000]
     fee_bps: 0
+    factory_address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"  # Uniswap V3 Factory (Base)
 
   - id: "aerodrome-base"
     name: "Aerodrome (Base)"
     chain_id: 8453
     address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
+    type: "solidly"
+    fee_bps: 30  # volatile pools default (0.3%); stable pools use fee=1 via Solidly routing
+
+  - id: "pancake-v3-base"
+    name: "PancakeSwap V3 (Base)"
+    chain_id: 8453
+    address: "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86"  # SmartRouter (7-field, same as Linea)
+    type: "v3"
+    fee_tiers: [100, 500, 2500]
+    fee_bps: 5
+    quoter_address: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"  # PancakeSwap QuoterV2
+    factory_address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"  # PancakeV3Factory
+
+  - id: "baseswap-v2"
+    name: "BaseSwap (Base)"
+    chain_id: 8453
+    address: "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86"
     type: "v2"
     fee_bps: 30
+
+  - id: "alienbase-v2"
+    name: "Alien Base (Base)"
+    chain_id: 8453
+    address: "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7"
+    type: "v2"
+    fee_bps: 12  # 0.12% protocol fee
+
+  # SushiSwap V3: factory confirmed (0xc35DADB65012eC5796536bD9864eD8773aBc74C4) but
+  # SwapRouter + QuoterV2 addresses not found in official docs — skipped until confirmed.
 
   # ── Arbitrum ──
   - id: "uniswap-v3-arb"
@@ -384,9 +414,10 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
+    trade_amount: "100"
+    max_trade: "500"
     min_swap_size: "10"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
   - id: "base-usdbc-weth"
@@ -397,9 +428,10 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
+    trade_amount: "100"
+    max_trade: "500"
     min_swap_size: "10"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
   - id: "base-usdc-usdbc"
@@ -410,23 +442,25 @@ pairs:
     token_out_symbol: "USDBC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "100"
+    max_trade: "1000"
     min_swap_size: "10"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
-  - id: "base-cbeth-weth"
-    chain_id: 8453
-    token_in: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH
-    token_out: "0x4200000000000000000000000000000000000006"   # WETH
-    token_in_symbol: "CBETH"
-    token_out_symbol: "WETH"
-    token_in_decimals: 18
-    token_out_decimals: 18
-    trade_amount: "2"
-    max_trade: "2"
-    min_swap_size: "0.01"
-    watch_pools: []
+  # cbETH disabled until contract funded with cbETH
+  # - id: "base-cbeth-weth"
+  #   chain_id: 8453
+  #   token_in: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH
+  #   token_out: "0x4200000000000000000000000000000000000006"   # WETH
+  #   token_in_symbol: "CBETH"
+  #   token_out_symbol: "WETH"
+  #   token_in_decimals: 18
+  #   token_out_decimals: 18
+  #   trade_amount: "0.05"
+  #   max_trade: "0.2"
+  #   min_swap_size: "0.01"
+  #   watch_pools: []
 
   # ── Arbitrum ──
   - id: "arb-usdc-weth"
