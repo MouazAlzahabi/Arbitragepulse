@@ -414,8 +414,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "99"
-    max_trade: "99"
+    trade_amount: "90"
+    max_trade: "90"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -443,8 +443,8 @@ pairs:
     token_out_symbol: "USDBC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "99"
-    max_trade: "99"
+    trade_amount: "90"
+    max_trade: "90"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -457,8 +457,36 @@ pairs:
     token_out_symbol: "USDT"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "99"
-    max_trade: "99"
+    trade_amount: "90"
+    max_trade: "90"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
+    watch_pools: []
+
+  - id: "base-usdc-cbbtc"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"   # cbBTC (Coinbase Wrapped BTC, 8 decimals)
+    token_in_symbol: "USDC"
+    token_out_symbol: "CBBTC"
+    token_in_decimals: 6
+    token_out_decimals: 8
+    trade_amount: "50"
+    max_trade: "50"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
+    watch_pools: []
+
+  - id: "base-usdc-aero"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x940181a94A35A4569E4529A3CDfB74e38FD98631"   # AERO (Aerodrome governance token)
+    token_in_symbol: "USDC"
+    token_out_symbol: "AERO"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "50"
+    max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
