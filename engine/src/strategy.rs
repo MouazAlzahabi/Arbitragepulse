@@ -957,6 +957,13 @@ impl Strategy {
                 );
                 let p15_raw = run_multicall(provider, p15_mc, self.rpc_concurrency).await;
 
+                // V3 router_b candidates that need a second QuoterV2 pass.
+                // Local sqrtPriceX96 approximation overestimates V3 reverse legs by 0.01–0.1%,
+                // causing phantom spreads that always fail pre-flight. Phase 1.5b runs a second
+                // batched QuoterV2 multicall for these to get exact on-chain amounts.
+                let mut p15b_candidates: Vec<(usize, String, u32, Address, Address, Address, U256, ForwardTask)> = Vec::new();
+                let mut p15b_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+
                 for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount), raw_opt)
                     in p15_list.into_iter().zip(p15_raw.into_iter())
                 {
@@ -977,6 +984,24 @@ impl Strategy {
 
                     for q_b in q_b_list {
                         let fee_b = q_b.fee;
+                        // V3 router_b: defer to Phase 1.5b QuoterV2 batch for exact quote.
+                        if matches!(q_b.router_type, RouterType::V3) {
+                            if let Some(quoter_b) = q_b.quoter_addr {
+                                let cd = IQuoterV2::quoteExactInputSingleCall {
+                                    params: IQuoterV2::QuoteExactInputSingleParams {
+                                        tokenIn: token_out,
+                                        tokenOut: token_in,
+                                        amountIn: quoter_out,
+                                        fee: Uint::from(fee_b),
+                                        sqrtPriceLimitX96: Uint::ZERO,
+                                    },
+                                }.abi_encode();
+                                p15b_mc.push((quoter_b, cd));
+                                p15b_candidates.push((pi, router_a_id.clone(), fee_a, router_a_addr,
+                                                      token_in, token_out, full_amount, q_b));
+                            }
+                            continue;
+                        }
                         let local_back = match q_b.router_type {
                             RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                                 &q_b.router_id, token_out, token_in, quoter_out,
@@ -987,12 +1012,10 @@ impl Strategy {
                                     &q_b.router_id, token_out, token_in, quoter_out, max_age,
                                 )
                             }
-                            RouterType::V3 => self.pool_cache.quote_v3_spot(
-                                &q_b.router_id, token_out, token_in, fee_b, quoter_out,
-                            ).map(|(out, _)| out),
                             RouterType::SyncSwap => self.pool_cache.get_amount_out_by_key_fresh(
                                 &q_b.router_id, token_out, token_in, quoter_out, VOLATILE_MAX_AGE,
                             ),
+                            RouterType::V3 => unreachable!(),
                         };
                         let amount_back = match local_back.filter(|b| !b.is_zero()) {
                             Some(b) => b, None => continue,
@@ -1028,6 +1051,61 @@ impl Strategy {
                                 router_b_type: q_b.router_type.clone(),
                                 fee_a,
                                 fee_b,
+                                expected_profit: profit,
+                                profit_usd,
+                                router_a_id: router_a_id.clone(),
+                                router_b_id: q_b.router_id.clone(),
+                            });
+                        }
+                    }
+                }
+
+                // ── Phase 1.5b: QuoterV2 for V3 router_b ─────────────────────────────
+                // Second multicall batch — exact reverse-leg quotes for V3→V3 routes.
+                if !p15b_mc.is_empty() {
+                    debug!("[chain={}] Phase 1.5b: {} V3×V3 reverse quote(s)", self.chain_id, p15b_mc.len());
+                    let p15b_raw = run_multicall(provider, p15b_mc, self.rpc_concurrency).await;
+
+                    for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount, q_b), raw_opt)
+                        in p15b_candidates.into_iter().zip(p15b_raw.into_iter())
+                    {
+                        let raw = match raw_opt { Some(r) => r, None => continue };
+                        let amount_back = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw) {
+                            Ok(r) if !r.amountOut.is_zero() => r.amountOut,
+                            _ => continue,
+                        };
+                        if amount_back <= full_amount { continue; }
+
+                        if (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount {
+                            warn!("[{}] Phase 1.5b phantom: {} | {}/{}", self.chain_id,
+                                  self.pairs[pi].id, router_a_id, q_b.router_id);
+                            continue;
+                        }
+                        let profit = amount_back - full_amount;
+                        let pair = &self.pairs[pi];
+                        let profit_usd = token_amount_to_usd(
+                            profit, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd,
+                        );
+
+                        let spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
+                        if spread > best_spread_pct { best_spread_pct = spread; }
+                        if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
+
+                        if profit_usd >= self.min_profit_usd {
+                            debug!("[{}] Phase 1.5b V3×V3 arb: {} | profit=${:.4} | {}/{}",
+                                   self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
+                            opportunities.push(ArbOpportunity {
+                                chain_id: self.chain_id,
+                                pair_id: pair.id.clone(),
+                                token_in,
+                                token_out,
+                                amount_in: full_amount,
+                                router_a: router_a_addr,
+                                router_b: q_b.router_addr,
+                                router_a_type: RouterType::V3,
+                                router_b_type: RouterType::V3,
+                                fee_a,
+                                fee_b: q_b.fee,
                                 expected_profit: profit,
                                 profit_usd,
                                 router_a_id: router_a_id.clone(),

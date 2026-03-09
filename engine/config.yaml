@@ -420,19 +420,20 @@ pairs:
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
-  - id: "base-usdbc-weth"
-    chain_id: 8453
-    token_in: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC (bridged USDC)
-    token_out: "0x4200000000000000000000000000000000000006"   # WETH
-    token_in_symbol: "USDBC"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "99"
-    max_trade: "99"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
-    watch_pools: []
+  # base-usdbc-weth disabled — contract has no USDbC; re-enable after funding with USDbC
+  # - id: "base-usdbc-weth"
+  #   chain_id: 8453
+  #   token_in: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC (bridged USDC)
+  #   token_out: "0x4200000000000000000000000000000000000006"   # WETH
+  #   token_in_symbol: "USDBC"
+  #   token_out_symbol: "WETH"
+  #   token_in_decimals: 6
+  #   token_out_decimals: 18
+  #   trade_amount: "99"
+  #   max_trade: "99"
+  #   min_swap_size: "10"
+  #   routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
+  #   watch_pools: []
 
   - id: "base-usdc-usdbc"
     chain_id: 8453
