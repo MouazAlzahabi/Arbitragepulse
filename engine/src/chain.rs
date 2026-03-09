@@ -809,21 +809,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 strat.optimize(opp, provider.as_ref(), max_bal).await
             };
 
-            // Guard: cached balance (refreshed every 30s) must cover amount_in.
-            // Prevents sending txs that will STF when contract has no token_in.
-            // A cooldown is inserted so the pair doesn't re-dominate the sorted list on
-            // every subsequent scan (underfunded pairs have large USD values that rank high).
-            if let Some(bal) = max_bal {
-                if bal < optimized.amount_in {
-                    warn!(
-                        "[{}] Skipping {} — insufficient token_in balance (have {}, need {})",
-                        cfg.name, optimized.pair_id, bal, optimized.amount_in
-                    );
-                    cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
-                    continue 'candidates;
-                }
-            }
-
+            // Log the opportunity first so detection is always visible.
             broadcast_log(
                 log_tx,
                 "opportunity",
@@ -840,9 +826,23 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 })),
             );
 
+            // Guard: cached balance (refreshed every 30s) must cover amount_in.
+            // Prevents sending txs that will STF when contract has no token_in.
+            if let Some(bal) = max_bal {
+                if bal < optimized.amount_in {
+                    warn!(
+                        "[{}] Skipping {} — insufficient token_in balance (have {}, need {})",
+                        cfg.name, optimized.pair_id, bal, optimized.amount_in
+                    );
+                    cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                    continue 'candidates;
+                }
+            }
+
             pending_pairs.insert(fingerprint.clone());
 
-            let dry_run = shared_state.read().await.dry_run;
+            let is_dry_run = shared_state.read().await.dry_run;
+            let dry_run = is_dry_run;
             let exec_start = std::time::Instant::now();
             let router_ids = vec![optimized.router_a_id.clone(), optimized.router_b_id.clone()];
 
@@ -1007,6 +1007,25 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         }
 
         Opportunity::Triangular(opp) => {
+            // Log the opportunity first so detection is always visible.
+            broadcast_log(
+                log_tx,
+                "opportunity",
+                &format!(
+                    "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
+                    cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
+                ),
+                Some(serde_json::json!({
+                    "chain":        cfg.name,
+                    "pair_id":      opp.triplet_id,
+                    "triplet_id":   opp.triplet_id,
+                    "profit_usd":   opp.profit_usd,
+                    "router_ab":    opp.router_ab_id,
+                    "router_bc":    opp.router_bc_id,
+                    "router_ca":    opp.router_ca_id,
+                })),
+            );
+
             // Guard: check cached token_a balance (the starting capital) before executing.
             // Triangular arb starting with an unfunded token (e.g. WETH) will STF on Leg 1.
             {
@@ -1026,27 +1045,10 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 }
             }
 
-            broadcast_log(
-                log_tx,
-                "opportunity",
-                &format!(
-                    "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
-                    cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
-                ),
-                Some(serde_json::json!({
-                    "chain":        cfg.name,
-                    "pair_id":      opp.triplet_id,
-                    "triplet_id":   opp.triplet_id,
-                    "profit_usd":   opp.profit_usd,
-                    "router_ab":    opp.router_ab_id,
-                    "router_bc":    opp.router_bc_id,
-                    "router_ca":    opp.router_ca_id,
-                })),
-            );
-
             pending_pairs.insert(fingerprint.clone());
 
-            let dry_run = shared_state.read().await.dry_run;
+            let is_dry_run = shared_state.read().await.dry_run;
+            let dry_run = is_dry_run;
             let exec_start = std::time::Instant::now();
             let router_ids = vec![
                 opp.router_ab_id.clone(),
