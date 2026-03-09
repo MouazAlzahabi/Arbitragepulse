@@ -414,8 +414,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "500"
+    trade_amount: "99"
+    max_trade: "99"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -428,8 +428,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "500"
+    trade_amount: "99"
+    max_trade: "99"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -442,8 +442,8 @@ pairs:
     token_out_symbol: "USDBC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "100"
-    max_trade: "1000"
+    trade_amount: "99"
+    max_trade: "99"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []

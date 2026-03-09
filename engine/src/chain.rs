@@ -830,10 +830,12 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             // Prevents sending txs that will STF when contract has no token_in.
             if let Some(bal) = max_bal {
                 if bal < optimized.amount_in {
-                    warn!(
+                    let msg = format!(
                         "[{}] Skipping {} — insufficient token_in balance (have {}, need {})",
                         cfg.name, optimized.pair_id, bal, optimized.amount_in
                     );
+                    warn!("{}", msg);
+                    broadcast_log(log_tx, "warn", &msg, None);
                     cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                     continue 'candidates;
                 }
@@ -1035,10 +1037,12 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 };
                 if let Some(b) = bal {
                     if b < opp.amount_in {
-                        warn!(
+                        let msg = format!(
                             "[{}] Skipping triangular {} — insufficient token_a balance (have {}, need {})",
                             cfg.name, opp.triplet_id, b, opp.amount_in
                         );
+                        warn!("{}", msg);
+                        broadcast_log(log_tx, "warn", &msg, None);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         continue 'candidates;
                     }
@@ -1532,7 +1536,7 @@ async fn refresh_contract_balances<P: Provider>(
                 b.insert(token, bal);
             }
             Err(e) => {
-                debug!("Failed to fetch balance for {:?}: {}", token, e);
+                warn!("Failed to fetch balance for {:?}: {}", token, e);
             }
         }
     }
