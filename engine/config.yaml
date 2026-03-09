@@ -449,6 +449,20 @@ pairs:
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
+  - id: "base-usdc-usdt"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"   # USDT (bridged)
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDT"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "99"
+    max_trade: "99"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
+    watch_pools: []
+
   # cbETH disabled until contract funded with cbETH
   # - id: "base-cbeth-weth"
   #   chain_id: 8453
