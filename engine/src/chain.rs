@@ -25,14 +25,9 @@ use crate::strategy::{Opportunity, Strategy};
 
 /// Cooldown after a dry-run failure or balance-guard skip (cheap check, no RPC spent).
 const COOLDOWN_SECS: u64 = 15;
-/// Cooldown after pre-flight eth_call rejection. The simulation consumed an RPC call and
-/// confirmed the route is unprofitable at current on-chain prices. L2 pool prices don't
-/// shift enough in 15s to make a rejected route suddenly valid — retry in 60s.
-const PREFLIGHT_COOLDOWN_SECS: u64 = 60;
-/// Cooldown after a tx is actually sent to chain (gas spent, pool needs time to settle
-/// and emit new Sync events so the local cache converges). Prevents repeated phantom
-/// arb attempts on the same fingerprint after a successful or reverted on-chain tx.
-const SEND_COOLDOWN_SECS: u64 = 60;
+/// Cooldown after a tx is sent to chain. Short window so the pool can emit Sync events
+/// and the local cache catches up before the next attempt.
+const SEND_COOLDOWN_SECS: u64 = 15;
 /// Cooldown for routes rejected as unprofitable after gas. These routes have a real gross
 /// spread but the profit doesn't cover gas. Gas prices on L2s are stable minute-to-minute,
 /// so there is no value in retrying the same route every 15s — it wastes log space and
@@ -893,18 +888,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         ).await;
                     }
                     Ok(prep) => {
-                        // Pre-flight simulation: verifies profitability on-chain before
-                        // spending Linea gas. Catches phantom arbs from V3 virtual-reserve
-                        // approximation. Does NOT hold the executor mutex.
-                        if let Err(e) = provider.call(prep.tx.clone()).await {
-                            { let mut exec = executor.lock().await; exec.record_failed(); }
-                            pending_pairs.remove(&fingerprint);
-                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
-                            let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
-                            warn!("{}", msg);
-                            broadcast_log(log_tx, "warn", &msg, None);
-                            continue 'candidates;
-                        }
+                        // Pre-flight skipped: on Base, gas per revert is <$0.02 and adding
+                        // an eth_call round-trip (~200ms) closes the opportunity window.
+                        // The contract enforces amountIn+minProfit on-chain; reverts are atomic.
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
                             Ok(pending) => {
@@ -1103,16 +1089,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         ).await;
                     }
                     Ok(prep) => {
-                        // Pre-flight simulation: same gate as 2-hop path.
-                        if let Err(e) = provider.call(prep.tx.clone()).await {
-                            { let mut exec = executor.lock().await; exec.record_failed(); }
-                            pending_pairs.remove(&fingerprint);
-                            cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(PREFLIGHT_COOLDOWN_SECS));
-                            let msg = format!("[{}] Pre-flight rejected {} — {}", cfg.name, display_id, e);
-                            warn!("{}", msg);
-                            broadcast_log(log_tx, "warn", &msg, None);
-                            continue 'candidates;
-                        }
+                        // Pre-flight skipped: same reasoning as 2-hop path above.
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
                             Ok(pending) => {
