@@ -34,7 +34,7 @@ chains:
     block_time_ms: 2000
     contract_address: "0xFC11784BD8BFD4B38fC4859c6115e16eD1cA8EE2"
     min_native_balance: 0.005
-    min_profit_usd: 0.001  # Low for monitoring — raise once live trading confirmed
+    min_profit_usd: 0.05  # $0.05 minimum — covers gas + 1-block price movement buffer on Base
     deadline_seconds: 120
     quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
     scan_interval_ms: 2000
