@@ -199,6 +199,7 @@ sol! {
     /// NOTE: Name MUST be "Sync" (not "PairSyncV2") — alloy computes SIGNATURE_HASH
     /// from the event name, and on-chain pairs emit Sync(uint112,uint112).
     event Sync(uint112 reserve0, uint112 reserve1);
+
 }
 
 // ─── Pool discovery (startup, one-time) ───────────────────────────────────────

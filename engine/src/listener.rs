@@ -88,8 +88,14 @@ impl Listener {
         let mut all_addrs = v2_pool_addrs.clone();
         all_addrs.extend_from_slice(&v3_pool_addrs);
 
+        // Solidly/Aerodrome pools emit Sync(uint256,uint256) — different topic hash
+        // from Uniswap V2's Sync(uint112,uint112). Both must be in the filter.
+        use alloy::primitives::keccak256;
+        let solidly_sync_hash = keccak256(b"Sync(uint256,uint256)");
+
         let event_sigs = vec![
-            Sync::SIGNATURE_HASH,
+            Sync::SIGNATURE_HASH,  // Uniswap V2: Sync(uint112,uint112)
+            solidly_sync_hash,     // Aerodrome/Solidly: Sync(uint256,uint256)
             Swap::SIGNATURE_HASH,
         ];
 
@@ -218,6 +224,51 @@ impl Listener {
                                     } else {
                                         debug!(
                                             "[{}] Sync pool={:?} r0={} r1={} block={}",
+                                            chain_name, pool, r0, r1, block
+                                        );
+                                    }
+                                }
+                            } else if topic0 == Some(solidly_sync_hash) {
+                                // Aerodrome/Solidly pools emit Sync(uint256,uint256).
+                                // Decode manually: 2×uint256 packed in log data (no indexed params).
+                                sync_count.fetch_add(1, Ordering::Relaxed);
+                                let raw_data = log.data().data.as_ref();
+                                if raw_data.len() >= 64 {
+                                    let mut r0_bytes = [0u8; 32];
+                                    let mut r1_bytes = [0u8; 32];
+                                    r0_bytes.copy_from_slice(&raw_data[0..32]);
+                                    r1_bytes.copy_from_slice(&raw_data[32..64]);
+                                    let r0 = U256::from_be_bytes(r0_bytes);
+                                    let r1 = U256::from_be_bytes(r1_bytes);
+
+                                    if large_swap_bps > 0 {
+                                        if let Some(old) = cache.by_address.get(&pool) {
+                                            let threshold = U256::from(large_swap_bps);
+                                            let bps_10k = U256::from(10_000u32);
+                                            if !old.reserve0.is_zero() {
+                                                let delta0 = if r0 > old.reserve0 { r0 - old.reserve0 } else { old.reserve0 - r0 };
+                                                if delta0 * bps_10k >= old.reserve0 * threshold {
+                                                    magnitude = SwapMagnitude::Large;
+                                                }
+                                            }
+                                            if magnitude == SwapMagnitude::Normal && !old.reserve1.is_zero() {
+                                                let delta1 = if r1 > old.reserve1 { r1 - old.reserve1 } else { old.reserve1 - r1 };
+                                                if delta1 * bps_10k >= old.reserve1 * threshold {
+                                                    magnitude = SwapMagnitude::Large;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    cache.update_reserves(pool, r0, r1);
+                                    if magnitude == SwapMagnitude::Large {
+                                        info!(
+                                            "[{}] LARGE Solidly Sync pool={:?} r0={} r1={} block={}",
+                                            chain_name, pool, r0, r1, block
+                                        );
+                                    } else {
+                                        debug!(
+                                            "[{}] Solidly Sync pool={:?} r0={} r1={} block={}",
                                             chain_name, pool, r0, r1, block
                                         );
                                     }

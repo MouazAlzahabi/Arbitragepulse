@@ -98,6 +98,16 @@ pub async fn run_chain(
         .as_deref()
         .and_then(|s| s.parse().ok());
 
+    // Announce startup immediately so the dashboard switches out of "connecting" state
+    // before the slow pool-discovery multicalls begin.
+    broadcast_log(
+        &log_tx,
+        "info",
+        &format!("[{}] Starting up — discovering pools for {} pairs across {} routers…",
+            cfg.name, chain_pairs.len(), chain_routers.len()),
+        None,
+    );
+
     // ── Pool discovery: populate V2/Solidly-volatile reserve cache ────────────
     // Eliminates per-block eth_calls for xy=k routers — reserves stay fresh via
     // on-chain Sync events (listener.rs subscribes and updates the cache live).
@@ -1577,13 +1587,14 @@ async fn discover_pools<P: Provider>(
     use alloy::sol_types::SolCall;
 
     // ── Collect V2 and Solidly routers ────────────────────────────────────────
-    struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32 }
+    struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32, stable_fee_bps: u32 }
     let target_routers: Vec<RouterMeta> = routers
         .iter()
         .filter(|r| r.router_type == RouterType::V2 || r.router_type == RouterType::Solidly)
         .filter_map(|r| {
             let addr: Address = r.address.parse().ok()?;
-            Some(RouterMeta { id: r.id.clone(), addr, rtype: r.router_type.clone(), fee_bps: r.fee_bps })
+            let stable_fee_bps = r.stable_fee_bps.unwrap_or(r.fee_bps);
+            Some(RouterMeta { id: r.id.clone(), addr, rtype: r.router_type.clone(), fee_bps: r.fee_bps, stable_fee_bps })
         })
         .collect();
 
@@ -1627,10 +1638,10 @@ async fn discover_pools<P: Provider>(
                     let cd_vol = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
                     pair_calls.push((factory, cd_vol));
                     pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
-                    // Stable pool (x³y+xy³=k) — Solidly deploys a separate pool address
+                    // Stable pool (x³y+xy³=k) — uses stable_fee_bps if configured
                     let cd_sta = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: true }.abi_encode();
                     pair_calls.push((factory, cd_sta));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: true });
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, ta, tb, is_stable: true });
                 }
                 _ => continue,
             }

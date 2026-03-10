@@ -1036,6 +1036,11 @@ impl Strategy {
                         if spread > best_spread_pct { best_spread_pct = spread; }
                         if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
 
+                        debug!(
+                            "[{}] Phase 1.5 result: {} | {}/{} | quoter_out={} amount_back={} profit_usd=${:.4} (min=${:.2})",
+                            self.chain_id, pair.id, router_a_id, q_b.router_id,
+                            quoter_out, amount_back, profit_usd, self.min_profit_usd
+                        );
                         if profit_usd >= self.min_profit_usd {
                             debug!("[{}] Phase 1.5 arb: {} | profit=${:.4} | {}/{}",
                                    self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
@@ -1091,6 +1096,11 @@ impl Strategy {
                         if spread > best_spread_pct { best_spread_pct = spread; }
                         if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
 
+                        debug!(
+                            "[{}] Phase 1.5b result: {} | {}/{} | amount_back={} profit_usd=${:.4} (min=${:.2})",
+                            self.chain_id, pair.id, router_a_id, q_b.router_id,
+                            amount_back, profit_usd, self.min_profit_usd
+                        );
                         if profit_usd >= self.min_profit_usd {
                             debug!("[{}] Phase 1.5b V3×V3 arb: {} | profit=${:.4} | {}/{}",
                                    self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);

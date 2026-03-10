@@ -114,6 +114,10 @@ pub struct RouterConfig {
     /// V3 swap routers don't expose factory() on-chain, so this must be configured.
     #[serde(default)]
     pub factory_address: Option<String>,
+    /// Fee (basis points) for Solidly stable pools (x³y+xy³=k).
+    /// If not set, falls back to fee_bps. Aerodrome stable pools use ~1 bps (0.01%).
+    #[serde(default)]
+    pub stable_fee_bps: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
