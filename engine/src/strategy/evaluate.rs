@@ -87,9 +87,14 @@ impl Strategy {
 
                 match router.router_type {
                     RouterType::V2 => {
-                        // Try local xy=k reserve cache first (no eth_call needed)
+                        // Try local xy=k reserve cache first (no eth_call needed).
+                        // VOLATILE_MAX_AGE (300s) freshness check: V2 reserves CAN go stale
+                        // between Sync events. Without a freshness check, reserves from the
+                        // last trade 10+ minutes ago produce phantom opportunities — the local
+                        // xy=k formula is exact given correct reserves, but stale reserves
+                        // overestimate output and cause on-chain "too little received" reverts.
                         if let Some(out) = self.pool_cache.get_amount_out_by_key(
-                            &router.id, token_in, token_out, amount_in, None,
+                            &router.id, token_in, token_out, amount_in, Some(VOLATILE_MAX_AGE),
                         ) {
                             pair_quotes.entry(pi).or_default().push(ForwardTask {
                                 pair_idx: pi,
@@ -322,7 +327,7 @@ impl Strategy {
                     // stale reserves (>VOLATILE/STABLE_MAX_AGE since last Sync event) → None → skip.
                     let local_back = match q_b.router_type {
                         RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                            &q_b.router_id, token_out, token_in, token_out_amount, None,
+                            &q_b.router_id, token_out, token_in, token_out_amount, Some(VOLATILE_MAX_AGE),
                         ),
                         RouterType::Solidly => {
                             // q_b.router_id is "router::volatile" or "router::stable"
@@ -603,7 +608,7 @@ impl Strategy {
                         }
                         let local_back = match q_b.router_type {
                             RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                                &q_b.router_id, token_out, token_in, quoter_out, None,
+                                &q_b.router_id, token_out, token_in, quoter_out, Some(VOLATILE_MAX_AGE),
                             ),
                             RouterType::Solidly => {
                                 let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
@@ -616,13 +621,6 @@ impl Strategy {
                             ),
                             RouterType::V3 => unreachable!(),
                         };
-                        // Track verified spread BEFORE the profitable filter so the heartbeat
-                        // can show QuoterV2-confirmed spread even when it's negative (phantom).
-                        let verified_spread = local_back.map(|ab| {
-                            u256_to_f64(ab) / u256_to_f64(full_amount) - 1.0
-                        }).unwrap_or(f64::NEG_INFINITY);
-                        if verified_spread > best_verified_spread { best_verified_spread = verified_spread; }
-
                         let amount_back = match local_back.filter(|b| !b.is_zero()) {
                             Some(b) => b, None => continue,
                         };
@@ -633,6 +631,11 @@ impl Strategy {
                                   router_a_id, q_b.router_id);
                             continue;
                         }
+
+                        // Track verified spread AFTER the phantom check so contaminated values
+                        // (>5% spread, caught above) don't corrupt the heartbeat metric.
+                        let verified_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
+                        if verified_spread > best_verified_spread { best_verified_spread = verified_spread; }
                         let profit = amount_back - full_amount;
                         let profit_usd = token_amount_to_usd(
                             profit, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd,
@@ -685,8 +688,6 @@ impl Strategy {
                             Ok(r) if !r.amountOut.is_zero() => r.amountOut,
                             _ => continue,
                         };
-                        let v_spread_1b = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
-                        if v_spread_1b > best_verified_spread { best_verified_spread = v_spread_1b; }
 
                         if amount_back <= full_amount { continue; }
 
@@ -695,6 +696,11 @@ impl Strategy {
                                   self.pairs[pi].id, router_a_id, q_b.router_id);
                             continue;
                         }
+
+                        // Track verified spread AFTER the phantom check (same as Phase 1.5 non-b).
+                        // Both legs are QuoterV2-confirmed here, so this is the most accurate signal.
+                        let v_spread_1b = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
+                        if v_spread_1b > best_verified_spread { best_verified_spread = v_spread_1b; }
                         let profit = amount_back - full_amount;
                         let pair = &self.pairs[pi];
                         let profit_usd = token_amount_to_usd(
