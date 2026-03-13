@@ -624,18 +624,24 @@ impl Strategy {
                         let amount_back = match local_back.filter(|b| !b.is_zero()) {
                             Some(b) => b, None => continue,
                         };
-                        if amount_back <= full_amount { continue; }
 
-                        if (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount {
+                        // Phantom check FIRST: >5% positive spread is physically impossible
+                        // for real arb — indicates stale Solidly/SyncSwap reserves or V3 spot
+                        // mismatch. Reject before updating any metrics.
+                        if amount_back > full_amount
+                            && (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount
+                        {
                             warn!("[{}] Phase 1.5 phantom: {} | {}/{}", self.chain_id, pair.id,
                                   router_a_id, q_b.router_id);
                             continue;
                         }
 
-                        // Track verified spread AFTER the phantom check so contaminated values
-                        // (>5% spread, caught above) don't corrupt the heartbeat metric.
+                        // Track verified spread for ALL non-phantom results, including losses
+                        // (negative value shows QuoterV2 confirmed the spread is a loss).
                         let verified_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
                         if verified_spread > best_verified_spread { best_verified_spread = verified_spread; }
+
+                        if amount_back <= full_amount { continue; }
                         let profit = amount_back - full_amount;
                         let profit_usd = token_amount_to_usd(
                             profit, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd,
@@ -689,18 +695,21 @@ impl Strategy {
                             _ => continue,
                         };
 
-                        if amount_back <= full_amount { continue; }
-
-                        if (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount {
+                        // Phantom check FIRST (same logic as Phase 1.5 non-b).
+                        if amount_back > full_amount
+                            && (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount
+                        {
                             warn!("[{}] Phase 1.5b phantom: {} | {}/{}", self.chain_id,
                                   self.pairs[pi].id, router_a_id, q_b.router_id);
                             continue;
                         }
 
-                        // Track verified spread AFTER the phantom check (same as Phase 1.5 non-b).
-                        // Both legs are QuoterV2-confirmed here, so this is the most accurate signal.
+                        // Track verified spread for ALL non-phantom results (including losses).
+                        // Both legs are QuoterV2-confirmed here — most accurate signal available.
                         let v_spread_1b = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
                         if v_spread_1b > best_verified_spread { best_verified_spread = v_spread_1b; }
+
+                        if amount_back <= full_amount { continue; }
                         let profit = amount_back - full_amount;
                         let pair = &self.pairs[pi];
                         let profit_usd = token_amount_to_usd(
