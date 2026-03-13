@@ -399,7 +399,7 @@ impl Strategy {
 
         // Phase 1.5 gate: collect V3 tick-capped forward tasks that show real cross-DEX
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
-        const P15_GATE_SPREAD: f64 = 0.0001; // 0.01% — fires QuoterV2 for any detectable spread
+        const P15_GATE_SPREAD: f64 = 0.0005; // 0.05% — gate for Phase 1.5/1.5c QuoterV2 batches
         let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
         // Best QuoterV2-verified spread (signed). NEG_INFINITY when Phase 1.5 didn't run or
         // all reverse lookups failed. Exposed in heartbeat as "bestV=" to distinguish real
@@ -486,8 +486,12 @@ impl Strategy {
                     // unverified entry alongside the Phase 1.5 verified one — causing double
                     // pre-flight attempts and cooldown spam for the same conceptual route.
                     let router_a_is_v3 = matches!(task.router_a_type, RouterType::V3);
+                    // V2→V3 routes need Phase 1.5c QuoterV2 verification for the V3 reverse leg.
+                    // quote_v3_spot overestimates output in concentrated pools crossing multiple
+                    // ticks — same problem Phase 1.5b solves for V3→V3.
+                    let router_b_is_v3 = matches!(task.router_b_type, RouterType::V3);
 
-                    if profit_usd >= self.min_profit_usd && !router_a_is_v3 {
+                    if profit_usd >= self.min_profit_usd && !router_a_is_v3 && !router_b_is_v3 {
                         debug!(
                             "[{}] Arb: {} | profit=${:.4} | {}/{}",
                             self.chain_id,
@@ -809,6 +813,117 @@ impl Strategy {
                                 router_b_id: q_b.router_id.clone(),
                             });
                         }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 1.5c: QuoterV2 for V3 reverse legs in V2→V3 routes ────────────────
+        // V2-forward / V3-reverse routes are not covered by Phase 1.5 (gates on V3-forward)
+        // or Phase 1.5b (V3×V3 only). The quote_v3_spot approximation overestimates output
+        // in concentrated pools where the trade crosses multiple ticks (each tick crossed
+        // reduces available liquidity). One batched Multicall3 call per scan.
+        {
+            let mut p15c_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+            let mut p15c_candidates: Vec<(usize, String, u32, Address, Address, Address, U256, u32, Address, String)> = Vec::new();
+
+            for task in &rev_tasks {
+                if !matches!(task.router_a_type, RouterType::V2) { continue; }
+                if !matches!(task.router_b_type, RouterType::V3) { continue; }
+
+                let local_back = match task.local_back { Some(v) => v, None => continue };
+                let spread = u256_to_f64(local_back) / u256_to_f64(task.amount_in) - 1.0;
+                if spread <= P15_GATE_SPREAD { continue; }
+
+                let pair = &self.pairs[task.pair_idx];
+                let full_amount = match parse_amount_capped(
+                    &pair.trade_amount, pair.max_trade.as_deref(), pair.token_in_decimals,
+                ) {
+                    Some(a) => a, None => continue,
+                };
+
+                // Find quoter for the V3 reverse router from forward quotes of this pair
+                let quoter_b = match pair_quotes.get(&task.pair_idx)
+                    .and_then(|ts| ts.iter().find(|t| t.router_id == task.router_b_id && t.fee == task.fee_b))
+                    .and_then(|t| t.quoter_addr)
+                {
+                    Some(q) => q, None => continue,
+                };
+
+                let cd = IQuoterV2::quoteExactInputSingleCall {
+                    params: IQuoterV2::QuoteExactInputSingleParams {
+                        tokenIn:           task.token_out,
+                        tokenOut:          task.token_in,
+                        amountIn:          task.token_out_amount,
+                        fee:               Uint::from(task.fee_b),
+                        sqrtPriceLimitX96: Uint::from(0u8),
+                    },
+                };
+                p15c_mc.push((quoter_b, cd.abi_encode()));
+                p15c_candidates.push((
+                    task.pair_idx,
+                    task.router_a_id.clone(), task.fee_a, task.router_a_addr,
+                    task.token_in, task.token_out, full_amount,
+                    task.fee_b, task.router_b_addr, task.router_b_id.clone(),
+                ));
+            }
+
+            if !p15c_mc.is_empty() {
+                debug!("[chain={}] Phase 1.5c: {} V2→V3 reverse quote(s)", self.chain_id, p15c_mc.len());
+                let p15c_raw = run_multicall(provider, p15c_mc, self.rpc_concurrency).await;
+
+                for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id), raw_opt)
+                    in p15c_candidates.into_iter().zip(p15c_raw.into_iter())
+                {
+                    let raw = match raw_opt { Some(r) => r, None => continue };
+                    let amount_back = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw) {
+                        Ok(r) if !r.amountOut.is_zero() => r.amountOut,
+                        _ => continue,
+                    };
+
+                    // Phantom check first (>5% positive spread = physically impossible)
+                    if amount_back > full_amount
+                        && (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount
+                    {
+                        warn!("[{}] Phase 1.5c phantom: {}/{}", self.chain_id, router_a_id, router_b_id);
+                        continue;
+                    }
+
+                    let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
+                    if v_spread > best_verified_spread { best_verified_spread = v_spread; }
+
+                    if amount_back <= full_amount { continue; }
+                    let profit = amount_back - full_amount;
+                    let pair = &self.pairs[pi];
+                    let profit_usd = token_amount_to_usd(
+                        profit, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd,
+                    );
+                    let spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
+                    if spread > best_spread_pct { best_spread_pct = spread; }
+                    if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
+
+                    info!(
+                        "[{}] Phase 1.5c result: {} | {}/{} | amount_back={} profit_usd=${:.4} (min=${:.2})",
+                        self.chain_id, pair.id, router_a_id, router_b_id, amount_back, profit_usd, self.min_profit_usd
+                    );
+                    if profit_usd >= self.min_profit_usd {
+                        info!("[{}] Phase 1.5c arb: {} | profit=${:.4} | {}/{}",
+                               self.chain_id, pair.id, profit_usd, router_a_id, router_b_id);
+                        opportunities.push(ArbOpportunity {
+                            chain_id: self.chain_id,
+                            pair_id: pair.id.clone(),
+                            token_in, token_out,
+                            amount_in: full_amount,
+                            router_a: router_a_addr,
+                            router_b: router_b_addr,
+                            router_a_type: RouterType::V2,
+                            router_b_type: RouterType::V3,
+                            fee_a, fee_b,
+                            expected_profit: profit,
+                            profit_usd,
+                            router_a_id,
+                            router_b_id,
+                        });
                     }
                 }
             }
