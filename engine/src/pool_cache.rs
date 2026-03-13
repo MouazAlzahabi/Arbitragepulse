@@ -3,6 +3,8 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::util::addr_key;
+
 // ─── Pool state ───────────────────────────────────────────────────────────────
 
 /// Current on-chain state of one V2 / Solidly-volatile / Solidly-stable /
@@ -52,12 +54,6 @@ pub struct V3PoolState {
     pub last_updated: Instant,
 }
 
-/// Retained for external reference; no longer used as a staleness gate in
-/// `quote_v3_spot`. V3 state is deterministic (only Swap events change it),
-/// so time-based expiry causes false blindness and has been removed.
-#[allow(dead_code)]
-pub const V3_STATE_MAX_AGE: Duration = Duration::from_secs(300);
-
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
 /// 300s (5 min): covers pools that swap every few minutes (typical on Linea).
 pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(300);
@@ -65,18 +61,6 @@ pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(300);
 /// How long a Solidly-stable / SyncSwap-stable pool reserve is considered fresh.
 pub const STABLE_MAX_AGE: Duration = Duration::from_secs(120);
 
-/// Price impact factor per fee tier (numerator; denominator = 10_000).
-/// Limits ΔsqrtP/sqrtP to stay within the active tick cluster without
-/// needing tick boundary data. See plan for derivation.
-pub fn v3_impact_factor(fee_ppm: u32) -> u64 {
-    match fee_ppm {
-        100  =>  6,   // 0.01% pool, 1bp tick spacing → 0.06% ΔP cap
-        500  => 10,   // 0.05% pool, 10bp tick spacing → 0.10% ΔP cap
-        2500 => 20,   // 0.25% pool, 50bp tick spacing → 0.20% ΔP cap
-        3000 => 25,   // 0.30% pool, 60bp tick spacing → 0.25% ΔP cap
-        _    => 50,   // 1.00%+ pool, wide spacing → 0.50% ΔP cap (default)
-    }
-}
 
 // ─── Pool cache ───────────────────────────────────────────────────────────────
 
@@ -114,8 +98,8 @@ impl PoolCache {
     /// `last_sync` is set to a very old instant so startup reserves are
     /// treated as stale until the first live Sync event updates them.
     pub fn insert(&self, pool: Address, info: PoolInfo) {
-        let t0 = format!("{:?}", info.token0).to_lowercase();
-        let t1 = format!("{:?}", info.token1).to_lowercase();
+        let t0 = addr_key(info.token0);
+        let t1 = addr_key(info.token1);
         let rid = &info.router_id;
 
         self.by_key.insert(format!("{}:{}:{}", rid, t0, t1), pool);
@@ -141,43 +125,31 @@ impl PoolCache {
         compute_amount_out(&info, token_in, amount_in)
     }
 
-    /// Convenience: look up by directional key, then compute amount out.
-    /// Does NOT check freshness — use `get_amount_out_by_key_fresh` for
-    /// detection to avoid stale startup reserves.
+    /// Look up by directional key and compute amount out.
+    ///
+    /// `max_age`: if `Some(d)`, returns `None` when the pool's reserves were last
+    /// synced more than `d` ago — prevents phantom profits from stale startup state.
+    /// Pass `None` for V2 pools (startup reserves are trustworthy for xy=k).
+    /// Pass `Some(VOLATILE_MAX_AGE)` / `Some(STABLE_MAX_AGE)` for Solidly/SyncSwap.
     pub fn get_amount_out_by_key(
         &self,
         router_id: &str,
         token_in: Address,
         token_out: Address,
         amount_in: U256,
+        max_age: Option<Duration>,
     ) -> Option<U256> {
-        let t_in  = format!("{:?}", token_in).to_lowercase();
-        let t_out = format!("{:?}", token_out).to_lowercase();
-        let key = format!("{}:{}:{}", router_id, t_in, t_out);
+        let key = format!("{}:{}:{}", router_id, addr_key(token_in), addr_key(token_out));
         let pool = *self.by_key.get(&key)?;
-        self.get_amount_out(pool, token_in, amount_in)
-    }
-
-    /// Like `get_amount_out_by_key` but returns None if `last_sync` is older
-    /// than `max_age`.  This prevents phantom profits from stale startup
-    /// reserves that haven't yet been rebalanced on-chain.
-    pub fn get_amount_out_by_key_fresh(
-        &self,
-        router_id: &str,
-        token_in: Address,
-        token_out: Address,
-        amount_in: U256,
-        max_age: Duration,
-    ) -> Option<U256> {
-        let t_in  = format!("{:?}", token_in).to_lowercase();
-        let t_out = format!("{:?}", token_out).to_lowercase();
-        let key = format!("{}:{}:{}", router_id, t_in, t_out);
-        let pool = *self.by_key.get(&key)?;
-        let info = self.by_address.get(&pool)?;
-        if info.last_sync.elapsed() > max_age {
-            return None; // stale — caller skips this DEX for this scan
+        if let Some(age) = max_age {
+            let info = self.by_address.get(&pool)?;
+            if info.last_sync.elapsed() > age {
+                return None; // stale — caller skips this DEX for this scan
+            }
+            compute_amount_out(&info, token_in, amount_in)
+        } else {
+            self.get_amount_out(pool, token_in, amount_in)
         }
-        compute_amount_out(&info, token_in, amount_in)
     }
 
     /// All pool addresses currently in the cache (used for Sync event subscription).
@@ -202,8 +174,8 @@ impl PoolCache {
     /// Insert a V3 pool and register both directional keys.
     /// Key format: "router_id:token_in_lower:token_out_lower:fee"
     pub fn insert_v3(&self, pool: Address, state: V3PoolState) {
-        let t0 = format!("{:?}", state.token0).to_lowercase();
-        let t1 = format!("{:?}", state.token1).to_lowercase();
+        let t0 = addr_key(state.token0);
+        let t1 = addr_key(state.token1);
         let fee = state.fee;
         let rid = &state.router_id;
 
@@ -249,9 +221,7 @@ impl PoolCache {
         fee: u32,
         amount_in: U256,
     ) -> Option<(U256, u128)> {
-        let t_in  = format!("{:?}", token_in).to_lowercase();
-        let t_out = format!("{:?}", token_out).to_lowercase();
-        let key = format!("{}:{}:{}:{}", router_id, t_in, t_out, fee);
+        let key = format!("{}:{}:{}:{}", router_id, addr_key(token_in), addr_key(token_out), fee);
         let pool_addr = *self.v3_by_key.get(&key)?;
 
         let state = self.v3_by_address.get(&pool_addr)?;
@@ -315,41 +285,6 @@ impl PoolCache {
         Some((amount_out, state.liquidity))
     }
 
-    /// Estimate the maximum capital safely tradeable within the current tick.
-    ///
-    /// Uses the price-impact formula: capacity = virtual_reserve × impact_factor.
-    /// Where virtual_reserve = L × Q96 / sqrtPriceX96 (for token0→token1).
-    /// impact_factor is fee-tier-aware (see v3_impact_factor()).
-    ///
-    /// This is NOT the exact tick boundary — it's the amount that moves sqrtPrice
-    /// by at most 0.05-0.50% (depending on fee tier), keeping the trade within the
-    /// active tick cluster without needing tick bitmap data.
-    pub fn estimate_safe_v3_capacity(&self, pool: Address, token_in: Address) -> U256 {
-        let state = match self.v3_by_address.get(&pool) {
-            Some(s) => s,
-            None => return U256::ZERO,
-        };
-        let sqrtp = state.sqrt_price_x96;
-        if sqrtp.is_zero() {
-            return U256::ZERO;
-        }
-
-        let l = U256::from(state.liquidity);
-        let q96 = U256::from(1u128) << 96u32;
-
-        let virtual_reserve = if token_in == state.token0 {
-            // token0→token1: virtual_reserve = L × Q96 / sqrtPriceX96
-            l.saturating_mul(q96)
-                .checked_div(sqrtp)
-                .unwrap_or(U256::ZERO)
-        } else {
-            // token1→token0: virtual_reserve = L × sqrtPriceX96 / Q96
-            l.saturating_mul(sqrtp) >> 96u32
-        };
-
-        let factor = U256::from(v3_impact_factor(state.fee));
-        virtual_reserve * factor / U256::from(10_000u64)
-    }
 }
 
 // ─── AMM math ─────────────────────────────────────────────────────────────────
