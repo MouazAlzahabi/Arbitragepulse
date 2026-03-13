@@ -422,8 +422,12 @@ impl Strategy {
 
     /// Evaluate all pairs on all router combinations for arb opportunities.
     /// All quotes run concurrently (two phases: forward then reverse).
-    /// Returns `(opportunities, best_raw_profit_usd, fwd_quotes_ok, pairs_with_multi, best_spread_pct, pairs_with_any)`:
+    /// Returns `(opportunities, best_raw_profit_usd, best_verified_spread, fwd_quotes_ok, pairs_with_multi, best_spread_pct, pairs_with_any)`:
     /// - `best_raw_profit_usd`: highest profit even if below min_profit_usd (for status logging)
+    /// - `best_verified_spread`: best signed spread confirmed by Phase 1.5 QuoterV2 (can be negative).
+    ///   NEG_INFINITY = Phase 1.5 didn't run or reverse lookup always failed.
+    ///   Negative = QuoterV2 confirmed loss after V3 fees (V3 phantom correctly deflated).
+    ///   Positive = real profit confirmed; if opps=0, it was below min_profit_usd threshold.
     /// - `fwd_quotes_ok`: total number of successful non-zero forward quotes
     /// - `pairs_with_multi`: number of pairs with quotes from ≥2 distinct router IDs
     /// - `best_spread_pct`: best (reverse_out/amount_in - 1.0) seen, even when negative.
@@ -441,7 +445,7 @@ impl Strategy {
         // False when called from a swap-event targeted scan — pair_scan is left unchanged
         // (a targeted scan only evaluates 1–2 pairs; rebuilding would mark all others stale).
         is_full_scan: bool,
-    ) -> (Vec<ArbOpportunity>, f64, usize, usize, f64, usize) {
+    ) -> (Vec<ArbOpportunity>, f64, f64, usize, usize, f64, usize) {
         let chain_routers: Vec<&RouterConfig> = self
             .routers
             .iter()
@@ -801,6 +805,10 @@ impl Strategy {
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
         const P15_GATE_SPREAD: f64 = 0.0001; // 0.01% — fires QuoterV2 for any detectable spread
         let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
+        // Best QuoterV2-verified spread (signed). NEG_INFINITY when Phase 1.5 didn't run or
+        // all reverse lookups failed. Exposed in heartbeat as "bestV=" to distinguish real
+        // profit ($0.001 verified) from V3 spot phantom ($0.29 raw).
+        let mut best_verified_spread: f64 = f64::NEG_INFINITY;
 
         for (task, raw_opt) in rev_tasks.iter().zip(rev_raw_by_task.into_iter()) {
             let amount_back_opt: Option<U256> = if let Some(local) = task.local_back {
@@ -1017,6 +1025,13 @@ impl Strategy {
                             ),
                             RouterType::V3 => unreachable!(),
                         };
+                        // Track verified spread BEFORE the profitable filter so the heartbeat
+                        // can show QuoterV2-confirmed spread even when it's negative (phantom).
+                        let verified_spread = local_back.map(|ab| {
+                            u256_to_f64(ab) / u256_to_f64(full_amount) - 1.0
+                        }).unwrap_or(f64::NEG_INFINITY);
+                        if verified_spread > best_verified_spread { best_verified_spread = verified_spread; }
+
                         let amount_back = match local_back.filter(|b| !b.is_zero()) {
                             Some(b) => b, None => continue,
                         };
@@ -1036,13 +1051,13 @@ impl Strategy {
                         if spread > best_spread_pct { best_spread_pct = spread; }
                         if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
 
-                        debug!(
+                        info!(
                             "[{}] Phase 1.5 result: {} | {}/{} | quoter_out={} amount_back={} profit_usd=${:.4} (min=${:.2})",
                             self.chain_id, pair.id, router_a_id, q_b.router_id,
                             quoter_out, amount_back, profit_usd, self.min_profit_usd
                         );
                         if profit_usd >= self.min_profit_usd {
-                            debug!("[{}] Phase 1.5 arb: {} | profit=${:.4} | {}/{}",
+                            info!("[{}] Phase 1.5 arb: {} | profit=${:.4} | {}/{}",
                                    self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
                             opportunities.push(ArbOpportunity {
                                 chain_id: self.chain_id,
@@ -1079,6 +1094,9 @@ impl Strategy {
                             Ok(r) if !r.amountOut.is_zero() => r.amountOut,
                             _ => continue,
                         };
+                        let v_spread_1b = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
+                        if v_spread_1b > best_verified_spread { best_verified_spread = v_spread_1b; }
+
                         if amount_back <= full_amount { continue; }
 
                         if (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount {
@@ -1096,13 +1114,13 @@ impl Strategy {
                         if spread > best_spread_pct { best_spread_pct = spread; }
                         if profit_usd > best_raw_usd { best_raw_usd = profit_usd; }
 
-                        debug!(
+                        info!(
                             "[{}] Phase 1.5b result: {} | {}/{} | amount_back={} profit_usd=${:.4} (min=${:.2})",
                             self.chain_id, pair.id, router_a_id, q_b.router_id,
                             amount_back, profit_usd, self.min_profit_usd
                         );
                         if profit_usd >= self.min_profit_usd {
-                            debug!("[{}] Phase 1.5b V3×V3 arb: {} | profit=${:.4} | {}/{}",
+                            info!("[{}] Phase 1.5b V3×V3 arb: {} | profit=${:.4} | {}/{}",
                                    self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
                             opportunities.push(ArbOpportunity {
                                 chain_id: self.chain_id,
@@ -1191,7 +1209,7 @@ impl Strategy {
             }
         }
 
-        (opportunities, best_raw_usd, total_fwd_ok, pairs_with_multi, best_spread_pct, pairs_with_any)
+        (opportunities, best_raw_usd, best_verified_spread, total_fwd_ok, pairs_with_multi, best_spread_pct, pairs_with_any)
     }
 
     /// Detect triangular arbitrage opportunities (A → B → C → A loops).

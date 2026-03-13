@@ -246,7 +246,6 @@ pub async fn run_chain(
     // ── Safety / efficiency state ──
     let mut pending_pairs: HashSet<String> = HashSet::new();
     let mut cooldowns: HashMap<String, Instant> = HashMap::new();
-    let mut cooldown_logged: HashMap<String, Instant> = HashMap::new();
     let mut consecutive_failures: u32 = 0;
 
     // ── Best-seen profit tracker (f64 stored as bits in AtomicU64) ────────────
@@ -256,6 +255,9 @@ pub async fn run_chain(
     // ── Best signed spread % (f64 bits). NEG_INFINITY when no quotes yet. ─────
     // Shows how close the market is to a profitable arb even when best_seen=$0.
     let best_spread_bits: Arc<AtomicU64> = Arc::new(AtomicU64::new(f64::NEG_INFINITY.to_bits()));
+    // ── Best QuoterV2-verified spread % (f64 bits). NEG_INFINITY = Phase 1.5 not yet run. ─
+    // Distinguishes V3 spot formula phantoms (best=$0.29 raw) from real profit (bestV=+0.01%).
+    let best_verified_spread_bits: Arc<AtomicU64> = Arc::new(AtomicU64::new(f64::NEG_INFINITY.to_bits()));
 
     // ── Quote diagnostic counters (last scan values) ──────────────────────────
     // fwd_count: how many non-zero forward quotes returned
@@ -351,6 +353,14 @@ pub async fn run_chain(
                 } else {
                     "n/a".to_string()
                 };
+                // Read and reset Phase 1.5 verified spread (QuoterV2-confirmed, can be negative).
+                // bestV distinguishes real spread from V3 spot formula phantoms.
+                let verified_spread = f64::from_bits(best_verified_spread_bits.swap(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed));
+                let verified_str = if verified_spread.is_finite() {
+                    format!("{:+.3}%", verified_spread * 100.0)
+                } else {
+                    "n/a".to_string()
+                };
                 // Read last-scan quote diagnostics
                 let fwd_ok = last_fwd_count.load(Ordering::Relaxed);
                 let multi_dex = last_multi_count.load(Ordering::Relaxed);
@@ -358,8 +368,8 @@ pub async fn run_chain(
                 let total_pairs = chain_pairs.len() as u64;
                 let opp_count = last_opp_count.load(Ordering::Relaxed);
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | best={} spread={} | quotes={} active={}/{} cross={} | opps={}",
-                    cfg.name, scans, attempts, success, best_seen_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
+                    "[{}] ♥ scans={} execs={} ok={} | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={}",
+                    cfg.name, scans, attempts, success, best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 info!("{}", heartbeat_msg);
@@ -488,8 +498,8 @@ pub async fn run_chain(
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
-                    &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &router_monitor, &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, None, disabled_set,
                 ).await;
                 last_scan_at = Instant::now();
@@ -519,8 +529,8 @@ pub async fn run_chain(
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
-                    &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &router_monitor, &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, None, disabled_set,
                 ).await;
                 last_scan_at = Instant::now();
@@ -603,8 +613,8 @@ pub async fn run_chain(
 
                 evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut cooldown_logged, &mut consecutive_failures,
-                    &router_monitor, &best_raw_profit, &best_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &router_monitor, &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
@@ -626,11 +636,11 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     metrics: &Arc<Metrics>,
     pending_pairs: &mut HashSet<String>,
     cooldowns: &mut HashMap<String, Instant>,
-    cooldown_logged: &mut HashMap<String, Instant>,
     consecutive_failures: &mut u32,
     router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
     best_raw_profit: &Arc<AtomicU64>,
     best_spread_bits: &Arc<AtomicU64>,
+    best_verified_spread_bits: &Arc<AtomicU64>,
     last_fwd_count: &Arc<AtomicU64>,
     last_multi_count: &Arc<AtomicU64>,
     last_active_count: &Arc<AtomicU64>,
@@ -669,7 +679,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         };
 
         let is_full_scan = targeted.is_none();
-        let ((opps_2hop, best_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
+        let ((opps_2hop, best_2hop, verified_spread_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
             strat.evaluate(provider.as_ref(), final_mask.as_ref(), is_full_scan),
             strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice()), &disabled_set),
         );
@@ -698,6 +708,13 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             let current_spread = f64::from_bits(best_spread_bits.load(Ordering::Relaxed));
             if spread_2hop > current_spread {
                 best_spread_bits.store(spread_2hop.to_bits(), Ordering::Relaxed);
+            }
+        }
+        // Update best Phase 1.5 QuoterV2-verified spread (running maximum; reset each heartbeat)
+        if verified_spread_2hop.is_finite() {
+            let current_v = f64::from_bits(best_verified_spread_bits.load(Ordering::Relaxed));
+            if verified_spread_2hop > current_v {
+                best_verified_spread_bits.store(verified_spread_2hop.to_bits(), Ordering::Relaxed);
             }
         }
 
@@ -738,8 +755,6 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // pre-flight failure, fall through to the next candidate. On a successful send or
     // dry-run, break. `continue 'candidates` is used for cheap skips (cooldown, balance
     // guard, detect-only) so higher-ranked blocked pairs don't starve the rest.
-    let mut all_blocked = !all_opportunities.is_empty();
-
     'candidates: for best_opp in &all_opportunities {
     let fingerprint = best_opp.fingerprint();
     let display_id = best_opp.pair_id();
@@ -749,16 +764,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     if let Some(expire_at) = expire_at_opt {
         if expire_at > Instant::now() {
             let remaining = expire_at.duration_since(Instant::now()).as_secs();
-            debug!("[{}] {} in cooldown, skipping", cfg.name, best_opp.pair_id());
-            let should_log = cooldown_logged
-                .get(&fingerprint)
-                .map_or(true, |t| t.elapsed().as_secs() >= 10);
-            if should_log {
-                cooldown_logged.insert(fingerprint.clone(), Instant::now());
-                broadcast_log(log_tx, "info",
-                    &format!("[{}] Skipped {} — cooldown ({}s remaining)", cfg.name, best_opp.pair_id(), remaining),
-                    None);
-            }
+            debug!("[{}] {} in cooldown ({}s remaining), skipping", cfg.name, best_opp.pair_id(), remaining);
             continue 'candidates;
         }
         cooldowns.remove(&fingerprint); // expired entry — clean up
@@ -772,8 +778,6 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             None);
         continue 'candidates;
     }
-
-    all_blocked = false;
 
     // ── SyncSwap detect-only check ────────────────────────────────────────────
     // SyncSwap opportunities are broadcast to the live feed but never sent to
@@ -836,8 +840,8 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             if let Some(bal) = max_bal {
                 if bal < optimized.amount_in {
                     let msg = format!(
-                        "[{}] Skipping {} — insufficient token_in balance (have {}, need {})",
-                        cfg.name, optimized.pair_id, bal, optimized.amount_in
+                        "[{}] Skipping {} — insufficient token_in balance (have {}, need {}) → cd={}s",
+                        cfg.name, optimized.pair_id, bal, optimized.amount_in, COOLDOWN_SECS
                     );
                     warn!("{}", msg);
                     broadcast_log(log_tx, "warn", &msg, None);
@@ -866,6 +870,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                            COOLDOWN_SECS,
                         ).await;
                         break 'candidates;
                     }
@@ -907,9 +912,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
                                 info!(
-                                    "[{}] Arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={}",
+                                    "[{}] Arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={} → cd={}s",
                                     cfg.name, elapsed_send, prep.profit_usd, prep.net_profit_usd,
-                                    &tx_hash[..10.min(tx_hash.len())],
+                                    &tx_hash[..10.min(tx_hash.len())], SEND_COOLDOWN_SECS,
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
@@ -974,6 +979,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                                    SEND_COOLDOWN_SECS,
                                 ).await;
                                 break 'candidates;
                             }
@@ -1034,8 +1040,8 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 if let Some(b) = bal {
                     if b < opp.amount_in {
                         let msg = format!(
-                            "[{}] Skipping triangular {} — insufficient token_a balance (have {}, need {})",
-                            cfg.name, opp.triplet_id, b, opp.amount_in
+                            "[{}] Skipping triangular {} — insufficient token_a balance (have {}, need {}) → cd={}s",
+                            cfg.name, opp.triplet_id, b, opp.amount_in, COOLDOWN_SECS
                         );
                         warn!("{}", msg);
                         broadcast_log(log_tx, "warn", &msg, None);
@@ -1069,6 +1075,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                            COOLDOWN_SECS,
                         ).await;
                         break 'candidates;
                     }
@@ -1106,9 +1113,9 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
                                 info!(
-                                    "[{}] Triangular arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={}",
+                                    "[{}] Triangular arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={} → cd={}s",
                                     cfg.name, elapsed_send, prep.profit_usd, prep.net_profit_usd,
-                                    &tx_hash[..10.min(tx_hash.len())],
+                                    &tx_hash[..10.min(tx_hash.len())], SEND_COOLDOWN_SECS,
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
@@ -1174,6 +1181,7 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, &router_monitor, exec_time_ms,
+                                    SEND_COOLDOWN_SECS,
                                 ).await;
                                 break 'candidates;
                             }
@@ -1207,21 +1215,6 @@ async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     } // end match best_opp
     } // end 'candidates: for
 
-    // All opportunities were blocked by cooldown or pending tx. Log once per 30s.
-    if all_blocked {
-        let blocked_key = "__all_blocked__".to_string();
-        let should_log = cooldown_logged
-            .get(&blocked_key)
-            .map_or(true, |t| t.elapsed().as_secs() >= 30);
-        if should_log {
-            cooldown_logged.insert(blocked_key, Instant::now());
-            broadcast_log(log_tx, "info",
-                &format!("[{}] {} opp{} found — all in cooldown/pending",
-                    cfg.name, all_opportunities.len(),
-                    if all_opportunities.len() == 1 { "" } else { "s" }),
-                None);
-        }
-    }
 }
 
 /// Handle successful execution (both 2-hop and triangular).
@@ -1240,6 +1233,7 @@ async fn handle_execution_success(
     metrics: &Arc<Metrics>,
     router_monitor: &Arc<crate::router_health::RouterHealthMonitor>,
     execution_time_ms: u64,
+    cooldown_secs: u64,
 ) {
     *consecutive_failures = 0;
     pending_pairs.remove(pair_id);
@@ -1266,11 +1260,12 @@ async fn handle_execution_success(
         log_tx,
         "trade",
         &format!(
-            "[{}] tx={} | pair={} | profit=${:.4}",
+            "[{}] tx={} | pair={} | profit=${:.4} → cd={}s",
             cfg.name,
             tx_hash,
             display_id,
-            profit_usd
+            profit_usd,
+            cooldown_secs,
         ),
         Some(serde_json::json!({
             "chain":      cfg.name,
@@ -1330,7 +1325,7 @@ async fn handle_execution_failure(
         broadcast_log(
             log_tx,
             "error",
-            &format!("[{}] Execute failed: {}", cfg.name, error),
+            &format!("[{}] Execute failed: {} → cd={}s", cfg.name, error, effective_cooldown),
             None,
         );
         return;
@@ -1343,7 +1338,7 @@ async fn handle_execution_failure(
         broadcast_log(
             log_tx,
             "warn",
-            &format!("[{}] Pre-flight failed (skipping): {}", cfg.name, error),
+            &format!("[{}] Pre-flight failed (skipping): {} → cd={}s", cfg.name, error, effective_cooldown),
             None,
         );
         return;
@@ -1386,7 +1381,7 @@ async fn handle_execution_failure(
     broadcast_log(
         log_tx,
         "error",
-        &format!("[{}] Execute failed: {}", cfg.name, error),
+        &format!("[{}] Execute failed: {} → cd={}s", cfg.name, error, effective_cooldown),
         None,
     );
 }
