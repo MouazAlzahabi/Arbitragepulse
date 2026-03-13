@@ -524,6 +524,9 @@ impl Strategy {
         if !p15_gate.is_empty() {
             let mut p15_list: Vec<(usize, String, u32, Address, Address, Address, U256)> = Vec::new();
             let mut p15_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+            // For each p15_list[i]: Some(v) = cache hit (v=ZERO means failed/skip),
+            // None = cache miss → has a corresponding entry in p15_mc.
+            let mut p15_pre: Vec<Option<U256>> = Vec::new();
 
             for (pi, router_a_id, fee_a) in &p15_gate {
                 let pair = &self.pairs[*pi];
@@ -539,27 +542,91 @@ impl Strategy {
                 };
                 let quoter = match fwd_task.quoter_addr { Some(q) => q, None => continue };
 
-                let cd = IQuoterV2::quoteExactInputSingleCall {
-                    params: IQuoterV2::QuoteExactInputSingleParams {
-                        tokenIn: fwd_task.token_in,
-                        tokenOut: fwd_task.token_out,
-                        amountIn: full_amount,
-                        fee: Uint::from(*fee_a),
-                        sqrtPriceLimitX96: Uint::ZERO,
-                    },
-                }.abi_encode();
+                // Cache key matches pool_cache.v3_by_key format.
+                let t_in_s  = format!("{:?}", fwd_task.token_in).to_lowercase();
+                let t_out_s = format!("{:?}", fwd_task.token_out).to_lowercase();
+                let v3_cache_key = format!("{}:{}:{}:{}", router_a_id, t_in_s, t_out_s, fee_a);
+
+                // Hit condition: current sqrtPriceX96 == sqrtPriceX96 stored in p15_cache.
+                // A V3 Swap event updates pool_cache.sqrt_price_x96 → cache auto-invalidates.
+                let cached = self.pool_cache.v3_by_key.get(&v3_cache_key)
+                    .and_then(|pool_addr| self.pool_cache.v3_by_address.get(&*pool_addr))
+                    .and_then(|state| {
+                        self.p15_cache.get(&v3_cache_key)
+                            .filter(|e| e.0 == state.sqrt_price_x96)
+                            .map(|e| e.1)
+                    });
 
                 p15_list.push((*pi, router_a_id.clone(), *fee_a, fwd_task.router_addr,
                                fwd_task.token_in, fwd_task.token_out, full_amount));
-                p15_mc.push((quoter, cd));
+
+                if cached.is_some() {
+                    p15_pre.push(cached);       // cache hit — no HTTP call needed
+                } else {
+                    p15_pre.push(None);         // cache miss — queue for MC
+                    let cd = IQuoterV2::quoteExactInputSingleCall {
+                        params: IQuoterV2::QuoteExactInputSingleParams {
+                            tokenIn: fwd_task.token_in,
+                            tokenOut: fwd_task.token_out,
+                            amountIn: full_amount,
+                            fee: Uint::from(*fee_a),
+                            sqrtPriceLimitX96: Uint::ZERO,
+                        },
+                    }.abi_encode();
+                    p15_mc.push((quoter, cd));
+                }
             }
 
-            if !p15_mc.is_empty() {
-                debug!(
-                    "[chain={}] Phase 1.5 (gated): {} V3 upgrade(s) — local spread > {:.1}%",
-                    self.chain_id, p15_mc.len(), P15_GATE_SPREAD * 100.0
-                );
-                let p15_raw = run_multicall(provider, p15_mc, self.rpc_concurrency).await;
+            let cache_hits  = p15_pre.iter().filter(|v| v.is_some()).count();
+            let cache_misses = p15_mc.len();
+            if cache_hits > 0 || cache_misses > 0 {
+                if cache_misses > 0 {
+                    debug!(
+                        "[chain={}] Phase 1.5 (gated): {} QuoterV2 call(s) + {} from cache — local spread > {:.1}%",
+                        self.chain_id, cache_misses, cache_hits, P15_GATE_SPREAD * 100.0
+                    );
+                } else {
+                    debug!(
+                        "[chain={}] Phase 1.5 (gated): all {} from cache — 0 HTTP calls",
+                        self.chain_id, cache_hits
+                    );
+                }
+                let p15_raw = if cache_misses > 0 {
+                    run_multicall(provider, p15_mc, self.rpc_concurrency).await
+                } else {
+                    vec![]
+                };
+
+                // Merge cache hits + MC results into final quoter_outs.
+                // MC results are also stored in p15_cache keyed on current sqrtPriceX96
+                // so the next scan with unchanged pool state gets a free cache hit.
+                let mut mc_raw_iter = p15_raw.into_iter();
+                let p15_quoter_outs: Vec<U256> = p15_list.iter()
+                    .zip(p15_pre.iter())
+                    .map(|((_, router_a_id, fee_a, _, token_in, token_out, _), pre)| {
+                        if let Some(cached_val) = pre {
+                            *cached_val  // served from cache — 0 HTTP
+                        } else {
+                            let raw_opt = mc_raw_iter.next().unwrap_or(None);
+                            let result = raw_opt.as_ref()
+                                .and_then(|raw| IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw).ok())
+                                .filter(|r| !r.amountOut.is_zero())
+                                .map(|r| r.amountOut)
+                                .unwrap_or(U256::ZERO);
+                            // Update p15_cache: store result under current sqrtPriceX96.
+                            let k_in  = format!("{:?}", token_in).to_lowercase();
+                            let k_out = format!("{:?}", token_out).to_lowercase();
+                            let key = format!("{}:{}:{}:{}", router_a_id, k_in, k_out, fee_a);
+                            if let Some(sqrtp) = self.pool_cache.v3_by_key.get(&key)
+                                .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
+                                .map(|s| s.sqrt_price_x96)
+                            {
+                                self.p15_cache.insert(key, (sqrtp, result));
+                            }
+                            result
+                        }
+                    })
+                    .collect();
 
                 // V3 router_b candidates that need a second QuoterV2 pass.
                 // Local sqrtPriceX96 approximation overestimates V3 reverse legs by 0.01–0.1%,
@@ -568,14 +635,10 @@ impl Strategy {
                 let mut p15b_candidates: Vec<(usize, String, u32, Address, Address, Address, U256, ForwardTask)> = Vec::new();
                 let mut p15b_mc: Vec<(Address, Vec<u8>)> = Vec::new();
 
-                for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount), raw_opt)
-                    in p15_list.into_iter().zip(p15_raw.into_iter())
+                for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount), quoter_out)
+                    in p15_list.into_iter().zip(p15_quoter_outs.into_iter())
                 {
-                    let raw = match raw_opt { Some(r) => r, None => continue };
-                    let quoter_out = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw) {
-                        Ok(r) if !r.amountOut.is_zero() => r.amountOut,
-                        _ => continue,
-                    };
+                    if quoter_out.is_zero() { continue; }
 
                     let pair = &self.pairs[pi];
                     let q_b_list: Vec<ForwardTask> = match pair_quotes.get(&pi) {

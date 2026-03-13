@@ -2,6 +2,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
+use dashmap::DashMap;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -103,6 +104,17 @@ pub struct Strategy {
     pub tri_scan: Mutex<Vec<PairScanInfo>>,
     /// Running count of opportunities found per pair/triplet this session.
     pub opp_session_counts: Mutex<HashMap<String, u64>>,
+    /// Phase 1.5 QuoterV2 result cache, keyed on forward V3 pool state.
+    /// Key:   "router_id:token_in_lower:token_out_lower:fee" (same as pool_cache.v3_by_key)
+    /// Value: (sqrtPriceX96 at cache time, quoter_out — U256::ZERO = failed/returned 0)
+    ///
+    /// Cache hit condition: current pool_cache.sqrt_price_x96 == stored sqrtPriceX96.
+    /// This auto-invalidates whenever a V3 Swap event updates the pool state, so the
+    /// cache is always consistent with on-chain reality without any explicit TTL.
+    ///
+    /// Effect: reduces Phase 1.5 from 1 QuoterV2 call per scan (~100–200/min) to
+    /// 1 call per V3 Swap event per pool — typically 5–20× fewer HTTP requests.
+    pub p15_cache: Arc<DashMap<String, (U256, U256)>>,
 }
 
 impl Strategy {
@@ -128,6 +140,7 @@ impl Strategy {
             pair_scan: Mutex::new(Vec::new()),
             tri_scan: Mutex::new(Vec::new()),
             opp_session_counts: Mutex::new(HashMap::new()),
+            p15_cache: Arc::new(DashMap::new()),
         }
     }
 
