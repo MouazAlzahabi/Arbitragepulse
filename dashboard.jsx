@@ -598,7 +598,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
   );
 }
 
-function ControlPanel({ ws, api, apiStats, clearAll }) {
+function ControlPanel({ ws, api, apiStats, clearAll, onDbReset }) {
   const [confirmLive, setConfirmLive] = useState(false);
   const dryRun = apiStats?.dry_run ?? true;
   const paused = apiStats?.paused ?? false;
@@ -744,6 +744,7 @@ function ControlPanel({ ws, api, apiStats, clearAll }) {
               setConfirmDbReset(false);
               await api.resetDb();
               clearAll();
+              onDbReset?.();
               setDbResetting(false);
             }}
             disabled={dbResetting}
@@ -1051,7 +1052,7 @@ export default function Dashboard() {
       )}
 
       {tab === "tokens" && <div style={{ flex: 1, overflow: "auto" }}><PairManager api={api} /></div>}
-      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} /></div>}
+      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} onDbReset={() => setApiStats(prev => prev ? { ...prev, chains: prev.chains?.map(c => ({ ...c, total_attempts: 0, total_success: 0, total_failed: 0, total_profit_usd: 0, ghost_profit_usd: 0, total_scans: 0 })) } : null)} /></div>}
     </div>
   );
 }

@@ -202,8 +202,12 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.get_gas_price(provider).await;
+        // priority_fee mirrors what the tx builder uses below — must match exactly so the
+        // "negative after gas" guard accounts for the full effective gas price (base + tip).
+        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = gas_price * GAS_LIMIT as u128;
+            let cost_wei = effective_gas_price * GAS_LIMIT as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -229,7 +233,6 @@ impl Executor {
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
-        let priority_fee = (gas_price / 10).max(100_000_000u128);
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
@@ -269,8 +272,10 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.get_gas_price(provider).await;
+        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = gas_price * GAS_LIMIT_TRIANGULAR as u128;
+            let cost_wei = effective_gas_price * GAS_LIMIT_TRIANGULAR as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -296,7 +301,6 @@ impl Executor {
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
-        let priority_fee = (gas_price / 10).max(100_000_000u128);
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)

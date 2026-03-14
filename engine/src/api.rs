@@ -84,6 +84,11 @@ pub struct EngineState {
     /// Pair IDs disabled via POST /pair-scan/{id}/toggle.
     /// Evaluated pairs in this set are skipped during each scan cycle.
     pub disabled_pairs: std::collections::HashSet<String>,
+    /// Set to true by POST /stats/reset. The chain heartbeat picks this up,
+    /// zeros the executor atomics, then clears the flag. This ensures the
+    /// in-memory cumulative counters (which come from atomics, not the DB)
+    /// are fully reset and don't bounce back on the next heartbeat.
+    pub stats_reset_requested: bool,
 }
 
 pub type SharedState = Arc<RwLock<EngineState>>;
@@ -315,6 +320,23 @@ async fn stats_reset(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     };
     match tokio::task::spawn_blocking(move || db.clear_all_trades()).await {
         Ok(Ok(deleted)) => {
+            // Zero all in-memory chain counters immediately so /stats reflects
+            // the reset without waiting for the next heartbeat. Also set
+            // stats_reset_requested so the next heartbeat zeros the executor
+            // atomics (confirmed_success etc.) — preventing them from
+            // overwriting the zeroed values when the heartbeat fires.
+            {
+                let mut engine = state.engine.write().await;
+                for chain in &mut engine.chains {
+                    chain.total_attempts = 0;
+                    chain.total_scans = 0;
+                    chain.total_success = 0;
+                    chain.total_failed = 0;
+                    chain.total_profit_usd = 0.0;
+                    chain.ghost_profit_usd = 0.0;
+                }
+                engine.stats_reset_requested = true;
+            }
             broadcast_log(&state.log_tx, "info",
                 &format!("[ENGINE] DB reset — {} trade records deleted", deleted), None);
             Json(serde_json::json!({ "deleted": deleted })).into_response()

@@ -315,6 +315,20 @@ pub async fn run_chain(
                 // (receipt background tasks update the atomics, not shared_state directly).
                 let confirmed_ok = {
                     let exec = executor.lock().await;
+                    // If a stats reset was requested via POST /stats/reset, zero the
+                    // executor atomics NOW (before reading them into shared_state).
+                    // This prevents the old cumulative values from bouncing back after
+                    // stats_reset already zeroed the shared_state chain counters.
+                    {
+                        let mut state = shared_state.write().await;
+                        if state.stats_reset_requested {
+                            exec.confirmed_success.store(0, Ordering::Relaxed);
+                            exec.confirmed_failed.store(0, Ordering::Relaxed);
+                            exec.confirmed_profit_usd_bits.store(0, Ordering::Relaxed);
+                            exec.ghost_profit_usd_bits.store(0, Ordering::Relaxed);
+                            state.stats_reset_requested = false;
+                        }
+                    }
                     let ok = exec.confirmed_success.load(Ordering::Relaxed);
                     let fail = exec.confirmed_failed.load(Ordering::Relaxed);
                     let profit = f64::from_bits(exec.confirmed_profit_usd_bits.load(Ordering::Relaxed));
