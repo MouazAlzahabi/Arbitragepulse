@@ -360,7 +360,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 break 'candidates;
                             }
                             Err(e) => {
-                                { let mut exec = executor.lock().await; exec.record_failed(); }
+                                {
+                                    let mut exec = executor.lock().await;
+                                    exec.record_failed();
+                                    exec.prefetch_nonce(provider.as_ref()).await;
+                                }
                                 if let Some(db) = prep.db.clone() {
                                     let cn = prep.chain_name.clone();
                                     let cid = prep.chain_id;
@@ -562,7 +566,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 break 'candidates;
                             }
                             Err(e) => {
-                                { let mut exec = executor.lock().await; exec.record_failed(); }
+                                {
+                                    let mut exec = executor.lock().await;
+                                    exec.record_failed();
+                                    exec.prefetch_nonce(provider.as_ref()).await;
+                                }
                                 if let Some(db) = prep.db.clone() {
                                     let cn = prep.chain_name.clone();
                                     let cid = prep.chain_id;

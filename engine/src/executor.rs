@@ -1,5 +1,6 @@
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Uint, U256};
-use alloy::providers::Provider;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{anyhow, Result};
@@ -107,6 +108,12 @@ pub struct Executor {
     /// the next optimize() call sees the updated balance without waiting for
     /// the 30s periodic timer.
     pub contract_balances: Option<Arc<RwLock<HashMap<Address, U256>>>>,
+    /// Wallet used to sign transactions for manual broadcast to submission_rpcs.
+    wallet: EthereumWallet,
+    /// Extra HTTP RPC endpoints to broadcast signed txs to simultaneously.
+    /// The same signed raw tx bytes are sent to all endpoints concurrently.
+    /// Leave empty to broadcast to the primary provider only.
+    submission_rpcs: Vec<url::Url>,
 }
 
 impl Executor {
@@ -115,6 +122,8 @@ impl Executor {
         chain_name: String,
         contract_address: Address,
         signer_address: Address,
+        wallet: EthereumWallet,
+        submission_rpcs: Vec<url::Url>,
         min_profit_usd: f64,
         block_time_ms: u64,
         db: Option<Arc<Database>>,
@@ -141,6 +150,8 @@ impl Executor {
             confirmed_profit_usd_bits: Arc::new(AtomicU64::new(0u64)),
             ghost_profit_usd_bits: Arc::new(AtomicU64::new(0u64)),
             contract_balances: None,
+            wallet,
+            submission_rpcs,
         }
     }
 
@@ -344,6 +355,21 @@ impl Executor {
         self.stats.total_failed += 1;
     }
 
+    /// Pre-fetch and cache the on-chain nonce so the first submission has zero
+    /// RPC overhead. Called at startup and can be called after reverts to avoid
+    /// the ~50ms nonce fetch on the next submission.
+    pub async fn prefetch_nonce<P: Provider + Clone>(&mut self, provider: &P) {
+        match provider.get_transaction_count(self.signer_address).await {
+            Ok(n) => {
+                self.nonce = Some(n);
+                debug!("Executor: nonce pre-fetched = {}", n);
+            }
+            Err(e) => {
+                warn!("Executor: nonce pre-fetch failed: {} — will fetch on first send", e);
+            }
+        }
+    }
+
     /// Execute (or simulate) the arb. Returns the tx hash string.
     ///
     /// Live path: releases the executor mutex after send_transaction (before
@@ -424,6 +450,32 @@ impl Executor {
             .max_fee_per_gas(gas_price + priority_fee);
 
         let start = std::time::Instant::now();
+
+        // ── Multi-RPC broadcast ────────────────────────────────────────────────
+        // Fire the same tx to secondary HTTP endpoints concurrently (fire-and-forget).
+        // Each secondary creates its own wallet provider — signing happens per-provider.
+        // Primary WS provider is used for receipt tracking below.
+        if !self.submission_rpcs.is_empty() {
+            let tx_clone = tx.clone();
+            let urls = self.submission_rpcs.clone();
+            let wallet = self.wallet.clone();
+            let cname = self.chain_name.clone();
+            tokio::spawn(async move {
+                let futs = urls.into_iter().map(|url| {
+                    let tx = tx_clone.clone();
+                    let wallet = wallet.clone();
+                    let cname = cname.clone();
+                    async move {
+                        let p = ProviderBuilder::new().wallet(wallet).connect_http(url);
+                        match p.send_transaction(tx).await {
+                            Ok(pend) => debug!("[{}] secondary RPC accepted tx={:?}", cname, pend.tx_hash()),
+                            Err(e) => debug!("[{}] secondary RPC rejected: {}", cname, e),
+                        }
+                    }
+                });
+                futures::future::join_all(futs).await;
+            });
+        }
 
         match provider.send_transaction(tx).await {
             Ok(pending) => {
@@ -596,6 +648,29 @@ impl Executor {
             .max_fee_per_gas(gas_price + priority_fee);
 
         let start = std::time::Instant::now();
+
+        // Multi-RPC broadcast (same pattern as execute())
+        if !self.submission_rpcs.is_empty() {
+            let tx_clone = tx.clone();
+            let urls = self.submission_rpcs.clone();
+            let wallet = self.wallet.clone();
+            let cname = self.chain_name.clone();
+            tokio::spawn(async move {
+                let futs = urls.into_iter().map(|url| {
+                    let tx = tx_clone.clone();
+                    let wallet = wallet.clone();
+                    let cname = cname.clone();
+                    async move {
+                        let p = ProviderBuilder::new().wallet(wallet).connect_http(url);
+                        match p.send_transaction(tx).await {
+                            Ok(pend) => debug!("[{}] secondary RPC accepted tx={:?}", cname, pend.tx_hash()),
+                            Err(e) => debug!("[{}] secondary RPC rejected: {}", cname, e),
+                        }
+                    }
+                });
+                futures::future::join_all(futs).await;
+            });
+        }
 
         match provider.send_transaction(tx).await {
             Ok(pending) => {

@@ -115,6 +115,14 @@ pub struct Strategy {
     /// Effect: reduces Phase 1.5 from 1 QuoterV2 call per scan (~100–200/min) to
     /// 1 call per V3 Swap event per pool — typically 5–20× fewer HTTP requests.
     pub p15_cache: Arc<DashMap<String, (U256, U256)>>,
+    /// Phase 1.5b QuoterV2 result cache, keyed on reverse V3 pool state + input amount.
+    /// Key:   "router_b_id:token_out_lower:token_in_lower:fee_b" (reverse leg direction)
+    /// Value: (sqrtPriceX96_b at cache time, quoter_out_input_used, amount_back)
+    ///
+    /// Cache hit condition: current sqrt_price_b == stored AND quoter_out == stored input.
+    /// Both conditions ensure the cache is invalidated when either pool trades.
+    /// Eliminates the second HTTP round trip (~80ms) for stable V3→V3 pairs.
+    pub p15b_cache: Arc<DashMap<String, (U256, U256, U256)>>,
 }
 
 impl Strategy {
@@ -141,6 +149,7 @@ impl Strategy {
             tri_scan: Mutex::new(Vec::new()),
             opp_session_counts: Mutex::new(HashMap::new()),
             p15_cache: Arc::new(DashMap::new()),
+            p15b_cache: Arc::new(DashMap::new()),
         }
     }
 

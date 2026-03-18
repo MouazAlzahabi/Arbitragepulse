@@ -48,6 +48,12 @@ pub struct ChainConfig {
     /// 50 = 0.5% sqrtP change (~1% price impact). Set to 0 to disable.
     #[serde(default = "default_large_v3_threshold_bps")]
     pub large_v3_threshold_bps: u32,
+    /// Extra HTTP RPC URLs to broadcast signed transactions to simultaneously.
+    /// The same signed tx bytes are sent to all endpoints concurrently; the first
+    /// success is used. Reduces submission latency by racing multiple paths to the
+    /// sequencer. Leave empty to use only the primary http_rpc.
+    #[serde(default)]
+    pub submission_rpcs: Vec<String>,
 }
 
 fn default_rpc_concurrency() -> usize {

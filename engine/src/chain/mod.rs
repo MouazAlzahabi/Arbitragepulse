@@ -62,7 +62,7 @@ pub async fn run_chain(
     let signer_address = signer.address();
     let wallet = EthereumWallet::from(signer);
 
-    let provider = connect_with_fallback(&cfg, wallet).await
+    let provider = connect_with_fallback(&cfg, wallet.clone()).await
         .map_err(|e| anyhow::anyhow!("[{}] All RPC endpoints failed: {}", cfg.name, e))?;
 
     let provider = Arc::new(provider);
@@ -74,11 +74,16 @@ pub async fn run_chain(
         .map_err(|_| anyhow::anyhow!("Invalid contract address: {}", cfg.contract_address))?;
 
     // ── Executor ──
+    let submission_rpc_urls: Vec<url::Url> = cfg.submission_rpcs.iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     let executor = Arc::new(Mutex::new(Executor::new(
         cfg.id,
         cfg.name.clone(),
         contract_addr,
         signer_address,
+        wallet.clone(),
+        submission_rpc_urls,
         cfg.min_profit_usd,
         cfg.block_time_ms,
         db,
@@ -162,6 +167,8 @@ pub async fn run_chain(
     state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances).await;
     // Wire balances into executor for post-trade immediate refresh.
     { executor.lock().await.contract_balances = Some(contract_balances.clone()); }
+    // Pre-fetch nonce at startup so first submission has zero RPC overhead.
+    { executor.lock().await.prefetch_nonce(provider.as_ref()).await; }
 
     // ── Register initial chain stats ──
     {

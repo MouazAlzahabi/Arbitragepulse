@@ -18,6 +18,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
 futures.workspace = true
+url.workspace = true
 
 # HTTP + WebSocket API server
 axum = { version = "0.8", features = ["ws"] }

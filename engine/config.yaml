@@ -39,6 +39,10 @@ chains:
     quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
     scan_interval_ms: 2000
     rpc_concurrency: 3
+    # Extra HTTP endpoints to broadcast signed txs concurrently (FCFS sequencer — race to arrive first)
+    submission_rpcs:
+      - "https://mainnet.base.org"          # Coinbase official RPC
+      - "https://base.llamarpc.com"          # LlamaRPC (low-latency)
 
   - id: 42161
     name: "Arbitrum"
