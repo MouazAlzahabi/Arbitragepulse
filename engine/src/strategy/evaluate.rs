@@ -492,7 +492,10 @@ impl Strategy {
                     // ticks — same problem Phase 1.5b solves for V3→V3.
                     let router_b_is_v3 = matches!(task.router_b_type, RouterType::V3);
 
-                    if profit_usd >= self.min_profit_usd && !router_a_is_v3 && !router_b_is_v3 {
+                    // Optimistic mode: bypass QuoterV2 and submit immediately on Phase 1 spot quotes.
+                    // Disable by setting optimistic_submission: false in config.yaml.
+                    let v3_allowed = self.optimistic_submission || (!router_a_is_v3 && !router_b_is_v3);
+                    if profit_usd >= self.min_profit_usd && v3_allowed {
                         debug!(
                             "[{}] Arb: {} | profit=${:.4} | {}/{}",
                             self.chain_id,
@@ -532,7 +535,7 @@ impl Strategy {
         let mut p15b_candidates: Vec<(usize, String, u32, Address, Address, Address, U256, ForwardTask, U256)> = Vec::new();
         let mut p15b_mc: Vec<(Address, Vec<u8>)> = Vec::new();
         let mut p15b_pre: Vec<Option<U256>> = Vec::new();
-        if !p15_gate.is_empty() {
+        if !p15_gate.is_empty() && !self.optimistic_submission {
             let mut p15_list: Vec<(usize, String, u32, Address, Address, Address, U256)> = Vec::new();
             let mut p15_mc: Vec<(Address, Vec<u8>)> = Vec::new();
             // For each p15_list[i]: Some(v) = cache hit (v=ZERO means failed/skip),

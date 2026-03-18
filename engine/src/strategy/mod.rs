@@ -123,6 +123,11 @@ pub struct Strategy {
     /// Both conditions ensure the cache is invalidated when either pool trades.
     /// Eliminates the second HTTP round trip (~80ms) for stable V3→V3 pairs.
     pub p15b_cache: Arc<DashMap<String, (U256, U256, U256)>>,
+    /// When true: skip QuoterV2 verification entirely (phases 1.5/1.5b/1.5c) and
+    /// submit immediately after Phase 1 local spot quotes. Saves ~80-160ms —
+    /// enough to land in the same block on FCFS chains (Base).
+    /// Disable by setting optimistic_submission: false in config.yaml.
+    pub optimistic_submission: bool,
 }
 
 impl Strategy {
@@ -134,6 +139,7 @@ impl Strategy {
         quoter_v2_address: Option<Address>,
         pool_cache: Arc<PoolCache>,
         rpc_concurrency: usize,
+        optimistic_submission: bool,
     ) -> Self {
         Self {
             chain_id,
@@ -150,6 +156,7 @@ impl Strategy {
             opp_session_counts: Mutex::new(HashMap::new()),
             p15_cache: Arc::new(DashMap::new()),
             p15b_cache: Arc::new(DashMap::new()),
+            optimistic_submission,
         }
     }
 

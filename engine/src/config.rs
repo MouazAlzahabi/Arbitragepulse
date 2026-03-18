@@ -54,6 +54,14 @@ pub struct ChainConfig {
     /// sequencer. Leave empty to use only the primary http_rpc.
     #[serde(default)]
     pub submission_rpcs: Vec<String>,
+    /// Skip QuoterV2 verification (phases 1.5/1.5b/1.5c) and submit immediately
+    /// after Phase 1 local spot quotes. Saves ~80-160ms per scan — enough to land
+    /// in the same block as the detected opportunity on FCFS chains (Base).
+    /// Tradeoff: some txs revert ("Too little received") when local quotes are
+    /// optimistic. The contract's min_profit floor is the only safety net.
+    /// Set to false to restore full QuoterV2 verification. Default: false.
+    #[serde(default)]
+    pub optimistic_submission: bool,
 }
 
 fn default_rpc_concurrency() -> usize {

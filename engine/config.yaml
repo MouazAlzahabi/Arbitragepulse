@@ -43,6 +43,9 @@ chains:
     submission_rpcs:
       - "https://mainnet.base.org"          # Coinbase official RPC
       - "https://base.llamarpc.com"          # LlamaRPC (low-latency)
+    # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).
+    # Set to false to restore full verification if revert rate is unacceptable.
+    optimistic_submission: true
 
   - id: 42161
     name: "Arbitrum"

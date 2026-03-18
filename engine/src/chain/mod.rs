@@ -137,6 +137,7 @@ pub async fn run_chain(
         quoter_v2_address,
         pool_cache.clone(),
         cfg.rpc_concurrency,
+        cfg.optimistic_submission,
     )));
 
     // Populate SyncSwap pool cache at startup (no-op if no SyncSwap routers configured)
