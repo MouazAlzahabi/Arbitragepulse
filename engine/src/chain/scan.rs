@@ -282,6 +282,38 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         // Pre-flight skipped: on Base, gas per revert is <$0.02 and adding
                         // an eth_call round-trip (~200ms) closes the opportunity window.
                         // The contract enforces amountIn+minProfit on-chain; reverts are atomic.
+                        debug!(
+                            "[{}] Submitting | pair={} amountIn={} gross=${:.4} gas=${:.4} net=${:.4} feeA={} feeB={}",
+                            cfg.name, optimized.pair_id, optimized.amount_in,
+                            prep.profit_usd, prep.gas_cost_usd, prep.net_profit_usd,
+                            optimized.fee_a, optimized.fee_b,
+                        );
+                        // ── Multi-RPC broadcast (fire-and-forget) ─────────────
+                        // Send the same signed tx to secondary HTTP endpoints concurrently.
+                        // Each uses its own wallet provider so signing is automatic.
+                        // This races the primary Alchemy send — whichever RPC delivers
+                        // first to the sequencer wins the earlier block position.
+                        if !prep.submission_rpcs.is_empty() {
+                            let tx_sec = prep.tx.clone();
+                            let urls_sec = prep.submission_rpcs.clone();
+                            let wallet_sec = prep.wallet.clone();
+                            let cname_sec = cfg.name.clone();
+                            tokio::spawn(async move {
+                                let futs = urls_sec.into_iter().map(|url| {
+                                    let tx = tx_sec.clone();
+                                    let wallet = wallet_sec.clone();
+                                    let cname = cname_sec.clone();
+                                    async move {
+                                        let p = ProviderBuilder::new().wallet(wallet).connect_http(url);
+                                        match p.send_transaction(tx).await {
+                                            Ok(pend) => debug!("[{}] secondary RPC accepted tx={:?}", cname, pend.tx_hash()),
+                                            Err(e) => debug!("[{}] secondary RPC rejected: {}", cname, e),
+                                        }
+                                    }
+                                });
+                                futures::future::join_all(futs).await;
+                            });
+                        }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
                             Ok(pending) => {
@@ -311,6 +343,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let profit_bg = prep.profit_usd;
                                 let contract_addr_bg = prep.contract_addr;
                                 let contract_balances_bg = prep.contract_balances.clone();
+                                let detected_profit_bg = prep.profit_usd;
                                 tokio::spawn(async move {
                                     match pending.get_receipt().await {
                                         Ok(receipt) => {
@@ -331,7 +364,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                                let msg = format!("[{}] ✗ tx reverted | pair={} | tx={}", chain_name_bg, opp_id_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                let msg = format!(
+                                                    "[{}] ✗ tx reverted | pair={} | detected_profit=${:.4} | gas_used={} | tx={}",
+                                                    chain_name_bg, opp_id_bg, detected_profit_bg,
+                                                    receipt.gas_used,
+                                                    &tx_hash_bg[..10.min(tx_hash_bg.len())]
+                                                );
                                                 warn!("{}", msg);
                                                 broadcast_log(&log_tx_bg, "error", &msg, None);
                                             }
@@ -487,6 +525,27 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Ok(prep) => {
                         // Pre-flight skipped: same reasoning as 2-hop path above.
+                        if !prep.submission_rpcs.is_empty() {
+                            let tx_sec = prep.tx.clone();
+                            let urls_sec = prep.submission_rpcs.clone();
+                            let wallet_sec = prep.wallet.clone();
+                            let cname_sec = cfg.name.clone();
+                            tokio::spawn(async move {
+                                let futs = urls_sec.into_iter().map(|url| {
+                                    let tx = tx_sec.clone();
+                                    let wallet = wallet_sec.clone();
+                                    let cname = cname_sec.clone();
+                                    async move {
+                                        let p = ProviderBuilder::new().wallet(wallet).connect_http(url);
+                                        match p.send_transaction(tx).await {
+                                            Ok(pend) => debug!("[{}] secondary RPC accepted tx={:?}", cname, pend.tx_hash()),
+                                            Err(e) => debug!("[{}] secondary RPC rejected: {}", cname, e),
+                                        }
+                                    }
+                                });
+                                futures::future::join_all(futs).await;
+                            });
+                        }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
                             Ok(pending) => {
@@ -517,6 +576,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let profit_bg = prep.profit_usd;
                                 let contract_addr_bg = prep.contract_addr;
                                 let contract_balances_bg = prep.contract_balances.clone();
+                                let detected_profit_bg = prep.profit_usd;
                                 tokio::spawn(async move {
                                     match pending.get_receipt().await {
                                         Ok(receipt) => {
@@ -537,7 +597,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                                let msg = format!("[{}] ✗ triangular reverted | pair={} | tx={}", chain_name_bg, opp_id_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                                let msg = format!(
+                                                    "[{}] ✗ triangular reverted | pair={} | detected_profit=${:.4} | gas_used={} | tx={}",
+                                                    chain_name_bg, opp_id_bg, detected_profit_bg,
+                                                    receipt.gas_used,
+                                                    &tx_hash_bg[..10.min(tx_hash_bg.len())]
+                                                );
                                                 warn!("{}", msg);
                                                 broadcast_log(&log_tx_bg, "error", &msg, None);
                                             }

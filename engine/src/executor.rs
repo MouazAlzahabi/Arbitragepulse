@@ -56,6 +56,11 @@ pub struct TxPrep {
     pub confirmed_profit_bits: Arc<AtomicU64>,
     pub contract_addr: Address,
     pub contract_balances: Option<Arc<RwLock<HashMap<Address, U256>>>>,
+    /// Secondary HTTP RPC endpoints to broadcast to concurrently with the primary send.
+    /// Cloned from Executor at prepare time so scan.rs can fire-and-forget without re-locking.
+    pub submission_rpcs: Vec<url::Url>,
+    /// Wallet for signing on secondary providers (each creates its own WalletFiller chain).
+    pub wallet: EthereumWallet,
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
@@ -270,6 +275,8 @@ impl Executor {
             confirmed_profit_bits: self.confirmed_profit_usd_bits.clone(),
             contract_addr: self.contract_address,
             contract_balances: self.contract_balances.clone(),
+            submission_rpcs: self.submission_rpcs.clone(),
+            wallet: self.wallet.clone(),
         })
     }
 
@@ -336,6 +343,8 @@ impl Executor {
             confirmed_profit_bits: self.confirmed_profit_usd_bits.clone(),
             contract_addr: self.contract_address,
             contract_balances: self.contract_balances.clone(),
+            submission_rpcs: self.submission_rpcs.clone(),
+            wallet: self.wallet.clone(),
         })
     }
 
