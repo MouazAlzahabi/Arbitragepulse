@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use tracing::{debug, info, warn};
 
-use crate::abi::{IQuoterV2, ISolidlyRouter, ISyncSwapPool, IUniswapV2Router02};
+use crate::abi::{IAerodromeRouter, IQuoterV2, ISolidlyRouter, ISyncSwapPool, IUniswapV2Router02};
 use crate::config::RouterType;
 use crate::pool_cache::{VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{PairScanInfo, TriangularOpportunity};
@@ -265,6 +265,27 @@ impl Strategy {
                     }.abi_encode();
                     Some((router_addr, cd))
                 }
+                RouterType::Aerodrome => {
+                    // Same pool discovery as Solidly — volatile pool only for triangular.
+                    let t_in = format!("{:?}", token_in).to_lowercase();
+                    let t_out = format!("{:?}", token_out).to_lowercase();
+                    if !self.pool_cache.by_key.contains_key(
+                        &format!("{}::volatile:{}:{}", router.id, t_in, t_out)
+                    ) {
+                        return None;
+                    }
+                    // Use 4-field Route with factory=address(0) (Aerodrome default factory)
+                    let cd = IAerodromeRouter::getAmountsOutCall {
+                        amountIn: amount,
+                        routes: vec![IAerodromeRouter::Route {
+                            from: token_in,
+                            to: token_out,
+                            stable: false,
+                            factory: Address::ZERO,
+                        }],
+                    }.abi_encode();
+                    Some((router_addr, cd))
+                }
                 RouterType::SyncSwap => {
                     // Look up pool from cache
                     let token_in_lower = format!("{token_in}").to_lowercase();
@@ -288,7 +309,7 @@ impl Strategy {
                     .ok().and_then(|v| v.last().copied()),
                 RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw)
                     .ok().map(|r| r.amountOut),
-                RouterType::Solidly => {
+                RouterType::Solidly | RouterType::Aerodrome => {
                     ISolidlyRouter::getAmountsOutCall::abi_decode_returns(raw)
                         .ok().and_then(|v| v.last().copied())
                 }
@@ -323,7 +344,7 @@ impl Strategy {
 
         for (ti, trip) in triplets.iter().enumerate() {
             for router in &chain_routers {
-                let router_addr: Address = router.address.parse().unwrap_or_default();
+                let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
                 let (fee, effective_amount_in, local_ab): (u32, U256, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
                         // Iterate all fee tiers; pick the one yielding the highest output.
@@ -341,7 +362,7 @@ impl Strategy {
                     RouterType::V2 => (0, trip.amount_in, self.pool_cache.get_amount_out_by_key(
                         &router.id, trip.token_a, trip.token_b, trip.amount_in, None,
                     )),
-                    RouterType::Solidly => {
+                    RouterType::Solidly | RouterType::Aerodrome => {
                         let vol = format!("{}::volatile", router.id);
                         let sta = format!("{}::stable", router.id);
                         (0, trip.amount_in, self.pool_cache.get_amount_out_by_key(
@@ -412,7 +433,7 @@ impl Strategy {
             let trip = &triplets[p1e.triplet_idx];
 
             for router in &chain_routers {
-                let router_addr: Address = router.address.parse().unwrap_or_default();
+                let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
                 let (fee, local_bc): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
                         let result = router.fee_tiers.iter().filter_map(|&f| {
@@ -427,7 +448,7 @@ impl Strategy {
                     RouterType::V2 => (0, self.pool_cache.get_amount_out_by_key(
                         &router.id, trip.token_b, trip.token_c, amount_b, None,
                     )),
-                    RouterType::Solidly => {
+                    RouterType::Solidly | RouterType::Aerodrome => {
                         let vol = format!("{}::volatile", router.id);
                         let sta = format!("{}::stable", router.id);
                         (0, self.pool_cache.get_amount_out_by_key(
@@ -503,7 +524,7 @@ impl Strategy {
             let trip = &triplets[p2e.triplet_idx];
 
             for router in &chain_routers {
-                let router_addr: Address = router.address.parse().unwrap_or_default();
+                let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
                 let (fee, local_ca): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
                         let result = router.fee_tiers.iter().filter_map(|&f| {
@@ -518,7 +539,7 @@ impl Strategy {
                     RouterType::V2 => (0, self.pool_cache.get_amount_out_by_key(
                         &router.id, trip.token_c, trip.token_a, amount_c, None,
                     )),
-                    RouterType::Solidly => {
+                    RouterType::Solidly | RouterType::Aerodrome => {
                         let vol = format!("{}::volatile", router.id);
                         let sta = format!("{}::stable", router.id);
                         (0, self.pool_cache.get_amount_out_by_key(

@@ -128,6 +128,10 @@ pub struct Strategy {
     /// enough to land in the same block on FCFS chains (Base).
     /// Disable by setting optimistic_submission: false in config.yaml.
     pub optimistic_submission: bool,
+    /// Pre-parsed router addresses keyed by router ID.
+    /// Populated once at construction — avoids Address::from_str() O(pairs × routers)
+    /// times per scan (e.g. 50 pairs × 6 routers = 300 parses per block).
+    pub router_addr_map: HashMap<String, Address>,
 }
 
 impl Strategy {
@@ -141,6 +145,11 @@ impl Strategy {
         rpc_concurrency: usize,
         optimistic_submission: bool,
     ) -> Self {
+        let router_addr_map: HashMap<String, Address> = routers
+            .iter()
+            .filter_map(|r| r.address.parse::<Address>().ok().map(|a| (r.id.clone(), a)))
+            .collect();
+
         Self {
             chain_id,
             pairs,
@@ -157,6 +166,7 @@ impl Strategy {
             p15_cache: Arc::new(DashMap::new()),
             p15b_cache: Arc::new(DashMap::new()),
             optimistic_submission,
+            router_addr_map,
         }
     }
 
@@ -299,6 +309,7 @@ impl Strategy {
                     decimals0,
                     decimals1,
                     last_sync: std::time::Instant::now(), // startup reserves are accurate (just fetched)
+                    fee_num: alloy::primitives::U256::ZERO, // overwritten by PoolCache::insert()
                 });
             }
             debug!("[chain={}] SyncSwap: {} pools seeded into pool_cache", self.chain_id, pool_entries.len());

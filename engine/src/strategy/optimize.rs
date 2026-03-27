@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use tracing::debug;
 
-use crate::abi::{IQuoterV2, ISolidlyRouter, IUniswapV2Router02};
+use crate::abi::{IAerodromeRouter, IQuoterV2, ISolidlyRouter, IUniswapV2Router02};
 use crate::config::RouterType;
 use crate::types::ArbOpportunity;
 use crate::util::u256_to_f64;
@@ -218,6 +218,9 @@ async fn probe_range<P: Provider + Clone + 'static>(
                 RouterType::Solidly => {
                     quote_solidly(&p, ra, probe_amount, token_in, token_out, fa).await
                 }
+                RouterType::Aerodrome => {
+                    quote_aerodrome(&p, ra, probe_amount, token_in, token_out, fa).await
+                }
                 RouterType::SyncSwap => None, // pool address not available in probe_range
             };
             let mid = mid.filter(|m| !m.is_zero())?;
@@ -230,6 +233,9 @@ async fn probe_range<P: Provider + Clone + 'static>(
                 },
                 RouterType::Solidly => {
                     quote_solidly(&p, rb, mid, token_out, token_in, fb).await
+                }
+                RouterType::Aerodrome => {
+                    quote_aerodrome(&p, rb, mid, token_out, token_in, fb).await
                 }
                 RouterType::SyncSwap => None,
             };
@@ -321,6 +327,37 @@ async fn quote_solidly<P: Provider>(
         Ok(amounts) => amounts.last().copied(),
         Err(e) => {
             debug!("Solidly quote failed on {:?} stable={}: {}", router, stable, e);
+            None
+        }
+    }
+}
+
+async fn quote_aerodrome<P: Provider>(
+    provider: &P,
+    router: Address,
+    amount_in: U256,
+    token_in: Address,
+    token_out: Address,
+    fee: u32, // 0=volatile, 1=stable
+) -> Option<U256> {
+    let stable = fee != 0;
+    // factory=address(0) → Aerodrome router uses its internal default factory
+    match IAerodromeRouter::new(router, provider)
+        .getAmountsOut(
+            amount_in,
+            vec![IAerodromeRouter::Route {
+                from: token_in,
+                to: token_out,
+                stable,
+                factory: Address::ZERO,
+            }],
+        )
+        .call()
+        .await
+    {
+        Ok(amounts) => amounts.last().copied(),
+        Err(e) => {
+            debug!("Aerodrome quote failed on {:?} stable={}: {}", router, stable, e);
             None
         }
     }

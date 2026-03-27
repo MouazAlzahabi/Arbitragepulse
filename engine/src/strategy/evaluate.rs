@@ -7,7 +7,7 @@ use crate::abi::{IQuoterV2, ISolidlyRouter, ISyncSwapPool, IUniswapV2Router02};
 use crate::config::RouterType;
 use crate::pool_cache::{VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{ArbOpportunity, PairScanInfo};
-use crate::util::u256_to_f64;
+use crate::util::{addr_key, u256_to_f64};
 use super::{ForwardTask, ReverseTask, Strategy, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY, parse_amount_capped};
 
 impl Strategy {
@@ -59,6 +59,13 @@ impl Strategy {
         let mut v3_cached: usize = 0;
         let mut v3_no_cache: usize = 0;
 
+        // Pre-compute Solidly/Aerodrome pool-cache key suffixes once per router.
+        // Avoids format!() inside the O(pairs × routers) hot loop (~200+ allocs/scan).
+        let solidly_vol_ids: Vec<String> = chain_routers.iter()
+            .map(|r| format!("{}::volatile", r.id)).collect();
+        let solidly_sta_ids: Vec<String> = chain_routers.iter()
+            .map(|r| format!("{}::stable", r.id)).collect();
+
         for (pi, pair) in self.pairs.iter().enumerate()
             .filter(|(_, p)| p.chain_id == self.chain_id)
             .filter(|(i, _)| pair_mask.map_or(true, |m| m.contains(i)))
@@ -80,10 +87,15 @@ impl Strategy {
                 None => continue,
             };
 
-            for router in &chain_routers {
-                let router_addr: Address = match router.address.parse() {
-                    Ok(a) => a,
-                    Err(_) => continue,
+            // Compute token address keys once per pair — reused across all routers/fee tiers.
+            // Replaces ~1500 format!("{:?}", addr).to_lowercase() calls per scan.
+            let token_in_key  = addr_key(token_in);
+            let token_out_key = addr_key(token_out);
+
+            for (ri, router) in chain_routers.iter().enumerate() {
+                let router_addr: Address = match self.router_addr_map.get(&router.id) {
+                    Some(&a) => a,
+                    None => continue,
                 };
 
                 match router.router_type {
@@ -136,9 +148,7 @@ impl Strategy {
                             // Cap the input to a single-tick safe amount so the xy=k formula
                             // is exact. Without the cap, a trade crossing into a tick with
                             // L=0 would cause the formula to overestimate output.
-                            let t_in_s = format!("{:?}", token_in).to_lowercase();
-                            let t_out_s = format!("{:?}", token_out).to_lowercase();
-                            let v3_key = format!("{}:{}:{}:{}", router.id, t_in_s, t_out_s, fee);
+                            let v3_key = format!("{}:{}:{}:{}", router.id, token_in_key, token_out_key, fee);
                             if self.pool_cache.v3_by_key.get(&v3_key).is_none() {
                                 v3_no_cache += 1; continue;
                             }
@@ -170,23 +180,25 @@ impl Strategy {
                             }
                         }
                     }
-                    RouterType::Solidly => {
+                    RouterType::Solidly | RouterType::Aerodrome => {
                         // Both volatile (fee=0) and stable (fee=1) pools use local reserve cache.
                         // Only adds to pair_quotes when the pool has had a recent Sync event
                         // (last_sync.elapsed() < max_age). Stale = no on-chain activity = skip.
-                        for (suffix, fee, max_age) in [
-                            ("volatile", 0u32, VOLATILE_MAX_AGE),
-                            ("stable",   1u32, STABLE_MAX_AGE),
+                        // Aerodrome pools use the same Sync(uint256,uint256) events and xy=k /
+                        // x³y+y³x=k curves as Solidly — pool discovery and quoting are identical.
+                        let rtype = router.router_type.clone();
+                        for (eff_id, fee, max_age) in [
+                            (solidly_vol_ids[ri].as_str(), 0u32, VOLATILE_MAX_AGE),
+                            (solidly_sta_ids[ri].as_str(), 1u32, STABLE_MAX_AGE),
                         ] {
-                            let eff_id = format!("{}::{}", router.id, suffix);
                             if let Some(out) = self.pool_cache.get_amount_out_by_key(
-                                &eff_id, token_in, token_out, amount_in, Some(max_age),
+                                eff_id, token_in, token_out, amount_in, Some(max_age),
                             ) {
                                 pair_quotes.entry(pi).or_default().push(ForwardTask {
                                     pair_idx: pi,
-                                    router_id: eff_id,
+                                    router_id: eff_id.to_string(),
                                     router_addr,
-                                    router_type: RouterType::Solidly,
+                                    router_type: rtype.clone(),
                                     fee,
                                     amount_in: out, // repurposed: carries token_out amount
                                     capped_amount_in: amount_in,
@@ -235,7 +247,7 @@ impl Strategy {
                 RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
                     .ok()
                     .map(|r| r.amountOut),
-                RouterType::Solidly => {
+                RouterType::Solidly | RouterType::Aerodrome => {
                     ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
                         .ok()
                         .and_then(|v| v.last().copied())
@@ -257,9 +269,7 @@ impl Strategy {
         let total_fwd_ok: usize = pair_quotes.values().map(|v| v.len()).sum();
         let pairs_with_any: usize = pair_quotes.len(); // pairs with ≥1 quote from any DEX
         let pairs_with_multi: usize = pair_quotes.values().filter(|v| {
-            let unique_routers: std::collections::HashSet<&String> =
-                v.iter().map(|q| &q.router_id).collect();
-            unique_routers.len() >= 2
+            v.first().map_or(false, |first| v[1..].iter().any(|q| q.router_id != first.router_id))
         }).count();
         debug!(
             "[chain={}] Forward quotes: ok={} pairs_with_any={} pairs_with_multi_dex={}",
@@ -330,7 +340,7 @@ impl Strategy {
                         RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                             &q_b.router_id, token_out, token_in, token_out_amount, Some(VOLATILE_MAX_AGE),
                         ),
-                        RouterType::Solidly => {
+                        RouterType::Solidly | RouterType::Aerodrome => {
                             // q_b.router_id is "router::volatile" or "router::stable"
                             let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
                             self.pool_cache.get_amount_out_by_key(
@@ -419,7 +429,7 @@ impl Strategy {
                     RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
                         .ok()
                         .map(|r| r.amountOut),
-                    RouterType::Solidly => {
+                    RouterType::Solidly | RouterType::Aerodrome => {
                         ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
                             .ok()
                             .and_then(|v| v.last().copied())
@@ -557,9 +567,8 @@ impl Strategy {
                 let quoter = match fwd_task.quoter_addr { Some(q) => q, None => continue };
 
                 // Cache key matches pool_cache.v3_by_key format.
-                let t_in_s  = format!("{:?}", fwd_task.token_in).to_lowercase();
-                let t_out_s = format!("{:?}", fwd_task.token_out).to_lowercase();
-                let v3_cache_key = format!("{}:{}:{}:{}", router_a_id, t_in_s, t_out_s, fee_a);
+                let v3_cache_key = format!("{}:{}:{}:{}", router_a_id,
+                    addr_key(fwd_task.token_in), addr_key(fwd_task.token_out), fee_a);
 
                 // Hit condition: current sqrtPriceX96 == sqrtPriceX96 stored in p15_cache.
                 // A V3 Swap event updates pool_cache.sqrt_price_x96 → cache auto-invalidates.
@@ -629,9 +638,8 @@ impl Strategy {
                                 .map(|r| r.amountOut)
                                 .unwrap_or(U256::ZERO);
                             // Update p15_cache: store result under current sqrtPriceX96.
-                            let k_in  = format!("{:?}", token_in).to_lowercase();
-                            let k_out = format!("{:?}", token_out).to_lowercase();
-                            let key = format!("{}:{}:{}:{}", router_a_id, k_in, k_out, fee_a);
+                            let key = format!("{}:{}:{}:{}", router_a_id,
+                                addr_key(*token_in), addr_key(*token_out), fee_a);
                             if let Some(sqrtp) = self.pool_cache.v3_by_key.get(&key)
                                 .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
                                 .map(|s| s.sqrt_price_x96)
@@ -672,9 +680,8 @@ impl Strategy {
                         // Hit requires BOTH pool B sqrtPrice AND quoter_out (input) to match.
                         if matches!(q_b.router_type, RouterType::V3) {
                             if let Some(quoter_b) = q_b.quoter_addr {
-                                let t_out_s = format!("{:?}", token_out).to_lowercase();
-                                let t_in_s  = format!("{:?}", token_in).to_lowercase();
-                                let p15b_key = format!("{}:{}:{}:{}", q_b.router_id, t_out_s, t_in_s, fee_b);
+                                let p15b_key = format!("{}:{}:{}:{}", q_b.router_id,
+                                    addr_key(token_out), addr_key(token_in), fee_b);
                                 let cached_b = self.pool_cache.v3_by_key.get(&p15b_key)
                                     .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
                                     .and_then(|state| {
@@ -706,7 +713,7 @@ impl Strategy {
                             RouterType::V2 => self.pool_cache.get_amount_out_by_key(
                                 &q_b.router_id, token_out, token_in, quoter_out, Some(VOLATILE_MAX_AGE),
                             ),
-                            RouterType::Solidly => {
+                            RouterType::Solidly | RouterType::Aerodrome => {
                                 let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
                                 self.pool_cache.get_amount_out_by_key(
                                     &q_b.router_id, token_out, token_in, quoter_out, Some(max_age),
@@ -869,9 +876,8 @@ impl Strategy {
                         .map(|r| r.amountOut)
                         .unwrap_or(U256::ZERO);
                     // Write to p15b_cache keyed on pool B sqrtPrice + quoter_out input.
-                    let t_out_s = format!("{:?}", token_out).to_lowercase();
-                    let t_in_s  = format!("{:?}", token_in).to_lowercase();
-                    let p15b_key = format!("{}:{}:{}:{}", q_b.router_id, t_out_s, t_in_s, q_b.fee);
+                    let p15b_key = format!("{}:{}:{}:{}", q_b.router_id,
+                        addr_key(token_out), addr_key(token_in), q_b.fee);
                     if let Some(sqrtp_b) = self.pool_cache.v3_by_key.get(&p15b_key)
                         .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
                         .map(|s| s.sqrt_price_x96)

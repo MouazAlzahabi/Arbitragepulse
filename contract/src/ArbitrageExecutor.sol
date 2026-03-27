@@ -55,6 +55,24 @@ interface ISolidlyRouter {
     ) external returns (uint256[] memory amounts);
 }
 
+// Aerodrome V2 (Base) — uses 4-field Route including factory address.
+// factory=address(0) → router uses its internal default factory.
+interface IAerodromeRouter {
+    struct Route {
+        address from;
+        address to;
+        bool stable;
+        address factory;
+    }
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Route[] calldata routes,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
 // SyncSwap — pools are called directly (transfer-then-swap, no approve pattern)
 interface ISyncSwapPool {
     // data = abi.encode(tokenIn, recipient, withdrawMode)
@@ -91,7 +109,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     // ─── Router Types ─────────────────────────────────────────
 
-    enum RouterType { V2, V3, Solidly, SyncSwap }
+    enum RouterType { V2, V3, Solidly, SyncSwap, Aerodrome }
 
     // ─── State ────────────────────────────────────────────────
 
@@ -361,6 +379,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             amountB = _executeSwapSolidly(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
         } else if (routerType[routerAB] == RouterType.SyncSwap) {
             amountB = _executeSwapSyncSwap(tokenA, tokenB, amountIn, routerAB, 0, deadline);
+        } else if (routerType[routerAB] == RouterType.Aerodrome) {
+            amountB = _executeSwapAerodrome(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
         } else {
             amountB = _executeSwapV2(tokenA, tokenB, amountIn, routerAB, 0, deadline);
         }
@@ -373,6 +393,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             amountC = _executeSwapSolidly(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
         } else if (routerType[routerBC] == RouterType.SyncSwap) {
             amountC = _executeSwapSyncSwap(tokenB, tokenC, amountB, routerBC, 0, deadline);
+        } else if (routerType[routerBC] == RouterType.Aerodrome) {
+            amountC = _executeSwapAerodrome(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
         } else {
             amountC = _executeSwapV2(tokenB, tokenC, amountB, routerBC, 0, deadline);
         }
@@ -385,6 +407,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             _executeSwapSolidly(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
         } else if (routerType[routerCA] == RouterType.SyncSwap) {
             _executeSwapSyncSwap(tokenC, tokenA, amountC, routerCA, amountIn + minProfit, deadline);
+        } else if (routerType[routerCA] == RouterType.Aerodrome) {
+            _executeSwapAerodrome(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
         } else {
             _executeSwapV2(tokenC, tokenA, amountC, routerCA, amountIn + minProfit, deadline);
         }
@@ -524,6 +548,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             tokenOutReceived = _executeSwapSolidly(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
         } else if (routerType[routerA] == RouterType.SyncSwap) {
             tokenOutReceived = _executeSwapSyncSwap(tokenIn, tokenOut, amountIn, routerA, 0, deadline);
+        } else if (routerType[routerA] == RouterType.Aerodrome) {
+            tokenOutReceived = _executeSwapAerodrome(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
         } else {
             tokenOutReceived = _executeSwapV2(tokenIn, tokenOut, amountIn, routerA, 0, deadline);
         }
@@ -536,6 +562,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             _executeSwapSolidly(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
         } else if (routerType[routerB] == RouterType.SyncSwap) {
             _executeSwapSyncSwap(tokenOut, tokenIn, tokenOutReceived, routerB, amountIn + minProfit, deadline);
+        } else if (routerType[routerB] == RouterType.Aerodrome) {
+            _executeSwapAerodrome(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
         } else {
             _executeSwapV2(tokenOut, tokenIn, tokenOutReceived, routerB, amountIn + minProfit, deadline);
         }
@@ -619,6 +647,30 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
         amountOut = amounts[amounts.length - 1];
         _resetAllowance(tokenIn, router);  // #4
+    }
+
+    function _executeSwapAerodrome(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address router,
+        uint24 fee,
+        uint256 amountOutMin,
+        uint256 deadline
+    ) internal returns (uint256 amountOut) {
+        _approveExact(tokenIn, router, amountIn);
+
+        // fee=0 → volatile pool (xy=k), fee≠0 → stable pool (x³y+y³x=k)
+        // factory=address(0) → Aerodrome router uses its internal default factory
+        bool stable = (fee != 0);
+        IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
+        routes[0] = IAerodromeRouter.Route({ from: tokenIn, to: tokenOut, stable: stable, factory: address(0) });
+
+        uint256[] memory amounts = IAerodromeRouter(router)
+            .swapExactTokensForTokens(amountIn, amountOutMin, routes, address(this), deadline);
+
+        amountOut = amounts[amounts.length - 1];
+        _resetAllowance(tokenIn, router);
     }
 
     function _executeSwapSyncSwap(

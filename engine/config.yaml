@@ -44,7 +44,8 @@ chains:
       - "https://mainnet.base.org"          # Coinbase official RPC
       - "https://base.llamarpc.com"          # LlamaRPC (low-latency)
     # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).
-    # Set to false to restore full verification if revert rate is unacceptable.
+    # Phantom V3 profits are caught by the pre-flight eth_call in executor.rs before any
+    # nonce is consumed — no on-chain reverts, ~50ms overhead instead of ~120ms QuoterV2.
     optimistic_submission: true
 
   - id: 42161
@@ -180,12 +181,17 @@ routers:
     factory_address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"  # Uniswap V3 Factory (Base)
 
   - id: "aerodrome-base"
-    name: "Aerodrome (Base)"
+    name: "Aerodrome V2 (Base)"
     chain_id: 8453
     address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
-    type: "solidly"
+    type: "aerodrome"    # 4-field Route{from,to,stable,factory} — distinct from solidly (3-field)
     fee_bps: 30        # volatile pools (0.3%)
     stable_fee_bps: 1  # stable pools (0.01%): USDC/USDbC, USDC/USDT, etc.
+    # Aerodrome Router V2 exposes defaultFactory() not factory() — must be configured explicitly.
+    factory_address: "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
+    # IMPORTANT: Must be whitelisted on-chain after contract redeployment:
+    #   executor.setAllowedRouter(0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43, true)
+    #   executor.setRouterType(0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43, 4)   # 4 = Aerodrome
 
   - id: "pancake-v3-base"
     name: "PancakeSwap V3 (Base)"
@@ -351,6 +357,8 @@ routers:
 # max_trade:    optional cap — actual trade = min(trade_amount, max_trade)
 #               prevents excessive price impact on low-liquidity pools
 # watch_pools:  optional pool addresses for real-time Swap event triggers
+# NOTE: the per-pair "routers:" field is NOT parsed — all chain-level routers in the
+#       routers: section above always apply to every pair on that chain.
 
 pairs:
   # ── Optimism mainnet pairs — DISABLED for local fork testing ──

@@ -148,6 +148,32 @@ sol! {
     }
 }
 
+// ─── Aerodrome Router (Base) ──────────────────────────────────────────────────
+// Aerodrome V2 uses Route{from, to, stable, factory} (4-field).
+// factory=address(0) → router falls back to its internal default factory.
+// fee=0 → volatile (xy=k), fee≠0 → stable (x³y+y³x=k).
+
+sol! {
+    #[sol(rpc)]
+    interface IAerodromeRouter {
+        struct Route {
+            address from;
+            address to;
+            bool stable;
+            address factory;
+        }
+        function getAmountsOut(uint256 amountIn, Route[] memory routes)
+            external view returns (uint256[] memory amounts);
+        function swapExactTokensForTokens(
+            uint256 amountIn,
+            uint256 amountOutMin,
+            Route[] calldata routes,
+            address to,
+            uint256 deadline
+        ) external returns (uint256[] memory amounts);
+    }
+}
+
 // ─── SyncSwap Pool (per-pool quoting) ────────────────────────────────────────
 // SyncSwap pools are queried directly (not via router).
 // Pool address obtained from factory.getPool(tokenA, tokenB).

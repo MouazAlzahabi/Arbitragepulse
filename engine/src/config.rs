@@ -97,6 +97,11 @@ pub enum RouterType {
     /// The router `address` in config points to the Pool Factory.
     /// Quoting only — execution requires major contract changes (not yet supported).
     SyncSwap,
+    /// Aerodrome V2 (Base): uses Route{from, to, stable, factory} (4-field struct).
+    /// Same pool discovery and local quoting as Solidly, different execution interface.
+    /// fee=0 → volatile (xy=k), fee=1 → stable (x³y+y³x=k).
+    /// factory=address(0) in Route → Aerodrome uses its own default factory.
+    Aerodrome,
 }
 
 impl Default for RouterType {

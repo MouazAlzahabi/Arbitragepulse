@@ -18,32 +18,43 @@ pub(crate) async fn discover_pools<P: Provider>(
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
 
-    // ── Collect V2 and Solidly routers ────────────────────────────────────────
-    struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32, stable_fee_bps: u32 }
+    // ── Collect V2, Solidly, and Aerodrome routers ────────────────────────────
+    // configured_factory: pre-parsed from config.factory_address — avoids the on-chain
+    // factory() call for routers that don't expose it (e.g. Aerodrome uses defaultFactory()).
+    struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32, stable_fee_bps: u32, configured_factory: Option<Address> }
     let target_routers: Vec<RouterMeta> = routers
         .iter()
-        .filter(|r| r.router_type == RouterType::V2 || r.router_type == RouterType::Solidly)
+        .filter(|r| r.router_type == RouterType::V2 || r.router_type == RouterType::Solidly || r.router_type == RouterType::Aerodrome)
         .filter_map(|r| {
             let addr: Address = r.address.parse().ok()?;
             let stable_fee_bps = r.stable_fee_bps.unwrap_or(r.fee_bps);
-            Some(RouterMeta { id: r.id.clone(), addr, rtype: r.router_type.clone(), fee_bps: r.fee_bps, stable_fee_bps })
+            let configured_factory = r.factory_address.as_deref().and_then(|s| s.parse::<Address>().ok());
+            Some(RouterMeta { id: r.id.clone(), addr, rtype: r.router_type.clone(), fee_bps: r.fee_bps, stable_fee_bps, configured_factory })
         })
         .collect();
 
     if target_routers.is_empty() { return; }
 
     // ── Round 1: factory address per router ───────────────────────────────────
+    // Routers with factory_address in config skip the on-chain call entirely.
     let factory_calls: Vec<(Address, Vec<u8>)> = target_routers
         .iter()
+        .filter(|r| r.configured_factory.is_none())
         .map(|r| (r.addr, IRouterWithFactory::factoryCall {}.abi_encode()))
         .collect();
     let factory_raw = discover_mc(factory_calls, provider).await;
-    let factories: Vec<Option<Address>> = factory_raw
+    let mut factory_raw_iter = factory_raw.into_iter();
+    let factories: Vec<Option<Address>> = target_routers
         .iter()
         .map(|r| {
-            r.as_ref()
-                .and_then(|raw| IRouterWithFactory::factoryCall::abi_decode_returns(raw).ok())
-                .filter(|a: &Address| !a.is_zero())
+            if let Some(f) = r.configured_factory {
+                Some(f)
+            } else {
+                factory_raw_iter.next()
+                    .flatten()
+                    .and_then(|raw| IRouterWithFactory::factoryCall::abi_decode_returns(&raw).ok())
+                    .filter(|a: &Address| !a.is_zero())
+            }
         })
         .collect();
 
@@ -65,7 +76,7 @@ pub(crate) async fn discover_pools<P: Provider>(
                     pair_calls.push((factory, cd));
                     pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
                 }
-                RouterType::Solidly => {
+                RouterType::Solidly | RouterType::Aerodrome => {
                     // Volatile pool (xy=k)
                     let cd_vol = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
                     pair_calls.push((factory, cd_vol));
@@ -135,7 +146,7 @@ pub(crate) async fn discover_pools<P: Provider>(
 
         // Key suffix: Solidly volatile → "::volatile", Solidly stable → "::stable", V2 → unchanged
         let effective_id = match pm.rtype {
-            RouterType::Solidly => if pm.is_stable {
+            RouterType::Solidly | RouterType::Aerodrome => if pm.is_stable {
                 format!("{}::stable", pm.router_id)
             } else {
                 format!("{}::volatile", pm.router_id)
@@ -157,6 +168,7 @@ pub(crate) async fn discover_pools<P: Provider>(
             decimals0,
             decimals1,
             last_sync: Instant::now(),
+            fee_num: U256::ZERO, // overwritten by PoolCache::insert()
         });
     }
 }
@@ -304,6 +316,10 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
             liquidity: liquidity.into(),
             router_id: sq.router_id.clone(),
             last_updated: Instant::now(),
+            // Derived fields: insert_v3 calls refresh_vr() to populate these.
+            vr0: U256::ZERO,
+            vr1: U256::ZERO,
+            fee_num_v3: U256::ZERO,
         });
     }
 }

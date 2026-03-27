@@ -30,6 +30,10 @@ pub struct PoolInfo {
     /// Initialised to a deliberately old instant so startup reserves are
     /// treated as stale until the first on-chain Sync event arrives.
     pub last_sync: Instant,
+    /// Precomputed fee numerator: 10_000 − fee_bps  (e.g. fee_bps=30 → fee_num=9_970).
+    /// Stored as U256 so amount_out_v2/amount_out_stable avoid U256::from() per call.
+    /// Populated by PoolCache::insert(); set to U256::ZERO in struct literals (overwritten).
+    pub fee_num: U256,
 }
 
 // ─── V3 pool state ────────────────────────────────────────────────────────────
@@ -52,6 +56,34 @@ pub struct V3PoolState {
     pub router_id: String,
     /// When this entry was last updated (used for staleness check).
     pub last_updated: Instant,
+
+    // ── Precomputed per Swap event — reused on every quote call ──────────────
+    /// Virtual reserve of token0: L × Q96 / sqrtPriceX96.
+    /// Zero when sqrtPrice or liquidity is zero.
+    pub vr0: U256,
+    /// Virtual reserve of token1: L × sqrtPriceX96 >> 96.
+    pub vr1: U256,
+    /// Fee numerator in ppm: 1_000_000 − fee.  (e.g. fee=500 → fee_num=999_500)
+    pub fee_num_v3: U256,
+}
+
+impl V3PoolState {
+    /// Recompute derived fields from current sqrtPriceX96 and liquidity.
+    /// Called once at insert and once per Swap event — amortises 2 U256 muls +
+    /// 1 U256 div across all quote_v3_spot() calls until the next price change.
+    pub fn refresh_vr(&mut self) {
+        self.fee_num_v3 = FEE_DENOM_V3.saturating_sub(U256::from(self.fee));
+        let l = U256::from(self.liquidity);
+        if self.sqrt_price_x96.is_zero() || l.is_zero() {
+            self.vr0 = U256::ZERO;
+            self.vr1 = U256::ZERO;
+        } else {
+            self.vr0 = l.saturating_mul(Q96)
+                .checked_div(self.sqrt_price_x96)
+                .unwrap_or(U256::ZERO);
+            self.vr1 = l.saturating_mul(self.sqrt_price_x96) >> 96u32;
+        }
+    }
 }
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
@@ -60,6 +92,41 @@ pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(300);
 
 /// How long a Solidly-stable / SyncSwap-stable pool reserve is considered fresh.
 pub const STABLE_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// Q96 = 2^96, used for V3 sqrtPriceX96 ↔ virtual-reserve conversion.
+/// Stored as a const to avoid `U256::from(1u128) << 96` on every quote call.
+/// Limb layout (little-endian u64): bit 96 = limb[1] bit 32 → limb[1] = 2^32 = 4_294_967_296.
+const Q96: U256 = U256::from_limbs([0, 4_294_967_296u64, 0, 0]);
+
+/// V3 fee denominator: 1_000_000 ppm.
+const FEE_DENOM_V3: U256 = U256::from_limbs([1_000_000u64, 0, 0, 0]);
+
+/// V2/Solidly fee denominator: 10_000 bps.
+const FEE_DENOM_V2: U256 = U256::from_limbs([10_000u64, 0, 0, 0]);
+
+/// Lookup table: SCALE[n] = 10^n  (n = 0..=18, all fit in u64).
+/// Avoids U256::pow() in the stable-AMM hot path (~6 multiplications per call → 1 array index).
+const SCALE: [U256; 19] = [
+    U256::from_limbs([                           1, 0, 0, 0]), // 10^0
+    U256::from_limbs([                          10, 0, 0, 0]), // 10^1
+    U256::from_limbs([                         100, 0, 0, 0]), // 10^2
+    U256::from_limbs([                       1_000, 0, 0, 0]), // 10^3
+    U256::from_limbs([                      10_000, 0, 0, 0]), // 10^4
+    U256::from_limbs([                     100_000, 0, 0, 0]), // 10^5
+    U256::from_limbs([                   1_000_000, 0, 0, 0]), // 10^6
+    U256::from_limbs([                  10_000_000, 0, 0, 0]), // 10^7
+    U256::from_limbs([                 100_000_000, 0, 0, 0]), // 10^8
+    U256::from_limbs([               1_000_000_000, 0, 0, 0]), // 10^9
+    U256::from_limbs([              10_000_000_000, 0, 0, 0]), // 10^10
+    U256::from_limbs([             100_000_000_000, 0, 0, 0]), // 10^11
+    U256::from_limbs([           1_000_000_000_000, 0, 0, 0]), // 10^12
+    U256::from_limbs([          10_000_000_000_000, 0, 0, 0]), // 10^13
+    U256::from_limbs([         100_000_000_000_000, 0, 0, 0]), // 10^14
+    U256::from_limbs([       1_000_000_000_000_000, 0, 0, 0]), // 10^15
+    U256::from_limbs([      10_000_000_000_000_000, 0, 0, 0]), // 10^16
+    U256::from_limbs([     100_000_000_000_000_000, 0, 0, 0]), // 10^17
+    U256::from_limbs([   1_000_000_000_000_000_000, 0, 0, 0]), // 10^18
+];
 
 
 // ─── Pool cache ───────────────────────────────────────────────────────────────
@@ -95,9 +162,10 @@ impl PoolCache {
     }
 
     /// Insert a pool and register both directional keys.
-    /// `last_sync` is set to a very old instant so startup reserves are
-    /// treated as stale until the first live Sync event updates them.
-    pub fn insert(&self, pool: Address, info: PoolInfo) {
+    /// Precomputes `fee_num = 10_000 − fee_bps` as U256 so hot-path AMM math
+    /// never calls U256::from() per quote call.
+    pub fn insert(&self, pool: Address, mut info: PoolInfo) {
+        info.fee_num = FEE_DENOM_V2.saturating_sub(U256::from(info.fee_bps));
         let t0 = addr_key(info.token0);
         let t1 = addr_key(info.token1);
         let rid = &info.router_id;
@@ -173,7 +241,8 @@ impl PoolCache {
 
     /// Insert a V3 pool and register both directional keys.
     /// Key format: "router_id:token_in_lower:token_out_lower:fee"
-    pub fn insert_v3(&self, pool: Address, state: V3PoolState) {
+    pub fn insert_v3(&self, pool: Address, mut state: V3PoolState) {
+        state.refresh_vr(); // precompute vr0, vr1, fee_num_v3 once at insert
         let t0 = addr_key(state.token0);
         let t1 = addr_key(state.token1);
         let fee = state.fee;
@@ -185,18 +254,65 @@ impl PoolCache {
     }
 
     /// Update sqrtPriceX96 and liquidity from a V3 Swap event.
-    /// Also resets the staleness timer (`last_updated`).
+    /// Also resets the staleness timer and recomputes cached virtual reserves
+    /// so quote_v3_spot() reads pre-built values without any per-call maths.
     pub fn update_v3_state(&self, pool: Address, sqrt_price_x96: U256, liquidity: u128) {
         if let Some(mut e) = self.v3_by_address.get_mut(&pool) {
             e.sqrt_price_x96 = sqrt_price_x96;
             e.liquidity = liquidity;
             e.last_updated = Instant::now();
+            e.refresh_vr();
         }
     }
 
     /// All V3 pool addresses (used for Swap event subscription).
     pub fn v3_pool_addresses(&self) -> Vec<Address> {
         self.v3_by_address.iter().map(|e| *e.key()).collect()
+    }
+
+    /// Evict V2/Solidly and V3 pools whose reserves/state have not been refreshed
+    /// by an on-chain event for longer than `v2_ttl` or `v3_ttl` respectively.
+    ///
+    /// Called periodically (e.g. every 10 min) to reclaim memory from pools that
+    /// became inactive or were removed from a DEX. Both `by_key` indexes are cleaned
+    /// up by reconstructing the keys from the evicted pool's metadata.
+    pub fn prune_stale(&self, v2_ttl: Duration, v3_ttl: Duration) -> (usize, usize) {
+        // ── V2 / Solidly / SyncSwap ──────────────────────────────────────────
+        let stale_v2: Vec<(Address, PoolInfo)> = self
+            .by_address
+            .iter()
+            .filter(|e| e.last_sync.elapsed() > v2_ttl)
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+
+        for (pool, info) in &stale_v2 {
+            self.by_address.remove(pool);
+            let t0 = addr_key(info.token0);
+            let t1 = addr_key(info.token1);
+            let rid = &info.router_id;
+            self.by_key.remove(&format!("{}:{}:{}", rid, t0, t1));
+            self.by_key.remove(&format!("{}:{}:{}", rid, t1, t0));
+        }
+
+        // ── V3 ───────────────────────────────────────────────────────────────
+        let stale_v3: Vec<(Address, V3PoolState)> = self
+            .v3_by_address
+            .iter()
+            .filter(|e| e.last_updated.elapsed() > v3_ttl)
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+
+        for (pool, state) in &stale_v3 {
+            self.v3_by_address.remove(pool);
+            let t0 = addr_key(state.token0);
+            let t1 = addr_key(state.token1);
+            let rid = &state.router_id;
+            let fee = state.fee;
+            self.v3_by_key.remove(&format!("{}:{}:{}:{}", rid, t0, t1, fee));
+            self.v3_by_key.remove(&format!("{}:{}:{}:{}", rid, t1, t0, fee));
+        }
+
+        (stale_v2.len(), stale_v3.len())
     }
 
     /// Spot-price screen for a V3 pool.
@@ -226,43 +342,11 @@ impl PoolCache {
 
         let state = self.v3_by_address.get(&pool_addr)?;
 
-        let sqrtp = state.sqrt_price_x96;
-        if sqrtp.is_zero() {
-            return None;
-        }
-
-        let l = U256::from(state.liquidity);
-        if l.is_zero() {
-            return None;
-        }
-
-        // Virtual-reserve constant-product formula (exact within one tick).
-        //
-        // Within a single V3 tick, the pool behaves identically to a V2 xy=k pool
-        // whose reserves are the "virtual reserves" derived from L and sqrtPriceX96:
-        //   vr_token0 = L × 2^96 / sqrtP     (virtual reserve of token0)
-        //   vr_token1 = L × sqrtP / 2^96     (virtual reserve of token1)
-        //
-        // Applying the standard xy=k fee formula to these virtual reserves gives the
-        // same output as the V3 contract for single-tick trades — including the
-        // price-impact term that the old marginal-rate formula completely missed.
-        //
-        // The old formula: amount_out = amount_in × price × fee_factor
-        //   → ignores the denominator's amount_in term → overestimates for large trades
-        //
-        // This formula: amount_out = amount_in × (1M-fee) × vr_out
-        //                           / (vr_in × 1M + amount_in × (1M-fee))
-        //   → exact for single-tick; underestimates when trade spans multiple ticks
-        //   → conservative: never produces phantom profits
-
-        let q96 = U256::from(1u128) << 96u32;
-        let fee_denom = U256::from(1_000_000u64);
-        let fee_num  = U256::from(1_000_000u64 - state.fee as u64);
-
-        // vr0 = L × Q96 / sqrtP,  vr1 = L × sqrtP >> 96
-        let vr0 = l.saturating_mul(q96).checked_div(sqrtp)?;
-        let vr1 = l.saturating_mul(sqrtp) >> 96u32;
-
+        // Virtual reserves are precomputed by refresh_vr() at insert / Swap event time.
+        // vr0 = L×Q96/sqrtP (token0 virtual reserve), vr1 = L×sqrtP>>96 (token1).
+        // Both are zero when sqrtPrice or liquidity is zero — single guard covers all cases.
+        let vr0 = state.vr0;
+        let vr1 = state.vr1;
         if vr0.is_zero() || vr1.is_zero() {
             return None;
         }
@@ -273,16 +357,16 @@ impl PoolCache {
             (vr1, vr0)
         };
 
-        // xy=k with ppm fee:  out = ai×(1M-fee)×vr_out / (vr_in×1M + ai×(1M-fee))
-        let ai_fee = amount_in.checked_mul(fee_num)?;
+        // xy=k with ppm fee:  out = ai×fee_num×vr_out / (vr_in×FEE_DENOM + ai×fee_num)
+        // fee_num = 1_000_000 − fee, precomputed in refresh_vr().
+        let ai_fee = amount_in.checked_mul(state.fee_num_v3)?;
         let num    = ai_fee.checked_mul(vr_out)?;
-        let den    = vr_in.checked_mul(fee_denom)?.checked_add(ai_fee)?;
+        let den    = vr_in.checked_mul(FEE_DENOM_V3)?.checked_add(ai_fee)?;
         if den.is_zero() {
             return None;
         }
-        let amount_out = num / den;
 
-        Some((amount_out, state.liquidity))
+        Some((num / den, state.liquidity))
     }
 
 }
@@ -302,26 +386,25 @@ fn compute_amount_out(info: &PoolInfo, token_in: Address, amount_in: U256) -> Op
         return None;
     }
     if info.is_stable {
-        amount_out_stable(amount_in, reserve_in, reserve_out, dec_in, dec_out, info.fee_bps)
+        amount_out_stable(amount_in, reserve_in, reserve_out, dec_in, dec_out, info.fee_num)
     } else {
-        Some(amount_out_v2(amount_in, reserve_in, reserve_out, info.fee_bps))
+        Some(amount_out_v2(amount_in, reserve_in, reserve_out, info.fee_num))
     }
 }
 
 /// Standard V2 xy=k constant-product output formula.
 /// Also correct for Solidly-volatile and SyncSwap-classic pools.
 ///
-/// fee_bps: fee in basis points (25 = 0.25%, 30 = 0.3%, 20 = 0.2%).
+/// fee_num: precomputed 10_000 − fee_bps (from PoolInfo.fee_num).
 pub fn amount_out_v2(
     amount_in: U256,
     reserve_in: U256,
     reserve_out: U256,
-    fee_bps: u32,
+    fee_num: U256,
 ) -> U256 {
-    let fee_num = U256::from(10_000u32 - fee_bps);
-    let ai_fee  = amount_in * fee_num;
-    let num     = ai_fee * reserve_out;
-    let den     = reserve_in * U256::from(10_000u32) + ai_fee;
+    let ai_fee = amount_in * fee_num;
+    let num    = ai_fee * reserve_out;
+    let den    = reserve_in * FEE_DENOM_V2 + ai_fee;
     if den.is_zero() { U256::ZERO } else { num / den }
 }
 
@@ -337,21 +420,19 @@ pub fn amount_out_stable(
     reserve_out: U256,
     decimals_in: u8,
     decimals_out: u8,
-    fee_bps: u32,
+    fee_num: U256,
 ) -> Option<U256> {
-    let one = U256::from(10u64).pow(U256::from(18u32));
+    let one = SCALE[18];
 
     // Normalise to 18 decimals so the curve math is token-agnostic.
-    let scale_in  = U256::from(10u64).pow(U256::from((18u32).saturating_sub(decimals_in as u32)));
-    let scale_out = U256::from(10u64).pow(U256::from((18u32).saturating_sub(decimals_out as u32)));
+    let scale_in  = SCALE[(18usize).saturating_sub(decimals_in  as usize)];
+    let scale_out = SCALE[(18usize).saturating_sub(decimals_out as usize)];
 
     let x = reserve_in.saturating_mul(scale_in);
     let y = reserve_out.saturating_mul(scale_out);
 
-    // Apply fee to amount_in
-    let dx = amount_in
-        .saturating_mul(U256::from(10_000u32 - fee_bps))
-        / U256::from(10_000u32);
+    // Apply fee to amount_in; fee_num = 10_000 − fee_bps (precomputed on PoolInfo).
+    let dx = amount_in.saturating_mul(fee_num) / FEE_DENOM_V2;
     let dx_norm = dx.saturating_mul(scale_in);
 
     // k = x³y + xy³  (invariant before the swap)
