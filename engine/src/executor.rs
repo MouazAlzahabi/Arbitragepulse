@@ -1,4 +1,5 @@
-use alloy::network::EthereumWallet;
+use alloy::eips::eip2718::Encodable2718;
+use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Uint, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
@@ -61,6 +62,12 @@ pub struct TxPrep {
     pub submission_rpcs: Vec<url::Url>,
     /// Wallet for signing on secondary providers (each creates its own WalletFiller chain).
     pub wallet: EthereumWallet,
+    /// Pre-signed EIP-2718 bytes for secondary broadcast via eth_sendRawTransaction.
+    /// None if signing failed at prepare time (secondary broadcast degrades to skip).
+    pub raw_tx: Option<Vec<u8>>,
+    /// Shared reqwest client — maintains a TCP connection pool so secondary broadcasts
+    /// reuse existing connections instead of handshaking on every transaction.
+    pub http_client: Arc<reqwest::Client>,
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
@@ -119,6 +126,8 @@ pub struct Executor {
     /// The same signed raw tx bytes are sent to all endpoints concurrently.
     /// Leave empty to broadcast to the primary provider only.
     submission_rpcs: Vec<url::Url>,
+    /// Shared reqwest client with connection pooling for secondary RPC broadcast.
+    http_client: Arc<reqwest::Client>,
 }
 
 impl Executor {
@@ -157,6 +166,13 @@ impl Executor {
             contract_balances: None,
             wallet,
             submission_rpcs,
+            http_client: Arc::new(
+                reqwest::Client::builder()
+                    .pool_max_idle_per_host(4)
+                    .tcp_keepalive(std::time::Duration::from_secs(30))
+                    .build()
+                    .expect("reqwest client build"),
+            ),
         }
     }
 
@@ -253,6 +269,18 @@ impl Executor {
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
             .max_fee_per_gas((gas_price * 2) + priority_fee);
+        // Pre-sign for secondary RPC broadcast (avoids TCP+TLS handshake per tx).
+        // The primary provider re-signs identically via WalletFiller — same bytes.
+        let raw_tx = if !self.submission_rpcs.is_empty() {
+            let mut tx_for_sign = tx.clone();
+            tx_for_sign.set_chain_id(self.chain_id);
+            match tx_for_sign.build(&self.wallet).await {
+                Ok(signed) => Some(signed.encoded_2718()),
+                Err(e) => { warn!("[{}] pre-sign failed: {:?}", self.chain_name, e); None }
+            }
+        } else {
+            None
+        };
         // Pre-increment nonce BEFORE releasing the lock so concurrent prepares
         // allocate distinct nonces without a chain round-trip.
         self.nonce = Some(nonce + 1);
@@ -277,6 +305,8 @@ impl Executor {
             contract_balances: self.contract_balances.clone(),
             submission_rpcs: self.submission_rpcs.clone(),
             wallet: self.wallet.clone(),
+            raw_tx,
+            http_client: self.http_client.clone(),
         })
     }
 
@@ -323,6 +353,16 @@ impl Executor {
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
             .max_fee_per_gas((gas_price * 2) + priority_fee);
+        let raw_tx = if !self.submission_rpcs.is_empty() {
+            let mut tx_for_sign = tx.clone();
+            tx_for_sign.set_chain_id(self.chain_id);
+            match tx_for_sign.build(&self.wallet).await {
+                Ok(signed) => Some(signed.encoded_2718()),
+                Err(e) => { warn!("[{}] pre-sign failed: {:?}", self.chain_name, e); None }
+            }
+        } else {
+            None
+        };
         self.nonce = Some(nonce + 1);
         Ok(TxPrep {
             tx,
@@ -345,6 +385,8 @@ impl Executor {
             contract_balances: self.contract_balances.clone(),
             submission_rpcs: self.submission_rpcs.clone(),
             wallet: self.wallet.clone(),
+            raw_tx,
+            http_client: self.http_client.clone(),
         })
     }
 

@@ -289,30 +289,36 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             optimized.fee_a, optimized.fee_b,
                         );
                         // ── Multi-RPC broadcast (fire-and-forget) ─────────────
-                        // Send the same signed tx to secondary HTTP endpoints concurrently.
-                        // Each uses its own wallet provider so signing is automatic.
-                        // This races the primary Alchemy send — whichever RPC delivers
-                        // first to the sequencer wins the earlier block position.
+                        // Send pre-signed raw bytes to secondary HTTP endpoints concurrently
+                        // using a shared reqwest::Client connection pool — no TCP/TLS handshake
+                        // per transaction after the first submission.
                         if !prep.submission_rpcs.is_empty() {
-                            let tx_sec = prep.tx.clone();
-                            let urls_sec = prep.submission_rpcs.clone();
-                            let wallet_sec = prep.wallet.clone();
-                            let cname_sec = cfg.name.clone();
-                            tokio::spawn(async move {
-                                let futs = urls_sec.into_iter().map(|url| {
-                                    let tx = tx_sec.clone();
-                                    let wallet = wallet_sec.clone();
-                                    let cname = cname_sec.clone();
-                                    async move {
-                                        let p = ProviderBuilder::new().wallet(wallet).connect_http(url);
-                                        match p.send_transaction(tx).await {
-                                            Ok(pend) => debug!("[{}] secondary RPC accepted tx={:?}", cname, pend.tx_hash()),
-                                            Err(e) => debug!("[{}] secondary RPC rejected: {}", cname, e),
+                            if let Some(raw_bytes) = prep.raw_tx.clone() {
+                                let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&raw_bytes));
+                                let urls_sec = prep.submission_rpcs.clone();
+                                let client = prep.http_client.clone();
+                                let cname_sec = cfg.name.clone();
+                                tokio::spawn(async move {
+                                    let body = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "eth_sendRawTransaction",
+                                        "params": [raw_hex],
+                                        "id": 1
+                                    });
+                                    let futs = urls_sec.into_iter().map(|url| {
+                                        let b = body.clone();
+                                        let c = client.clone();
+                                        let cname = cname_sec.clone();
+                                        async move {
+                                            match c.post(url.as_str()).json(&b).send().await {
+                                                Ok(r) => debug!("[{}] secondary RPC: {}", cname, r.status()),
+                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e),
+                                            }
                                         }
-                                    }
+                                    });
+                                    futures::future::join_all(futs).await;
                                 });
-                                futures::future::join_all(futs).await;
-                            });
+                            }
                         }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {
@@ -526,25 +532,32 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(prep) => {
                         // Pre-flight skipped: same reasoning as 2-hop path above.
                         if !prep.submission_rpcs.is_empty() {
-                            let tx_sec = prep.tx.clone();
-                            let urls_sec = prep.submission_rpcs.clone();
-                            let wallet_sec = prep.wallet.clone();
-                            let cname_sec = cfg.name.clone();
-                            tokio::spawn(async move {
-                                let futs = urls_sec.into_iter().map(|url| {
-                                    let tx = tx_sec.clone();
-                                    let wallet = wallet_sec.clone();
-                                    let cname = cname_sec.clone();
-                                    async move {
-                                        let p = ProviderBuilder::new().wallet(wallet).connect_http(url);
-                                        match p.send_transaction(tx).await {
-                                            Ok(pend) => debug!("[{}] secondary RPC accepted tx={:?}", cname, pend.tx_hash()),
-                                            Err(e) => debug!("[{}] secondary RPC rejected: {}", cname, e),
+                            if let Some(raw_bytes) = prep.raw_tx.clone() {
+                                let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&raw_bytes));
+                                let urls_sec = prep.submission_rpcs.clone();
+                                let client = prep.http_client.clone();
+                                let cname_sec = cfg.name.clone();
+                                tokio::spawn(async move {
+                                    let body = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "eth_sendRawTransaction",
+                                        "params": [raw_hex],
+                                        "id": 1
+                                    });
+                                    let futs = urls_sec.into_iter().map(|url| {
+                                        let b = body.clone();
+                                        let c = client.clone();
+                                        let cname = cname_sec.clone();
+                                        async move {
+                                            match c.post(url.as_str()).json(&b).send().await {
+                                                Ok(r) => debug!("[{}] secondary RPC: {}", cname, r.status()),
+                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e),
+                                            }
                                         }
-                                    }
+                                    });
+                                    futures::future::join_all(futs).await;
                                 });
-                                futures::future::join_all(futs).await;
-                            });
+                            }
                         }
                         let send_start = std::time::Instant::now();
                         match provider.send_transaction(prep.tx.clone()).await {

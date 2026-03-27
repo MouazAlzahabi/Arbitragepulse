@@ -37,5 +37,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Metrics
 prometheus = "0.13"
 
+# Persistent HTTP connections for secondary RPC broadcast
+reqwest = { version = "0.12", features = ["json"] }
+
 # Config env-var substitution
 regex = "1"
