@@ -141,6 +141,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     event WithdrawToken(address indexed token, address indexed to, uint256 amount);
     event RouterApproved(address indexed router, bool approved);
     event RouterTypeSet(address indexed router, RouterType rtype);
+    event ApprovalRevoked(address indexed token, address indexed spender);
 
     // ─── Errors ───────────────────────────────────────────────
 
@@ -311,7 +312,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             revert NotProfitable(balanceBefore, balanceAfter, minProfit);
         }
 
-        uint256 profit = balanceAfter - balanceBefore;
+        uint256 profit;
+        unchecked { profit = balanceAfter - balanceBefore; } // balanceAfter >= balanceBefore + minProfit checked above
         totalProfit[tokenIn] += profit;
         totalTrades++;
 
@@ -419,7 +421,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             revert NotProfitable(balanceBefore, balanceAfter, minProfit);
         }
 
-        uint256 profit = balanceAfter - balanceBefore;
+        uint256 profit;
+        unchecked { profit = balanceAfter - balanceBefore; } // balanceAfter >= balanceBefore + minProfit checked above
         totalProfit[tokenA] += profit;
         totalTrades++;
 
@@ -513,7 +516,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         ArbParams calldata a,
         uint256 deadline
     ) external returns (uint256 profit) {
-        require(msg.sender == address(this), "Internal only");
+        if (msg.sender != address(this)) revert RouterNotAllowed(msg.sender);
         if (!allowedRouters[a.routerA]) revert RouterNotAllowed(a.routerA);
         if (!allowedRouters[a.routerB]) revert RouterNotAllowed(a.routerB);
 
@@ -575,7 +578,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             revert NotProfitable(balanceBefore, balanceAfter, minProfit);
         }
 
-        profit = balanceAfter - balanceBefore;
+        unchecked { profit = balanceAfter - balanceBefore; } // balanceAfter >= balanceBefore + minProfit checked above
     }
 
     function _executeSwapV2(
@@ -710,9 +713,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
      * @dev Reset allowance to 0 after swap. Prevents dangling allowances.
      */
     function _resetAllowance(address token, address spender) internal {
-        if (IERC20(token).allowance(address(this), spender) > 0) {
-            IERC20(token).forceApprove(spender, 0);
-        }
+        IERC20(token).forceApprove(spender, 0);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -827,5 +828,6 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Zero out allowance for a token on a spender.
     function revokeApproval(address _token, address _spender) external onlyOwner {
         IERC20(_token).forceApprove(_spender, 0);
+        emit ApprovalRevoked(_token, _spender);
     }
 }
