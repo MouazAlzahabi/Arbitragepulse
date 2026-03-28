@@ -280,8 +280,8 @@ sol! {
 // ─── V3 Pool (for swap event subscriptions + local state seeding) ─────────────
 
 sol! {
-    /// NOTE: Name MUST be "Swap" (not "PoolSwapV3") — alloy computes SIGNATURE_HASH
-    /// from the event name, and on-chain V3 pools emit Swap(...).
+    /// Uniswap V3 Swap event (7 non-indexed fields).
+    /// topic0 = keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
     event Swap(
         address indexed sender,
         address indexed recipient,
@@ -290,6 +290,21 @@ sol! {
         uint160 sqrtPriceX96,
         uint128 liquidity,
         int24 tick
+    );
+
+    /// PancakeSwap V3 Swap event (9 non-indexed fields — adds protocol fees).
+    /// PancakeV3Pool emits this variant; topic0 differs from Uniswap V3's Swap.
+    /// topic0 = keccak256("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)")
+    event PancakeV3Swap(
+        address indexed sender,
+        address indexed recipient,
+        int256 amount0,
+        int256 amount1,
+        uint160 sqrtPriceX96,
+        uint128 liquidity,
+        int24 tick,
+        uint128 protocolFeesToken0,
+        uint128 protocolFeesToken1
     );
 }
 

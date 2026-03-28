@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::{Swap, Sync};
+use crate::abi::{PancakeV3Swap, Swap, Sync};
 use crate::api::{broadcast_log, LogBroadcaster};
 use crate::pool_cache::PoolCache;
 
@@ -42,6 +42,11 @@ pub fn apply_log_to_cache(
         }
     } else if topic0 == Some(Swap::SIGNATURE_HASH) {
         if let Ok(decoded) = Swap::decode_log(log.as_ref()) {
+            cache.update_v3_state(pool, U256::from(decoded.sqrtPriceX96), decoded.liquidity.into());
+            return true;
+        }
+    } else if topic0 == Some(PancakeV3Swap::SIGNATURE_HASH) {
+        if let Ok(decoded) = PancakeV3Swap::decode_log(log.as_ref()) {
             cache.update_v3_state(pool, U256::from(decoded.sqrtPriceX96), decoded.liquidity.into());
             return true;
         }
@@ -130,9 +135,10 @@ impl Listener {
         let solidly_sync_hash = keccak256(b"Sync(uint256,uint256)");
 
         let event_sigs = vec![
-            Sync::SIGNATURE_HASH,  // Uniswap V2: Sync(uint112,uint112)
-            solidly_sync_hash,     // Aerodrome/Solidly: Sync(uint256,uint256)
-            Swap::SIGNATURE_HASH,
+            Sync::SIGNATURE_HASH,           // Uniswap V2: Sync(uint112,uint112)
+            solidly_sync_hash,              // Aerodrome/Solidly: Sync(uint256,uint256)
+            Swap::SIGNATURE_HASH,           // Uniswap V3: Swap(7 fields)
+            PancakeV3Swap::SIGNATURE_HASH,  // PancakeSwap V3: Swap(9 fields, with protocol fees)
         ];
 
         let sync_count = Arc::new(AtomicU64::new(0));
@@ -309,11 +315,21 @@ impl Listener {
                                         );
                                     }
                                 }
-                            } else if topic0 == Some(Swap::SIGNATURE_HASH) {
+                            } else if topic0 == Some(Swap::SIGNATURE_HASH) || topic0 == Some(PancakeV3Swap::SIGNATURE_HASH) {
                                 v3_count.fetch_add(1, Ordering::Relaxed);
-                                if let Ok(decoded) = Swap::decode_log(log.as_ref()) {
-                                    let sqrtp = U256::from(decoded.sqrtPriceX96);
-                                    let liq: u128 = decoded.liquidity.into();
+                                // Decode sqrtPriceX96 and liquidity from whichever V3 Swap variant fired.
+                                let v3_decoded = if topic0 == Some(Swap::SIGNATURE_HASH) {
+                                    Swap::decode_log(log.as_ref())
+                                        .ok()
+                                        .map(|d| (U256::from(d.sqrtPriceX96), d.liquidity.into()))
+                                } else {
+                                    PancakeV3Swap::decode_log(log.as_ref())
+                                        .ok()
+                                        .map(|d| (U256::from(d.sqrtPriceX96), d.liquidity.into()))
+                                };
+                                if let Some((sqrtp, liq)) = v3_decoded {
+                                    let sqrtp: U256 = sqrtp;
+                                    let liq: u128 = liq;
 
                                     // Detect large sqrtPriceX96 shift BEFORE updating cache
                                     if large_v3_bps > 0 {
