@@ -49,7 +49,7 @@ chains:
     # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
     # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
     # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
-    optimistic_submission: false
+    optimistic_submission: true
 
   - id: 42161
     name: "Arbitrum"

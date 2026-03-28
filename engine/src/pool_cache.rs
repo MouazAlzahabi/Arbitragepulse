@@ -220,9 +220,14 @@ impl PoolCache {
         }
     }
 
-    /// All pool addresses currently in the cache (used for Sync event subscription).
+    /// All V2/Solidly/SyncSwap pool addresses currently in the cache.
     pub fn pool_addresses(&self) -> Vec<Address> {
         self.by_address.iter().map(|e| *e.key()).collect()
+    }
+
+    /// All V3 pool addresses currently in the cache.
+    pub fn v3_pool_addresses(&self) -> Vec<Address> {
+        self.v3_by_address.iter().map(|e| *e.key()).collect()
     }
 
     /// Returns (token0, token1) for any watched pool — V2/Solidly/SyncSwap or V3.
@@ -263,11 +268,6 @@ impl PoolCache {
             e.last_updated = Instant::now();
             e.refresh_vr();
         }
-    }
-
-    /// All V3 pool addresses (used for Swap event subscription).
-    pub fn v3_pool_addresses(&self) -> Vec<Address> {
-        self.v3_by_address.iter().map(|e| *e.key()).collect()
     }
 
     /// Evict V2/Solidly and V3 pools whose reserves/state have not been refreshed

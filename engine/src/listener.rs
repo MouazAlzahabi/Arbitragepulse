@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
@@ -12,6 +12,42 @@ use tracing::{debug, error, info, warn};
 use crate::abi::{Swap, Sync};
 use crate::api::{broadcast_log, LogBroadcaster};
 use crate::pool_cache::PoolCache;
+
+/// Decode a single Swap/Sync log and apply it to the pool cache.
+/// Returns `true` if the log was recognized and applied.
+/// Idempotent — calling twice with the same log is safe (just overwrites with same values).
+/// Used by both the polling listener and the real-time log subscription in chain/mod.rs.
+pub fn apply_log_to_cache(
+    log: &alloy::rpc::types::Log,
+    cache: &PoolCache,
+    solidly_sync_hash: B256,
+) -> bool {
+    let pool = log.address();
+    let topic0 = log.topics().first().copied();
+
+    if topic0 == Some(Sync::SIGNATURE_HASH) {
+        if let Ok(decoded) = Sync::decode_log(log.as_ref()) {
+            cache.update_reserves(pool, U256::from(decoded.reserve0), U256::from(decoded.reserve1));
+            return true;
+        }
+    } else if topic0 == Some(solidly_sync_hash) {
+        let raw_data = log.data().data.as_ref();
+        if raw_data.len() >= 64 {
+            let mut r0_bytes = [0u8; 32];
+            let mut r1_bytes = [0u8; 32];
+            r0_bytes.copy_from_slice(&raw_data[0..32]);
+            r1_bytes.copy_from_slice(&raw_data[32..64]);
+            cache.update_reserves(pool, U256::from_be_bytes(r0_bytes), U256::from_be_bytes(r1_bytes));
+            return true;
+        }
+    } else if topic0 == Some(Swap::SIGNATURE_HASH) {
+        if let Ok(decoded) = Swap::decode_log(log.as_ref()) {
+            cache.update_v3_state(pool, U256::from(decoded.sqrtPriceX96), decoded.liquidity.into());
+            return true;
+        }
+    }
+    false
+}
 
 // ─── Swap event (generic across V2 + V3) ─────────────────────────────────────
 

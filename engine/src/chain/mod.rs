@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+use alloy::sol_types::SolEvent;
 use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool};
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
@@ -232,6 +233,46 @@ pub async fn run_chain(
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        });
+    }
+
+    // ── Real-time log subscription for instant pool state updates ──────────
+    // Logs arrive on the WS connection before the next newHeads event,
+    // so pool state is current when block_rx fires the scanner.
+    let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
+    let (log_tx_sub, mut log_rx) = mpsc::channel::<alloy::rpc::types::Log>(1024);
+    {
+        let mut log_addrs = pool_cache.pool_addresses();
+        log_addrs.extend(pool_cache.v3_pool_addresses());
+        let log_filter = alloy::rpc::types::Filter::new()
+            .address(log_addrs)
+            .event_signature(vec![
+                crate::abi::Sync::SIGNATURE_HASH,
+                solidly_sync_hash_sub,
+                crate::abi::Swap::SIGNATURE_HASH,
+            ]);
+        let provider_logs = (*provider).clone();
+        let log_tx_sub2 = log_tx_sub.clone();
+        let cname = cfg.name.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                match provider_logs.subscribe_logs(&log_filter).await {
+                    Ok(sub) => {
+                        backoff = Duration::from_secs(1);
+                        let mut stream = sub.into_stream();
+                        while let Some(log) = stream.next().await {
+                            let _ = log_tx_sub2.send(log).await;
+                        }
+                        debug!("[{}] log subscription ended, reconnecting...", cname);
+                    }
+                    Err(e) => {
+                        debug!("[{}] log subscription failed: {} — retrying in {:?}", cname, e, backoff);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
+                }
             }
         });
     }
@@ -532,6 +573,18 @@ pub async fn run_chain(
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
                 if global_paused || chain_paused { continue; }
+
+                // ── Drain pending log events before scanning ──────────────────
+                // Logs from the just-mined block arrive on the WS subscription
+                // before newHeads — flush any queued updates so the scanner sees
+                // fresh pool state. try_recv() is non-blocking.
+                {
+                    let pc = strategy.read().await.pool_cache.clone();
+                    while let Ok(log) = log_rx.try_recv() {
+                        crate::listener::apply_log_to_cache(&log, &pc, solidly_sync_hash_sub);
+                    }
+                }
+                // ─────────────────────────────────────────────────────────────
 
                 scan::evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
