@@ -189,9 +189,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 let bals = contract_balances.read().await;
                 bals.get(&opp.token_in).copied()
             };
+            // Skip optimizer in optimistic mode — each round costs ~100ms of QuoterV2 calls.
+            // On FCFS chains (Base), 200ms of optimizer latency = ~65 positions lost.
             let optimized = {
                 let strat = strategy.read().await;
-                strat.optimize(opp, provider.as_ref(), max_bal).await
+                if strat.optimistic_submission {
+                    opp.clone()
+                } else {
+                    strat.optimize(opp, provider.as_ref(), max_bal).await
+                }
             };
 
             // Log the opportunity first so detection is always visible.
@@ -321,7 +327,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             }
                         }
                         let send_start = std::time::Instant::now();
-                        match provider.send_transaction(prep.tx.clone()).await {
+                        // Use pre-signed raw bytes when available (skips re-signing in WalletFiller).
+                        let send_result = if let Some(ref raw) = prep.raw_tx {
+                            provider.send_raw_transaction(raw).await
+                        } else {
+                            provider.send_transaction(prep.tx.clone()).await
+                        };
+                        match send_result {
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
@@ -560,7 +572,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             }
                         }
                         let send_start = std::time::Instant::now();
-                        match provider.send_transaction(prep.tx.clone()).await {
+                        let send_result = if let Some(ref raw) = prep.raw_tx {
+                            provider.send_raw_transaction(raw).await
+                        } else {
+                            provider.send_transaction(prep.tx.clone()).await
+                        };
+                        match send_result {
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
