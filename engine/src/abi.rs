@@ -291,21 +291,29 @@ sol! {
         uint128 liquidity,
         int24 tick
     );
+}
 
-    /// PancakeSwap V3 Swap event (9 non-indexed fields — adds protocol fees).
-    /// PancakeV3Pool emits this variant; topic0 differs from Uniswap V3's Swap.
-    /// topic0 = keccak256("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)")
-    event PancakeV3Swap(
-        address indexed sender,
-        address indexed recipient,
-        int256 amount0,
-        int256 amount1,
-        uint160 sqrtPriceX96,
-        uint128 liquidity,
-        int24 tick,
-        uint128 protocolFeesToken0,
-        uint128 protocolFeesToken1
-    );
+// ─── PancakeSwap V3 pool (9-field Swap event) ─────────────────────────────────
+// PancakeV3Pool emits Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128).
+// topic0 = 0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83
+// Wrapped in an interface so alloy derives SIGNATURE_HASH from the on-chain name "Swap",
+// not from any Rust alias — matching the correct on-chain topic0.
+
+sol! {
+    interface IPancakeV3Pool {
+        /// PancakeSwap V3 Swap event — 9 fields (adds protocolFeesToken0/1).
+        event Swap(
+            address indexed sender,
+            address indexed recipient,
+            int256 amount0,
+            int256 amount1,
+            uint160 sqrtPriceX96,
+            uint128 liquidity,
+            int24 tick,
+            uint128 protocolFeesToken0,
+            uint128 protocolFeesToken1
+        );
+    }
 }
 
 // ─── Uniswap V3 Pool Factory ──────────────────────────────────────────────────

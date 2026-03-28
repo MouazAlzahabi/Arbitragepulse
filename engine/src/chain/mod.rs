@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use alloy::sol_types::SolEvent;
-use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool, PancakeV3Swap};
+use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool, IPancakeV3Pool};
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
@@ -251,7 +251,7 @@ pub async fn run_chain(
                 crate::abi::Sync::SIGNATURE_HASH,
                 solidly_sync_hash_sub,
                 crate::abi::Swap::SIGNATURE_HASH,
-                PancakeV3Swap::SIGNATURE_HASH,
+                IPancakeV3Pool::Swap::SIGNATURE_HASH,
             ]);
         let provider_logs = (*provider).clone();
         let log_tx_sub2 = log_tx_sub.clone();
