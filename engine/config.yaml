@@ -46,9 +46,10 @@ chains:
       - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
       - "https://base.llamarpc.com"          # LlamaRPC parallel submit
     # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).
-    # Phantom V3 profits are caught by the pre-flight eth_call in executor.rs before any
-    # nonce is consumed — no on-chain reverts, ~50ms overhead instead of ~120ms QuoterV2.
-    optimistic_submission: true
+    # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
+    # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
+    # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
+    optimistic_submission: false
 
   - id: 42161
     name: "Arbitrum"
