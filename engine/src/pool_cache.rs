@@ -230,6 +230,16 @@ impl PoolCache {
         self.v3_by_address.iter().map(|e| *e.key()).collect()
     }
 
+    /// Count V3 pools updated within `window`. Returns (fresh, total).
+    /// fresh = pools that received at least one Swap event within the window.
+    pub fn count_fresh_v3_pools(&self, window: Duration) -> (usize, usize) {
+        let total = self.v3_by_address.len();
+        let fresh = self.v3_by_address.iter()
+            .filter(|e| e.last_updated.elapsed() <= window)
+            .count();
+        (fresh, total)
+    }
+
     /// Returns (token0, token1) for any watched pool — V2/Solidly/SyncSwap or V3.
     /// Used by the targeted-scan path to identify which tokens moved on a Swap event.
     pub fn get_pool_tokens(&self, pool: Address) -> Option<(Address, Address)> {

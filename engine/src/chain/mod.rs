@@ -433,9 +433,13 @@ pub async fn run_chain(
                 let active_pairs = last_active_count.load(Ordering::Relaxed);
                 let total_pairs = chain_pairs.len() as u64;
                 let opp_count = last_opp_count.load(Ordering::Relaxed);
+                let (v3_fresh, v3_total) = {
+                    let strat = strategy.read().await;
+                    strat.pool_cache.count_fresh_v3_pools(Duration::from_secs(30))
+                };
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={}",
-                    cfg.name, scans, attempts, success, best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
+                    "[{}] ♥ scans={} execs={} ok={} | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}",
+                    cfg.name, scans, attempts, success, best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, v3_fresh, v3_total,
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 info!("{}", heartbeat_msg);
