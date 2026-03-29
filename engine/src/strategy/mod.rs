@@ -1,5 +1,5 @@
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
+use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use dashmap::DashMap;
@@ -128,6 +128,10 @@ pub struct Strategy {
     /// enough to land in the same block on FCFS chains (Base).
     /// Disable by setting optimistic_submission: false in config.yaml.
     pub optimistic_submission: bool,
+    /// Dedicated HTTP provider for QuoterV2 multicalls.
+    /// HTTP/2 connection pooling is faster than WS for single request-response calls.
+    /// Falls back to the WS provider passed to evaluate() when None.
+    pub http_provider: Option<DynProvider>,
     /// Pre-parsed router addresses keyed by router ID.
     /// Populated once at construction — avoids Address::from_str() O(pairs × routers)
     /// times per scan (e.g. 50 pairs × 6 routers = 300 parses per block).
@@ -144,6 +148,7 @@ impl Strategy {
         pool_cache: Arc<PoolCache>,
         rpc_concurrency: usize,
         optimistic_submission: bool,
+        http_provider: Option<DynProvider>,
     ) -> Self {
         let router_addr_map: HashMap<String, Address> = routers
             .iter()
@@ -166,6 +171,7 @@ impl Strategy {
             p15_cache: Arc::new(DashMap::new()),
             p15b_cache: Arc::new(DashMap::new()),
             optimistic_submission,
+            http_provider,
             router_addr_map,
         }
     }

@@ -616,7 +616,11 @@ impl Strategy {
                     );
                 }
                 let p15_raw = if cache_misses > 0 {
-                    run_multicall(provider, p15_mc, self.rpc_concurrency).await
+                    if let Some(ref hp) = self.http_provider {
+                        run_multicall(hp, p15_mc, self.rpc_concurrency).await
+                    } else {
+                        run_multicall(provider, p15_mc, self.rpc_concurrency).await
+                    }
                 } else {
                     vec![]
                 };
@@ -855,10 +859,17 @@ impl Strategy {
             debug!("[chain={}] Phase 1.5c: {} V2→V3 reverse quote(s)", self.chain_id, p15c_mc.len());
         }
 
-        let (p15b_raw_mc, p15c_raw) = tokio::join!(
-            async { if p15b_cache_misses > 0 { run_multicall(provider, p15b_mc, self.rpc_concurrency).await } else { vec![] } },
-            async { if !p15c_mc.is_empty() { run_multicall(provider, p15c_mc, self.rpc_concurrency).await } else { vec![] } },
-        );
+        let (p15b_raw_mc, p15c_raw) = if let Some(ref hp) = self.http_provider {
+            tokio::join!(
+                async { if p15b_cache_misses > 0 { run_multicall(hp, p15b_mc, self.rpc_concurrency).await } else { vec![] } },
+                async { if !p15c_mc.is_empty() { run_multicall(hp, p15c_mc, self.rpc_concurrency).await } else { vec![] } },
+            )
+        } else {
+            tokio::join!(
+                async { if p15b_cache_misses > 0 { run_multicall(provider, p15b_mc, self.rpc_concurrency).await } else { vec![] } },
+                async { if !p15c_mc.is_empty() { run_multicall(provider, p15c_mc, self.rpc_concurrency).await } else { vec![] } },
+            )
+        };
 
         // ── Process Phase 1.5b results ────────────────────────────────────────────────
         {
