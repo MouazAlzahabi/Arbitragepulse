@@ -201,6 +201,7 @@ pub async fn run_chain(
     // ── Swap event listener ──
     let listener = Listener::new(cfg.id, cfg.name.clone(), cfg.large_swap_threshold_bps, cfg.large_v3_threshold_bps);
     let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(256);
+    let swap_tx_for_sub = swap_tx.clone();
     {
         let provider_clone = (*provider).clone();
         listener.subscribe(provider_clone, swap_tx, pool_cache.clone(), log_tx.clone()).await?;
@@ -255,6 +256,9 @@ pub async fn run_chain(
             ]);
         let provider_logs = (*provider).clone();
         let log_tx_sub2 = log_tx_sub.clone();
+        let swap_tx_sub = swap_tx_for_sub;
+        let cache_for_sub = pool_cache.clone();
+        let chain_id_sub = cfg.id;
         let cname = cfg.name.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
@@ -264,6 +268,22 @@ pub async fn run_chain(
                         backoff = Duration::from_secs(1);
                         let mut stream = sub.into_stream();
                         while let Some(log) = stream.next().await {
+                            // Apply to cache immediately so pool state is fresh
+                            let applied = crate::listener::apply_log_to_cache(
+                                &log, &cache_for_sub, solidly_sync_hash_sub,
+                            );
+                            // Trigger a targeted scan immediately — no waiting for the 2s poll cycle
+                            if applied {
+                                let pool = log.address();
+                                let block_number = log.block_number.unwrap_or(0);
+                                let _ = swap_tx_sub.try_send(crate::listener::SwapEvent {
+                                    chain_id: chain_id_sub,
+                                    pool,
+                                    block_number,
+                                    magnitude: crate::listener::SwapMagnitude::Normal,
+                                });
+                            }
+                            // Forward raw log to log_rx for pre-scan drain (idempotent safety net)
                             let _ = log_tx_sub2.send(log).await;
                         }
                         debug!("[{}] log subscription ended, reconnecting...", cname);

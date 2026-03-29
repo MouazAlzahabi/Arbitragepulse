@@ -43,8 +43,9 @@ chains:
     ws_rpc_fallbacks:
       - "wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy fallback
     submission_rpcs:
+      - "https://mainnet.base.org"                               # Official Base RPC
       - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
-      - "https://base.llamarpc.com"          # LlamaRPC parallel submit
+      - "https://base.llamarpc.com"                              # LlamaRPC parallel submit
     # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).
     # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
     # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
@@ -523,6 +524,36 @@ pairs:
   #   max_trade: "0.2"
   #   min_swap_size: "0.01"
   #   watch_pools: []
+
+  # USDC → DAI: Aerodrome stable pool vs UniV3 — less MEV competition than WETH pairs
+  - id: "base-usdc-dai"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI (Base)
+    token_in_symbol: "USDC"
+    token_out_symbol: "DAI"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "50"
+    max_trade: "200"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
+
+  # USDC → cbETH: staked ETH derivative — distinct liquidity profile, less bot competition
+  - id: "base-usdc-cbeth"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH (Coinbase staked ETH)
+    token_in_symbol: "USDC"
+    token_out_symbol: "cbETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "50"
+    max_trade: "200"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
 
   # ── Arbitrum ──
   - id: "arb-usdc-weth"
