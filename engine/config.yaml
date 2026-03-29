@@ -34,7 +34,7 @@ chains:
     block_time_ms: 2000
     contract_address: "0xF8aa9d575CEccdFed211383Cd3979241d9C6E0c2"
     min_native_balance: 0.005
-    min_profit_usd: 0.005  # $0.005 minimum — covers gas on Base (~$0.003-0.01); allows execution at small spreads
+    min_profit_usd: 0.0001  # near-zero threshold for pipeline verification — will burn gas, raise after first successful trade
     deadline_seconds: 120
     quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
     scan_interval_ms: 2000
@@ -43,7 +43,7 @@ chains:
     ws_rpc_fallbacks:
       - "wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy fallback
     submission_rpcs:
-      - "https://mainnet.base.org"                               # Official Base RPC
+      - "https://mainnet-sequencer.base.org"                     # Direct OP Stack sequencer (bypasses CDN)
       - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
       - "https://base.llamarpc.com"                              # LlamaRPC parallel submit
     # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).

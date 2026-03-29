@@ -505,7 +505,8 @@ impl Strategy {
                     // Optimistic mode: bypass QuoterV2 and submit immediately on Phase 1 spot quotes.
                     // Disable by setting optimistic_submission: false in config.yaml.
                     let v3_allowed = self.optimistic_submission || (!router_a_is_v3 && !router_b_is_v3);
-                    if profit_usd >= self.min_profit_usd && v3_allowed {
+                    let pair_min_profit = self.pairs[task.pair_idx].min_profit_usd.unwrap_or(self.min_profit_usd);
+                    if profit_usd >= pair_min_profit && v3_allowed {
                         debug!(
                             "[{}] Arb: {} | profit=${:.4} | {}/{}",
                             self.chain_id,
@@ -757,9 +758,9 @@ impl Strategy {
                         info!(
                             "[{}] Phase 1.5 result: {} | {}/{} | quoter_out={} amount_back={} profit_usd=${:.4} (min=${:.2})",
                             self.chain_id, pair.id, router_a_id, q_b.router_id,
-                            quoter_out, amount_back, profit_usd, self.min_profit_usd
+                            quoter_out, amount_back, profit_usd, pair.min_profit_usd.unwrap_or(self.min_profit_usd)
                         );
-                        if profit_usd >= self.min_profit_usd {
+                        if profit_usd >= pair.min_profit_usd.unwrap_or(self.min_profit_usd) {
                             info!("[{}] Phase 1.5 arb: {} | profit=${:.4} | {}/{}",
                                    self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
                             opportunities.push(ArbOpportunity {
@@ -916,9 +917,9 @@ impl Strategy {
                 info!(
                     "[{}] Phase 1.5b result: {} | {}/{} | amount_back={} profit_usd=${:.4} (min=${:.2})",
                     self.chain_id, pair.id, router_a_id, q_b.router_id,
-                    amount_back, profit_usd, self.min_profit_usd
+                    amount_back, profit_usd, pair.min_profit_usd.unwrap_or(self.min_profit_usd)
                 );
-                if profit_usd >= self.min_profit_usd {
+                if profit_usd >= pair.min_profit_usd.unwrap_or(self.min_profit_usd) {
                     info!("[{}] Phase 1.5b V3×V3 arb: {} | profit=${:.4} | {}/{}",
                            self.chain_id, pair.id, profit_usd, router_a_id, q_b.router_id);
                     opportunities.push(ArbOpportunity {
@@ -975,9 +976,9 @@ impl Strategy {
 
             info!(
                 "[{}] Phase 1.5c result: {} | {}/{} | amount_back={} profit_usd=${:.4} (min=${:.2})",
-                self.chain_id, pair.id, router_a_id, router_b_id, amount_back, profit_usd, self.min_profit_usd
+                self.chain_id, pair.id, router_a_id, router_b_id, amount_back, profit_usd, pair.min_profit_usd.unwrap_or(self.min_profit_usd)
             );
-            if profit_usd >= self.min_profit_usd {
+            if profit_usd >= pair.min_profit_usd.unwrap_or(self.min_profit_usd) {
                 info!("[{}] Phase 1.5c arb: {} | profit=${:.4} | {}/{}",
                        self.chain_id, pair.id, profit_usd, router_a_id, router_b_id);
                 opportunities.push(ArbOpportunity {

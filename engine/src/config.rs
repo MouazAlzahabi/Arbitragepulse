@@ -154,6 +154,11 @@ pub struct PairConfig {
     /// Optional cap: if set, actual trade size = min(trade_amount, max_trade)
     #[serde(default)]
     pub max_trade: Option<String>,
+    /// Per-pair profit floor in USD. Overrides chain-level min_profit_usd when set.
+    /// Use to raise the bar on competitive pairs (e.g. USDC/WETH) while keeping it
+    /// low for less-contested pairs (ZORA, VIRTUAL) that share the same chain config.
+    #[serde(default)]
+    pub min_profit_usd: Option<f64>,
     #[serde(default)]
     pub watch_pools: Vec<String>,
 }
