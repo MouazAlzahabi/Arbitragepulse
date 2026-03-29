@@ -236,7 +236,7 @@ impl Executor {
         let gas_price = self.get_gas_price(provider).await;
         // priority_fee mirrors what the tx builder uses below — must match exactly so the
         // "negative after gas" guard accounts for the full effective gas price (base + tip).
-        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * GAS_LIMIT as u128;
@@ -320,7 +320,7 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.get_gas_price(provider).await;
-        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * GAS_LIMIT_TRIANGULAR as u128;
@@ -494,7 +494,7 @@ impl Executor {
 
         // ── Live execution with EIP-1559 tip tuning ────────────────────────────
         // priority_fee = 10% of base fee, minimum 0.1 gwei
-        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
@@ -692,7 +692,7 @@ impl Executor {
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
 
-        let priority_fee = (gas_price / 10).max(100_000_000u128);
+        let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)

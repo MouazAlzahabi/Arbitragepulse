@@ -534,8 +534,8 @@ pairs:
     token_out_symbol: "DAI"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "200"
-    max_trade: "200"
+    trade_amount: "50"
+    max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
@@ -549,10 +549,42 @@ pairs:
     token_out_symbol: "cbETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "200"
-    max_trade: "200"
+    trade_amount: "50"
+    max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
+
+  # USDC → ZORA: Zora Network governance token — $2.7M/day UniV3 + $685K PancakeV3
+  # Aerodrome pool is SlipStream (concentrated) only — not classic vAMM, excluded
+  - id: "base-usdc-zora"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x1111111111166b7fe7bd91427724b487980afc69"   # ZORA (Zora Network)
+    token_in_symbol: "USDC"
+    token_out_symbol: "ZORA"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "50"
+    max_trade: "50"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base"]
+    watch_pools: []
+
+  # USDC → VIRTUAL: Virtuals Protocol token — $3M/day PancakeV3 + $217K UniV3
+  # Less bot competition than WETH; price discovery primarily on PancakeV3
+  - id: "base-usdc-virtual"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b"   # VIRTUAL (Virtuals Protocol)
+    token_in_symbol: "USDC"
+    token_out_symbol: "VIRTUAL"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "50"
+    max_trade: "50"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base"]
     watch_pools: []
 
   # ── Arbitrum ──
