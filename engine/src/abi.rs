@@ -248,6 +248,12 @@ sol! {
     }
 
     #[sol(rpc)]
+    interface IAerodromeFactory {
+        /// Aerodrome V2 factory uses getPool() not getPair()
+        function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
+    }
+
+    #[sol(rpc)]
     interface IUniswapV2Pair {
         function token0() external view returns (address);
         function token1() external view returns (address);

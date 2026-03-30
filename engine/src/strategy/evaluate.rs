@@ -793,12 +793,14 @@ impl Strategy {
 
         // ── Phase 1.5c candidate collection ──────────────────────────────────────────
         // Collected before firing so it can run concurrently with Phase 1.5b below.
-        // V2-forward / V3-reverse routes: quote_v3_spot overestimates multi-tick output.
+        // Local-forward (V2/Solidly/Aerodrome) / V3-reverse routes: quote_v3_spot overestimates
+        // multi-tick output. QuoterV2 verifies the exact V3 reverse output before submission.
         let mut p15c_mc: Vec<(Address, Vec<u8>)> = Vec::new();
-        let mut p15c_candidates: Vec<(usize, String, u32, Address, Address, Address, U256, u32, Address, String)> = Vec::new();
+        let mut p15c_candidates: Vec<(usize, String, u32, Address, RouterType, Address, Address, U256, u32, Address, String)> = Vec::new();
         {
             for task in &rev_tasks {
-                if !matches!(task.router_a_type, RouterType::V2) { continue; }
+                let router_a_is_local = matches!(task.router_a_type, RouterType::V2 | RouterType::Solidly | RouterType::Aerodrome);
+                if !router_a_is_local { continue; }
                 if !matches!(task.router_b_type, RouterType::V3) { continue; }
 
                 let local_back = match task.local_back { Some(v) => v, None => continue };
@@ -833,6 +835,7 @@ impl Strategy {
                 p15c_candidates.push((
                     task.pair_idx,
                     task.router_a_id.clone(), task.fee_a, task.router_a_addr,
+                    task.router_a_type.clone(),
                     task.token_in, task.token_out, full_amount,
                     task.fee_b, task.router_b_addr, task.router_b_id.clone(),
                 ));
@@ -856,7 +859,7 @@ impl Strategy {
             }
         }
         if !p15c_mc.is_empty() {
-            debug!("[chain={}] Phase 1.5c: {} V2→V3 reverse quote(s)", self.chain_id, p15c_mc.len());
+            debug!("[chain={}] Phase 1.5c: {} local→V3 reverse quote(s)", self.chain_id, p15c_mc.len());
         }
 
         let (p15b_raw_mc, p15c_raw) = if let Some(ref hp) = self.http_provider {
@@ -955,7 +958,7 @@ impl Strategy {
         }
 
         // ── Process Phase 1.5c results ────────────────────────────────────────────────
-        for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id), raw_opt)
+        for ((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id), raw_opt)
             in p15c_candidates.into_iter().zip(p15c_raw.into_iter())
         {
             let raw = match raw_opt { Some(r) => r, None => continue };
@@ -999,7 +1002,7 @@ impl Strategy {
                     amount_in: full_amount,
                     router_a: router_a_addr,
                     router_b: router_b_addr,
-                    router_a_type: RouterType::V2,
+                    router_a_type,
                     router_b_type: RouterType::V3,
                     fee_a, fee_b,
                     expected_profit: profit,

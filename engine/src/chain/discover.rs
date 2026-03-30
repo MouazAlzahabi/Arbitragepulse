@@ -76,13 +76,22 @@ pub(crate) async fn discover_pools<P: Provider>(
                     pair_calls.push((factory, cd));
                     pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
                 }
-                RouterType::Solidly | RouterType::Aerodrome => {
+                RouterType::Solidly => {
                     // Volatile pool (xy=k)
                     let cd_vol = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
                     pair_calls.push((factory, cd_vol));
                     pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
                     // Stable pool (x³y+xy³=k) — uses stable_fee_bps if configured
                     let cd_sta = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: true }.abi_encode();
+                    pair_calls.push((factory, cd_sta));
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, ta, tb, is_stable: true });
+                }
+                RouterType::Aerodrome => {
+                    // Aerodrome uses getPool() not getPair() — different 4-byte selector
+                    let cd_vol = IAerodromeFactory::getPoolCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
+                    pair_calls.push((factory, cd_vol));
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
+                    let cd_sta = IAerodromeFactory::getPoolCall { tokenA: ta, tokenB: tb, stable: true }.abi_encode();
                     pair_calls.push((factory, cd_sta));
                     pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, ta, tb, is_stable: true });
                 }
