@@ -368,7 +368,6 @@ pub async fn run_chain(
     let mut price_tick    = tokio::time::interval(Duration::from_secs(60));
     let mut config_tick   = tokio::time::interval(Duration::from_secs(30));
     let mut balance_tick  = tokio::time::interval(Duration::from_secs(30));
-    let mut prune_tick    = tokio::time::interval(Duration::from_secs(600)); // every 10 min
 
     loop {
         tokio::select! {
@@ -529,18 +528,6 @@ pub async fn run_chain(
                 state::refresh_contract_balances(provider.as_ref(), contract_addr, &contract_balances).await;
             }
 
-            // ── Pool cache staleness pruning (every 10 min) ───────────────────
-            _ = prune_tick.tick() => {
-                let pool_cache = strategy.read().await.pool_cache.clone();
-                let (evicted_v2, evicted_v3) = pool_cache.prune_stale(
-                    Duration::from_secs(600),   // 10 min TTL for V2/Solidly
-                    Duration::from_secs(1800),  // 30 min TTL for V3 (quieter pools ok)
-                );
-                if evicted_v2 + evicted_v3 > 0 {
-                    debug!("[{}] pool cache pruned: {} V2/Solidly, {} V3 stale entries evicted",
-                        cfg.name, evicted_v2, evicted_v3);
-                }
-            }
 
             // ── Config hot-reload ─────────────────────────────────────────────
             _ = config_tick.tick() => {
