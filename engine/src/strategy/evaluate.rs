@@ -751,6 +751,12 @@ impl Strategy {
                             continue;
                         }
 
+                        // Apply 0.15% slippage discount: the Aerodrome/V2 reverse leg uses the
+                        // local pool cache; if those reserves shifted between scan and execution,
+                        // the on-chain swap returns less than the cached estimate. Without this
+                        // buffer the contract reverts with InsufficientOutputAmount().
+                        let amount_back = (amount_back * U256::from(9985)) / U256::from(10000);
+
                         // Track verified spread for ALL non-phantom results, including losses
                         // (negative value shows QuoterV2 confirmed the spread is a loss).
                         let verified_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
