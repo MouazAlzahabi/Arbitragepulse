@@ -410,7 +410,7 @@ impl Strategy {
 
         // Phase 1.5 gate: collect V3 tick-capped forward tasks that show real cross-DEX
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
-        const P15_GATE_SPREAD: f64 = 0.0005; // 0.05% — gate for Phase 1.5/1.5c QuoterV2 batches
+        const P15_GATE_SPREAD: f64 = 0.00005; // 0.005% — gate for Phase 1.5/1.5c QuoterV2 batches
         let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
         // Best QuoterV2-verified spread (signed). NEG_INFINITY when Phase 1.5 didn't run or
         // all reverse lookups failed. Exposed in heartbeat as "bestV=" to distinguish real
