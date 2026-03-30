@@ -16,9 +16,9 @@ use crate::abi::{ArbitrageExecutor, IERC20};
 use crate::db::Database;
 use crate::strategy::{ArbOpportunity, TriangularOpportunity};
 
-// Hardcoded gas limit — 500k covers any 2-hop arb (V2+V2, V2+V3, V3+V3).
-// We skip eth_estimateGas to save one RPC round-trip per execution.
-const GAS_LIMIT: u64 = 500_000;
+// Hardcoded gas limit — 700k covers any 2-hop arb including PancakeV3 SmartRouter
+// which is more gas-intensive than UniV3 SwapRouter02 (observed 496K/500K = 99.3% on Base).
+const GAS_LIMIT: u64 = 700_000;
 
 // Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
 const GAS_LIMIT_TRIANGULAR: u64 = 900_000;
@@ -493,12 +493,14 @@ impl Executor {
         };
 
         // ── Live execution with EIP-1559 tip tuning ────────────────────────────
-        // priority_fee = 10% of base fee, minimum 0.1 gwei
+        // priority_fee = 10% of base fee, minimum 0.001 gwei
+        // max_fee_per_gas = 2× base fee: Base can increase base fee by up to 12.5% per block;
+        // setting max_fee exactly at current base fee causes sequencer rejection if fee ticks up.
         let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
-            .max_fee_per_gas(gas_price + priority_fee);
+            .max_fee_per_gas((gas_price * 2) + priority_fee);
 
         let start = std::time::Instant::now();
 
@@ -696,7 +698,7 @@ impl Executor {
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
-            .max_fee_per_gas(gas_price + priority_fee);
+            .max_fee_per_gas((gas_price * 2) + priority_fee);
 
         let start = std::time::Instant::now();
 

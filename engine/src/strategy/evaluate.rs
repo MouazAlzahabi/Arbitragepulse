@@ -322,6 +322,13 @@ impl Strategy {
                     // that consistently fail on-chain. Real arbs always cross DEX/router
                     // boundaries; same-router V3 × V3 is never reliably detectable with
                     // local spot math.
+                    // Never route both legs through the same router contract.
+                    // Aerodrome volatile and stable share one router_addr but have different
+                    // router_ids — without this guard, vol×sta creates a same-DEX "arb" that
+                    // always fails on-chain (InsufficientOutputAmount from the stable pool).
+                    if q_a.router_addr == q_b.router_addr {
+                        continue;
+                    }
                     if q_a.router_id == q_b.router_id
                         && matches!(q_a.router_type, RouterType::V3)
                     {
@@ -912,6 +919,12 @@ impl Strategy {
                     continue;
                 }
 
+                // Apply 0.15% slippage discount: QuoterV2 quotes the current block; the tx
+                // lands in the next block (~2s on Base) where the V3 pool price may have moved.
+                // Without this buffer, a 1-wei price shift makes amountFinalOut < amountIn +
+                // minProfit and the contract reverts with "Too little received".
+                let amount_back = (amount_back * U256::from(9985)) / U256::from(10000);
+
                 // Track verified spread for ALL non-phantom results (including losses).
                 // Both legs are QuoterV2-confirmed here — most accurate signal available.
                 let v_spread_1b = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
@@ -974,6 +987,10 @@ impl Strategy {
                 warn!("[{}] Phase 1.5c phantom: {}/{}", self.chain_id, router_a_id, router_b_id);
                 continue;
             }
+
+            // Apply 0.15% slippage discount: QuoterV2 quotes the current block; the tx
+            // lands in the next block (~2s on Base) where the V3 pool price may have moved.
+            let amount_back = (amount_back * U256::from(9985)) / U256::from(10000);
 
             let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
             if v_spread > best_verified_spread { best_verified_spread = v_spread; }
