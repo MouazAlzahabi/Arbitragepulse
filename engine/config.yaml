@@ -34,7 +34,7 @@ chains:
     block_time_ms: 2000
     contract_address: "0xF8aa9d575CEccdFed211383Cd3979241d9C6E0c2"
     min_native_balance: 0.005
-    min_profit_usd: 0.0001  # near-zero threshold for pipeline verification — will burn gas, raise after first successful trade
+    min_profit_usd: 0.0001  # near-zero threshold for pipeline verification — the 0.25% slippage buffer in evaluate.rs filters marginal routes
     deadline_seconds: 120
     quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
     scan_interval_ms: 2000
@@ -568,7 +568,7 @@ pairs:
     trade_amount: "50"
     max_trade: "50"
     min_swap_size: "5"
-    routers: ["uniswap-v3-base", "pancake-v3-base"]
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
   # USDC → VIRTUAL: Virtuals Protocol token — $3M/day PancakeV3 + $217K UniV3
@@ -584,7 +584,67 @@ pairs:
     trade_amount: "50"
     max_trade: "50"
     min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
+
+  # USDC → BRETT: $1.2M+ UniV3 USDC pool; Aerodrome is Slipstream CL only (excluded)
+  - id: "base-usdc-brett"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x532f27101965dd16442E59d40670FaF5eBB142E4"   # BRETT
+    token_in_symbol: "USDC"
+    token_out_symbol: "BRETT"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "25"
+    max_trade: "25"
+    min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base"]
+    watch_pools: []
+
+  # USDC → WELL: Morpho/Moonwell governance token — Aerodrome V1 vAMM + V3 pools
+  - id: "base-usdc-well"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0xA88594D404727625A9437C3f886C7643872296AE"   # WELL (Moonwell)
+    token_in_symbol: "USDC"
+    token_out_symbol: "WELL"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "25"
+    max_trade: "25"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
+
+  # USDC → DEGEN: Farcaster community token — UniV3 + Aerodrome V1 vAMM pools
+  - id: "base-usdc-degen"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"   # DEGEN
+    token_in_symbol: "USDC"
+    token_out_symbol: "DEGEN"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "25"
+    max_trade: "25"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
+
+  # USDC → doginme: meme token — $1.2M UniV3 + Aerodrome V1 vAMM
+  - id: "base-usdc-doginme"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x6921B130D297cc43754afba22e5EAc0FBf8Db75b"   # doginme
+    token_in_symbol: "USDC"
+    token_out_symbol: "doginme"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "25"
+    max_trade: "25"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
   # ── Arbitrum ──

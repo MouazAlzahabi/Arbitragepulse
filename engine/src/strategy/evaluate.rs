@@ -751,11 +751,13 @@ impl Strategy {
                             continue;
                         }
 
-                        // Apply 0.07% slippage discount: the Aerodrome/V2 reverse leg uses the
+                        // Apply 0.25% slippage discount: the Aerodrome/V2 reverse leg uses the
                         // local pool cache; if those reserves shifted between scan and execution,
-                        // the on-chain swap returns less than the cached estimate. Without this
-                        // buffer the contract reverts with InsufficientOutputAmount().
-                        let amount_back = (amount_back * U256::from(9993)) / U256::from(10000);
+                        // the on-chain swap returns less than the cached estimate. 0.07% was
+                        // insufficient — Aerodrome volatile pools (0.3% fee, high volume) can
+                        // move >0.07% in one 2s Base block. 0.25% = ~1 full Aerodrome fee tier
+                        // of headroom; marginal trades are filtered by min_profit_usd instead.
+                        let amount_back = (amount_back * U256::from(9975)) / U256::from(10000);
 
                         // Track verified spread for ALL non-phantom results, including losses
                         // (negative value shows QuoterV2 confirmed the spread is a loss).

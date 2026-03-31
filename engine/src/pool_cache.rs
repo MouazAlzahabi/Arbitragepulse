@@ -87,11 +87,14 @@ impl V3PoolState {
 }
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
-/// 300s (5 min): covers pools that swap every few minutes (typical on Linea).
-pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(300);
+/// 60s: Base pools are heavily traded; stale reserves > 60s create phantom spreads.
+pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// How long a Solidly-stable / SyncSwap-stable pool reserve is considered fresh.
-pub const STABLE_MAX_AGE: Duration = Duration::from_secs(120);
+/// 30s: If a stable pool gets one-sided arb'd to near-zero, it stops receiving Sync events
+/// (no one trades terrible rates). A missed Sync event would keep the cache stale forever
+/// at 120s. 30s ensures the pool falls out of scope within one scan cycle if events stop.
+pub const STABLE_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// Q96 = 2^96, used for V3 sqrtPriceX96 ↔ virtual-reserve conversion.
 /// Stored as a const to avoid `U256::from(1u128) << 96` on every quote call.
