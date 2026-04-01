@@ -751,13 +751,12 @@ impl Strategy {
                             continue;
                         }
 
-                        // Apply 0.25% slippage discount: the Aerodrome/V2 reverse leg uses the
-                        // local pool cache; if those reserves shifted between scan and execution,
-                        // the on-chain swap returns less than the cached estimate. 0.07% was
-                        // insufficient — Aerodrome volatile pools (0.3% fee, high volume) can
-                        // move >0.07% in one 2s Base block. 0.25% = ~1 full Aerodrome fee tier
-                        // of headroom; marginal trades are filtered by min_profit_usd instead.
-                        let amount_back = (amount_back * U256::from(9975)) / U256::from(10000);
+                        // Apply 0.10% slippage buffer (Phase 1.5: V3 forward + Aerodrome/V2 reverse).
+                        // The Aerodrome reverse leg uses local pool cache (VOLATILE_MAX_AGE=60s).
+                        // With the 60s TTL, cache is fresh within a few blocks for active pools.
+                        // 0.10% covers the ~2s execution window plus cache age uncertainty.
+                        // The stale-cache phantom problem is solved by the TTL, not the buffer size.
+                        let amount_back = (amount_back * U256::from(9990)) / U256::from(10000);
 
                         // Track verified spread for ALL non-phantom results, including losses
                         // (negative value shows QuoterV2 confirmed the spread is a loss).
@@ -927,12 +926,10 @@ impl Strategy {
                     continue;
                 }
 
-                // Apply 0.15% slippage buffer for Phase 1.5b (V3×V3): both the forward and
-                // reverse V3 pools can independently shift between QuoterV2 quote time and tx
-                // execution (~2s on Base). Each pool can move up to ~0.07-0.10% per block in
-                // normal conditions, compounding to ~0.14-0.20% total. 0.15% covers the typical
-                // case while still letting real cross-DEX V3×V3 spreads through.
-                let amount_back = (amount_back * U256::from(9985)) / U256::from(10000);
+                // Apply 0.08% slippage buffer (Phase 1.5b: V3×V3, both legs QuoterV2-confirmed).
+                // Both pools can shift in the ~2s from quote to execution. Each typically moves
+                // 0.02-0.04% per Base block. 0.08% covers both legs with margin.
+                let amount_back = (amount_back * U256::from(9992)) / U256::from(10000);
 
                 // Track verified spread for ALL non-phantom results (including losses).
                 // Both legs are QuoterV2-confirmed here — most accurate signal available.
@@ -997,13 +994,13 @@ impl Strategy {
                 continue;
             }
 
-            // Apply 0.35% combined slippage buffer for Phase 1.5c (local forward + V3 reverse):
-            // ~0.28% for local Aerodrome/V2 forward leg variability — the cached reserve quote
-            // gives X tokens; the actual on-chain swap gives X' ≠ X (pool moved since last Sync).
-            // UniV3 reverse receives X' tokens and returns Y' ≈ Y×(X'/X) < amountOutMin (set
-            // from Y×0.9993). ~0.07% for V3 price movement between QuoterV2 quote and execution.
-            // Combined: 0.35% = 9965/10000. This is the compounding of both leg uncertainties.
-            let amount_back = (amount_back * U256::from(9965)) / U256::from(10000);
+            // Apply 0.10% slippage buffer (Phase 1.5c: Aerodrome/V2 forward + V3 reverse).
+            // Forward leg uses local pool cache (VOLATILE_MAX_AGE=60s); uncertainty is bounded
+            // by how much the Aerodrome pool moved since the last Sync event. With 60s TTL,
+            // active pools receive Sync events every few seconds, so cache age is typically
+            // 2-10s. V3 reverse leg risk: 0.02-0.04% per 2s block. Total: 0.10% is conservative
+            // but allows detection of the 0.10-0.20% spreads that the market actually offers.
+            let amount_back = (amount_back * U256::from(9990)) / U256::from(10000);
 
             let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
             if v_spread > best_verified_spread { best_verified_spread = v_spread; }

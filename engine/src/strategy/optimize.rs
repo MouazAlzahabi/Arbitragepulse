@@ -137,13 +137,11 @@ impl Strategy {
             .max_by_key(|(amt, back)| *back - *amt)
             .unwrap_or((opp.amount_in, opp.amount_in + opp.expected_profit));
 
-        // Apply 0.25% slippage buffer to opt_back: the optimizer uses live QuoterV2/RPC quotes
+        // Apply 0.08% slippage buffer to opt_back: the optimizer uses live QuoterV2/RPC quotes
         // at probe time, but the tx executes ~60-130ms later. In that window, V3 and Aerodrome
-        // pools can move. Without this buffer, the optimizer can return an opportunity whose
-        // raw profit only barely exceeds the original detected profit — stripping the buffer
-        // that evaluate.rs applied (0.25-0.35%). This causes "Too little received" reverts when
-        // on-chain slippage reduces actual_return below amount_in + min_profit_gas.
-        let opt_back = (opt_back_raw * U256::from(9975)) / U256::from(10000);
+        // pools can move (~0.02-0.04% per 2s block). Without this buffer, the optimizer strips
+        // the buffer that evaluate.rs applied, allowing thin-margin upgrades that fail on-chain.
+        let opt_back = (opt_back_raw * U256::from(9992)) / U256::from(10000);
 
         let opt_profit = if opt_back > opt_amount {
             opt_back - opt_amount
