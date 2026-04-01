@@ -927,11 +927,12 @@ impl Strategy {
                     continue;
                 }
 
-                // Apply 0.07% slippage discount: QuoterV2 quotes the current block; the tx
-                // lands in the next block (~2s on Base) where the V3 pool price may have moved.
-                // Without this buffer, a 1-wei price shift makes amountFinalOut < amountIn +
-                // minProfit and the contract reverts with "Too little received".
-                let amount_back = (amount_back * U256::from(9993)) / U256::from(10000);
+                // Apply 0.15% slippage buffer for Phase 1.5b (V3×V3): both the forward and
+                // reverse V3 pools can independently shift between QuoterV2 quote time and tx
+                // execution (~2s on Base). Each pool can move up to ~0.07-0.10% per block in
+                // normal conditions, compounding to ~0.14-0.20% total. 0.15% covers the typical
+                // case while still letting real cross-DEX V3×V3 spreads through.
+                let amount_back = (amount_back * U256::from(9985)) / U256::from(10000);
 
                 // Track verified spread for ALL non-phantom results (including losses).
                 // Both legs are QuoterV2-confirmed here — most accurate signal available.
@@ -996,9 +997,13 @@ impl Strategy {
                 continue;
             }
 
-            // Apply 0.07% slippage discount: QuoterV2 quotes the current block; the tx
-            // lands in the next block (~2s on Base) where the V3 pool price may have moved.
-            let amount_back = (amount_back * U256::from(9993)) / U256::from(10000);
+            // Apply 0.35% combined slippage buffer for Phase 1.5c (local forward + V3 reverse):
+            // ~0.28% for local Aerodrome/V2 forward leg variability — the cached reserve quote
+            // gives X tokens; the actual on-chain swap gives X' ≠ X (pool moved since last Sync).
+            // UniV3 reverse receives X' tokens and returns Y' ≈ Y×(X'/X) < amountOutMin (set
+            // from Y×0.9993). ~0.07% for V3 price movement between QuoterV2 quote and execution.
+            // Combined: 0.35% = 9965/10000. This is the compounding of both leg uncertainties.
+            let amount_back = (amount_back * U256::from(9965)) / U256::from(10000);
 
             let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
             if v_spread > best_verified_spread { best_verified_spread = v_spread; }
