@@ -87,8 +87,11 @@ impl V3PoolState {
 }
 
 /// How long a V2/Solidly-volatile pool reserve is considered fresh.
-/// 60s: Base pools are heavily traded; stale reserves > 60s create phantom spreads.
-pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(60);
+/// 120s: volatile pools self-correct via arbitrage — they cannot become critically
+/// imbalanced like stable pools can. Lower-volume pairs (BRETT, DEGEN, doginme) may
+/// not trade every 60s; a 60s TTL makes their pools go stale and disappear from Phase 1.
+/// 120s keeps them in scope for detection without adding phantom-spread risk.
+pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// How long a Solidly-stable / SyncSwap-stable pool reserve is considered fresh.
 /// 30s: If a stable pool gets one-sided arb'd to near-zero, it stops receiving Sync events

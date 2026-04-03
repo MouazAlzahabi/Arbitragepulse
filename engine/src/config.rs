@@ -62,6 +62,11 @@ pub struct ChainConfig {
     /// Set to false to restore full QuoterV2 verification. Default: false.
     #[serde(default)]
     pub optimistic_submission: bool,
+    /// When false, skip the two-round adaptive size optimizer and trade at the configured
+    /// trade_amount directly. Saves ~80-100ms per opportunity on FCFS chains (Base).
+    /// Set to true to re-enable. Default: true (optimizer on).
+    #[serde(default = "default_true")]
+    pub optimize_size: bool,
 }
 
 fn default_rpc_concurrency() -> usize {
@@ -71,6 +76,8 @@ fn default_rpc_concurrency() -> usize {
 fn default_scan_interval_ms() -> u64 {
     1000
 }
+
+fn default_true() -> bool { true }
 
 fn default_min_swap_amount() -> u128 {
     100_000_000_000_000_000 // 1e17 = 0.1 ETH or 100k USDC (6 decimals)

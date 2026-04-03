@@ -193,7 +193,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             // On FCFS chains (Base), 200ms of optimizer latency = ~65 positions lost.
             let optimized = {
                 let strat = strategy.read().await;
-                if strat.optimistic_submission {
+                if strat.optimistic_submission || !cfg.optimize_size {
                     opp.clone()
                 } else {
                     strat.optimize(opp, provider.as_ref(), max_bal).await
