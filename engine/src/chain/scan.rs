@@ -146,6 +146,19 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         cooldowns.remove(&fingerprint); // expired entry — clean up
     }
 
+    // Pair-level cooldown: a successful TX was recently sent for this token pair on a
+    // different router combo. Block all combos for the same pair until the cooldown clears.
+    // Prevents two competing TXs (e.g. UniV3→Aerodrome and PancakeV3→Aerodrome) from
+    // firing in the same block when triggered by two rapid Swap events.
+    if let Some(&pair_expire) = cooldowns.get(display_id) {
+        if pair_expire > Instant::now() {
+            let remaining = pair_expire.duration_since(Instant::now()).as_secs();
+            debug!("[{}] {} pair in cooldown ({}s remaining), skipping", cfg.name, display_id, remaining);
+            continue 'candidates;
+        }
+        cooldowns.remove(display_id); // expired — clean up
+    }
+
     // Pending tx dedup
     if pending_pairs.contains(&fingerprint) {
         debug!("[{}] {} tx already in-flight, skipping", cfg.name, best_opp.pair_id());
@@ -248,6 +261,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                        cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         handle_execution_success(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -344,6 +358,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
+                                cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
 
                                 // Fire-and-forget receipt task using cloned prep fields
                                 let log_tx_bg = log_tx.clone();
@@ -507,6 +522,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                        cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         handle_execution_success(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -588,6 +604,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
+                                cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
 
                                 // Fire-and-forget receipt task
                                 let log_tx_bg = log_tx.clone();
