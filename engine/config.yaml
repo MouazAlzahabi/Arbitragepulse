@@ -50,8 +50,9 @@ chains:
     # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
     # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
     # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
-    optimistic_submission: true   # skip QuoterV2 verification (~80-160ms saved) — gets to position ~2-10
+    optimistic_submission: true   # skip QuoterV2 verification (~80-160ms saved)
     optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
+    priority_fee_wei: 15000000    # 15 Mwei tip — Base sequencer orders by gas price; top bots use ~15M Wei to land at position 1-5
 
   - id: 42161
     name: "Arbitrum"

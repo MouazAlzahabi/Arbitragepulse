@@ -67,6 +67,13 @@ pub struct ChainConfig {
     /// Set to true to re-enable. Default: true (optimizer on).
     #[serde(default = "default_true")]
     pub optimize_size: bool,
+    /// EIP-1559 maxPriorityFeePerGas (tip) in Wei added on top of baseFee.
+    /// Higher values land earlier in the block when sequencers order by effective gas price.
+    /// Base L2 competing bots use ~15_000_000 Wei (15 Mwei = 0.015 gwei).
+    /// Default: 1_000_000 Wei (1 Mwei = 0.001 gwei) — conservative, good for non-competitive chains.
+    /// Set to 15_000_000 on Base to reach position 1-5 vs 50-200.
+    #[serde(default = "default_priority_fee_wei")]
+    pub priority_fee_wei: u128,
 }
 
 fn default_rpc_concurrency() -> usize {
@@ -78,6 +85,10 @@ fn default_scan_interval_ms() -> u64 {
 }
 
 fn default_true() -> bool { true }
+
+fn default_priority_fee_wei() -> u128 {
+    1_000_000 // 1 Mwei = 0.001 gwei — safe default for non-competitive chains
+}
 
 fn default_min_swap_amount() -> u128 {
     100_000_000_000_000_000 // 1e17 = 0.1 ETH or 100k USDC (6 decimals)

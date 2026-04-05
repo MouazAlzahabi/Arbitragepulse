@@ -128,6 +128,9 @@ pub struct Executor {
     submission_rpcs: Vec<url::Url>,
     /// Shared reqwest client with connection pooling for secondary RPC broadcast.
     http_client: Arc<reqwest::Client>,
+    /// EIP-1559 maxPriorityFeePerGas (tip) in Wei. Set from chain config.
+    /// Higher values land earlier in the block on sequencer chains that order by gas price.
+    priority_fee_wei: u128,
 }
 
 impl Executor {
@@ -140,6 +143,7 @@ impl Executor {
         submission_rpcs: Vec<url::Url>,
         min_profit_usd: f64,
         block_time_ms: u64,
+        priority_fee_wei: u128,
         db: Option<Arc<Database>>,
     ) -> Self {
         // Gas price cache TTL = 2× block time (cache valid for 2 blocks)
@@ -166,6 +170,7 @@ impl Executor {
             contract_balances: None,
             wallet,
             submission_rpcs,
+            priority_fee_wei,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .pool_max_idle_per_host(4)
@@ -234,9 +239,8 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.get_gas_price(provider).await;
-        // priority_fee mirrors what the tx builder uses below — must match exactly so the
-        // "negative after gas" guard accounts for the full effective gas price (base + tip).
-        let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
+        // priority_fee (tip) from chain config — must match tx builder below for gas cost guard.
+        let priority_fee = self.priority_fee_wei;
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * GAS_LIMIT as u128;
@@ -320,7 +324,7 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.get_gas_price(provider).await;
-        let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
+        let priority_fee = self.priority_fee_wei;
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * GAS_LIMIT_TRIANGULAR as u128;
@@ -436,7 +440,7 @@ impl Executor {
 
         // ── Gas profitability check (300k hardcoded — no eth_estimateGas) ─────
         let gas_cost_usd = {
-            let cost_wei = gas_price * GAS_LIMIT as u128;
+            let cost_wei = (gas_price + self.priority_fee_wei) * GAS_LIMIT as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -493,10 +497,10 @@ impl Executor {
         };
 
         // ── Live execution with EIP-1559 tip tuning ────────────────────────────
-        // priority_fee = 10% of base fee, minimum 0.001 gwei
+        // priority_fee from chain config (priority_fee_wei).
         // max_fee_per_gas = 2× base fee: Base can increase base fee by up to 12.5% per block;
         // setting max_fee exactly at current base fee causes sequencer rejection if fee ticks up.
-        let priority_fee = (gas_price / 10).max(1_000_000u128); // 0.001 gwei min — Base L2 fees are ~0.001-0.005 gwei
+        let priority_fee = self.priority_fee_wei;
         let tx = tx_base
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)

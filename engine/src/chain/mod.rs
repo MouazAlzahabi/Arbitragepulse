@@ -87,6 +87,7 @@ pub async fn run_chain(
         submission_rpc_urls,
         cfg.min_profit_usd,
         cfg.block_time_ms,
+        cfg.priority_fee_wei,
         db,
     )));
 
