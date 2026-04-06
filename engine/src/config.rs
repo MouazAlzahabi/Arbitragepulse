@@ -74,6 +74,13 @@ pub struct ChainConfig {
     /// Set to 15_000_000 on Base to reach position 1-5 vs 50-200.
     #[serde(default = "default_priority_fee_wei")]
     pub priority_fee_wei: u128,
+    /// Enable pending transaction monitoring for same-block execution.
+    /// Subscribes to the mempool and fires an arb TX when a large swap is detected
+    /// before it confirms, matching the trigger TX's tip so both land in the same block.
+    /// Requires a WS endpoint that exposes the mempool (Alchemy, QuickNode).
+    /// Default: false.
+    #[serde(default)]
+    pub pending_tx_monitoring: bool,
 }
 
 fn default_rpc_concurrency() -> usize {

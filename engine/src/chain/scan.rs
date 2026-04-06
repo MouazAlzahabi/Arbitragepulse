@@ -27,6 +27,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Pre-read from shared_state by the caller (alongside the paused check) to avoid
     // an extra shared_state.read().await here on every scan.
     disabled_set: HashSet<String>,
+    // When Some, override the executor's priority_fee_wei for this submission.
+    // Used by pending TX monitor to match the trigger TX's tip for same-block landing.
+    tip_override: Option<u128>,
 ) {
     // Clone ghost_profit_bits from executor once — passed to handle_execution_failure
     // at each callsite so gas-rejected opportunities accumulate into the metric.
@@ -287,7 +290,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 let prep_result: Result<TxPrep> = {
                     let mut exec = executor.lock().await;
                     exec.dry_run = false;
-                    exec.prepare_2hop(provider.as_ref(), &optimized).await
+                    exec.prepare_2hop(provider.as_ref(), &optimized, tip_override).await
                     // lock drops here
                 };
                 match prep_result {
@@ -546,7 +549,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 let prep_result: Result<TxPrep> = {
                     let mut exec = executor.lock().await;
                     exec.dry_run = false;
-                    exec.prepare_triangular(provider.as_ref(), opp).await
+                    exec.prepare_triangular(provider.as_ref(), opp, tip_override).await
                     // lock drops here
                 };
                 match prep_result {

@@ -27,6 +27,7 @@ use crate::strategy::{Opportunity, Strategy};
 pub mod scan;
 pub mod state;
 pub mod discover;
+pub mod pending;
 
 /// Cooldown after a dry-run failure or balance-guard skip (cheap check, no RPC spent).
 pub(crate) const COOLDOWN_SECS: u64 = 15;
@@ -307,6 +308,24 @@ pub async fn run_chain(
                 }
             }
         });
+    }
+
+    // ── Pending TX monitor (optional, requires mempool-enabled WS endpoint) ──
+    // Fires a targeted arb scan with matching tip when a large swap is detected
+    // before it confirms — enables same-block execution on FCFS chains like Base.
+    let (pending_tx_chan, mut pending_rx) = mpsc::channel::<pending::PendingSwapEvent>(256);
+    if cfg.pending_tx_monitoring {
+        let router_addrs: std::collections::HashSet<alloy::primitives::Address> = chain_routers
+            .iter()
+            .filter_map(|r| r.address.parse::<alloy::primitives::Address>().ok())
+            .collect();
+        pending::spawn_pending_monitor(
+            (*provider).clone(),
+            cfg.name.clone(),
+            router_addrs,
+            cfg.min_swap_amount_filter,
+            pending_tx_chan,
+        );
     }
 
     info!("[{}] Chain engine started", cfg.name);
@@ -613,7 +632,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None, disabled_set,
+                    &last_opp_count, &contract_balances, None, disabled_set, None,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -644,7 +663,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None, disabled_set,
+                    &last_opp_count, &contract_balances, None, disabled_set, None,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -729,6 +748,50 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    None,
+                ).await;
+                // NOTE: last_scan_at intentionally NOT updated here.
+            }
+
+            // ── Pending TX detected → same-block arb submission ──────────────
+            // Fires when a large pending swap is seen in the mempool before it
+            // confirms. We run a targeted scan for pairs involving the swapped
+            // tokens and override the tip to match the pending TX's tip, landing
+            // our TX in the SAME block as the triggering swap.
+            Some(pending_event) = pending_rx.recv() => {
+                let (global_paused, chain_paused, disabled_set) = {
+                    let state = shared_state.read().await;
+                    let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
+                    (state.paused, cp, state.disabled_pairs.clone())
+                };
+                if global_paused || chain_paused { continue; }
+
+                // Build targeted mask for pairs involving the pending swap's tokens
+                let (pair_mask, token_filter) = {
+                    let strat = strategy.read().await;
+                    let indices = strat.pairs_for_tokens(pending_event.token_in, pending_event.token_out);
+                    (indices.into_iter().collect::<HashSet<usize>>(), vec![pending_event.token_in, pending_event.token_out])
+                };
+                if pair_mask.is_empty() { continue; }
+
+                // tip = pending TX tip (we match to land in same block).
+                // Slightly higher than the trigger so we're competitive for same-block ordering.
+                let tip_override = pending_event.tip_wei.max(cfg.priority_fee_wei);
+
+                let msg = format!(
+                    "[{}] Pending swap detected: {:?}→{:?} amt={} tip={}wei — fast-path scan ({} pairs)",
+                    cfg.name, pending_event.token_in, pending_event.token_out,
+                    pending_event.amount_in, pending_event.tip_wei, pair_mask.len()
+                );
+                info!("{}", msg);
+                broadcast_log(&log_tx, "info", &msg, None);
+
+                scan::evaluate_and_execute(
+                    &strategy, &executor, &provider, &shared_state, &log_tx,
+                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
+                    &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
+                    &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    Some(tip_override),
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
             }

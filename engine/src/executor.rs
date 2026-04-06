@@ -234,13 +234,15 @@ impl Executor {
         &mut self,
         provider: &P,
         opp: &ArbOpportunity,
+        tip_override: Option<u128>,
     ) -> Result<TxPrep> {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.get_gas_price(provider).await;
-        // priority_fee (tip) from chain config — must match tx builder below for gas cost guard.
-        let priority_fee = self.priority_fee_wei;
+        // priority_fee (tip): use override from pending TX monitor when provided,
+        // otherwise use chain config value.
+        let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * GAS_LIMIT as u128;
@@ -319,12 +321,13 @@ impl Executor {
         &mut self,
         provider: &P,
         opp: &TriangularOpportunity,
+        tip_override: Option<u128>,
     ) -> Result<TxPrep> {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.get_gas_price(provider).await;
-        let priority_fee = self.priority_fee_wei;
+        let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * GAS_LIMIT_TRIANGULAR as u128;
