@@ -319,9 +319,14 @@ pub async fn run_chain(
             .iter()
             .filter_map(|r| r.address.parse::<alloy::primitives::Address>().ok())
             .collect();
+        // Build the full list of WS URLs to try. The primary WS endpoint (mainnet.base.org)
+        // is a public OP Stack node and does NOT expose the mempool. We put fallbacks FIRST
+        // so Alchemy (which has sequencer-level mempool access) is tried before the public node.
+        let mut pending_ws_urls: Vec<String> = cfg.ws_rpc_fallbacks.clone();
+        pending_ws_urls.push(cfg.ws_rpc.clone()); // public node last as fallback
         pending::spawn_pending_monitor(
-            (*provider).clone(),
             cfg.name.clone(),
+            pending_ws_urls,
             router_addrs,
             cfg.min_swap_amount_filter,
             pending_tx_chan,
