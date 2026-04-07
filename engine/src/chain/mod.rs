@@ -328,7 +328,10 @@ pub async fn run_chain(
             cfg.name.clone(),
             pending_ws_urls,
             router_addrs,
-            cfg.min_swap_amount_filter,
+            // Use 0 here — min_swap_amount_filter is calibrated for 18-decimal tokens
+            // (1e17 = 0.1 ETH) and would silently filter ALL USDC/USDT swaps (6 decimals).
+            // Profitability filtering happens naturally inside evaluate_and_execute().
+            0u128,
             pending_tx_chan,
         );
     }
