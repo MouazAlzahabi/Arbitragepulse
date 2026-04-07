@@ -72,6 +72,9 @@ pub fn parse_swap_calldata(
             }
             let token_in  = parse_address(&data[4..36])?;
             let token_out = parse_address(&data[36..68])?;
+            if token_in == token_out {
+                return None;
+            }
             let amount_in = parse_u256(&data[132..164]);
             Some((token_in, token_out, amount_in))
         }
@@ -91,7 +94,7 @@ pub fn parse_swap_calldata(
                 return None;
             }
             let path_len = parse_u256(&data[path_offset..path_offset + 32]).to::<usize>();
-            if path_len < 2 {
+            if path_len < 2 || path_len > 100 {
                 return None;
             }
             let path_data_start = path_offset + 32;
@@ -101,6 +104,9 @@ pub fn parse_swap_calldata(
             let token_in  = parse_address(&data[path_data_start..path_data_start + 32])?;
             let token_out_offset = path_data_start + (path_len - 1) * 32;
             let token_out = parse_address(&data[token_out_offset..token_out_offset + 32])?;
+            if token_in == token_out {
+                return None;
+            }
             Some((token_in, token_out, amount_in))
         }
 
@@ -116,7 +122,7 @@ pub fn parse_swap_calldata(
                 return None;
             }
             let path_len = parse_u256(&data[path_offset..path_offset + 32]).to::<usize>();
-            if path_len < 2 {
+            if path_len < 2 || path_len > 100 {
                 return None;
             }
             let path_data_start = path_offset + 32;
@@ -126,6 +132,9 @@ pub fn parse_swap_calldata(
             let token_in  = parse_address(&data[path_data_start..path_data_start + 32])?;
             let token_out_offset = path_data_start + (path_len - 1) * 32;
             let token_out = parse_address(&data[token_out_offset..token_out_offset + 32])?;
+            if token_in == token_out {
+                return None;
+            }
             Some((token_in, token_out, eth_value))
         }
 
