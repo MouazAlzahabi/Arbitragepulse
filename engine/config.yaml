@@ -498,7 +498,7 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "100"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
@@ -512,7 +512,7 @@ pairs:
     token_out_symbol: "CBBTC"
     token_in_decimals: 6
     token_out_decimals: 8
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
@@ -526,7 +526,7 @@ pairs:
     token_out_symbol: "AERO"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
@@ -555,7 +555,7 @@ pairs:
     token_out_symbol: "DAI"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
@@ -570,7 +570,7 @@ pairs:
     token_out_symbol: "cbETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
@@ -586,7 +586,7 @@ pairs:
     token_out_symbol: "ZORA"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
@@ -602,7 +602,7 @@ pairs:
     token_out_symbol: "VIRTUAL"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "50"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
@@ -635,7 +635,7 @@ pairs:
     token_out_symbol: "wstETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "50"
+    trade_amount: "90"
     max_trade: "100"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
