@@ -484,12 +484,11 @@ pairs:
     token_out_decimals: 6
     trade_amount: "90"
     max_trade: "90"
-    min_swap_size: "5"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
   # USDT → WETH: Aerodrome Slipstream 0.05% ($221K TVL, $775K/day) vs UniV3 0.05% ($41K TVL)
-  # 5x TVL imbalance + separate fee pools creates frequent price divergence
   - id: "base-usdt-weth"
     chain_id: 8453
     token_in: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"   # USDT (bridged)
@@ -499,8 +498,8 @@ pairs:
     token_in_decimals: 6
     token_out_decimals: 18
     trade_amount: "90"
-    max_trade: "100"
-    min_swap_size: "5"
+    max_trade: "90"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
@@ -513,8 +512,8 @@ pairs:
     token_in_decimals: 6
     token_out_decimals: 8
     trade_amount: "90"
-    max_trade: "50"
-    min_swap_size: "5"
+    max_trade: "90"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
@@ -527,8 +526,8 @@ pairs:
     token_in_decimals: 6
     token_out_decimals: 18
     trade_amount: "90"
-    max_trade: "50"
-    min_swap_size: "5"
+    max_trade: "90"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
@@ -546,22 +545,17 @@ pairs:
   #   min_swap_size: "0.01"
   #   watch_pools: []
 
-  # USDC → DAI: Aerodrome stable pool vs UniV3 — less MEV competition than WETH pairs
-  - id: "base-usdc-dai"
-    chain_id: 8453
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI (Base)
-    token_in_symbol: "USDC"
-    token_out_symbol: "DAI"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "50"
-    min_swap_size: "5"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
+  # USDC → DAI: stablecoin spread — disabled at 99 USDC capital (spread too small to cover gas)
+  # Re-enable and set trade_amount: "1000" when contract holds 1000+ USDC
+  # - id: "base-usdc-dai"
+  #   chain_id: 8453
+  #   token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+  #   token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI
+  #   trade_amount: "1000"
+  #   max_trade: "1000"
+  #   routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
 
-  # USDC → cbETH: staked ETH derivative — distinct liquidity profile, less bot competition
+  # USDC → cbETH: Coinbase staked ETH — LST premium divergence across DEXes
   - id: "base-usdc-cbeth"
     chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -571,13 +565,12 @@ pairs:
     token_in_decimals: 6
     token_out_decimals: 18
     trade_amount: "90"
-    max_trade: "50"
-    min_swap_size: "5"
+    max_trade: "90"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
-  # USDC → ZORA: Zora Network governance token — $2.7M/day UniV3 + $685K PancakeV3
-  # Aerodrome pool is SlipStream (concentrated) only — not classic vAMM, excluded
+  # USDC → ZORA: Zora Network token — $2.7M/day UniV3 + $685K PancakeV3
   - id: "base-usdc-zora"
     chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -587,13 +580,12 @@ pairs:
     token_in_decimals: 6
     token_out_decimals: 18
     trade_amount: "90"
-    max_trade: "50"
-    min_swap_size: "5"
+    max_trade: "90"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
-  # USDC → VIRTUAL: Virtuals Protocol token — $3M/day PancakeV3 + $217K UniV3
-  # Less bot competition than WETH; price discovery primarily on PancakeV3
+  # USDC → VIRTUAL: Virtuals Protocol — $3M/day PancakeV3 + $217K UniV3
   - id: "base-usdc-virtual"
     chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -603,8 +595,8 @@ pairs:
     token_in_decimals: 6
     token_out_decimals: 18
     trade_amount: "90"
-    max_trade: "50"
-    min_swap_size: "5"
+    max_trade: "90"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
@@ -619,14 +611,13 @@ pairs:
     token_out_symbol: "EURC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "500"
-    max_trade: "1000"
+    trade_amount: "90"
+    max_trade: "90"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "aerodrome-base"]
     watch_pools: []
 
-  # USDC → wstETH: Lido wrapped staked ETH — LST with price divergence from WETH peg
-  # UniV3 0.05% USDC pool ~$134K TVL; Aerodrome has wstETH/WETH (indirect but included for discovery)
+  # USDC → wstETH: Lido wrapped staked ETH — LST premium divergence across DEXes
   - id: "base-usdc-wsteth"
     chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -636,8 +627,8 @@ pairs:
     token_in_decimals: 6
     token_out_decimals: 18
     trade_amount: "90"
-    max_trade: "100"
-    min_swap_size: "5"
+    max_trade: "90"
+    min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
