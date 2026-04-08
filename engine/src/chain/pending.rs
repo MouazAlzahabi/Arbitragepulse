@@ -4,7 +4,6 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::ws::WsConnect;
 use futures::StreamExt;
-use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -28,7 +27,7 @@ pub struct PendingSwapEvent {
     pub token_in: Address,
     /// Token being swapped OUT of the pool.
     pub token_out: Address,
-    /// Router address the pending TX targets.
+    /// Contract address the pending TX targets (router or aggregator).
     #[allow(dead_code)]
     pub router: Address,
     /// Amount the user is swapping in (raw, unscaled).
@@ -161,18 +160,21 @@ fn parse_u256(word: &[u8]) -> U256 {
 /// Spawn a background task that connects to WS endpoints and subscribes to
 /// pending transactions.
 ///
-/// **Important**: `wss://mainnet.base.org` (the primary provider used for blocks/logs)
-/// does NOT expose the mempool — OP Stack sequencer nodes don't P2P-gossip pending
-/// TXs to non-sequencer peers. This task creates its OWN WS connections by cycling
-/// through `ws_urls` (primary + fallbacks) until it finds one that exposes the mempool.
+/// **No router filter**: The selector check in `parse_swap_calldata` is the sole
+/// filter. This is intentional — many large swaps route through aggregators
+/// (Uniswap Universal Router, 1inch, etc.) that are not in the DEX router list.
+/// Filtering by `to` address would silently drop all aggregator-routed swaps.
+/// The `pairs_for_tokens` check in the main loop gates which swaps actually
+/// trigger a scan.
+///
+/// **Important**: `wss://mainnet.base.org` does NOT expose the mempool on OP Stack.
+/// This task creates its OWN WS connections by cycling through `ws_urls`.
 /// Alchemy (`wss://base-mainnet.g.alchemy.com/v2/KEY`) is the recommended source.
 ///
 /// The task runs indefinitely with exponential-backoff reconnect on error.
-/// If NO endpoint exposes the mempool, it logs a warning and backs off to 60s cycles.
 pub fn spawn_pending_monitor(
     chain_name: String,
     ws_urls: Vec<String>,
-    router_addrs: HashSet<Address>,
     min_swap_amount: u128,
     tx: mpsc::Sender<PendingSwapEvent>,
 ) {
@@ -188,7 +190,8 @@ pub fn spawn_pending_monitor(
 
         loop {
             let url = &ws_urls[url_idx % ws_urls.len()];
-            debug!("[{}] Pending TX monitor: connecting to {}", chain_name, url);
+            let short_url = url.split('?').next().unwrap_or(url);
+            info!("[{}] Pending TX monitor: connecting to {}", chain_name, short_url);
 
             let connect_result = ProviderBuilder::<_, _, Ethereum>::new()
                 .connect_ws(WsConnect::new(url.clone()))
@@ -196,7 +199,7 @@ pub fn spawn_pending_monitor(
 
             match connect_result {
                 Err(e) => {
-                    warn!("[{}] Pending TX monitor: WS connect failed ({}): {} — next URL", chain_name, url, e);
+                    warn!("[{}] Pending TX monitor: WS connect failed ({}): {} — next URL", chain_name, short_url, e);
                     url_idx += 1;
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -205,11 +208,7 @@ pub fn spawn_pending_monitor(
                 Ok(provider) => {
                     match provider.subscribe_full_pending_transactions().await {
                         Err(e) => {
-                            if backoff.as_secs() <= 4 {
-                                warn!("[{}] Pending TX monitor: subscription failed on {}: {} — trying next URL", chain_name, url, e);
-                            } else {
-                                debug!("[{}] Pending TX monitor: subscription error on {}: {}", chain_name, url, e);
-                            }
+                            warn!("[{}] Pending TX monitor: subscription failed on {}: {} — trying next URL", chain_name, short_url, e);
                             url_idx += 1;
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(Duration::from_secs(60));
@@ -217,8 +216,7 @@ pub fn spawn_pending_monitor(
                         }
                         Ok(sub) => {
                             backoff = Duration::from_secs(1);
-                            let short_url = url.split('?').next().unwrap_or(url);
-                            info!("[{}] Pending TX monitor active on {} ({} routers watched)", chain_name, short_url, router_addrs.len());
+                            info!("[{}] Pending TX monitor active on {} (no router filter — selector match only)", chain_name, short_url);
 
                             let mut stream = sub.into_stream();
                             let mut stream_events: u64 = 0;
@@ -227,17 +225,23 @@ pub fn spawn_pending_monitor(
                             while let Some(pending_tx) = stream.next().await {
                                 stream_events += 1;
 
+                                // Periodic heartbeat every 10,000 TXs so we can verify
+                                // the monitor is alive and diagnose match rate.
+                                if stream_events % 10_000 == 0 {
+                                    info!(
+                                        "[{}] Pending TX monitor heartbeat: seen={} matched={} total_fired={}",
+                                        chain_name, stream_events, matched_events, events_received
+                                    );
+                                }
+
                                 // Access the inner envelope for transaction fields
                                 let inner = &pending_tx.inner;
 
-                                // Only care about TXs targeting our watched routers
+                                // Skip contract deployments (no `to` address)
                                 let to_addr = match inner.to() {
                                     Some(addr) => addr,
                                     None => continue,
                                 };
-                                if !router_addrs.contains(&to_addr) {
-                                    continue;
-                                }
 
                                 let input = inner.input();
                                 let eth_value = inner.value();
@@ -259,7 +263,7 @@ pub fn spawn_pending_monitor(
                                 events_received += 1;
 
                                 info!(
-                                    "[{}] Pending swap detected: {:?}→{:?} amount={} tip={}wei router={:?} (seen={} matched={})",
+                                    "[{}] Pending swap detected: {:?}→{:?} amount={} tip={}wei target={:?} (seen={} matched={})",
                                     chain_name, token_in, token_out, amount_in, tip_wei, to_addr,
                                     stream_events, matched_events
                                 );

@@ -315,10 +315,6 @@ pub async fn run_chain(
     // before it confirms — enables same-block execution on FCFS chains like Base.
     let (pending_tx_chan, mut pending_rx) = mpsc::channel::<pending::PendingSwapEvent>(256);
     if cfg.pending_tx_monitoring {
-        let router_addrs: std::collections::HashSet<alloy::primitives::Address> = chain_routers
-            .iter()
-            .filter_map(|r| r.address.parse::<alloy::primitives::Address>().ok())
-            .collect();
         // Build the full list of WS URLs to try. The primary WS endpoint (mainnet.base.org)
         // is a public OP Stack node and does NOT expose the mempool. We put fallbacks FIRST
         // so Alchemy (which has sequencer-level mempool access) is tried before the public node.
@@ -327,7 +323,6 @@ pub async fn run_chain(
         pending::spawn_pending_monitor(
             cfg.name.clone(),
             pending_ws_urls,
-            router_addrs,
             // Use 0 here — min_swap_amount_filter is calibrated for 18-decimal tokens
             // (1e17 = 0.1 ETH) and would silently filter ALL USDC/USDT swaps (6 decimals).
             // Profitability filtering happens naturally inside evaluate_and_execute().
