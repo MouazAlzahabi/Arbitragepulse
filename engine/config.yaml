@@ -488,6 +488,22 @@ pairs:
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
+  # USDT → WETH: Aerodrome Slipstream 0.05% ($221K TVL, $775K/day) vs UniV3 0.05% ($41K TVL)
+  # 5x TVL imbalance + separate fee pools creates frequent price divergence
+  - id: "base-usdt-weth"
+    chain_id: 8453
+    token_in: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"   # USDT (bridged)
+    token_out: "0x4200000000000000000000000000000000000006"   # WETH
+    token_in_symbol: "USDT"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "50"
+    max_trade: "100"
+    min_swap_size: "5"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
+
   - id: "base-usdc-cbbtc"
     chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -592,62 +608,35 @@ pairs:
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
-  # USDC → BRETT: $1.2M+ UniV3 USDC pool; Aerodrome is Slipstream CL only (excluded)
-  - id: "base-usdc-brett"
+  # USDC → EURC: stablecoin arb — Circle EUR stablecoin, both 6 decimals
+  # Aerodrome Slipstream CL1 pool: ~$817K TVL, $8.3M/day volume
+  # UniV3 0.05% pool: ~$22K TVL — shallow, creates price divergence on large Aerodrome flows
+  - id: "base-usdc-eurc"
     chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x532f27101965dd16442E59d40670FaF5eBB142E4"   # BRETT
+    token_out: "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1aDb42"   # EURC (Circle EUR stablecoin)
     token_in_symbol: "USDC"
-    token_out_symbol: "BRETT"
+    token_out_symbol: "EURC"
     token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "25"
-    max_trade: "25"
-    min_swap_size: "5"
-    routers: ["uniswap-v3-base", "pancake-v3-base"]
+    token_out_decimals: 6
+    trade_amount: "500"
+    max_trade: "1000"
+    min_swap_size: "10"
+    routers: ["uniswap-v3-base", "aerodrome-base"]
     watch_pools: []
 
-  # USDC → WELL: Morpho/Moonwell governance token — Aerodrome V1 vAMM + V3 pools
-  - id: "base-usdc-well"
+  # USDC → wstETH: Lido wrapped staked ETH — LST with price divergence from WETH peg
+  # UniV3 0.05% USDC pool ~$134K TVL; Aerodrome has wstETH/WETH (indirect but included for discovery)
+  - id: "base-usdc-wsteth"
     chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0xA88594D404727625A9437C3f886C7643872296AE"   # WELL (Moonwell)
+    token_out: "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"   # wstETH (Lido)
     token_in_symbol: "USDC"
-    token_out_symbol: "WELL"
+    token_out_symbol: "wstETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "25"
-    max_trade: "25"
-    min_swap_size: "5"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
-
-  # USDC → DEGEN: Farcaster community token — UniV3 + Aerodrome V1 vAMM pools
-  - id: "base-usdc-degen"
-    chain_id: 8453
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"   # DEGEN
-    token_in_symbol: "USDC"
-    token_out_symbol: "DEGEN"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "25"
-    max_trade: "25"
-    min_swap_size: "5"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
-
-  # USDC → doginme: meme token — $1.2M UniV3 + Aerodrome V1 vAMM
-  - id: "base-usdc-doginme"
-    chain_id: 8453
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x6921B130D297cc43754afba22e5EAc0FBf8Db75b"   # doginme
-    token_in_symbol: "USDC"
-    token_out_symbol: "doginme"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "25"
-    max_trade: "25"
+    trade_amount: "50"
+    max_trade: "100"
     min_swap_size: "5"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
