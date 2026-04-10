@@ -196,6 +196,29 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         continue 'candidates;
     }
 
+    // ── Pending-only submission gate ──────────────────────────────────────────
+    // When pending_only_submission is enabled, block-scan / poll-tick / swap-event
+    // triggered calls have tip_override=None. Skip TX for those — log the opportunity
+    // so detection is visible, but don't submit (they land at position 500+ on Base).
+    // Pending-monitor triggered calls carry Some(tip_override) and always proceed.
+    if cfg.pending_only_submission && tip_override.is_none() {
+        broadcast_log(
+            log_tx,
+            "opportunity",
+            &format!(
+                "[{}] OPP! (pending-only mode, no submit) {} | profit=${:.4}",
+                cfg.name, display_id, best_opp.profit_usd(),
+            ),
+            Some(serde_json::json!({
+                "chain":      cfg.name,
+                "pair_id":    display_id,
+                "profit_usd": best_opp.profit_usd(),
+                "detect_only": true,
+            })),
+        );
+        continue 'candidates;
+    }
+
     // ── Dispatch based on opportunity type ────────────────────────────────────
 
     match best_opp {

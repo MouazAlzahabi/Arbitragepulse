@@ -52,8 +52,9 @@ chains:
     # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
     optimistic_submission: true   # skip QuoterV2 verification (~80-160ms saved)
     optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
-    priority_fee_wei: 25000000    # 25 Mwei tip — two persistent competing bots at 15Mwei sit at pos 1-2; 25M puts us at pos 1
+    priority_fee_wei: 200000000   # 200 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei
     pending_tx_monitoring: true   # monitor mempool for large swaps before they confirm → same-block arb
+    pending_only_submission: true # only submit TXs from pending monitor path; block/poll scans detect but don't submit (avoids pos 500+ failures)
 
   - id: 42161
     name: "Arbitrum"

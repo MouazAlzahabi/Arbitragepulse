@@ -81,6 +81,13 @@ pub struct ChainConfig {
     /// Default: false.
     #[serde(default)]
     pub pending_tx_monitoring: bool,
+    /// When true, only submit TXs triggered by the pending monitor (which uses dynamic
+    /// tip matching for same-block landing). Block-scan, poll-tick, and swap-event
+    /// triggered scans will detect opportunities and log them but skip TX submission.
+    /// Prevents position-500+ failures from block-scan submissions on FCFS chains (Base).
+    /// Scans still run (pool state stays fresh). Default: false.
+    #[serde(default)]
+    pub pending_only_submission: bool,
 }
 
 fn default_rpc_concurrency() -> usize {
