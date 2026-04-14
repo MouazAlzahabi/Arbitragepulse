@@ -54,7 +54,7 @@ chains:
     optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
     priority_fee_wei: 200000000   # 200 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei
     pending_tx_monitoring: true   # monitor mempool for large swaps before they confirm → same-block arb
-    pending_only_submission: true # only submit TXs from pending monitor path; block/poll scans detect but don't submit (avoids pos 500+ failures)
+    pending_only_submission: false # only submit TXs from pending monitor path; block/poll scans detect but don't submit (avoids pos 500+ failures)
 
   - id: 42161
     name: "Arbitrum"

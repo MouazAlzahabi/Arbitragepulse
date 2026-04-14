@@ -1,6 +1,6 @@
 use alloy::consensus::Transaction as TxTrait;
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::transports::ws::WsConnect;
 use futures::StreamExt;
@@ -301,10 +301,35 @@ fn parse_u256(word: &[u8]) -> U256 {
     U256::from_be_slice(&word[..32])
 }
 
+// ─── Shared tx processor ──────────────────────────────────────────────────────
+
+/// Extract a `PendingSwapEvent` from a resolved transaction's raw fields.
+/// Returns `None` if the tx is not a recognised swap or is below `min_swap_amount`.
+fn try_extract_event(
+    to_addr: Option<Address>,
+    input: &Bytes,
+    eth_value: U256,
+    tip_wei: u128,
+    min_swap_amount: u128,
+) -> Option<PendingSwapEvent> {
+    let router = to_addr?; // skip contract deployments
+    let (token_in, token_out, amount_in) = parse_swap_calldata(input, eth_value)?;
+    if amount_in < U256::from(min_swap_amount) {
+        return None;
+    }
+    Some(PendingSwapEvent { token_in, token_out, router, amount_in, tip_wei })
+}
+
 // ─── Subscription task ────────────────────────────────────────────────────────
 
 /// Spawn a background task that connects to WS endpoints and subscribes to
 /// pending transactions.
+///
+/// **Subscription strategy (tried in order per URL):**
+/// 1. `eth_subscribe("newPendingTransactions", true)` — full transaction bodies.
+///    Supported by private nodes and some paid RPC tiers (e.g. Alchemy Growth+).
+/// 2. Hash-only fallback: `eth_subscribe("newPendingTransactions")` + `eth_getTransactionByHash`
+///    per hash. Works on Alchemy free tier and any node that exposes the mempool.
 ///
 /// **No router filter**: The selector check in `parse_swap_calldata` is the sole
 /// filter. This is intentional — many large swaps route through aggregators
@@ -343,7 +368,7 @@ pub fn spawn_pending_monitor(
                 .connect_ws(WsConnect::new(url.clone()))
                 .await;
 
-            match connect_result {
+            let provider = match connect_result {
                 Err(e) => {
                     warn!("[{}] Pending TX monitor: WS connect failed ({}): {} — next URL", chain_name, short_url, e);
                     url_idx += 1;
@@ -351,94 +376,166 @@ pub fn spawn_pending_monitor(
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                     continue;
                 }
-                Ok(provider) => {
-                    match provider.subscribe_full_pending_transactions().await {
-                        Err(e) => {
-                            warn!("[{}] Pending TX monitor: subscription failed on {}: {} — trying next URL", chain_name, short_url, e);
+                Ok(p) => p,
+            };
+
+            // ── Strategy 1: full pending transactions ─────────────────────────
+            // Sends eth_subscribe("newPendingTransactions", true).
+            // Returns full tx bodies — zero extra RPC calls needed.
+            // Supported by private/paid nodes (Alchemy Growth+, QuickNode, etc.).
+            match provider.subscribe_full_pending_transactions().await {
+                Ok(sub) => {
+                    backoff = Duration::from_secs(1);
+                    info!("[{}] Pending TX monitor ACTIVE (full-tx mode) on {}", chain_name, short_url);
+
+                    let mut stream = sub.into_stream();
+                    let mut stream_events: u64 = 0;
+                    let mut matched_events: u64 = 0;
+
+                    while let Some(pending_tx) = stream.next().await {
+                        stream_events += 1;
+
+                        if stream_events % 10_000 == 0 {
+                            info!(
+                                "[{}] Pending TX monitor heartbeat (full): seen={} matched={} total_fired={}",
+                                chain_name, stream_events, matched_events, events_received
+                            );
+                        }
+
+                        let inner = &pending_tx.inner;
+                        let tip_wei = inner.max_priority_fee_per_gas()
+                            .unwrap_or_else(|| inner.gas_price().unwrap_or(0));
+
+                        if let Some(event) = try_extract_event(
+                            inner.to(),
+                            inner.input(),
+                            inner.value(),
+                            tip_wei,
+                            min_swap_amount,
+                        ) {
+                            matched_events += 1;
+                            events_received += 1;
+                            info!(
+                                "[{}] Pending swap (full): {:?}→{:?} amount={} tip={}wei (seen={} matched={})",
+                                chain_name, event.token_in, event.token_out,
+                                event.amount_in, tip_wei, stream_events, matched_events
+                            );
+                            if tx.try_send(event).is_err() {
+                                debug!("[{}] Pending TX channel full — dropping event", chain_name);
+                            }
+                        }
+                    }
+
+                    if stream_events == 0 {
+                        warn!(
+                            "[{}] Pending TX monitor (full): {} returned 0 events — \
+                            node may not support full pending TX subscription. \
+                            Trying hash-only fallback next.",
+                            chain_name, short_url
+                        );
+                        // Don't advance url_idx — try hash-only on the same URL next iteration
+                    } else {
+                        info!(
+                            "[{}] Pending TX monitor stream ended (full, seen={} matched={}), reconnecting...",
+                            chain_name, stream_events, matched_events
+                        );
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    // Fall through to retry loop — next attempt tries hash-only on same URL
+                    // because we don't advance url_idx when full-tx returns 0 events.
+                    // Once hash-only is tried and also fails, url_idx advances.
+                }
+
+                Err(full_err) => {
+                    // ── Strategy 2: hash-only + resolve ──────────────────────
+                    // eth_subscribe("newPendingTransactions") returns tx hashes.
+                    // Works on Alchemy free tier and most nodes with mempool access.
+                    // Cost: one eth_getTransactionByHash per pending tx seen.
+                    warn!(
+                        "[{}] Pending TX monitor: full-tx subscription failed on {} ({}), \
+                        trying hash-only fallback",
+                        chain_name, short_url, full_err
+                    );
+
+                    match provider.subscribe_pending_transactions().await {
+                        Err(hash_err) => {
+                            warn!(
+                                "[{}] Pending TX monitor: hash-only subscription also failed on {}: {} — \
+                                node does not expose the mempool. Trying next URL.",
+                                chain_name, short_url, hash_err
+                            );
                             url_idx += 1;
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(Duration::from_secs(60));
-                            continue;
                         }
-                        Ok(sub) => {
-                            backoff = Duration::from_secs(1);
-                            info!("[{}] Pending TX monitor active on {} (no router filter — selector match only)", chain_name, short_url);
 
-                            let mut stream = sub.into_stream();
+                        Ok(hash_sub) => {
+                            backoff = Duration::from_secs(1);
+                            info!(
+                                "[{}] Pending TX monitor ACTIVE (hash-only mode) on {} — \
+                                resolving each hash via eth_getTransactionByHash",
+                                chain_name, short_url
+                            );
+
+                            let mut stream = hash_sub.into_stream();
                             let mut stream_events: u64 = 0;
                             let mut matched_events: u64 = 0;
 
-                            while let Some(pending_tx) = stream.next().await {
+                            while let Some(hash) = stream.next().await {
                                 stream_events += 1;
 
-                                // Periodic heartbeat every 10,000 TXs so we can verify
-                                // the monitor is alive and diagnose match rate.
                                 if stream_events % 10_000 == 0 {
                                     info!(
-                                        "[{}] Pending TX monitor heartbeat: seen={} matched={} total_fired={}",
+                                        "[{}] Pending TX monitor heartbeat (hash): seen={} matched={} total_fired={}",
                                         chain_name, stream_events, matched_events, events_received
                                     );
                                 }
 
-                                // Access the inner envelope for transaction fields
-                                let inner = &pending_tx.inner;
-
-                                // Skip contract deployments (no `to` address)
-                                let to_addr = match inner.to() {
-                                    Some(addr) => addr,
-                                    None => continue,
+                                let hash: TxHash = hash;
+                                let resolved = match provider.get_transaction_by_hash(hash).await {
+                                    Ok(Some(tx_body)) => tx_body,
+                                    Ok(None) => continue, // tx already confirmed / dropped
+                                    Err(_) => continue,   // RPC error — skip this tx
                                 };
 
-                                let input = inner.input();
-                                let eth_value = inner.value();
-
-                                let (token_in, token_out, amount_in) = match parse_swap_calldata(input, eth_value) {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
-
-                                // Filter dust swaps
-                                if amount_in < U256::from(min_swap_amount) {
-                                    continue;
-                                }
-
+                                let inner = &resolved.inner;
                                 let tip_wei = inner.max_priority_fee_per_gas()
                                     .unwrap_or_else(|| inner.gas_price().unwrap_or(0));
 
-                                matched_events += 1;
-                                events_received += 1;
-
-                                info!(
-                                    "[{}] Pending swap detected: {:?}→{:?} amount={} tip={}wei target={:?} (seen={} matched={})",
-                                    chain_name, token_in, token_out, amount_in, tip_wei, to_addr,
-                                    stream_events, matched_events
-                                );
-
-                                let event = PendingSwapEvent {
-                                    token_in,
-                                    token_out,
-                                    router: to_addr,
-                                    amount_in,
+                                if let Some(event) = try_extract_event(
+                                    inner.to(),
+                                    inner.input(),
+                                    inner.value(),
                                     tip_wei,
-                                };
-
-                                if tx.try_send(event).is_err() {
-                                    debug!("[{}] Pending TX channel full — dropping event", chain_name);
+                                    min_swap_amount,
+                                ) {
+                                    matched_events += 1;
+                                    events_received += 1;
+                                    info!(
+                                        "[{}] Pending swap (hash): {:?}→{:?} amount={} tip={}wei (seen={} matched={})",
+                                        chain_name, event.token_in, event.token_out,
+                                        event.amount_in, tip_wei, stream_events, matched_events
+                                    );
+                                    if tx.try_send(event).is_err() {
+                                        debug!("[{}] Pending TX channel full — dropping event", chain_name);
+                                    }
                                 }
                             }
 
-                            // Stream ended — log how many events we received on this connection
                             if stream_events == 0 {
                                 warn!(
-                                    "[{}] Pending TX monitor: {} returned 0 events — node may not expose mempool. \
-                                    Configure Alchemy WS in ws_rpc or ws_rpc_fallbacks for pending TX access.",
+                                    "[{}] Pending TX monitor (hash): {} returned 0 events — \
+                                    node does not expose the mempool. Trying next URL.",
                                     chain_name, short_url
                                 );
                                 url_idx += 1;
                             } else {
-                                info!("[{}] Pending TX monitor stream ended (seen={} matched={}), reconnecting...", chain_name, stream_events, matched_events);
+                                info!(
+                                    "[{}] Pending TX monitor stream ended (hash, seen={} matched={}), reconnecting...",
+                                    chain_name, stream_events, matched_events
+                                );
                             }
-
                             tokio::time::sleep(backoff).await;
                             backoff = (backoff * 2).min(Duration::from_secs(30));
                         }
