@@ -1,0 +1,10 @@
+[Unit]
+Description=ArbitragePulse Health Watchdog (single run)
+After=arbitragepulse.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ap-watchdog
+User=root
+StandardOutput=journal
+StandardError=journal

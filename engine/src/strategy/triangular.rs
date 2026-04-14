@@ -590,7 +590,7 @@ impl Strategy {
 
         // ── Calculate profits ─────────────────────────────────────────────────────
 
-        info!(
+        debug!(
             "[{}] triangular scan: {} V3 spot, {} triplets, P1={} P2={} P3={} routes",
             self.chain_id, tri_v3_spot, triplets.len(),
             p1_entries.len(), p2_entries.len(), p3_entries.len()
@@ -758,7 +758,7 @@ impl Strategy {
         }
 
         if best_tri_spread.is_finite() && !p3_entries.is_empty() {
-            info!(
+            debug!(
                 "[{}] triangular best spread: {:+.3}% ({} routes evaluated)",
                 self.chain_id, best_tri_spread * 100.0, p3_entries.len()
             );

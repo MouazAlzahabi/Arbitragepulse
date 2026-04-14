@@ -1,0 +1,12 @@
+/var/log/arbitragepulse/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    # copytruncate: truncate the live file instead of moving it
+    # Safe for append-mode logs where the process keeps the fd open
+    copytruncate
+    create 640 botadmin botadmin
+}

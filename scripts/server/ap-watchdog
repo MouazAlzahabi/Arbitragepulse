@@ -1,0 +1,128 @@
+#!/bin/bash
+# ArbitragePulse Health Watchdog
+# Invoked every 30 seconds by ap-watchdog.timer.
+#
+# Restarts the engine when:
+#   1. /health endpoint is unresponsive for 3 consecutive checks (90 s)
+#   2. last_block stops advancing for 10 consecutive checks (5 min) — hung RPC
+#
+# State is persisted in /tmp/ap-watchdog.state between runs.
+
+set -uo pipefail
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+ENV_FILE="/home/botadmin/Arbitragepulse/engine/.env"
+LOG_FILE="/var/log/arbitragepulse/watchdog.log"
+STATE_FILE="/tmp/ap-watchdog.state"
+SERVICE="arbitragepulse"
+
+HEALTH_FAIL_THRESHOLD=3    # unresponsive for 90 s → restart
+BLOCK_STUCK_THRESHOLD=10   # same block for 5 min → restart (RPC hung)
+
+# ── Load API key and PORT from .env ────────────────────────────────────────────
+API_KEY=""
+PORT="3000"
+if [ -f "$ENV_FILE" ]; then
+    _val=$(grep -E "^API_KEY=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+    [ -n "$_val" ] && API_KEY="$_val"
+    _port=$(grep -E "^PORT=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+    [ -n "$_port" ] && PORT="$_port"
+fi
+
+HEALTH_URL="http://localhost:${PORT}/health"
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log() {
+    local level="$1"; shift
+    local msg="[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] [$level] $*"
+    echo "$msg" >> "$LOG_FILE"
+    echo "$msg"
+}
+
+# ── Load previous state ────────────────────────────────────────────────────────
+prev_block=0
+health_fails=0
+block_stuck=0
+
+if [ -f "$STATE_FILE" ]; then
+    _b=$(grep "^block=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+    _f=$(grep "^fails=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+    _s=$(grep "^stuck=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+    [ -n "$_b" ] && prev_block="$_b"
+    [ -n "$_f" ] && health_fails="$_f"
+    [ -n "$_s" ] && block_stuck="$_s"
+fi
+
+# ── Helper: save state ─────────────────────────────────────────────────────────
+save_state() {
+    printf "block=%s\nfails=%s\nstuck=%s\n" "$1" "$2" "$3" > "$STATE_FILE"
+}
+
+# ── Helper: restart engine ─────────────────────────────────────────────────────
+do_restart() {
+    local reason="$1"
+    log "ERROR" "Restarting $SERVICE — $reason"
+    systemctl restart "$SERVICE"
+    save_state 0 0 0
+    log "INFO" "$SERVICE restart issued"
+}
+
+# ── Poll /health ───────────────────────────────────────────────────────────────
+if [ -n "$API_KEY" ]; then
+    RESPONSE=$(curl -sf --max-time 5 \
+        -H "Authorization: Bearer $API_KEY" \
+        "$HEALTH_URL" 2>/dev/null || true)
+else
+    RESPONSE=$(curl -sf --max-time 5 "$HEALTH_URL" 2>/dev/null || true)
+fi
+
+# ── Handle unresponsive engine ─────────────────────────────────────────────────
+if [ -z "$RESPONSE" ]; then
+    health_fails=$((health_fails + 1))
+    log "WARN" "Health check failed (${health_fails}/${HEALTH_FAIL_THRESHOLD}) — ${HEALTH_URL} unresponsive"
+
+    if [ "$health_fails" -ge "$HEALTH_FAIL_THRESHOLD" ]; then
+        do_restart "API unresponsive for $((health_fails * 30))s"
+        exit 0
+    fi
+
+    save_state "$prev_block" "$health_fails" "$block_stuck"
+    exit 0
+fi
+
+# ── Parse JSON response ────────────────────────────────────────────────────────
+STATUS=$(python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+print(d.get('status','unknown'))
+" <<< "$RESPONSE" 2>/dev/null || echo "parse_error")
+
+LAST_BLOCK=$(python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+chains = d.get('chains', [])
+active = [c.get('last_block', 0) for c in chains if c.get('rpc_ok', False)]
+print(max(active) if active else 0)
+" <<< "$RESPONSE" 2>/dev/null || echo 0)
+
+# Health endpoint responded — reset fail counter
+health_fails=0
+
+# ── Check block progress ───────────────────────────────────────────────────────
+if [ "$LAST_BLOCK" -gt 0 ] && [ "$LAST_BLOCK" -eq "$prev_block" ]; then
+    block_stuck=$((block_stuck + 1))
+    log "WARN" "Block stuck at $LAST_BLOCK (${block_stuck}/${BLOCK_STUCK_THRESHOLD} checks, $((block_stuck * 30))s)"
+
+    if [ "$block_stuck" -ge "$BLOCK_STUCK_THRESHOLD" ]; then
+        do_restart "Block $LAST_BLOCK stuck for $((block_stuck * 30))s — RPC likely hung"
+        exit 0
+    fi
+else
+    if [ "$block_stuck" -gt 0 ]; then
+        log "INFO" "Block unstuck: $prev_block → $LAST_BLOCK (was stuck for $((block_stuck * 30))s)"
+    fi
+    block_stuck=0
+fi
+
+log "OK" "status=$STATUS last_block=$LAST_BLOCK"
+save_state "$LAST_BLOCK" "$health_fails" "$block_stuck"
