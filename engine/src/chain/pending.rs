@@ -16,6 +16,13 @@ const SEL_V3_EXACT_INPUT_SINGLE: [u8; 4] = [0x04, 0xe4, 0x5a, 0xaf];
 const SEL_V2_SWAP_EXACT_TOKENS: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
 /// V2 swapExactETHForTokens
 const SEL_V2_SWAP_EXACT_ETH: [u8; 4] = [0x7f, 0xf3, 0x6a, 0xb5];
+/// Uniswap UniversalRouter execute(bytes commands, bytes[] inputs, uint256 deadline)
+/// Most large Base swaps route through this (aggregates V2+V3, handles permit2).
+const SEL_UNIVERSAL_ROUTER: [u8; 4] = [0x35, 0x93, 0x56, 0x4c];
+
+// UniversalRouter command bytes (first command in the commands array)
+const CMD_V3_SWAP_EXACT_IN: u8 = 0x00;
+const CMD_V2_SWAP_EXACT_IN: u8 = 0x08;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -45,6 +52,7 @@ pub struct PendingSwapEvent {
 /// - `0x04e45aaf` exactInputSingle (V3)
 /// - `0x38ed1739` swapExactTokensForTokens (V2/Aerodrome)
 /// - `0x7ff36ab5` swapExactETHForTokens (V2 — amount_in from tx.value, passed as `eth_value`)
+/// - `0x3593564c` UniversalRouter execute — V3_SWAP_EXACT_IN (cmd 0x00) and V2_SWAP_EXACT_IN (cmd 0x08)
 pub fn parse_swap_calldata(
     input: &Bytes,
     eth_value: U256,
@@ -135,6 +143,144 @@ pub fn parse_swap_calldata(
                 return None;
             }
             Some((token_in, token_out, eth_value))
+        }
+
+        // ── Uniswap UniversalRouter execute ───────────────────────────────────
+        // execute(bytes commands, bytes[] inputs, uint256 deadline)
+        //
+        // ABI layout (all offsets from byte 0 of calldata including selector):
+        //   [4..36]   commands_offset  (uint256) — offset to commands blob from byte 4
+        //   [36..68]  inputs_offset    (uint256) — offset to inputs array from byte 4
+        //   [68..100] deadline         (uint256)
+        //
+        // commands blob (at data[4 + commands_offset]):
+        //   [0..32]   length           (uint256)
+        //   [32..]    command bytes    (one byte per command)
+        //
+        // inputs array (at data[4 + inputs_offset]):
+        //   [0..32]   array_length     (uint256)
+        //   [32..]    element offsets  (one uint256 per element, relative to inputs base)
+        //   then each element: [0..32] bytes_length, [32..] bytes_data
+        //
+        // We only handle the first command and only for single-hop swaps.
+        // Multi-command TXs return None (safe fallback).
+        SEL_UNIVERSAL_ROUTER => {
+            if data.len() < 100 {
+                return None;
+            }
+            // Offsets are relative to byte 4 (after selector)
+            let commands_offset = parse_u256(&data[4..36]).to::<usize>();
+            let inputs_offset   = parse_u256(&data[36..68]).to::<usize>();
+
+            // commands blob
+            let cmd_blob_start = 4 + commands_offset;
+            if data.len() < cmd_blob_start + 33 {
+                return None;
+            }
+            let cmd_len = parse_u256(&data[cmd_blob_start..cmd_blob_start + 32]).to::<usize>();
+            if cmd_len == 0 || cmd_len > 16 {
+                return None; // sanity: skip huge or empty command arrays
+            }
+            let first_cmd = data[cmd_blob_start + 32] & 0x3f; // mask off flag bits (top 2)
+
+            // inputs array base
+            let inputs_base = 4 + inputs_offset;
+            if data.len() < inputs_base + 32 {
+                return None;
+            }
+            let inputs_len = parse_u256(&data[inputs_base..inputs_base + 32]).to::<usize>();
+            if inputs_len == 0 {
+                return None;
+            }
+            // ABI spec: array element offsets are measured from byte 0 of the array
+            // encoding (the length word at inputs_base). With N=1, the header is
+            // 64 bytes (32 length + 32 offset), so typical elem0_offset = 0x40 (64).
+            // elem0_start = inputs_base + elem0_offset is correct per the ABI spec.
+            if data.len() < inputs_base + 64 {
+                return None;
+            }
+            let elem0_offset = parse_u256(&data[inputs_base + 32..inputs_base + 64]).to::<usize>();
+            let elem0_start  = inputs_base + elem0_offset;
+            if data.len() < elem0_start + 32 {
+                return None;
+            }
+            let elem0_len = parse_u256(&data[elem0_start..elem0_start + 32]).to::<usize>();
+            let elem0_data_start = elem0_start + 32;
+            if data.len() < elem0_data_start + elem0_len {
+                return None;
+            }
+            let elem0 = &data[elem0_data_start..elem0_data_start + elem0_len];
+
+            match first_cmd {
+                // V3_SWAP_EXACT_IN: abi.encode(address recipient, uint256 amountIn,
+                //   uint256 amountOutMin, bytes path, bool payerIsUser)
+                // path = abi.encodePacked(tokenIn[20], fee[3], tokenOut[20]) for single hop
+                CMD_V3_SWAP_EXACT_IN => {
+                    // elem0 ABI layout:
+                    //   [0..32]   recipient
+                    //   [32..64]  amountIn
+                    //   [64..96]  amountOutMin
+                    //   [96..128] path_offset (relative to elem0 start)
+                    //   [128..160] payerIsUser
+                    if elem0.len() < 160 {
+                        return None;
+                    }
+                    let amount_in  = parse_u256(&elem0[32..64]);
+                    let path_off   = parse_u256(&elem0[96..128]).to::<usize>();
+                    if elem0.len() < path_off + 32 {
+                        return None;
+                    }
+                    let path_len = parse_u256(&elem0[path_off..path_off + 32]).to::<usize>();
+                    let path_data_start = path_off + 32;
+                    // Single-hop path = 20 + 3 + 20 = 43 bytes
+                    if path_len < 43 || elem0.len() < path_data_start + path_len {
+                        return None;
+                    }
+                    let path = &elem0[path_data_start..path_data_start + path_len];
+                    let token_in  = Address::from_slice(&path[0..20]);
+                    let token_out = Address::from_slice(&path[path_len - 20..path_len]);
+                    if token_in == token_out {
+                        return None;
+                    }
+                    Some((token_in, token_out, amount_in))
+                }
+
+                // V2_SWAP_EXACT_IN: abi.encode(address recipient, uint256 amountIn,
+                //   uint256 amountOutMin, address[] path, bool payerIsUser)
+                CMD_V2_SWAP_EXACT_IN => {
+                    // elem0 ABI layout:
+                    //   [0..32]   recipient
+                    //   [32..64]  amountIn
+                    //   [64..96]  amountOutMin
+                    //   [96..128] path_offset (relative to elem0 start)
+                    //   [128..160] payerIsUser
+                    if elem0.len() < 160 {
+                        return None;
+                    }
+                    let amount_in = parse_u256(&elem0[32..64]);
+                    let path_off  = parse_u256(&elem0[96..128]).to::<usize>();
+                    if elem0.len() < path_off + 32 {
+                        return None;
+                    }
+                    let path_len = parse_u256(&elem0[path_off..path_off + 32]).to::<usize>();
+                    if path_len < 2 || path_len > 100 {
+                        return None;
+                    }
+                    let path_data_start = path_off + 32;
+                    if elem0.len() < path_data_start + path_len * 32 {
+                        return None;
+                    }
+                    let token_in  = parse_address(&elem0[path_data_start..path_data_start + 32])?;
+                    let token_out_off = path_data_start + (path_len - 1) * 32;
+                    let token_out = parse_address(&elem0[token_out_off..token_out_off + 32])?;
+                    if token_in == token_out {
+                        return None;
+                    }
+                    Some((token_in, token_out, amount_in))
+                }
+
+                _ => None, // multi-hop, WRAP_ETH, SWEEP, etc — ignore safely
+            }
         }
 
         _ => None,

@@ -72,6 +72,13 @@ async fn main() -> Result<()> {
     };
 
     // ── API server ──
+    if env.api_key.is_empty() {
+        tracing::warn!(
+            "API_KEY is not set — HTTP API has NO authentication. \
+             Anyone on the network can pause/restart the engine. \
+             Set API_KEY=<secret> in .env for production."
+        );
+    }
     let api_server = api::ApiServer::new(env.port, env.api_key.clone(), db.clone(), metrics.clone(), env.dry_run);
     let log_tx = api_server.log_sender();
     let shared_state = api_server.shared_state();

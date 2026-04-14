@@ -453,10 +453,10 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-slipstream-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
 
   # base-usdbc-weth disabled — contract has no USDbC; re-enable after funding with USDbC
@@ -482,8 +482,8 @@ pairs:
     token_out_symbol: "USDBC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -496,8 +496,8 @@ pairs:
     token_out_symbol: "USDT"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -511,10 +511,10 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "270"
+    max_trade: "270"
     min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-slipstream-base", "aerodrome-base"]
     watch_pools: []
 
   - id: "base-usdc-cbbtc"
@@ -525,8 +525,8 @@ pairs:
     token_out_symbol: "CBBTC"
     token_in_decimals: 6
     token_out_decimals: 8
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -539,8 +539,8 @@ pairs:
     token_out_symbol: "AERO"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
     watch_pools: []
@@ -559,15 +559,20 @@ pairs:
   #   min_swap_size: "0.01"
   #   watch_pools: []
 
-  # USDC → DAI: stablecoin spread — disabled at 99 USDC capital (spread too small to cover gas)
-  # Re-enable and set trade_amount: "1000" when contract holds 1000+ USDC
-  # - id: "base-usdc-dai"
-  #   chain_id: 8453
-  #   token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-  #   token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI
-  #   trade_amount: "1000"
-  #   max_trade: "1000"
-  #   routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+  # USDC → DAI: stablecoin spread — enabled now that contract holds 1000+ USDC
+  - id: "base-usdc-dai"
+    chain_id: 8453
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
+    token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI
+    token_in_symbol: "USDC"
+    token_out_symbol: "DAI"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "1000"
+    max_trade: "1000"
+    min_swap_size: "10"
+    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
+    watch_pools: []
 
   # USDC → cbETH: Coinbase staked ETH — LST premium divergence across DEXes
   - id: "base-usdc-cbeth"
@@ -578,8 +583,8 @@ pairs:
     token_out_symbol: "cbETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
@@ -593,8 +598,8 @@ pairs:
     token_out_symbol: "ZORA"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
@@ -608,8 +613,8 @@ pairs:
     token_out_symbol: "VIRTUAL"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
@@ -626,8 +631,8 @@ pairs:
     token_out_symbol: "EURC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "aerodrome-slipstream-base"]
     watch_pools: []
@@ -641,8 +646,8 @@ pairs:
     token_out_symbol: "wstETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "90"
-    max_trade: "90"
+    trade_amount: "1000"
+    max_trade: "1000"
     min_swap_size: "10"
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []

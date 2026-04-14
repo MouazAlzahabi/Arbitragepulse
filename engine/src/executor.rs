@@ -209,7 +209,7 @@ impl Executor {
         }
 
         // Cache miss or expired — fetch from chain
-        let gas_price = provider.get_gas_price().await.unwrap_or(1_000_000_000u128);
+        let gas_price = provider.get_gas_price().await.unwrap_or(5_000_000_000u128);
         self.gas_price_cache = Some((gas_price, Instant::now()));
         debug!(
             "[{}] Gas price fetched: {} wei (cached for {:?})",
