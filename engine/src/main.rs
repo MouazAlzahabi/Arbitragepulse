@@ -83,13 +83,20 @@ async fn main() -> Result<()> {
     let log_tx = api_server.log_sender();
     let shared_state = api_server.shared_state();
 
-    // Seed initial chain stats from DB (live trades only)
+    // Seed initial chain stats from DB — only for chains currently enabled in config.
+    // Chains that were active in a previous session but are no longer configured would
+    // otherwise appear with rpc_ok=false, making status "degraded" on every startup.
+    let enabled_chain_ids: std::collections::HashSet<u64> =
+        enabled_chains.iter().map(|c| c.id).collect();
     if let Some(ref db_ref) = db {
         let db_for_seed = Arc::clone(db_ref);
         match tokio::task::spawn_blocking(move || db_for_seed.get_chain_stats()).await {
             Ok(Ok(rows)) => {
                 let mut state = shared_state.write().await;
                 for (chain_id, chain_name, attempts, successes, profit) in rows {
+                    if !enabled_chain_ids.contains(&chain_id) {
+                        continue; // skip chains no longer in config
+                    }
                     state.chains.push(api::ChainStats {
                         chain_id,
                         chain_name,
@@ -100,7 +107,7 @@ async fn main() -> Result<()> {
                         total_profit_usd: profit,
                         ghost_profit_usd: 0.0,
                         base_fee_gwei: 0.0,
-                        dry_run: true,
+                        dry_run: env.dry_run,
                         paused: false,
                         rpc_ok: false,
                         last_block: 0,

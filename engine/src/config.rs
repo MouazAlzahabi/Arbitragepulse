@@ -88,6 +88,13 @@ pub struct ChainConfig {
     /// Scans still run (pool state stays fresh). Default: false.
     #[serde(default)]
     pub pending_only_submission: bool,
+    /// Minimum detected profit in USD required to submit a triangular arb.
+    /// Triangular V3 routes overestimate output via cached sqrtPriceX96 (tick-level
+    /// liquidity not modelled). This floor filters phantom opportunities before they
+    /// reach the sequencer and revert. Default: same as min_profit_usd.
+    /// Recommended on Base: 0.80 (covers ~0.30% overestimate on a 270 USDT trade).
+    #[serde(default)]
+    pub min_triangular_profit_usd: Option<f64>,
 }
 
 fn default_rpc_concurrency() -> usize {

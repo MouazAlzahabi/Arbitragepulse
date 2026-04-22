@@ -647,7 +647,7 @@ impl Strategy {
                 best_raw_usd = profit_usd;
             }
 
-            if profit_usd < self.min_profit_usd { continue; }
+            if profit_usd < self.min_triangular_profit_usd { continue; }
 
             debug!(
                 "[{}] Triangular: {} | profit=${:.4} | {}/{}/{}",

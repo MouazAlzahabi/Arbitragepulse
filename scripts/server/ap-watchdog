@@ -69,11 +69,11 @@ do_restart() {
 
 # ── Poll /health ───────────────────────────────────────────────────────────────
 if [ -n "$API_KEY" ]; then
-    RESPONSE=$(curl -sf --max-time 5 \
+    RESPONSE=$(curl -s --max-time 5 \
         -H "Authorization: Bearer $API_KEY" \
         "$HEALTH_URL" 2>/dev/null || true)
 else
-    RESPONSE=$(curl -sf --max-time 5 "$HEALTH_URL" 2>/dev/null || true)
+    RESPONSE=$(curl -s --max-time 5 "$HEALTH_URL" 2>/dev/null || true)
 fi
 
 # ── Handle unresponsive engine ─────────────────────────────────────────────────

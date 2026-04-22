@@ -152,6 +152,7 @@ impl ApiServer {
             .route("/engine/resume", post(engine_resume))
             .route("/engine/dry-run", post(engine_dry_run))
             .route("/engine/restart", post(engine_restart))
+            .route("/engine/state", get(engine_state_get))
             .route("/tokens", get(tokens_list).post(token_add))
             .route("/tokens/pairs", get(tokens_pairs))
             .route("/tokens/{chain_id}/{address}", patch(token_trust).delete(token_remove))
@@ -372,6 +373,15 @@ async fn trades_list(
         )
             .into_response(),
     }
+}
+
+/// GET /engine/state — pause/dry-run flags (camelCase for dashboard).
+async fn engine_state_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let engine = state.engine.read().await;
+    Json(serde_json::json!({
+        "dryRun": engine.dry_run,
+        "paused": engine.paused,
+    }))
 }
 
 async fn engine_pause(State(state): State<Arc<AppState>>) -> impl IntoResponse {

@@ -141,11 +141,16 @@ pub async fn run_chain(
         .ok()
         .map(|url| ProviderBuilder::new().connect_http(url).erased());
 
+    let min_triangular_profit_usd = cfg
+        .min_triangular_profit_usd
+        .unwrap_or(cfg.min_profit_usd);
+
     let strategy = Arc::new(RwLock::new(Strategy::new(
         cfg.id,
         chain_pairs.clone(),
         chain_routers.clone(),
         cfg.min_profit_usd,
+        min_triangular_profit_usd,
         quoter_v2_address,
         pool_cache.clone(),
         cfg.rpc_concurrency,
@@ -315,11 +320,12 @@ pub async fn run_chain(
     // before it confirms — enables same-block execution on FCFS chains like Base.
     let (pending_tx_chan, mut pending_rx) = mpsc::channel::<pending::PendingSwapEvent>(256);
     if cfg.pending_tx_monitoring {
-        // Build the full list of WS URLs to try. The primary WS endpoint (mainnet.base.org)
-        // is a public OP Stack node and does NOT expose the mempool. We put fallbacks FIRST
-        // so Alchemy (which has sequencer-level mempool access) is tried before the public node.
-        let mut pending_ws_urls: Vec<String> = cfg.ws_rpc_fallbacks.clone();
-        pending_ws_urls.push(cfg.ws_rpc.clone()); // public node last as fallback
+        // Build the pending-monitor URL list: primary ws_rpc first (Alchemy — has mempool access),
+        // then fallbacks. Public nodes (wss://mainnet.base.org) don't expose the mempool on OP
+        // Stack and will always fail with 405; they sit in fallbacks as a last resort for block
+        // subscriptions only.
+        let mut pending_ws_urls: Vec<String> = vec![cfg.ws_rpc.clone()];
+        pending_ws_urls.extend_from_slice(&cfg.ws_rpc_fallbacks);
         pending::spawn_pending_monitor(
             cfg.name.clone(),
             pending_ws_urls,
@@ -559,10 +565,13 @@ pub async fn run_chain(
                         .filter(|p| p.chain_id == cfg.id).cloned().collect();
                     let new_routers: Vec<_> = new_cfg.routers.iter()
                         .filter(|r| r.chain_id == cfg.id).cloned().collect();
-                    let new_min_profit = new_cfg.chains.iter()
-                        .find(|c| c.id == cfg.id)
+                    let new_chain_cfg = new_cfg.chains.iter().find(|c| c.id == cfg.id);
+                    let new_min_profit = new_chain_cfg
                         .map(|c| c.min_profit_usd)
                         .unwrap_or(cfg.min_profit_usd);
+                    let new_min_tri_profit = new_chain_cfg
+                        .and_then(|c| c.min_triangular_profit_usd)
+                        .unwrap_or(new_min_profit);
 
                     {
                         let mut strat = strategy.write().await;
@@ -579,9 +588,13 @@ pub async fn run_chain(
                             strat.populate_syncswap_pools(provider.as_ref()).await;
                         }
 
-                        if strat.min_profit_usd != new_min_profit {
+                        if strat.min_profit_usd != new_min_profit || strat.min_triangular_profit_usd != new_min_tri_profit {
                             strat.min_profit_usd = new_min_profit;
-                            info!("[{}] Config hot-reloaded (min_profit=${:.2})", cfg.name, new_min_profit);
+                            strat.min_triangular_profit_usd = new_min_tri_profit;
+                            info!(
+                                "[{}] Config hot-reloaded (min_profit=${:.2}, min_triangular_profit=${:.2})",
+                                cfg.name, new_min_profit, new_min_tri_profit
+                            );
                         }
                     } // strategy write lock released here — before acquiring executor lock
 
@@ -636,6 +649,7 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, None, disabled_set, None,
+                    "block",
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -667,6 +681,7 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, None, disabled_set, None,
+                    "poll",
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -752,6 +767,7 @@ pub async fn run_chain(
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     None,
+                    "swap",
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
             }
@@ -795,6 +811,7 @@ pub async fn run_chain(
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     Some(tip_override),
+                    "pending",
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
             }

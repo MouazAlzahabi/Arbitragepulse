@@ -4,9 +4,9 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "rec
 // ═══════════════════════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════════════════════
-const DEFAULT_WS = location.port === "5174"
-  ? "ws://localhost:3000/ws"                                              // local Vite dev
-  : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`; // served from engine
+// Same-origin WS: Vite proxies /ws to the engine (vite.config.js); production static
+// files are served by the engine, so location.host is the engine too.
+const DEFAULT_WS = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 
 // Known chain ID → display name mapping
 const CHAIN_NAMES = {
@@ -33,7 +33,7 @@ const extractChain = (msg) => {
 // ═══════════════════════════════════════════════════════════
 // HOOKS
 // ═══════════════════════════════════════════════════════════
-function useWebSocket(url, apiKey) {
+function useWebSocket(url, apiKey, httpBaseUrl) {
   const [status, setStatus] = useState("disconnected");
   const [logs, setLogs] = useState(() => {
     try { return JSON.parse(localStorage.getItem("ap_logs") || "[]"); } catch { return []; }
@@ -44,6 +44,23 @@ function useWebSocket(url, apiKey) {
   const wsRef = useRef(null);
   const reconnRef = useRef(null);
   const attempts = useRef(0);
+
+  const hydrateFromHttp = useCallback(async () => {
+    if (!httpBaseUrl) return;
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+      const r = await fetch(`${httpBaseUrl}/stats`, { headers });
+      if (r.status === 401) {
+        setAuthError(true);
+        return;
+      }
+      if (!r.ok) return;
+      const d = await r.json();
+      setEngineState({ dryRun: d.dry_run, paused: d.paused });
+      setStats(d);
+    } catch {}
+  }, [httpBaseUrl, apiKey]);
 
   const connect = useCallback(() => {
     if (!url) return;
@@ -68,8 +85,8 @@ function useWebSocket(url, apiKey) {
       ws.onopen = () => {
         setStatus("connected");
         attempts.current = 0;
-        ws.send(JSON.stringify({ command: "status" }));
-        ws.send(JSON.stringify({ command: "state" }));
+        // Server ignores WS JSON commands; hydrate counters/mode immediately via REST.
+        void hydrateFromHttp();
       };
       ws.onmessage = (e) => {
         try {
@@ -96,7 +113,7 @@ function useWebSocket(url, apiKey) {
         ws.close();
       };
     } catch { setStatus("disconnected"); scheduleReconnect(); }
-  }, [url, apiKey]);
+  }, [url, apiKey, hydrateFromHttp]);
 
   const scheduleReconnect = useCallback(() => {
     attempts.current++;
@@ -115,7 +132,7 @@ function useWebSocket(url, apiKey) {
     clearLogs: () => { setLogs([]); try { localStorage.removeItem("ap_logs"); } catch {} },
     disconnect: () => { clearTimeout(reconnRef.current); attempts.current = 999; wsRef.current?.close(); setStatus("disconnected"); },
     reconnect: () => { attempts.current = 0; connect(); },
-    refreshState: () => send({ command: "state" }),
+    refreshState: () => void hydrateFromHttp(),
   };
 }
 
@@ -133,17 +150,21 @@ function useApi(baseUrl, apiKey) {
     try { const r = await fetch(`${baseUrl}${path}`, { ...opts, headers: { ...headers, ...(opts.headers || {}) } }); if (r.status === 401) return { _authError: true }; return await r.json(); } catch { return null; }
   }, [baseUrl, headers]);
 
+  const fetchStats = useCallback(() => f("/stats"), [f]);
+
+  const fetchPairScan = useCallback(async () => {
+    const d = await f("/pair-scan");
+    if (!d?.chains) return;
+    const m = {};
+    for (const c of d.chains) m[c.chain_id] = c.pairs;
+    setPairScan(m);
+  }, [f]);
+
   return {
     tokens, pairs, pairScan, loading,
     fetchTokens: async (cid) => { setLoading(true); const d = await f(`/tokens${cid ? `?chain_id=${cid}` : ""}`); setTokens(d?.tokens || []); setLoading(false); },
     fetchPairs: async (cid) => { const d = await f(`/tokens/pairs${cid ? `?chain_id=${cid}` : ""}`); setPairs(d?.pairs || []); },
-    fetchPairScan: async () => {
-      const d = await f("/pair-scan");
-      if (!d?.chains) return;
-      const m = {};
-      for (const c of d.chains) m[c.chain_id] = c.pairs;
-      setPairScan(m);
-    },
+    fetchPairScan,
     togglePair: async (pairId) => { await f(`/pair-scan/${encodeURIComponent(pairId)}/toggle`, { method: "POST" }); },
     toggleTrust: async (cid, addr, trusted) => { await f(`/tokens/${cid}/${addr}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trusted }) }); },
     addToken: async (t) => { const r = await fetch(`${baseUrl}/tokens`, { method: "POST", headers, body: JSON.stringify(t) }); return r?.ok; },
@@ -153,7 +174,7 @@ function useApi(baseUrl, apiKey) {
     setDryRun: (enabled) => f("/engine/dry-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }),
     restartEngine: () => f("/engine/restart", { method: "POST", headers: { "Content-Type": "application/json" } }),
     resetDb: () => f("/stats/reset", { method: "POST", headers: { "Content-Type": "application/json" } }),
-    fetchStats: () => f("/stats"),
+    fetchStats,
     fetchState: () => f("/engine/state"),
     fetchTrades: (limit) => f(`/trades?limit=${limit || 500}`),
   };
@@ -183,7 +204,11 @@ function LoginScreen({ engineUrl, setEngineUrl, apiKey, setApiKey, onConnect, er
         </div>
         {error && <div style={{ background: "#450a0a", border: "1px solid #7f1d1d", borderRadius: 6, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 12 }}>Authentication failed. Check your API key.</div>}
         <button onClick={handleSubmit} style={{ ...btn, width: "100%", padding: "12px 20px", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg, #4c1d95, #1e1b4b)", color: "#a78bfa", borderRadius: 6 }}>Connect</button>
-        <div style={{ marginTop: 24, fontSize: 10, color: "#1e293b", textAlign: "center", lineHeight: 1.8 }}>Engine not running?<br /><span style={{ color: "#334155" }}>cargo run -p engine</span> in your workspace directory</div>
+        <div style={{ marginTop: 24, fontSize: 10, color: "#1e293b", textAlign: "center", lineHeight: 1.8 }}>
+          Remote engine? Use <span style={{ color: "#475569" }}>ws://HOST:PORT/ws</span> (not localhost from an old session — run <span style={{ color: "#475569" }}>localStorage.clear()</span> in DevTools if stuck).
+          <br />Local Vite: run the engine on port 3000 (or set <span style={{ color: "#475569" }}>ENGINE_PROXY_TARGET</span>) so the dev proxy can reach it.
+          <br />Engine not running? <span style={{ color: "#334155" }}>cargo run -p engine</span> in your workspace directory
+        </div>
       </div>
     </div>
   );
@@ -325,12 +350,15 @@ function ChainCards({ apiStats }) {
 }
 
 
-function GasLatencyBar({ apiStats, apiLatency }) {
+function GasLatencyBar({ apiStats, apiLatency, statsPollError }) {
   // Show RPC latency per chain (only chains that have a measurement)
   const rpcChains = (apiStats?.chains || []).filter((c) => c.rpc_latency_ms > 0);
-  if (apiLatency == null && rpcChains.length === 0) return null;
+  if (statsPollError == null && apiLatency == null && rpcChains.length === 0) return null;
   return (
-    <div style={{ display: "flex", gap: 24, padding: "4px 16px", background: "#0a0f1a", borderBottom: "1px solid #1e293b", fontSize: 11 }}>
+    <div style={{ display: "flex", gap: 24, padding: "4px 16px", background: "#0a0f1a", borderBottom: "1px solid #1e293b", fontSize: 11, alignItems: "center", flexWrap: "wrap" }}>
+      {statsPollError != null && (
+        <span style={{ color: "#f87171" }}>⚠ /stats: {statsPollError}</span>
+      )}
       {rpcChains.map((c) => {
         const ms = Math.round(c.rpc_latency_ms);
         const col = ms < 100 ? "#34d399" : ms < 300 ? "#fbbf24" : "#f87171";
@@ -770,12 +798,12 @@ function PairManager({ api }) {
     if (chainIds.length > 0 && selectedChain === null) setSelectedChain(chainIds[0]);
   }, [chainIds.length]);
 
-  // Poll pair scan every 30s
+  // Poll pair scan (10s) — restarts when API base URL or key changes
   useEffect(() => {
     api.fetchPairScan();
-    const t = setInterval(() => api.fetchPairScan(), 30000);
+    const t = setInterval(() => api.fetchPairScan(), 10000);
     return () => clearInterval(t);
-  }, []);
+  }, [api.fetchPairScan]);
 
   const activeChain = selectedChain ?? chainIds[0] ?? null;
   const allRows = activeChain != null ? (api.pairScan[activeChain] ?? []) : [];
@@ -921,7 +949,7 @@ function PairManager({ api }) {
       )}
 
       <div style={{ fontSize: 10, color: "#334155", marginTop: 4 }}>
-        Scan data updates every heartbeat (~60s). Toggle disables a pair or triplet from future scans — takes effect on the next cycle.
+        Tokens tab refreshes pair-scan every ~10s; engine heartbeat log ~60s. Toggle disables a pair or triplet from future scans — takes effect on the next cycle.
       </div>
     </div>
   );
@@ -939,7 +967,7 @@ export default function Dashboard() {
   useEffect(() => { localStorage.setItem("ap_url", url); }, [url]);
   useEffect(() => { localStorage.setItem("ap_key", apiKey); }, [apiKey]);
   const apiUrl = url.replace("ws://", "http://").replace("wss://", "https://").replace("/ws", "");
-  const ws = useWebSocket(url, apiKey);
+  const ws = useWebSocket(url, apiKey, apiUrl);
   const api = useApi(apiUrl, apiKey);
   const [tab, setTab] = useState("monitor");
   const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info", "heartbeat"]));
@@ -948,20 +976,28 @@ export default function Dashboard() {
   // Measure API latency from each poll.
   const [apiStats, setApiStats] = useState(null);
   const [apiLatency, setApiLatency] = useState(null);
+  const [statsPollError, setStatsPollError] = useState(null);
   useEffect(() => {
     if (!authenticated) return;
     const poll = async () => {
       const t0 = Date.now();
       const d = await api.fetchStats();
-      if (d && !d._authError) {
+      if (d?._authError) {
+        setStatsPollError("unauthorized");
+        return;
+      }
+      if (d) {
+        setStatsPollError(null);
         setApiLatency(Date.now() - t0);
         setApiStats(d);
+      } else {
+        setStatsPollError("unreachable");
       }
     };
     poll();
     const iv = setInterval(poll, 3000);
     return () => clearInterval(iv);
-  }, [authenticated]);
+  }, [authenticated, api.fetchStats]);
 
   // Poll /stats/pairs every 5s for the pair leaderboard.
   // pairStatsCleared: when true, show empty until user clicks Reload.
@@ -1016,7 +1052,7 @@ export default function Dashboard() {
 
       <Header tab={tab} setTab={setTab} status={ws.status} engineUrl={url} apiKey={apiKey} onLogout={handleLogout} />
       <StatsRow stats={ws.stats} logs={ws.logs} engineState={ws.engineState} apiStats={apiStats} />
-      <GasLatencyBar apiStats={apiStats} apiLatency={apiLatency} />
+      <GasLatencyBar apiStats={apiStats} apiLatency={apiLatency} statsPollError={statsPollError} />
 
       {tab === "monitor" && (
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>

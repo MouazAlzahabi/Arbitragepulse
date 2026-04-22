@@ -1,6 +1,50 @@
 use super::*;
+use alloy::network::ReceiptResponse;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Structured receipt line for grep / dashboards: timing, trigger, tip, block position.
+fn log_exec_confirm(
+    chain: &str,
+    route: &str,
+    ok: bool,
+    receipt: &impl ReceiptResponse,
+    trigger: &'static str,
+    max_priority_fee_wei: u128,
+    exec_start: Instant,
+    send_rpc_ms: u64,
+    profit_usd: f64,
+    opp_id: &str,
+    tx_hash: &str,
+) {
+    let block = receipt.block_number();
+    let tx_index = receipt.transaction_index();
+    let gas_used = receipt.gas_used();
+    let eff_gas = receipt.effective_gas_price();
+    let total_ms = exec_start.elapsed().as_millis() as u64;
+    let msg = format!(
+        "[{}] exec_confirm | route={} | ok={} | block={:?} | tx_index={:?} | gas_used={} | eff_gas_price_wei={} | total_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | profit_usd={:.4} | opp={} | tx={}",
+        chain,
+        route,
+        ok,
+        block,
+        tx_index,
+        gas_used,
+        eff_gas,
+        total_ms,
+        send_rpc_ms,
+        trigger,
+        max_priority_fee_wei,
+        profit_usd,
+        opp_id,
+        tx_hash,
+    );
+    if ok {
+        info!("{}", msg);
+    } else {
+        warn!("{}", msg);
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
@@ -30,6 +74,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // When Some, override the executor's priority_fee_wei for this submission.
     // Used by pending TX monitor to match the trigger TX's tip for same-block landing.
     tip_override: Option<u128>,
+    // Scan source: block | poll | swap | pending — execution telemetry (see chain/mod.rs call sites).
+    trigger: &'static str,
 ) {
     // Clone ghost_profit_bits from executor once — passed to handle_execution_failure
     // at each callsite so gas-rejected opportunities accumulate into the metric.
@@ -377,17 +423,19 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
+                                let pipeline_ms = exec_start.elapsed().as_millis() as u64;
+                                let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 info!(
-                                    "[{}] Arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={} → cd={}s",
-                                    cfg.name, elapsed_send, prep.profit_usd, prep.net_profit_usd,
-                                    &tx_hash[..10.min(tx_hash.len())], SEND_COOLDOWN_SECS,
+                                    "[{}] exec_send | route=2hop | pipeline_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
+                                    cfg.name, pipeline_ms, elapsed_send, trigger, tip_w,
+                                    prep.profit_usd, prep.net_profit_usd, optimized.pair_id,
+                                    &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
                                 cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
 
                                 // Fire-and-forget receipt task using cloned prep fields
-                                let log_tx_bg = log_tx.clone();
                                 let tx_hash_bg = tx_hash.clone();
                                 let provider_bg = provider.clone();
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -403,15 +451,32 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let contract_addr_bg = prep.contract_addr;
                                 let contract_balances_bg = prep.contract_balances.clone();
                                 let detected_profit_bg = prep.profit_usd;
+                                let trigger_bg = trigger;
+                                let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
+                                let exec_start_bg = exec_start;
+                                let send_rpc_bg = elapsed_send;
                                 tokio::spawn(async move {
                                     match pending.get_receipt().await {
                                         Ok(receipt) => {
-                                            if receipt.status() {
+                                            let ok = receipt.status();
+                                            log_exec_confirm(
+                                                &chain_name_bg,
+                                                "2hop",
+                                                ok,
+                                                &receipt,
+                                                trigger_bg,
+                                                tip_bg,
+                                                exec_start_bg,
+                                                send_rpc_bg,
+                                                detected_profit_bg,
+                                                &opp_id_bg,
+                                                &tx_hash_bg,
+                                            );
+                                            if ok {
                                                 confirmed_success_bg.fetch_add(1, Ordering::Relaxed);
                                                 confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                                                     Some((f64::from_bits(bits) + profit_bg).to_bits())
                                                 }).ok();
-                                                info!("[{}] ✓ confirmed | gas={} | tx={}", chain_name_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
                                                     for token in token_addrs {
@@ -423,14 +488,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                                let msg = format!(
-                                                    "[{}] ✗ tx reverted | pair={} | detected_profit=${:.4} | gas_used={} | tx={}",
-                                                    chain_name_bg, opp_id_bg, detected_profit_bg,
-                                                    receipt.gas_used,
-                                                    &tx_hash_bg[..10.min(tx_hash_bg.len())]
-                                                );
-                                                warn!("{}", msg);
-                                                broadcast_log(&log_tx_bg, "error", &msg, None);
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -623,17 +680,19 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
+                                let pipeline_ms = exec_start.elapsed().as_millis() as u64;
+                                let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 info!(
-                                    "[{}] Triangular arb sent ({}ms) | gross=${:.4} net=${:.4} | tx={} → cd={}s",
-                                    cfg.name, elapsed_send, prep.profit_usd, prep.net_profit_usd,
-                                    &tx_hash[..10.min(tx_hash.len())], SEND_COOLDOWN_SECS,
+                                    "[{}] exec_send | route=triangular | pipeline_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
+                                    cfg.name, pipeline_ms, elapsed_send, trigger, tip_w,
+                                    prep.profit_usd, prep.net_profit_usd, opp.triplet_id,
+                                    &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
                                 cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
 
                                 // Fire-and-forget receipt task
-                                let log_tx_bg = log_tx.clone();
                                 let tx_hash_bg = tx_hash.clone();
                                 let provider_bg = provider.clone();
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -650,15 +709,32 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let contract_addr_bg = prep.contract_addr;
                                 let contract_balances_bg = prep.contract_balances.clone();
                                 let detected_profit_bg = prep.profit_usd;
+                                let trigger_bg = trigger;
+                                let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
+                                let exec_start_bg = exec_start;
+                                let send_rpc_bg = elapsed_send;
                                 tokio::spawn(async move {
                                     match pending.get_receipt().await {
                                         Ok(receipt) => {
-                                            if receipt.status() {
+                                            let ok = receipt.status();
+                                            log_exec_confirm(
+                                                &chain_name_bg,
+                                                "triangular",
+                                                ok,
+                                                &receipt,
+                                                trigger_bg,
+                                                tip_bg,
+                                                exec_start_bg,
+                                                send_rpc_bg,
+                                                detected_profit_bg,
+                                                &opp_id_bg,
+                                                &tx_hash_bg,
+                                            );
+                                            if ok {
                                                 confirmed_success_bg.fetch_add(1, Ordering::Relaxed);
                                                 confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                                                     Some((f64::from_bits(bits) + profit_bg).to_bits())
                                                 }).ok();
-                                                info!("[{}] ✓ triangular confirmed | gas={} | tx={}", chain_name_bg, receipt.gas_used, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
                                                     for token in token_addrs {
@@ -670,14 +746,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                                let msg = format!(
-                                                    "[{}] ✗ triangular reverted | pair={} | detected_profit=${:.4} | gas_used={} | tx={}",
-                                                    chain_name_bg, opp_id_bg, detected_profit_bg,
-                                                    receipt.gas_used,
-                                                    &tx_hash_bg[..10.min(tx_hash_bg.len())]
-                                                );
-                                                warn!("{}", msg);
-                                                broadcast_log(&log_tx_bg, "error", &msg, None);
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();

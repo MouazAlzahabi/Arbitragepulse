@@ -83,6 +83,11 @@ pub struct Strategy {
     pub routers: Vec<RouterConfig>,
     pub native_price_usd: f64,
     pub min_profit_usd: f64,
+    /// Separate minimum profit floor for triangular arbs (USD).
+    /// Triangular V3 routes use cached sqrtPriceX96 which overestimates output by
+    /// >0.24% on WETH routes due to tick-level liquidity not being modelled. This
+    /// floor is set higher than min_profit_usd to filter phantom opportunities.
+    pub min_triangular_profit_usd: f64,
     /// QuoterV2 contract address for V3 quotes (chain-specific, NOT the swap router)
     pub quoter_v2_address: Option<Address>,
     /// Max concurrent Multicall3 chunks per scan (from config rpc_concurrency).
@@ -144,6 +149,7 @@ impl Strategy {
         pairs: Vec<PairConfig>,
         routers: Vec<RouterConfig>,
         min_profit_usd: f64,
+        min_triangular_profit_usd: f64,
         quoter_v2_address: Option<Address>,
         pool_cache: Arc<PoolCache>,
         rpc_concurrency: usize,
@@ -161,6 +167,7 @@ impl Strategy {
             routers,
             native_price_usd: 2500.0,
             min_profit_usd,
+            min_triangular_profit_usd,
             quoter_v2_address,
             syncswap_pool_cache: HashMap::new(),
             pool_cache,
