@@ -46,6 +46,31 @@ fn log_exec_confirm(
     }
 }
 
+/// Dashboard `trade` events mean **included & successful on-chain** (matches block explorer).
+fn broadcast_confirmed_trade(
+    log_tx: &LogBroadcaster,
+    chain_name: &str,
+    tx_hash: &str,
+    display_id: &str,
+    profit_usd: f64,
+) {
+    broadcast_log(
+        log_tx,
+        "trade",
+        &format!(
+            "[{}] Confirmed tx={} | pair={} | profit=${:.4}",
+            chain_name, tx_hash, display_id, profit_usd
+        ),
+        Some(serde_json::json!({
+            "chain":      chain_name,
+            "pair_id":    display_id,
+            "profit_usd": profit_usd,
+            "tx_hash":    tx_hash,
+            "confirmed":  true,
+        })),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     strategy: &Arc<RwLock<Strategy>>,
@@ -455,6 +480,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 let exec_start_bg = exec_start;
                                 let send_rpc_bg = elapsed_send;
+                                let log_tx_bg = log_tx.clone();
+                                let metrics_bg = metrics.clone();
                                 tokio::spawn(async move {
                                     match pending.get_receipt().await {
                                         Ok(receipt) => {
@@ -477,6 +504,17 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                                                     Some((f64::from_bits(bits) + profit_bg).to_bits())
                                                 }).ok();
+                                                metrics_bg
+                                                    .profit_usd
+                                                    .with_label_values(&[&chain_name_bg])
+                                                    .add(profit_bg);
+                                                broadcast_confirmed_trade(
+                                                    &log_tx_bg,
+                                                    &chain_name_bg,
+                                                    &tx_hash_bg,
+                                                    &opp_id_bg,
+                                                    profit_bg,
+                                                );
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
                                                     for token in token_addrs {
@@ -488,6 +526,21 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                broadcast_log(
+                                                    &log_tx_bg,
+                                                    "warn",
+                                                    &format!(
+                                                        "[{}] tx reverted on-chain | pair={} | profit=${:.4} | tx={}",
+                                                        chain_name_bg, opp_id_bg, profit_bg, tx_hash_bg,
+                                                    ),
+                                                    Some(serde_json::json!({
+                                                        "chain":      chain_name_bg,
+                                                        "pair_id":    opp_id_bg,
+                                                        "profit_usd": profit_bg,
+                                                        "tx_hash":    tx_hash_bg,
+                                                        "success":    false,
+                                                    })),
+                                                );
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -713,6 +766,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 let exec_start_bg = exec_start;
                                 let send_rpc_bg = elapsed_send;
+                                let log_tx_bg = log_tx.clone();
+                                let metrics_bg = metrics.clone();
                                 tokio::spawn(async move {
                                     match pending.get_receipt().await {
                                         Ok(receipt) => {
@@ -735,6 +790,17 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 confirmed_profit_bg.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                                                     Some((f64::from_bits(bits) + profit_bg).to_bits())
                                                 }).ok();
+                                                metrics_bg
+                                                    .profit_usd
+                                                    .with_label_values(&[&chain_name_bg])
+                                                    .add(profit_bg);
+                                                broadcast_confirmed_trade(
+                                                    &log_tx_bg,
+                                                    &chain_name_bg,
+                                                    &tx_hash_bg,
+                                                    &opp_id_bg,
+                                                    profit_bg,
+                                                );
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
                                                     for token in token_addrs {
@@ -746,6 +812,21 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                broadcast_log(
+                                                    &log_tx_bg,
+                                                    "warn",
+                                                    &format!(
+                                                        "[{}] triangular tx reverted on-chain | pair={} | profit=${:.4} | tx={}",
+                                                        chain_name_bg, opp_id_bg, profit_bg, tx_hash_bg,
+                                                    ),
+                                                    Some(serde_json::json!({
+                                                        "chain":      chain_name_bg,
+                                                        "pair_id":    opp_id_bg,
+                                                        "profit_usd": profit_bg,
+                                                        "tx_hash":    tx_hash_bg,
+                                                        "success":    false,
+                                                    })),
+                                                );
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -821,7 +902,7 @@ pub(crate) async fn handle_execution_success(
     shared_state: &SharedState,
     log_tx: &LogBroadcaster,
     metrics: &Arc<Metrics>,
-    execution_time_ms: u64,
+    _execution_time_ms: u64,
     cooldown_secs: u64,
 ) {
     *consecutive_failures = 0;
@@ -829,9 +910,7 @@ pub(crate) async fn handle_execution_success(
 
     let dry_label = if dry_run { "true" } else { "false" };
     metrics.executed.with_label_values(&[&cfg.name, dry_label]).inc();
-    if !dry_run {
-        metrics.profit_usd.with_label_values(&[&cfg.name]).add(profit_usd);
-    }
+    // Live `arb_profit_usd_total` and dashboard TRDE lines are updated only after a successful receipt.
 
     // total_attempts = tx sent; total_success is updated in the heartbeat
     // from executor.confirmed_success (set after receipt confirms on-chain).
@@ -840,24 +919,39 @@ pub(crate) async fn handle_execution_success(
         chain.total_attempts += 1;
     }
 
-    broadcast_log(
-        log_tx,
-        "trade",
-        &format!(
-            "[{}] tx={} | pair={} | profit=${:.4} → cd={}s",
-            cfg.name,
-            tx_hash,
-            display_id,
-            profit_usd,
-            cooldown_secs,
-        ),
-        Some(serde_json::json!({
-            "chain":      cfg.name,
-            "pair_id":    display_id,
-            "profit_usd": profit_usd,
-            "tx_hash":    tx_hash,
-        })),
-    );
+    if dry_run {
+        broadcast_log(
+            log_tx,
+            "trade",
+            &format!(
+                "[{}] DRY-RUN ok | simulated tx={} | pair={} | profit=${:.4}",
+                cfg.name, tx_hash, display_id, profit_usd,
+            ),
+            Some(serde_json::json!({
+                "chain":      cfg.name,
+                "pair_id":    display_id,
+                "profit_usd": profit_usd,
+                "tx_hash":    tx_hash,
+                "dry_run":    true,
+            })),
+        );
+    } else {
+        broadcast_log(
+            log_tx,
+            "info",
+            &format!(
+                "[{}] Submitted (pending) tx={} | pair={} | profit=${:.4} → cd={}s — awaiting receipt",
+                cfg.name, tx_hash, display_id, profit_usd, cooldown_secs,
+            ),
+            Some(serde_json::json!({
+                "chain":                  cfg.name,
+                "pair_id":                display_id,
+                "profit_usd":             profit_usd,
+                "tx_hash":                tx_hash,
+                "pending_confirmation":   true,
+            })),
+        );
+    }
 }
 
 /// Handle execution failure (both 2-hop and triangular).
