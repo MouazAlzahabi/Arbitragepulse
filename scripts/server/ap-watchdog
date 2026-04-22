@@ -2,6 +2,12 @@
 # ArbitragePulse Health Watchdog
 # Invoked every 30 seconds by ap-watchdog.timer.
 #
+# If you `systemctl stop arbitragepulse` for maintenance, /health goes down and
+# this script will call `systemctl restart arbitragepulse` after 3 failed checks
+# (~90s). To keep the engine off, also stop the timer:
+#   sudo systemctl stop ap-watchdog.timer
+# When done: sudo systemctl start ap-watchdog.timer && sudo systemctl start arbitragepulse
+#
 # Restarts the engine when:
 #   1. /health endpoint is unresponsive for 3 consecutive checks (90 s)
 #   2. last_block stops advancing for 10 consecutive checks (5 min) — hung RPC
