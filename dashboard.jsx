@@ -8,6 +8,20 @@ import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "rec
 // files are served by the engine, so location.host is the engine too.
 const DEFAULT_WS = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 
+/** If localStorage has a WS URL from another host (e.g. dev Vite), use this page's origin instead. */
+function normalizeWsUrl(stored, sameOriginDefault) {
+  const d = (stored || "").trim();
+  if (!d) return sameOriginDefault;
+  try {
+    const forParse = d.replace(/^ws:\/\//i, "http://").replace(/^wss:\/\//i, "https://");
+    const u = new URL(forParse);
+    if (u.host !== location.host) return sameOriginDefault;
+  } catch {
+    return sameOriginDefault;
+  }
+  return d;
+}
+
 // Known chain ID → display name mapping
 const CHAIN_NAMES = {
   10:     "Optimism",
@@ -553,7 +567,7 @@ function PairLeaderboard({ pairStats, wsLogs, onReload }) {
   );
 }
 
-function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
+function LogFeed({ logs, enabledTypes, setEnabledTypes, wsStatus }) {
   const ref = useRef(null);
   const [auto, setAuto] = useState(true);
   useEffect(() => { if (auto && ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [logs, auto]);
@@ -568,7 +582,7 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
     if (l.type === "trade") return enabledTypes.has("trade");
     if (l.type === "opportunity") return enabledTypes.has("opportunity");
     if (l.type === "error" || l.type === "warn") return enabledTypes.has("errors");
-    if (l.type === "info") return enabledTypes.has("info");
+    if (l.type === "info" || l.type === "debug") return enabledTypes.has("info");
     return false;
   });
 
@@ -610,7 +624,16 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes }) {
         if (!atBot && auto) setAuto(false);
         if (atBot && !auto) setAuto(true);
       }} style={{ flex: 1, overflow: "auto", padding: "6px 10px", fontSize: 11, lineHeight: 1.8, background: "#020617" }}>
-        {filtered.length === 0 && <div style={{ color: "#1e293b", fontStyle: "italic", paddingTop: 16, textAlign: "center" }}>{logs.length === 0 ? "Connecting…" : "No matching logs"}</div>}
+        {wsStatus !== "connected" && (
+          <div style={{ color: "#f87171", padding: "10px 8px", marginBottom: 8, background: "#450a0a", borderRadius: 6, fontSize: 11, lineHeight: 1.5 }}>
+            WebSocket <strong>{wsStatus}</strong> — live logs need <code style={{ color: "#fecaca" }}>{DEFAULT_WS}</code> (same host as this page). Use <strong>Logout</strong> if the header still shows a different host.
+          </div>
+        )}
+        {filtered.length === 0 && (
+          <div style={{ color: "#1e293b", fontStyle: "italic", paddingTop: 16, textAlign: "center" }}>
+            {wsStatus !== "connected" ? "Waiting for WebSocket…" : logs.length === 0 ? "Connecting…" : "No matching logs"}
+          </div>
+        )}
         {filtered.map((l) => {
           const [clr, badge] = TYPE[l.type] || TYPE.info;
           return (
@@ -959,7 +982,12 @@ function PairManager({ api }) {
 // MAIN
 // ═══════════════════════════════════════════════════════════
 export default function Dashboard() {
-  const [url, setUrl] = useState(() => localStorage.getItem("ap_url") || DEFAULT_WS);
+  const [url, setUrl] = useState(() => {
+    const stored = localStorage.getItem("ap_url") || "";
+    const normalized = normalizeWsUrl(stored, DEFAULT_WS);
+    if (normalized !== stored) localStorage.setItem("ap_url", normalized);
+    return normalized;
+  });
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("ap_key") || "");
   const [authenticated, setAuthenticated] = useState(
     () => !!(localStorage.getItem("ap_url") && localStorage.getItem("ap_key"))
@@ -1081,7 +1109,7 @@ export default function Dashboard() {
               <button onClick={ws.clearLogs} style={{ ...btn, fontSize: 9, padding: "2px 8px" }}>Clear</button>
             </div>
             <div style={{ flex: 1, minHeight: 0 }}>
-              <LogFeed logs={ws.logs} enabledTypes={enabledTypes} setEnabledTypes={setEnabledTypes} />
+              <LogFeed logs={ws.logs} enabledTypes={enabledTypes} setEnabledTypes={setEnabledTypes} wsStatus={ws.status} />
             </div>
           </div>
         </div>

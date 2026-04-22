@@ -2,7 +2,8 @@
   "name": "arbitragepulse-dashboard",
   "private": true,
   "scripts": {
-    "dashboard": "vite --port 5173 --open"
+    "dashboard": "vite --port 5173 --open",
+    "build": "vite build"
   },
   "dependencies": {
     "react": "^18.3.1",

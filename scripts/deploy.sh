@@ -36,6 +36,16 @@ echo "  Sync:  $DO_SYNC"
 echo "  Build: $DO_BUILD"
 echo ""
 
+# ── Step 0: Dashboard static bundle (dist/) — gitignored, must build before rsync
+if [ "$DO_SYNC" = true ]; then
+    echo "[0/3] Building dashboard (vite) → dist/..."
+    if command -v npm >/dev/null 2>&1; then
+        (cd "$PROJECT_ROOT" && npm ci --no-audit --no-fund && npm run build)
+    else
+        echo "      WARN: npm not found — skipping Vite build; ensure dist/ exists or dashboard assets will be stale"
+    fi
+fi
+
 # ── Step 1: Sync code ─────────────────────────────────────────────────────────
 if [ "$DO_SYNC" = true ]; then
     echo "[1/3] Syncing code..."
