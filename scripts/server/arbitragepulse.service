@@ -2,7 +2,7 @@
 Description=ArbitragePulse Multi-Chain Arbitrage Engine
 After=network-online.target
 Wants=network-online.target
-# Allow up to 5 rapid restarts in 2 min before systemd gives up (watchdog will still restart via systemctl)
+# Allow up to 5 rapid restarts in 2 min before systemd gives up
 StartLimitIntervalSec=120
 StartLimitBurst=5
 
@@ -13,7 +13,7 @@ WorkingDirectory=/home/botadmin/Arbitragepulse
 EnvironmentFile=/home/botadmin/Arbitragepulse/engine/.env
 ExecStart=/home/botadmin/Arbitragepulse/target/release/engine
 
-# Restart on crash/error — not on clean exit (SIGTERM from watchdog/systemctl restart)
+# Restart on crash/error — not on clean exit (SIGTERM from systemctl stop)
 Restart=on-failure
 RestartSec=5
 

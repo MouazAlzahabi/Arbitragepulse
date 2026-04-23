@@ -1,6 +1,6 @@
 #!/bin/bash
-# ArbitragePulse Self-Healing Pipeline — Server Installation
-# Run as root on the Hetzner server:
+# ArbitragePulse — Server installation (systemd + logs)
+# Run as root on the server:
 #   sudo bash /home/botadmin/Arbitragepulse/scripts/server/setup.sh
 
 set -euo pipefail
@@ -10,48 +10,41 @@ LOG_DIR="/var/log/arbitragepulse"
 SERVICE_USER="botadmin"
 
 echo "================================================"
-echo " ArbitragePulse Self-Healing Pipeline — Install"
+echo " ArbitragePulse — Server install"
 echo "================================================"
 echo ""
 
 # ── 1. Log directory ──────────────────────────────────────────────────────────
-echo "[1/6] Creating log directory..."
+echo "[1/4] Creating log directory..."
 mkdir -p "$LOG_DIR"
 chown "${SERVICE_USER}:${SERVICE_USER}" "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 echo "      ${LOG_DIR} ready"
 
-# ── 2. Watchdog script ────────────────────────────────────────────────────────
-echo "[2/6] Installing watchdog script..."
-cp "${SCRIPTS_DIR}/ap-watchdog" /usr/local/bin/ap-watchdog
-chmod +x /usr/local/bin/ap-watchdog
-echo "      /usr/local/bin/ap-watchdog installed"
-
-# ── 3. Systemd units ──────────────────────────────────────────────────────────
-echo "[3/6] Installing systemd units..."
+# ── 2. Systemd unit ───────────────────────────────────────────────────────────
+echo "[2/4] Installing systemd unit..."
 cp "${SCRIPTS_DIR}/arbitragepulse.service" /etc/systemd/system/arbitragepulse.service
-cp "${SCRIPTS_DIR}/ap-watchdog.service"    /etc/systemd/system/ap-watchdog.service
-cp "${SCRIPTS_DIR}/ap-watchdog.timer"      /etc/systemd/system/ap-watchdog.timer
-echo "      3 units installed"
+echo "      arbitragepulse.service installed"
 
-# ── 4. Log rotation ───────────────────────────────────────────────────────────
-echo "[4/6] Installing logrotate config..."
+# Legacy ap-watchdog (removed from this repo): stop, disable, drop unit files
+systemctl stop ap-watchdog.timer 2>/dev/null || true
+systemctl disable ap-watchdog.timer 2>/dev/null || true
+systemctl disable ap-watchdog.service 2>/dev/null || true
+rm -f /etc/systemd/system/ap-watchdog.timer /etc/systemd/system/ap-watchdog.service
+rm -f /usr/local/bin/ap-watchdog
+
+# ── 3. Log rotation ───────────────────────────────────────────────────────────
+echo "[3/4] Installing logrotate config..."
 cp "${SCRIPTS_DIR}/logrotate" /etc/logrotate.d/arbitragepulse
 echo "      /etc/logrotate.d/arbitragepulse installed"
 
-# ── 5. Reload systemd + enable units ─────────────────────────────────────────
-echo "[5/6] Enabling services..."
+# ── 4. Reload systemd + enable engine ────────────────────────────────────────
+echo "[4/4] Enabling and starting engine..."
 systemctl daemon-reload
 systemctl enable arbitragepulse
-systemctl enable ap-watchdog.timer
-echo "      arbitragepulse + ap-watchdog.timer enabled"
-
-# ── 6. Start / restart everything ────────────────────────────────────────────
-echo "[6/6] Starting services..."
 systemctl restart arbitragepulse
 sleep 6
-systemctl start ap-watchdog.timer
-echo "      Services started"
+echo "      arbitragepulse started"
 
 echo ""
 echo "================================================"
@@ -60,9 +53,8 @@ echo "================================================"
 echo ""
 echo "Useful commands:"
 echo "  Engine status:   systemctl status arbitragepulse"
+echo "  Stop engine:     sudo systemctl stop arbitragepulse"
 echo "  Engine logs:     journalctl -fu arbitragepulse"
-echo "  Watchdog status: systemctl status ap-watchdog.timer"
-echo "  Watchdog log:    tail -f /var/log/arbitragepulse/watchdog.log"
-echo "  Engine log:      tail -f /var/log/arbitragepulse/engine.log"
+echo "  Engine log file: tail -f /var/log/arbitragepulse/engine.log"
 echo "  Health check:    source /home/botadmin/Arbitragepulse/engine/.env && curl -s -H \"Authorization: Bearer \$API_KEY\" http://localhost:\${PORT:-3000}/health | python3 -m json.tool"
 echo ""

@@ -6,7 +6,6 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -23,31 +22,6 @@ const GAS_LIMIT: u64 = 700_000;
 
 // Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
 const GAS_LIMIT_TRIANGULAR: u64 = 900_000;
-
-// #region agent log
-/// NDJSON debug line for Cursor debug mode (hypothesis testing). Path: env `AP_DEBUG_LOG` or `.cursor/debug-0da3f4.log`.
-fn agent_debug_ndjson(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    let path = std::env::var("AP_DEBUG_LOG").unwrap_or_else(|_| ".cursor/debug-0da3f4.log".to_string());
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let _ = writeln!(
-            f,
-            "{}",
-            serde_json::json!({
-                "sessionId": "0da3f4",
-                "hypothesisId": hypothesis_id,
-                "location": location,
-                "message": message,
-                "data": data,
-                "timestamp": ts,
-            })
-        );
-    }
-}
-// #endregion
 
 // ─── TxPrep ───────────────────────────────────────────────────────────────────
 
@@ -283,27 +257,6 @@ impl Executor {
         }
         let deadline = self.deadline();
         let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
-        // #region agent log
-        let predicted_back = opp.amount_in.saturating_add(opp.expected_profit);
-        let leg2_min = opp.amount_in.saturating_add(min_profit);
-        agent_debug_ndjson(
-            "H3-H5",
-            "executor.rs:prepare_2hop",
-            "amountOutMinimum_chain",
-            serde_json::json!({
-                "pair_id": &opp.pair_id,
-                "amount_in": opp.amount_in.to_string(),
-                "expected_profit_raw": opp.expected_profit.to_string(),
-                "min_profit_raw": min_profit.to_string(),
-                "leg2_amountOutMinimum": leg2_min.to_string(),
-                "quoted_roundtrip_back": predicted_back.to_string(),
-                "min_profit_gt_expected_profit": min_profit > opp.expected_profit,
-                "leg2_min_gt_quoted_back": leg2_min > predicted_back,
-                "gas_cost_usd": gas_cost_usd,
-                "profit_usd": opp.profit_usd,
-            }),
-        );
-        // #endregion
         let calldata = self.build_calldata(opp, deadline, min_profit);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
@@ -389,27 +342,6 @@ impl Executor {
         }
         let deadline = self.deadline();
         let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
-        // #region agent log
-        let predicted_back = opp.amount_in.saturating_add(opp.expected_profit);
-        let leg2_min = opp.amount_in.saturating_add(min_profit);
-        agent_debug_ndjson(
-            "H3-H5",
-            "executor.rs:prepare_triangular",
-            "amountOutMinimum_chain",
-            serde_json::json!({
-                "triplet_id": &opp.triplet_id,
-                "amount_in": opp.amount_in.to_string(),
-                "expected_profit_raw": opp.expected_profit.to_string(),
-                "min_profit_raw": min_profit.to_string(),
-                "leg2_amountOutMinimum": leg2_min.to_string(),
-                "quoted_roundtrip_back": predicted_back.to_string(),
-                "min_profit_gt_expected_profit": min_profit > opp.expected_profit,
-                "leg2_min_gt_quoted_back": leg2_min > predicted_back,
-                "gas_cost_usd": gas_cost_usd,
-                "profit_usd": opp.profit_usd,
-            }),
-        );
-        // #endregion
         let calldata = self.build_triangular_calldata(opp, deadline, min_profit);
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
@@ -923,23 +855,6 @@ impl Executor {
         let tokens_per_usd = ep_f64 / profit_usd;
         let gas_tokens = (gas_cost_usd * tokens_per_usd) as u128;
         let out = U256::from(gas_tokens).max(U256::from(1));
-        // #region agent log
-        agent_debug_ndjson(
-            "H1-H2",
-            "executor.rs:gas_cost_to_token_floor",
-            "gas_to_token_floor",
-            serde_json::json!({
-                "expected_profit_raw": expected_profit.to_string(),
-                "profit_usd": profit_usd,
-                "gas_cost_usd": gas_cost_usd,
-                "ep_f64_parsed": ep_f64,
-                "tokens_per_usd": tokens_per_usd,
-                "gas_tokens_u128": gas_tokens,
-                "min_profit_out": out.to_string(),
-                "min_gt_expected_profit": out > expected_profit,
-            }),
-        );
-        // #endregion
         out
     }
 
