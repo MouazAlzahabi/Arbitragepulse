@@ -50,6 +50,8 @@ chains:
     # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
     # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
     # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
+    # Diagnostic: production uses this file via CONFIG_PATH=engine/config.yaml; bestV=n/a in heartbeat
+    # while optimistic_submission=true (Phase 1.5 Quoter batch skipped for latency). opps= is last scan only.
     optimistic_submission: true   # skip QuoterV2 verification (~80-160ms saved)
     # Triangular arbs through V3 pools overestimate output via cached sqrtPriceX96
     # (tick-level liquidity not modelled). Historical data: even $0.6571 on 270 USDT

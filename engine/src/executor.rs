@@ -23,6 +23,12 @@ const GAS_LIMIT: u64 = 700_000;
 // Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
 const GAS_LIMIT_TRIANGULAR: u64 = 900_000;
 
+/// Shave this many basis points off the gas-derived `minProfit` before encoding the tx.
+/// The contract sets the **sell leg** V3 `amountOutMinimum = amountIn + minProfit`. If that sum
+/// sits exactly on the quoted edge, inclusion delay / tick crossing / competing flow causes
+/// Uniswap V3 to revert with **Too little received** even when simulation looked fine.
+const ROUTER_MIN_OUT_SLACK_BPS: u64 = 75; // 0.75%
+
 // ─── TxPrep ───────────────────────────────────────────────────────────────────
 
 /// Prepared transaction data returned by `prepare_2hop()` / `prepare_triangular()`
@@ -858,16 +864,32 @@ impl Executor {
     /// Convert gas cost from USD to token-in units using the same exchange rate
     /// as expected_profit → profit_usd. This gives a token-denominated floor
     /// for on-chain minProfit that covers gas regardless of token type or decimals.
+    ///
+    /// Uses U256 + ppm math — converting `expected_profit` through `f64` loses precision
+    /// on Base-mainnet-sized wei and can inflate `minProfit`, tightening the V3 minOut.
     fn gas_cost_to_token_floor(expected_profit: U256, profit_usd: f64, gas_cost_usd: f64) -> U256 {
         if profit_usd <= 0.0 || expected_profit.is_zero() {
-            return U256::from(1);
+            return U256::from(1u8);
         }
-        // tokens_per_usd = expected_profit (raw) / profit_usd
-        let ep_f64 = expected_profit.to_string().parse::<f64>().unwrap_or(1.0);
-        let tokens_per_usd = ep_f64 / profit_usd;
-        let gas_tokens = (gas_cost_usd * tokens_per_usd) as u128;
-        let out = U256::from(gas_tokens).max(U256::from(1));
-        out
+        // ppm = fraction of *gross quoted profit* (in wei) that equals gas cost in USD
+        // gas_tokens = expected_profit * (gas_cost_usd / profit_usd)
+        let ppm_f = (gas_cost_usd / profit_usd) * 1_000_000.0;
+        if !ppm_f.is_finite() || ppm_f <= 0.0 {
+            return U256::from(1u8);
+        }
+        let ppm = ppm_f.min(1_000_000.0).round() as u64;
+        let gas_tokens = (expected_profit.saturating_mul(U256::from(ppm)))
+            / U256::from(1_000_000u64);
+        let gas_tokens = gas_tokens.max(U256::from(1u8));
+
+        // Never ask the router for more than the quoted gross edge — that guarantees revert
+        // when `amountOutMinimum` exceeds what any post-quote pool state can deliver.
+        let max_reasonable = expected_profit;
+        let capped = gas_tokens.min(max_reasonable);
+
+        let slack_mul = 10_000u64.saturating_sub(ROUTER_MIN_OUT_SLACK_BPS);
+        let out = (capped.saturating_mul(U256::from(slack_mul))) / U256::from(10_000u64);
+        out.max(U256::from(1u8))
     }
 
     fn build_calldata(&self, opp: &ArbOpportunity, deadline: U256, min_profit: U256) -> Vec<u8> {

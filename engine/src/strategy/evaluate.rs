@@ -10,6 +10,11 @@ use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::{addr_key, u256_to_f64};
 use super::{ForwardTask, ReverseTask, Strategy, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY, parse_amount_capped};
 
+/// QuoterV2 post-buffer: basis points removed from `amount_back` before USD profit vs `min_profit_usd`.
+/// **Single tuning knob** for detection vs execution: lower = more routes pass the floor, higher revert risk on-chain.
+/// Replaces hardcoded `9990/10000` (10 bps).
+const P15_QUOTER_HAIRCUT_BPS: u64 = 5;
+
 impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
     /// All quotes run concurrently (two phases: forward then reverse).
@@ -705,7 +710,8 @@ impl Strategy {
                         // With the 60s TTL, cache is fresh within a few blocks for active pools.
                         // 0.10% covers the ~2s execution window plus cache age uncertainty.
                         // The stale-cache phantom problem is solved by the TTL, not the buffer size.
-                        let amount_back = (amount_back * U256::from(9990)) / U256::from(10000);
+                        let amount_back = (amount_back * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS))
+                            / U256::from(10_000u32);
 
                         // Track verified spread for ALL non-phantom results, including losses
                         // (negative value shows QuoterV2 confirmed the spread is a loss).
@@ -949,7 +955,8 @@ impl Strategy {
             // active pools receive Sync events every few seconds, so cache age is typically
             // 2-10s. V3 reverse leg risk: 0.02-0.04% per 2s block. Total: 0.10% is conservative
             // but allows detection of the 0.10-0.20% spreads that the market actually offers.
-            let amount_back = (amount_back * U256::from(9990)) / U256::from(10000);
+            let amount_back = (amount_back * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS))
+                / U256::from(10_000u32);
 
             let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
             if v_spread > best_verified_spread { best_verified_spread = v_spread; }
@@ -1058,6 +1065,16 @@ impl Strategy {
             self.chain_id, scan_start.elapsed().as_millis(), t_after_p15,
             opportunities.len()
         );
+
+        let min_floor = self.min_profit_usd;
+        if opportunities.is_empty() && best_raw_usd > 0.0 && best_raw_usd >= min_floor {
+            warn!(
+                chain_id = self.chain_id,
+                best_raw_usd,
+                min_profit_usd = min_floor,
+                "evaluate: raw profit ≥ min but 0 opportunities (phantom cap, post-Quoter buffer, or router gating)",
+            );
+        }
 
         (opportunities, best_raw_usd, best_verified_spread, total_fwd_ok, pairs_with_multi, best_spread_pct, pairs_with_any)
     }
