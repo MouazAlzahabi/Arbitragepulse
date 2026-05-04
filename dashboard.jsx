@@ -214,9 +214,9 @@ function LoginScreen({ engineUrl, setEngineUrl, apiKey, setApiKey, onConnect, er
         </div>
         <div style={{ marginBottom: 24 }}>
           <label style={{ display: "block", fontSize: 10, color: "#475569", letterSpacing: 1.2, marginBottom: 6, textTransform: "uppercase", fontWeight: 700 }}>API Key <span style={{ color: "#334155", fontWeight: 400 }}>(leave empty if auth disabled)</span></label>
-          <input value={localKey} onChange={(e) => setLocalKey(e.target.value)} type="password" placeholder="Your API key" style={{ width: "100%", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, color: "#e2e8f0", fontFamily: "inherit", padding: "10px 14px", fontSize: 13 }} autoComplete="off" />
+          <input value={localKey} onChange={(e) => setLocalKey(e.target.value)} type="password" placeholder="Same value as API_KEY in engine/.env on the server" style={{ width: "100%", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, color: "#e2e8f0", fontFamily: "inherit", padding: "10px 14px", fontSize: 13 }} autoComplete="off" />
         </div>
-        {error && <div style={{ background: "#450a0a", border: "1px solid #7f1d1d", borderRadius: 6, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 12 }}>Authentication failed. Check your API key.</div>}
+        {error && <div style={{ background: "#450a0a", border: "1px solid #7f1d1d", borderRadius: 6, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 12 }}>Authentication failed. Use the exact <code style={{ color: "#fecaca" }}>API_KEY</code> from the engine&apos;s <code style={{ color: "#fecaca" }}>.env</code> on the server (REST and WebSocket require it).</div>}
         <button onClick={handleSubmit} style={{ ...btn, width: "100%", padding: "12px 20px", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg, #4c1d95, #1e1b4b)", color: "#a78bfa", borderRadius: 6 }}>Connect</button>
         <div style={{ marginTop: 24, fontSize: 10, color: "#1e293b", textAlign: "center", lineHeight: 1.8 }}>
           Remote engine? Use <span style={{ color: "#475569" }}>ws://HOST:PORT/ws</span> (not localhost from an old session — run <span style={{ color: "#475569" }}>localStorage.clear()</span> in DevTools if stuck).
@@ -1005,6 +1005,8 @@ export default function Dashboard() {
   const [apiStats, setApiStats] = useState(null);
   const [apiLatency, setApiLatency] = useState(null);
   const [statsPollError, setStatsPollError] = useState(null);
+  /** True when /stats returns 401 — same as bad WS auth but easy to miss in the UI. */
+  const [statsAuthFailed, setStatsAuthFailed] = useState(false);
   useEffect(() => {
     if (!authenticated) return;
     const poll = async () => {
@@ -1012,10 +1014,12 @@ export default function Dashboard() {
       const d = await api.fetchStats();
       if (d?._authError) {
         setStatsPollError("unauthorized");
+        setStatsAuthFailed(true);
         return;
       }
       if (d) {
         setStatsPollError(null);
+        setStatsAuthFailed(false);
         setApiLatency(Date.now() - t0);
         setApiStats(d);
       } else {
@@ -1056,14 +1060,14 @@ export default function Dashboard() {
 
   useEffect(() => { if (ws.status === "connected") setAuthenticated(true); }, [ws.status]);
 
-  const handleConnect = () => setAuthenticated(true);
-  const handleLogout = () => { ws.disconnect(); setAuthenticated(false); };
+  const handleConnect = () => { setStatsAuthFailed(false); setAuthenticated(true); };
+  const handleLogout = () => { ws.disconnect(); setStatsAuthFailed(false); setAuthenticated(false); };
 
-  if (!authenticated || ws.authError) {
+  if (!authenticated || ws.authError || statsAuthFailed) {
     return (
       <>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}button:hover{filter:brightness(1.15)}input:focus{outline:none;border-color:#a78bfa}`}</style>
-        <LoginScreen engineUrl={url} setEngineUrl={setUrl} apiKey={apiKey} setApiKey={setApiKey} onConnect={handleConnect} error={ws.authError} />
+        <LoginScreen engineUrl={url} setEngineUrl={setUrl} apiKey={apiKey} setApiKey={setApiKey} onConnect={handleConnect} error={ws.authError || statsAuthFailed} />
       </>
     );
   }
