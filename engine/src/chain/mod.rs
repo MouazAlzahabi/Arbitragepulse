@@ -74,6 +74,9 @@ pub async fn run_chain(
         .contract_address
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid contract address: {}", cfg.contract_address))?;
+    if contract_addr.is_zero() {
+        return Err(anyhow::anyhow!("[{}] contract_address is zero — check config", cfg.name));
+    }
 
     // ── Executor ──
     let submission_rpc_urls: Vec<url::Url> = cfg.submission_rpcs.iter()
@@ -217,7 +220,7 @@ pub async fn run_chain(
 
     // ── Swap event listener ──
     let listener = Listener::new(cfg.id, cfg.name.clone(), cfg.large_swap_threshold_bps, cfg.large_v3_threshold_bps);
-    let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(256);
+    let (swap_tx, mut swap_rx) = mpsc::channel::<SwapEvent>(1024);
     let swap_tx_for_sub = swap_tx.clone();
     {
         let provider_clone = (*provider).clone();
@@ -383,6 +386,9 @@ pub async fn run_chain(
     let mut consecutive_zero_fwd: u32 = 0;
     // Scans at the previous heartbeat — used to show per-beat delta instead of cumulative.
     let mut last_hb_scans: u64 = 0;
+    // Lock-free scan counter — incremented by poll_tick and swap handlers (no write lock needed).
+    // Synced to shared_state.total_scans during heartbeat's existing write() acquisition.
+    let scan_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // ── Main loop ──
     // Tracks when the last full evaluate ran — used to gate the poll_tick fallback.
@@ -410,6 +416,12 @@ pub async fn run_chain(
             // ── Periodic price update + cache cleanup + status log ────────────
             _ = price_tick.tick() => {
                 state::update_native_price(&strategy, &executor, &provider, &chain_routers, &chain_pairs, &cfg).await;
+
+                // Prune expired cooldown entries. Entries are cleaned up lazily when
+                // the same fingerprint is looked up, but one-off fingerprints (different
+                // amount_in each time) never get re-seen and accumulate indefinitely.
+                let now = Instant::now();
+                cooldowns.retain(|_, expire_at| *expire_at > now);
 
                 // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
                 let rpc_ping_start = Instant::now();
@@ -443,7 +455,7 @@ pub async fn run_chain(
                     let profit = f64::from_bits(exec.confirmed_profit_usd_bits.load(Ordering::Relaxed));
                     let ghost = f64::from_bits(exec.ghost_profit_usd_bits.load(Ordering::Relaxed));
                     drop(exec);
-                    // Sync confirmed counts from executor atomics → shared_state
+                    // Sync executor atomics + lock-free scan_count → shared_state.
                     let mut state = shared_state.write().await;
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
                         chain.total_success = ok;
@@ -451,16 +463,18 @@ pub async fn run_chain(
                         chain.total_profit_usd = profit;
                         chain.rpc_latency_ms = rpc_latency_ms;
                         chain.ghost_profit_usd = ghost;
+                        chain.total_scans = scan_count.load(Ordering::Relaxed);
                     }
                     ok
                 };
-                let (total_scans, attempts, success) = {
+                let (attempts, success) = {
                     let state = shared_state.read().await;
                     state.chains.iter()
                         .find(|c| c.chain_id == cfg.id)
-                        .map(|c| (c.total_scans, c.total_attempts, c.total_success))
-                        .unwrap_or((0, 0, confirmed_ok))
+                        .map(|c| (c.total_attempts, c.total_success))
+                        .unwrap_or((0, confirmed_ok))
                 };
+                let total_scans = scan_count.load(Ordering::Relaxed);
                 let scans = total_scans.saturating_sub(last_hb_scans);
                 last_hb_scans = total_scans;
                 // Read and reset the best raw profit seen since last tick
@@ -582,6 +596,7 @@ pub async fn run_chain(
 
                         strat.pairs = new_pairs;
                         strat.routers = new_routers;
+                        strat.rebuild_token_pair_index();
 
                         if structure_changed {
                             info!("[{}] Config structure changed — refreshing SyncSwap cache", cfg.name);
@@ -612,12 +627,12 @@ pub async fn run_chain(
 
                 // Update RPC health + block number in shared state, count each block as a scan
                 {
+                    scan_count.fetch_add(1, Ordering::Relaxed);
                     let base_fee_gwei = base_fee as f64 / 1e9;
                     let mut state = shared_state.write().await;
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
                         chain.rpc_ok = true;
                         chain.last_block = block_num;
-                        chain.total_scans += 1;
                         chain.base_fee_gwei = base_fee_gwei;
                     }
                 }
@@ -664,13 +679,9 @@ pub async fn run_chain(
                            last_scan_at.elapsed().as_millis());
                     continue;
                 }
+                scan_count.fetch_add(1, Ordering::Relaxed);
                 let (global_paused, chain_paused, disabled_set) = {
-                    let mut state = shared_state.write().await;
-                    // Count poll_tick scans too — block_rx misses during WS reconnects
-                    // are covered by poll_tick, so total_scans should include them.
-                    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
-                        chain.total_scans += 1;
-                    }
+                    let state = shared_state.read().await;
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
@@ -716,32 +727,30 @@ pub async fn run_chain(
                     None => continue, // Pool not in cache — block scan covers it
                 };
 
-                // Large swap: clear cooldowns for all fingerprints involving these tokens.
-                // A whale trade fundamentally changes pool state — previous pre-flight
-                // rejections are no longer valid at the new price.
-                if is_large {
-                    let ta_lower = format!("{:?}", tok_a).to_lowercase();
-                    let tb_lower = format!("{:?}", tok_b).to_lowercase();
-                    cooldowns.retain(|fingerprint, _| {
-                        let fp_lower = fingerprint.to_lowercase();
-                        !fp_lower.contains(&ta_lower) && !fp_lower.contains(&tb_lower)
-                    });
-                }
-
-                // Find which configured pairs involve these tokens
-                let (pair_mask, token_filter) = {
+                // Find which configured pairs involve these tokens.
+                // For large swaps, also collect pair IDs so we can clear stale cooldowns —
+                // a whale trade changes pool state, making previous rejections invalid.
+                let (pair_mask, token_filter, affected_pair_ids) = {
                     let strat = strategy.read().await;
                     let indices = strat.pairs_for_tokens(tok_a, tok_b);
-                    (indices.into_iter().collect::<HashSet<usize>>(), vec![tok_a, tok_b])
+                    let ids: Vec<String> = if is_large {
+                        indices.iter().map(|&i| strat.pairs[i].id.clone()).collect()
+                    } else { vec![] };
+                    (indices.into_iter().collect::<HashSet<usize>>(), vec![tok_a, tok_b], ids)
                 };
                 if pair_mask.is_empty() { continue; }
 
-                // Read paused + disabled in one lock; also increment total_scans.
+                // Clear cooldowns for affected pairs. Fingerprints contain pair_id as a prefix
+                // so a simple contains() check works without any allocations per entry.
+                if is_large && !affected_pair_ids.is_empty() {
+                    cooldowns.retain(|fingerprint, _| {
+                        !affected_pair_ids.iter().any(|id| fingerprint.contains(id.as_str()))
+                    });
+                }
+
+                scan_count.fetch_add(1, Ordering::Relaxed);
                 let (global_paused, chain_paused, disabled_set) = {
-                    let mut state = shared_state.write().await;
-                    if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
-                        chain.total_scans += 1;
-                    }
+                    let state = shared_state.read().await;
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
@@ -797,14 +806,9 @@ pub async fn run_chain(
                 // Slightly higher than the trigger so we're competitive for same-block ordering.
                 let tip_override = pending_event.tip_wei.max(cfg.priority_fee_wei);
 
-                let msg = format!(
-                    "[{}] Pending swap detected: {:?}→{:?} amt={} tip={}wei — fast-path scan ({} pairs)",
-                    cfg.name, pending_event.token_in, pending_event.token_out,
-                    pending_event.amount_in, pending_event.tip_wei, pair_mask.len()
-                );
-                info!("{}", msg);
-                broadcast_log(&log_tx, "info", &msg, None);
-
+                let pair_count = pair_mask.len();
+                // Log AFTER evaluate_and_execute to avoid a format!+String alloc on the hot path
+                // before the scan fires. The log still appears immediately after return.
                 scan::evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
@@ -813,6 +817,11 @@ pub async fn run_chain(
                     Some(tip_override),
                     "pending",
                 ).await;
+                info!(
+                    "[{}] Pending swap processed: {:?}→{:?} amt={} tip={}wei ({} pairs)",
+                    cfg.name, pending_event.token_in, pending_event.token_out,
+                    pending_event.amount_in, pending_event.tip_wei, pair_count
+                );
                 // NOTE: last_scan_at intentionally NOT updated here.
             }
         }

@@ -141,6 +141,10 @@ pub struct Strategy {
     /// Populated once at construction — avoids Address::from_str() O(pairs × routers)
     /// times per scan (e.g. 50 pairs × 6 routers = 300 parses per block).
     pub router_addr_map: HashMap<String, Address>,
+    /// Reverse index: token address → pair indices that include that token.
+    /// Populated once at construction and after config hot-reload.
+    /// Replaces linear scan + Address::from_str() on every pending/swap event (~300–500µs saved).
+    token_pair_index: HashMap<Address, Vec<usize>>,
 }
 
 impl Strategy {
@@ -161,6 +165,8 @@ impl Strategy {
             .filter_map(|r| r.address.parse::<Address>().ok().map(|a| (r.id.clone(), a)))
             .collect();
 
+        let token_pair_index = Self::build_token_pair_index_for(&pairs);
+
         Self {
             chain_id,
             pairs,
@@ -180,7 +186,22 @@ impl Strategy {
             optimistic_submission,
             http_provider,
             router_addr_map,
+            token_pair_index,
         }
+    }
+
+    fn build_token_pair_index_for(pairs: &[PairConfig]) -> HashMap<Address, Vec<usize>> {
+        let mut idx: HashMap<Address, Vec<usize>> = HashMap::new();
+        for (i, p) in pairs.iter().enumerate() {
+            if let Ok(a) = p.token_in.parse::<Address>() { idx.entry(a).or_default().push(i); }
+            if let Ok(b) = p.token_out.parse::<Address>() { idx.entry(b).or_default().push(i); }
+        }
+        idx
+    }
+
+    /// Rebuild the token→pairs reverse index after `self.pairs` has been replaced (hot-reload).
+    pub fn rebuild_token_pair_index(&mut self) {
+        self.token_pair_index = Self::build_token_pair_index_for(&self.pairs);
     }
 
     /// Populate the SyncSwap pool address cache by calling getPool() on each factory
@@ -338,15 +359,16 @@ impl Strategy {
 
     /// Returns indices into `self.pairs` for all pairs that trade `token_a` or `token_b`.
     /// Used by the targeted scan to narrow evaluation to pairs affected by a Swap event.
+    /// O(1) lookup via pre-built reverse index — replaces O(n) linear scan with Address::from_str().
     pub fn pairs_for_tokens(&self, token_a: Address, token_b: Address) -> Vec<usize> {
-        self.pairs.iter().enumerate()
-            .filter(|(_, p)| {
-                let ta: Address = p.token_in.parse().unwrap_or_default();
-                let tb: Address = p.token_out.parse().unwrap_or_default();
-                ta == token_a || ta == token_b || tb == token_a || tb == token_b
-            })
-            .map(|(i, _)| i)
-            .collect()
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for addr in [token_a, token_b] {
+            for &i in self.token_pair_index.get(&addr).into_iter().flatten() {
+                if seen.insert(i) { out.push(i); }
+            }
+        }
+        out
     }
 
     pub fn update_native_price(&mut self, price: f64) {

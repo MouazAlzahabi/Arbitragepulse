@@ -95,7 +95,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     targeted: Option<(HashSet<usize>, Vec<Address>)>,
     // Pre-read from shared_state by the caller (alongside the paused check) to avoid
     // an extra shared_state.read().await here on every scan.
-    disabled_set: HashSet<String>,
+    disabled_set: std::sync::Arc<std::collections::HashSet<String>>,
     // When Some, override the executor's priority_fee_wei for this submission.
     // Used by pending TX monitor to match the trigger TX's tip for same-block landing.
     tip_override: Option<u128>,
@@ -131,7 +131,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         let is_full_scan = targeted.is_none();
         let ((opps_2hop, best_2hop, verified_spread_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
             strat.evaluate(provider.as_ref(), final_mask.as_ref(), is_full_scan),
-            strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice()), &disabled_set),
+            strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice()), &*disabled_set),
         );
 
         // Update quote diagnostic counters only on full scans.
@@ -189,10 +189,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // This is key for diagnosing "single pair always" — it shows whether other pairs have
     // spreads below threshold vs not being scanned at all.
     if all_opportunities.len() > 1 {
-        let summary: Vec<String> = all_opportunities.iter()
-            .map(|o| format!("{}=${:.4}", o.pair_id(), o.profit_usd()))
-            .collect();
-        info!("[{}] {} opps this scan: {}", cfg.name, all_opportunities.len(), summary.join(", "));
+        let mut summary = String::with_capacity(all_opportunities.len() * 20);
+        for (i, o) in all_opportunities.iter().enumerate() {
+            if i > 0 { summary.push_str(", "); }
+            let _ = std::fmt::write(&mut summary, format_args!("{}=${:.4}", o.pair_id(), o.profit_usd()));
+        }
+        info!("[{}] {} opps this scan: {}", cfg.name, all_opportunities.len(), summary);
     }
 
     if all_opportunities.is_empty() {
@@ -385,7 +387,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     let mut exec = executor.lock().await;
                     exec.dry_run = false;
                     exec.prepare_2hop(provider.as_ref(), &optimized, tip_override).await
-                    // lock drops here
+                    // lock drops here — secp256k1 signing happens below, outside the lock
+                };
+                // Sign for secondary broadcast outside the mutex (~10ms freed from lock hold).
+                let prep_result = match prep_result {
+                    Ok(p) => Ok(p.sign_if_needed().await),
+                    Err(e) => Err(e),
                 };
                 match prep_result {
                     Err(e) => {
@@ -483,7 +490,18 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let log_tx_bg = log_tx.clone();
                                 let metrics_bg = metrics.clone();
                                 tokio::spawn(async move {
-                                    match pending.get_receipt().await {
+                                    let receipt_result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(300),
+                                        pending.get_receipt(),
+                                    ).await;
+                                    let receipt_result = match receipt_result {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            warn!("[{}] Receipt wait timed out after 300s for tx {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                            return;
+                                        }
+                                    };
+                                    match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
                                             log_exec_confirm(
@@ -517,11 +535,18 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 );
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
-                                                    for token in token_addrs {
-                                                        if let Ok(bal) = IERC20::new(token, &provider_bg).balanceOf(contract_addr_bg).call().await {
-                                                            let mut b = bals.write().await;
-                                                            b.insert(token, bal);
-                                                        }
+                                                    // Fetch all balances concurrently, then write-lock once.
+                                                    let results = futures::future::join_all(
+                                                        token_addrs.iter().map(|&token| {
+                                                            let p = provider_bg.clone();
+                                                            async move {
+                                                                (token, IERC20::new(token, &p).balanceOf(contract_addr_bg).call().await.ok())
+                                                            }
+                                                        })
+                                                    ).await;
+                                                    let mut b = bals.write().await;
+                                                    for (token, bal_opt) in results {
+                                                        if let Some(bal) = bal_opt { b.insert(token, bal); }
                                                     }
                                                 }
                                             } else {
@@ -568,9 +593,18 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             }
                             Err(e) => {
                                 {
+                                    let err_str = e.to_string().to_lowercase();
+                                    let nonce_consumed = err_str.contains("nonce too low")
+                                        || err_str.contains("already known")
+                                        || err_str.contains("replacement transaction");
                                     let mut exec = executor.lock().await;
-                                    exec.record_failed();
-                                    exec.prefetch_nonce(provider.as_ref()).await;
+                                    exec.record_failed(nonce_consumed);
+                                    // Only re-fetch nonce from chain when it was consumed by
+                                    // another TX. For network/gas failures the pre-incremented
+                                    // nonce was reclaimed by record_failed — no RPC needed.
+                                    if nonce_consumed {
+                                        exec.prefetch_nonce(provider.as_ref()).await;
+                                    }
                                 }
                                 if let Some(db) = prep.db.clone() {
                                     let cn = prep.chain_name.clone();
@@ -683,7 +717,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     let mut exec = executor.lock().await;
                     exec.dry_run = false;
                     exec.prepare_triangular(provider.as_ref(), opp, tip_override).await
-                    // lock drops here
+                    // lock drops here — secp256k1 signing happens below, outside the lock
+                };
+                let prep_result = match prep_result {
+                    Ok(p) => Ok(p.sign_if_needed().await),
+                    Err(e) => Err(e),
                 };
                 match prep_result {
                     Err(e) => {
@@ -769,7 +807,18 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let log_tx_bg = log_tx.clone();
                                 let metrics_bg = metrics.clone();
                                 tokio::spawn(async move {
-                                    match pending.get_receipt().await {
+                                    let receipt_result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(300),
+                                        pending.get_receipt(),
+                                    ).await;
+                                    let receipt_result = match receipt_result {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            warn!("[{}] Receipt wait timed out after 300s for tx {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                            return;
+                                        }
+                                    };
+                                    match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
                                             log_exec_confirm(
@@ -803,11 +852,17 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 );
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
-                                                    for token in token_addrs {
-                                                        if let Ok(bal) = IERC20::new(token, &provider_bg).balanceOf(contract_addr_bg).call().await {
-                                                            let mut b = bals.write().await;
-                                                            b.insert(token, bal);
-                                                        }
+                                                    let results = futures::future::join_all(
+                                                        token_addrs.iter().map(|&token| {
+                                                            let p = provider_bg.clone();
+                                                            async move {
+                                                                (token, IERC20::new(token, &p).balanceOf(contract_addr_bg).call().await.ok())
+                                                            }
+                                                        })
+                                                    ).await;
+                                                    let mut b = bals.write().await;
+                                                    for (token, bal_opt) in results {
+                                                        if let Some(bal) = bal_opt { b.insert(token, bal); }
                                                     }
                                                 }
                                             } else {
@@ -854,9 +909,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             }
                             Err(e) => {
                                 {
+                                    let err_str = e.to_string().to_lowercase();
+                                    let nonce_consumed = err_str.contains("nonce too low")
+                                        || err_str.contains("already known")
+                                        || err_str.contains("replacement transaction");
                                     let mut exec = executor.lock().await;
-                                    exec.record_failed();
-                                    exec.prefetch_nonce(provider.as_ref()).await;
+                                    exec.record_failed(nonce_consumed);
+                                    if nonce_consumed {
+                                        exec.prefetch_nonce(provider.as_ref()).await;
+                                    }
                                 }
                                 if let Some(db) = prep.db.clone() {
                                     let cn = prep.chain_name.clone();

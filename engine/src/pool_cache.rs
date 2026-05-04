@@ -226,6 +226,30 @@ impl PoolCache {
         }
     }
 
+    /// Look up by a pre-built directional key string and compute amount out.
+    ///
+    /// Same as `get_amount_out_by_key` but accepts a caller-supplied key to avoid
+    /// the `format!("{}:{}:{}", ...)` allocation inside the hot scan loop.
+    /// Use when the key has already been built once per pair (not once per router).
+    pub fn get_amount_out_by_key_str(
+        &self,
+        key: &str,
+        token_in: Address,
+        amount_in: U256,
+        max_age: Option<Duration>,
+    ) -> Option<U256> {
+        let pool = *self.by_key.get(key)?;
+        if let Some(age) = max_age {
+            let info = self.by_address.get(&pool)?;
+            if info.last_sync.elapsed() > age {
+                return None;
+            }
+            compute_amount_out(&info, token_in, amount_in)
+        } else {
+            self.get_amount_out(pool, token_in, amount_in)
+        }
+    }
+
     /// All V2/Solidly/SyncSwap pool addresses currently in the cache.
     pub fn pool_addresses(&self) -> Vec<Address> {
         self.by_address.iter().map(|e| *e.key()).collect()

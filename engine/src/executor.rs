@@ -68,6 +68,26 @@ pub struct TxPrep {
     /// Shared reqwest client — maintains a TCP connection pool so secondary broadcasts
     /// reuse existing connections instead of handshaking on every transaction.
     pub http_client: Arc<reqwest::Client>,
+    /// True when secondary broadcast is needed and signing hasn't happened yet.
+    /// Set by prepare_*(); cleared (and raw_tx filled) by sign_if_needed().
+    pub needs_sign: bool,
+}
+
+impl TxPrep {
+    /// Sign the transaction for secondary broadcast if needed (~10ms secp256k1).
+    /// Call this AFTER releasing the executor mutex so the lock isn't held during signing.
+    pub async fn sign_if_needed(mut self) -> Self {
+        if self.needs_sign {
+            let mut tx_for_sign = self.tx.clone();
+            tx_for_sign.set_chain_id(self.chain_id);
+            match tx_for_sign.build(&self.wallet).await {
+                Ok(signed) => self.raw_tx = Some(signed.encoded_2718()),
+                Err(e) => warn!("[{}] pre-sign failed: {:?}", self.chain_name, e),
+            }
+            self.needs_sign = false;
+        }
+        self
+    }
 }
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
@@ -275,21 +295,11 @@ impl Executor {
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
             .max_fee_per_gas((gas_price * 2) + priority_fee);
-        // Pre-sign for secondary RPC broadcast (avoids TCP+TLS handshake per tx).
-        // The primary provider re-signs identically via WalletFiller — same bytes.
-        let raw_tx = if !self.submission_rpcs.is_empty() {
-            let mut tx_for_sign = tx.clone();
-            tx_for_sign.set_chain_id(self.chain_id);
-            match tx_for_sign.build(&self.wallet).await {
-                Ok(signed) => Some(signed.encoded_2718()),
-                Err(e) => { warn!("[{}] pre-sign failed: {:?}", self.chain_name, e); None }
-            }
-        } else {
-            None
-        };
         // Pre-increment nonce BEFORE releasing the lock so concurrent prepares
         // allocate distinct nonces without a chain round-trip.
         self.nonce = Some(nonce + 1);
+        // Signing (~10ms secp256k1) happens AFTER the lock is released via sign_if_needed().
+        let needs_sign = !self.submission_rpcs.is_empty();
         Ok(TxPrep {
             tx,
             nonce,
@@ -311,7 +321,8 @@ impl Executor {
             contract_balances: self.contract_balances.clone(),
             submission_rpcs: self.submission_rpcs.clone(),
             wallet: self.wallet.clone(),
-            raw_tx,
+            raw_tx: None,
+            needs_sign,
             http_client: self.http_client.clone(),
         })
     }
@@ -360,17 +371,8 @@ impl Executor {
             .nonce(nonce)
             .max_priority_fee_per_gas(priority_fee)
             .max_fee_per_gas((gas_price * 2) + priority_fee);
-        let raw_tx = if !self.submission_rpcs.is_empty() {
-            let mut tx_for_sign = tx.clone();
-            tx_for_sign.set_chain_id(self.chain_id);
-            match tx_for_sign.build(&self.wallet).await {
-                Ok(signed) => Some(signed.encoded_2718()),
-                Err(e) => { warn!("[{}] pre-sign failed: {:?}", self.chain_name, e); None }
-            }
-        } else {
-            None
-        };
         self.nonce = Some(nonce + 1);
+        let needs_sign = !self.submission_rpcs.is_empty();
         Ok(TxPrep {
             tx,
             nonce,
@@ -392,7 +394,8 @@ impl Executor {
             contract_balances: self.contract_balances.clone(),
             submission_rpcs: self.submission_rpcs.clone(),
             wallet: self.wallet.clone(),
-            raw_tx,
+            raw_tx: None,
+            needs_sign,
             http_client: self.http_client.clone(),
         })
     }
@@ -405,11 +408,20 @@ impl Executor {
         self.stats.last_execution_ms = Some(elapsed_ms);
     }
 
-    /// Phase 3 (failure): reset nonce and update stats after `send_transaction` fails.
-    /// The nonce was pre-incremented in prepare_*() but the send failed — it was
-    /// NOT consumed. Reset to None so the next prepare re-fetches from chain.
-    pub fn record_failed(&mut self) {
-        self.nonce = None;
+    /// Phase 3 (failure): update stats and nonce state after `send_transaction` fails.
+    ///
+    /// `nonce_consumed`: true when the RPC confirms the nonce was accepted and the TX
+    /// exists on-chain (nonce too low / replacement / already known errors). False for
+    /// all other failures (network timeout, gas rejection, revert before mining) where
+    /// the nonce was pre-incremented but NOT consumed — safe to decrement and reuse.
+    pub fn record_failed(&mut self, nonce_consumed: bool) {
+        if nonce_consumed {
+            // Nonce was accepted by the mempool — re-fetch from chain on next attempt.
+            self.nonce = None;
+        } else if let Some(n) = self.nonce {
+            // Nonce was NOT sent — reclaim the pre-incremented slot to avoid a gap.
+            self.nonce = Some(n.saturating_sub(1));
+        }
         self.stats.total_failed += 1;
     }
 

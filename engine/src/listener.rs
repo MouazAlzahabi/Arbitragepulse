@@ -176,6 +176,12 @@ impl Listener {
         let log_tx_poll = log_tx.clone();
         let large_swap_bps = self.large_swap_bps;
         let large_v3_bps = self.large_v3_bps;
+        // Pre-build the static part of the log filter (addresses + event signatures).
+        // Cloning a pre-built Filter is cheaper than reconstructing FilterSet<Address>
+        // from a Vec on every 2-second poll tick.
+        let base_filter = Filter::new()
+            .address(all_addrs)
+            .event_signature(event_sigs);
         tokio::spawn(async move {
             let mut last_block: u64 = 0;
             let poll_interval = Duration::from_secs(2); // Linea ~2s block time
@@ -214,9 +220,7 @@ impl Listener {
                 };
                 let to = current_block;
 
-                let filter = Filter::new()
-                    .address(all_addrs.clone())
-                    .event_signature(event_sigs.clone())
+                let filter = base_filter.clone()
                     .from_block(from)
                     .to_block(to);
 

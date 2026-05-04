@@ -3,7 +3,7 @@ use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use tracing::{debug, info, warn};
 
-use crate::abi::{IQuoterV2, ISolidlyRouter, ISyncSwapPool, IUniswapV2Router02};
+use crate::abi::IQuoterV2;
 use crate::config::RouterType;
 use crate::pool_cache::{VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{ArbOpportunity, PairScanInfo};
@@ -53,8 +53,6 @@ impl Strategy {
         let mut pair_quotes: std::collections::HashMap<usize, Vec<ForwardTask>> =
             std::collections::HashMap::new();
 
-        let fwd_tasks: Vec<ForwardTask> = Vec::new();
-        let fwd_mc: Vec<(Address, Vec<u8>)> = Vec::new();
         // V3 scan diagnostic counters: cached=used spot (0 HTTP), no_cache=QuoterV2 needed.
         let mut v3_cached: usize = 0;
         let mut v3_no_cache: usize = 0;
@@ -66,10 +64,17 @@ impl Strategy {
         let solidly_sta_ids: Vec<String> = chain_routers.iter()
             .map(|r| format!("{}::stable", r.id)).collect();
 
-        for (pi, pair) in self.pairs.iter().enumerate()
-            .filter(|(_, p)| p.chain_id == self.chain_id)
-            .filter(|(i, _)| pair_mask.map_or(true, |m| m.contains(i)))
-        {
+        let target_indices: Vec<usize> = match pair_mask {
+            Some(m) => m.iter().copied()
+                .filter(|&i| self.pairs.get(i).map_or(false, |p| p.chain_id == self.chain_id))
+                .collect(),
+            None => self.pairs.iter().enumerate()
+                .filter(|(_, p)| p.chain_id == self.chain_id)
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        for pi in target_indices {
+            let pair = &self.pairs[pi];
             let token_in = match pair.token_in.parse::<Address>() {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -106,8 +111,9 @@ impl Strategy {
                         // last trade 10+ minutes ago produce phantom opportunities — the local
                         // xy=k formula is exact given correct reserves, but stale reserves
                         // overestimate output and cause on-chain "too little received" reverts.
-                        if let Some(out) = self.pool_cache.get_amount_out_by_key(
-                            &router.id, token_in, token_out, amount_in, Some(VOLATILE_MAX_AGE),
+                        let fwd_key = format!("{}:{}:{}", router.id, token_in_key, token_out_key);
+                        if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
+                            &fwd_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
                         ) {
                             pair_quotes.entry(pi).or_default().push(ForwardTask {
                                 pair_idx: pi,
@@ -191,8 +197,9 @@ impl Strategy {
                             (solidly_vol_ids[ri].as_str(), 0u32, VOLATILE_MAX_AGE),
                             (solidly_sta_ids[ri].as_str(), 1u32, STABLE_MAX_AGE),
                         ] {
-                            if let Some(out) = self.pool_cache.get_amount_out_by_key(
-                                eff_id, token_in, token_out, amount_in, Some(max_age),
+                            let sol_fwd_key = format!("{}:{}:{}", eff_id, token_in_key, token_out_key);
+                            if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
+                                &sol_fwd_key, token_in, amount_in, Some(max_age),
                             ) {
                                 pair_quotes.entry(pi).or_default().push(ForwardTask {
                                     pair_idx: pi,
@@ -213,8 +220,9 @@ impl Strategy {
                         // SyncSwap pools are now seeded into pool_cache at startup
                         // (populate_syncswap_pools also calls pool_cache.insert).
                         // Use local reserve state with freshness check (0 eth_call).
-                        if let Some(out) = self.pool_cache.get_amount_out_by_key(
-                            &router.id, token_in, token_out, amount_in, Some(VOLATILE_MAX_AGE),
+                        let ss_fwd_key = format!("{}:{}:{}", router.id, token_in_key, token_out_key);
+                        if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
+                            &ss_fwd_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
                         ) {
                             pair_quotes.entry(pi).or_default().push(ForwardTask {
                                 pair_idx: pi,
@@ -231,35 +239,6 @@ impl Strategy {
                         }
                     }
                 }
-            }
-        }
-
-        // Run multicall for routers that couldn't be resolved locally
-        let fwd_raw = run_multicall(provider, fwd_mc, self.rpc_concurrency).await;
-
-        // Add multicall results to pair_quotes (locally-resolved already added above)
-        for (task, raw_opt) in fwd_tasks.into_iter().zip(fwd_raw.into_iter()) {
-            let raw = match raw_opt { Some(r) => r, None => continue };
-            let amount_out = match task.router_type {
-                RouterType::V2 => IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&raw)
-                    .ok()
-                    .and_then(|v| v.last().copied()),
-                RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
-                    .ok()
-                    .map(|r| r.amountOut),
-                RouterType::Solidly | RouterType::Aerodrome => {
-                    ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
-                        .ok()
-                        .and_then(|v| v.last().copied())
-                }
-                RouterType::SyncSwap => {
-                    ISyncSwapPool::getAmountOutCall::abi_decode_returns(&raw).ok()
-                }
-            };
-            if let Some(out) = amount_out.filter(|o| !o.is_zero()) {
-                let mut t = task;
-                t.amount_in = out; // repurpose field to carry token_out amount
-                pair_quotes.entry(t.pair_idx).or_default().push(t);
             }
         }
 
@@ -288,9 +267,6 @@ impl Strategy {
         // SyncSwap and Solidly-stable still need multicall.
 
         let mut rev_tasks: Vec<ReverseTask> = Vec::new();
-        let rev_mc: Vec<(Address, Vec<u8>)> = Vec::new();
-        // Maps rev_mc[i] → rev_tasks[j] so we can write results back after multicall.
-        let rev_mc_task_idx: Vec<usize> = Vec::new();
 
         for (pi, quotes) in &pair_quotes {
             if quotes.len() < 2 {
@@ -398,15 +374,6 @@ impl Strategy {
             }
         }
 
-        // Run multicall for reverse quotes that need it
-        let rev_raw = run_multicall(provider, rev_mc, self.rpc_concurrency).await;
-
-        // Map multicall results back to rev_tasks
-        let mut rev_raw_by_task: Vec<Option<Vec<u8>>> = vec![None; rev_tasks.len()];
-        for (mc_i, &task_i) in rev_mc_task_idx.iter().enumerate() {
-            rev_raw_by_task[task_i] = rev_raw.get(mc_i).and_then(|r| r.clone());
-        }
-
         // ── Find profitable opportunities ──────────────────────────────────────
 
         let mut opportunities = Vec::new();
@@ -424,122 +391,104 @@ impl Strategy {
         // profit ($0.001 verified) from V3 spot phantom ($0.29 raw).
         let mut best_verified_spread: f64 = f64::NEG_INFINITY;
 
-        for (task, raw_opt) in rev_tasks.iter().zip(rev_raw_by_task.into_iter()) {
-            let amount_back_opt: Option<U256> = if let Some(local) = task.local_back {
-                Some(local)
-            } else {
-                let raw = match raw_opt { Some(r) => r, None => continue };
-                match task.router_b_type {
-                    RouterType::V2 => IUniswapV2Router02::getAmountsOutCall::abi_decode_returns(&raw)
-                        .ok()
-                        .and_then(|v| v.last().copied()),
-                    RouterType::V3 => IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw)
-                        .ok()
-                        .map(|r| r.amountOut),
-                    RouterType::Solidly | RouterType::Aerodrome => {
-                        ISolidlyRouter::getAmountsOutCall::abi_decode_returns(&raw)
-                            .ok()
-                            .and_then(|v| v.last().copied())
-                    }
-                    RouterType::SyncSwap => {
-                        ISyncSwapPool::getAmountOutCall::abi_decode_returns(&raw).ok()
-                    }
-                }
+        for task in rev_tasks.iter() {
+            // All tasks reaching here have local_back = Some(...); tasks with None were popped above.
+            let amount_back = match task.local_back.filter(|b| !b.is_zero()) {
+                Some(a) => a,
+                None => continue,
             };
-            if let Some(amount_back) = amount_back_opt.filter(|&b| !b.is_zero()) {
-                if amount_back > task.amount_in {
-                    // Sanity cap: profit > 5% of input is almost certainly a V3 spot
-                    // mismatch phantom (different routers' sqrtPriceX96 values compound
-                    // errors across the fwd/rev legs, producing billion-dollar phantoms).
-                    if (amount_back - task.amount_in).saturating_mul(U256::from(20)) > task.amount_in {
-                        warn!(
-                            "[{}] 2-hop phantom skipped: {} | profit/input > 5% | {}/{}",
-                            self.chain_id, task.pair_id, task.router_a_id, task.router_b_id
-                        );
-                        continue;
-                    }
+            // Sanity cap: profit > 5% of input is almost certainly a V3 spot
+            // mismatch phantom (different routers' sqrtPriceX96 values compound
+            // errors across the fwd/rev legs, producing billion-dollar phantoms).
+            if amount_back > task.amount_in
+                && (amount_back - task.amount_in).saturating_mul(U256::from(20)) > task.amount_in
+            {
+                warn!(
+                    "[{}] 2-hop phantom skipped: {} | profit/input > 5% | {}/{}",
+                    self.chain_id, task.pair_id, task.router_a_id, task.router_b_id
+                );
+                continue;
+            }
+
+            // Track signed spread % for all non-phantom quotes (even unprofitable ones).
+            // Must be after the sanity cap to prevent V3 spot mismatch artifacts from
+            // corrupting the spread metric with astronomical values.
+            let amount_in_f64 = task.amount_in.to::<u128>() as f64;
+            let amount_back_f64 = amount_back.to::<u128>() as f64;
+            if amount_in_f64 > 0.0 {
+                let spread = amount_back_f64 / amount_in_f64 - 1.0;
+                if spread > best_spread_pct {
+                    best_spread_pct = spread;
                 }
 
-                // Track signed spread % for all non-phantom quotes (even unprofitable ones).
-                // Must be after the sanity cap to prevent V3 spot mismatch artifacts from
-                // corrupting the spread metric with astronomical values.
-                let amount_in_f64 = task.amount_in.to::<u128>() as f64;
-                let amount_back_f64 = amount_back.to::<u128>() as f64;
-                if amount_in_f64 > 0.0 {
-                    let spread = amount_back_f64 / amount_in_f64 - 1.0;
-                    if spread > best_spread_pct {
-                        best_spread_pct = spread;
-                    }
+                // Phase 1.5 gate: local cross-DEX spread is promising AND forward router is V3.
+                // Fire for ALL V3 forwards with spread > threshold, not just tick-capped ones.
+                // QuoterV2 verifies the actual on-chain amount at full trade size. Without this,
+                // liquid pools (safe_cap >= trade_amount, task.amount_in == full) never trigger
+                // Phase 1.5 and V3×V3 spreads are permanently blocked from all_opportunities.
+                if spread > P15_GATE_SPREAD && matches!(task.router_a_type, RouterType::V3) {
+                    p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                }
+            }
 
-                    // Phase 1.5 gate: local cross-DEX spread is promising AND forward router is V3.
-                    // Fire for ALL V3 forwards with spread > threshold, not just tick-capped ones.
-                    // QuoterV2 verifies the actual on-chain amount at full trade size. Without this,
-                    // liquid pools (safe_cap >= trade_amount, task.amount_in == full) never trigger
-                    // Phase 1.5 and V3×V3 spreads are permanently blocked from all_opportunities.
-                    if spread > P15_GATE_SPREAD && matches!(task.router_a_type, RouterType::V3) {
-                        p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
-                    }
+            if amount_back > task.amount_in {
+                let profit = amount_back - task.amount_in;
+                let profit_usd = token_amount_to_usd(
+                    profit,
+                    task.token_in_decimals,
+                    &task.token_in_symbol,
+                    self.native_price_usd,
+                );
+
+                // Track best profit seen regardless of threshold (for status logging)
+                if profit_usd > best_raw_usd {
+                    best_raw_usd = profit_usd;
                 }
 
-                if amount_back > task.amount_in {
-                    let profit = amount_back - task.amount_in;
-                    let profit_usd = token_amount_to_usd(
-                        profit,
-                        task.token_in_decimals,
-                        &task.token_in_symbol,
-                        self.native_price_usd,
+                // Any route with a V3 forward leg: the sqrtPriceX96 virtual-reserve
+                // approximation can overestimate by 0.01–0.1% (single-tick math vs
+                // actual multi-tick execution + fee). This creates phantom spreads on
+                // V3→V2 and V3→V3 routes that consistently fail pre-flight.
+                // Phase 1.5 handles ALL V3-forward routes via QuoterV2, which gives
+                // the exact on-chain output. Letting them through here creates a second
+                // unverified entry alongside the Phase 1.5 verified one — causing double
+                // pre-flight attempts and cooldown spam for the same conceptual route.
+                let router_a_is_v3 = matches!(task.router_a_type, RouterType::V3);
+                // V2→V3 routes need Phase 1.5c QuoterV2 verification for the V3 reverse leg.
+                // quote_v3_spot overestimates output in concentrated pools crossing multiple
+                // ticks — same problem Phase 1.5b solves for V3→V3.
+                let router_b_is_v3 = matches!(task.router_b_type, RouterType::V3);
+
+                // Optimistic mode: bypass QuoterV2 and submit immediately on Phase 1 spot quotes.
+                // Disable by setting optimistic_submission: false in config.yaml.
+                let v3_allowed = self.optimistic_submission || (!router_a_is_v3 && !router_b_is_v3);
+                let pair_min_profit = self.pairs[task.pair_idx].min_profit_usd.unwrap_or(self.min_profit_usd);
+                if profit_usd >= pair_min_profit && v3_allowed {
+                    debug!(
+                        "[{}] Arb: {} | profit=${:.4} | {}/{}",
+                        self.chain_id,
+                        task.pair_id,
+                        profit_usd,
+                        task.router_a_id,
+                        task.router_b_id
                     );
-
-                    // Track best profit seen regardless of threshold (for status logging)
-                    if profit_usd > best_raw_usd {
-                        best_raw_usd = profit_usd;
-                    }
-
-                    // Any route with a V3 forward leg: the sqrtPriceX96 virtual-reserve
-                    // approximation can overestimate by 0.01–0.1% (single-tick math vs
-                    // actual multi-tick execution + fee). This creates phantom spreads on
-                    // V3→V2 and V3→V3 routes that consistently fail pre-flight.
-                    // Phase 1.5 handles ALL V3-forward routes via QuoterV2, which gives
-                    // the exact on-chain output. Letting them through here creates a second
-                    // unverified entry alongside the Phase 1.5 verified one — causing double
-                    // pre-flight attempts and cooldown spam for the same conceptual route.
-                    let router_a_is_v3 = matches!(task.router_a_type, RouterType::V3);
-                    // V2→V3 routes need Phase 1.5c QuoterV2 verification for the V3 reverse leg.
-                    // quote_v3_spot overestimates output in concentrated pools crossing multiple
-                    // ticks — same problem Phase 1.5b solves for V3→V3.
-                    let router_b_is_v3 = matches!(task.router_b_type, RouterType::V3);
-
-                    // Optimistic mode: bypass QuoterV2 and submit immediately on Phase 1 spot quotes.
-                    // Disable by setting optimistic_submission: false in config.yaml.
-                    let v3_allowed = self.optimistic_submission || (!router_a_is_v3 && !router_b_is_v3);
-                    let pair_min_profit = self.pairs[task.pair_idx].min_profit_usd.unwrap_or(self.min_profit_usd);
-                    if profit_usd >= pair_min_profit && v3_allowed {
-                        debug!(
-                            "[{}] Arb: {} | profit=${:.4} | {}/{}",
-                            self.chain_id,
-                            task.pair_id,
-                            profit_usd,
-                            task.router_a_id,
-                            task.router_b_id
-                        );
-                        opportunities.push(ArbOpportunity {
-                            chain_id: self.chain_id,
-                            pair_id: task.pair_id.clone(),
-                            token_in: task.token_in,
-                            token_out: task.token_out,
-                            amount_in: task.amount_in,
-                            router_a: task.router_a_addr,
-                            router_b: task.router_b_addr,
-                            router_a_type: task.router_a_type.clone(),
-                            router_b_type: task.router_b_type.clone(),
-                            fee_a: task.fee_a,
-                            fee_b: task.fee_b,
-                            expected_profit: profit,
-                            profit_usd,
-                            router_a_id: task.router_a_id.clone(),
-                            router_b_id: task.router_b_id.clone(),
-                        });
-                    }
+                    opportunities.push(ArbOpportunity {
+                        chain_id: self.chain_id,
+                        pair_id: task.pair_id.clone(),
+                        token_in: task.token_in,
+                        token_out: task.token_out,
+                        amount_in: task.amount_in,
+                        router_a: task.router_a_addr,
+                        router_b: task.router_b_addr,
+                        router_a_type: task.router_a_type.clone(),
+                        router_b_type: task.router_b_type.clone(),
+                        fee_a: task.fee_a,
+                        fee_b: task.fee_b,
+                        expected_profit: profit,
+                        profit_usd,
+                        router_a_id: task.router_a_id.clone(),
+                        router_b_id: task.router_b_id.clone(),
+                    });
                 }
             }
         }

@@ -83,7 +83,7 @@ pub struct EngineState {
     pub pair_scan: std::collections::HashMap<u64, Vec<PairScanInfo>>,
     /// Pair IDs disabled via POST /pair-scan/{id}/toggle.
     /// Evaluated pairs in this set are skipped during each scan cycle.
-    pub disabled_pairs: std::collections::HashSet<String>,
+    pub disabled_pairs: std::sync::Arc<std::collections::HashSet<String>>,
     /// Set to true by POST /stats/reset. The chain heartbeat picks this up,
     /// zeros the executor atomics, then clears the flag. This ensures the
     /// in-memory cumulative counters (which come from atomics, not the DB)
@@ -539,11 +539,15 @@ async fn pair_scan_toggle(
     Path(pair_id): Path<String>,
 ) -> impl IntoResponse {
     let mut engine = state.engine.write().await;
-    let now_disabled = if engine.disabled_pairs.contains(&pair_id) {
-        engine.disabled_pairs.remove(&pair_id);
+    let now_disabled = if engine.disabled_pairs.contains(pair_id.as_str()) {
+        let mut new_set = (*engine.disabled_pairs).clone();
+        new_set.remove(&pair_id);
+        engine.disabled_pairs = std::sync::Arc::new(new_set);
         false
     } else {
-        engine.disabled_pairs.insert(pair_id.clone());
+        let mut new_set = (*engine.disabled_pairs).clone();
+        new_set.insert(pair_id.clone());
+        engine.disabled_pairs = std::sync::Arc::new(new_set);
         true
     };
     Json(serde_json::json!({ "pair_id": pair_id, "disabled": now_disabled }))
