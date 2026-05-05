@@ -493,7 +493,7 @@ pub fn parse_amount_capped(trade_amount: &str, max_trade: Option<&str>, decimals
 pub(crate) fn token_amount_to_usd(amount: U256, decimals: u8, symbol: &str, native_price: f64) -> f64 {
     let scale = 10_f64.powi(decimals as i32);
     let float_amount = u256_to_f64(amount) / scale;
-    match symbol.to_uppercase().as_str() {
+    match symbol {
         "USDC" | "USDT" | "DAI" | "WXDAI" | "USDC.E" | "USDBC" => float_amount,
         "WETH" | "ETH" | "WMATIC" | "MATIC" => float_amount * native_price,
         _ => float_amount,

@@ -54,9 +54,20 @@ impl Strategy {
         // quotes locally from cached reserves — zero eth_calls.
         // V3, SyncSwap, and Solidly-stable still need multicall (different curves / no cache).
 
-        // pair_quotes is pre-populated here for locally-resolved routers.
+        // Build target index list first so we can use .len() for capacity hints below.
+        let target_indices: Vec<usize> = match pair_mask {
+            Some(m) => m.iter().copied()
+                .filter(|&i| self.pairs.get(i).map_or(false, |p| p.chain_id == self.chain_id))
+                .collect(),
+            None => self.pairs.iter().enumerate()
+                .filter(|(_, p)| p.chain_id == self.chain_id)
+                .map(|(i, _)| i)
+                .collect(),
+        };
+
+        // pair_quotes: one entry per pair → pre-size to avoid all rehashes in the hot loop.
         let mut pair_quotes: std::collections::HashMap<usize, Vec<ForwardTask>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(target_indices.len());
 
         // V3 scan diagnostic counters: cached=used spot (0 HTTP), no_cache=QuoterV2 needed.
         let mut v3_cached: usize = 0;
@@ -69,15 +80,6 @@ impl Strategy {
         let solidly_sta_ids: Vec<String> = chain_routers.iter()
             .map(|r| format!("{}::stable", r.id)).collect();
 
-        let target_indices: Vec<usize> = match pair_mask {
-            Some(m) => m.iter().copied()
-                .filter(|&i| self.pairs.get(i).map_or(false, |p| p.chain_id == self.chain_id))
-                .collect(),
-            None => self.pairs.iter().enumerate()
-                .filter(|(_, p)| p.chain_id == self.chain_id)
-                .map(|(i, _)| i)
-                .collect(),
-        };
         for pi in target_indices {
             let pair = &self.pairs[pi];
             let token_in = match pair.token_in.parse::<Address>() {
@@ -120,7 +122,7 @@ impl Strategy {
                         if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
                             &fwd_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
                         ) {
-                            pair_quotes.entry(pi).or_default().push(ForwardTask {
+                            pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(chain_routers.len() * 2)).push(ForwardTask {
                                 pair_idx: pi,
                                 router_id: router.id.clone(),
                                 router_addr,
@@ -149,29 +151,28 @@ impl Strategy {
                                 continue;
                             }
                         };
-                        let tiers = if router.fee_tiers.is_empty() {
-                            vec![500u32, 3000, 10000]
+                        const DEFAULT_FEE_TIERS: &[u32] = &[500, 3000, 10000];
+                        let tiers: &[u32] = if router.fee_tiers.is_empty() {
+                            DEFAULT_FEE_TIERS
                         } else {
-                            router.fee_tiers.clone()
+                            &router.fee_tiers
                         };
-                        for fee in tiers {
+                        for &fee in tiers {
                             // ── V3 cache-first: use sqrtPriceX96 virtual-reserve spot ──
                             // Cap the input to a single-tick safe amount so the xy=k formula
                             // is exact. Without the cap, a trade crossing into a tick with
                             // L=0 would cause the formula to overestimate output.
+                            // Key built once here — passed to quote_v3_spot_str to avoid
+                            // a second format!() + addr_key() pair inside pool_cache.
                             let v3_key = format!("{}:{}:{}:{}", router.id, token_in_key, token_out_key, fee);
-                            if self.pool_cache.v3_by_key.get(&v3_key).is_none() {
-                                v3_no_cache += 1; continue;
-                            }
-
-                            if let Some((spot_out, liquidity)) = self.pool_cache.quote_v3_spot(
-                                &router.id, token_in, token_out, fee, amount_in,
+                            if let Some((spot_out, liquidity)) = self.pool_cache.quote_v3_spot_str(
+                                &v3_key, token_in, amount_in,
                             ) {
                                 if liquidity < MIN_V3_LIQUIDITY {
                                     v3_cached += 1;
                                     continue;
                                 }
-                                pair_quotes.entry(pi).or_default().push(ForwardTask {
+                                pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(chain_routers.len() * 2)).push(ForwardTask {
                                     pair_idx: pi,
                                     router_id: router.id.clone(),
                                     router_addr,
@@ -206,7 +207,7 @@ impl Strategy {
                             if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
                                 &sol_fwd_key, token_in, amount_in, Some(max_age),
                             ) {
-                                pair_quotes.entry(pi).or_default().push(ForwardTask {
+                                pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(chain_routers.len() * 2)).push(ForwardTask {
                                     pair_idx: pi,
                                     router_id: eff_id.to_string(),
                                     router_addr,
@@ -229,7 +230,7 @@ impl Strategy {
                         if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
                             &ss_fwd_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
                         ) {
-                            pair_quotes.entry(pi).or_default().push(ForwardTask {
+                            pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(chain_routers.len() * 2)).push(ForwardTask {
                                 pair_idx: pi,
                                 router_id: router.id.clone(),
                                 router_addr,
@@ -253,7 +254,7 @@ impl Strategy {
         let total_fwd_ok: usize = pair_quotes.values().map(|v| v.len()).sum();
         let pairs_with_any: usize = pair_quotes.len(); // pairs with ≥1 quote from any DEX
         let pairs_with_multi: usize = pair_quotes.values().filter(|v| {
-            v.first().map_or(false, |first| v[1..].iter().any(|q| q.router_id != first.router_id))
+            v.len() > 1 && v[1..].iter().any(|q| q.router_id != v[0].router_id)
         }).count();
         debug!(
             "[chain={}] Forward quotes: ok={} pairs_with_any={} pairs_with_multi_dex={}",
@@ -271,7 +272,11 @@ impl Strategy {
         // V3 uses cached spot when fresh; falls back to QuoterV2 only when stale.
         // SyncSwap and Solidly-stable still need multicall.
 
-        let mut rev_tasks: Vec<ReverseTask> = Vec::new();
+        // Pre-size rev_tasks to the exact number of A×B combinations across all pairs with ≥2 quotes.
+        let rev_cap: usize = pair_quotes.values()
+            .map(|v| if v.len() >= 2 { v.len() * (v.len() - 1) } else { 0 })
+            .sum();
+        let mut rev_tasks: Vec<ReverseTask> = Vec::with_capacity(rev_cap);
 
         for (pi, quotes) in &pair_quotes {
             if quotes.len() < 2 {
@@ -348,6 +353,13 @@ impl Strategy {
                         }
                     };
 
+                    // All DEX types: stale/absent cache = no recent activity = no arb → skip.
+                    // Check before constructing ReverseTask to avoid 2 String clones on the
+                    // stale path (~20-50% of iterations depending on pool activity).
+                    if local_back.is_none() {
+                        continue;
+                    }
+
                     rev_tasks.push(ReverseTask {
                         pair_idx: *pi,
                         pair_id: pair.id.clone(),
@@ -369,12 +381,6 @@ impl Strategy {
                         token_out,
                         local_back,
                     });
-
-                    // All DEX types: stale/absent cache = no recent activity = no arb → skip.
-                    if local_back.is_none() {
-                        rev_tasks.pop();
-                        continue;
-                    }
                 }
             }
         }
@@ -524,11 +530,12 @@ impl Strategy {
                 let fwd_task = match pair_quotes.get(pi)
                     .and_then(|ts| ts.iter().find(|t| &t.router_id == router_a_id && t.fee == *fee_a))
                 {
-                    Some(t) => t.clone(), None => continue,
+                    Some(t) => t, None => continue,
                 };
                 let quoter = match fwd_task.quoter_addr { Some(q) => q, None => continue };
 
                 // Cache key matches pool_cache.v3_by_key format.
+                // token_in/token_out already lowercased in addr_key() — no extra alloc.
                 let v3_cache_key = format!("{}:{}:{}:{}", router_a_id,
                     addr_key(fwd_task.token_in), addr_key(fwd_task.token_out), fee_a);
 

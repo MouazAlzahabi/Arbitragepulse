@@ -203,6 +203,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     metrics.opportunities.with_label_values(&[&cfg.name]).inc();
 
+    // Read once before the loop — dry_run doesn't change mid-scan.
+    let dry_run = shared_state.read().await.dry_run;
+
     // Try each opportunity in priority order (profit descending). On gas-rejection or
     // pre-flight failure, fall through to the next candidate. On a successful send or
     // dry-run, break. `continue 'candidates` is used for cheap skips (cooldown, balance
@@ -346,8 +349,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
             pending_pairs.insert(fingerprint.clone());
 
-            let is_dry_run = shared_state.read().await.dry_run;
-            let dry_run = is_dry_run;
             let exec_start = std::time::Instant::now();
             let router_ids = vec![optimized.router_a_id.clone(), optimized.router_b_id.clone()];
 
@@ -674,8 +675,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
             pending_pairs.insert(fingerprint.clone());
 
-            let is_dry_run = shared_state.read().await.dry_run;
-            let dry_run = is_dry_run;
             let exec_start = std::time::Instant::now();
             let router_ids = vec![
                 opp.router_ab_id.clone(),

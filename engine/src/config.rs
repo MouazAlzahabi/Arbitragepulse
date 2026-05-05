@@ -123,7 +123,7 @@ fn default_large_v3_threshold_bps() -> u32 {
     50 // 0.5% sqrtP change (~1% price impact)
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum RouterType {
     V2,

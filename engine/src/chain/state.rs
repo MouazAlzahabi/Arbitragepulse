@@ -58,8 +58,9 @@ pub(crate) async fn update_native_price<P: Provider>(
                 Some(q) => q,
                 None => continue,
             };
-            let tiers: Vec<u32> = if router.fee_tiers.is_empty() { vec![500u32, 3000] } else { router.fee_tiers.clone() };
-            for fee in &tiers {
+            const DEFAULT_TIERS: &[u32] = &[500, 3000];
+            let tiers: &[u32] = if router.fee_tiers.is_empty() { DEFAULT_TIERS } else { &router.fee_tiers };
+            for fee in tiers {
                 if let Ok(r) = IQuoterV2::new(quoter, provider.as_ref())
                     .quoteExactInputSingle(IQuoterV2::QuoteExactInputSingleParams {
                         tokenIn: wrapped_native,

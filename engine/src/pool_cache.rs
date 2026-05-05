@@ -378,7 +378,18 @@ impl PoolCache {
         amount_in: U256,
     ) -> Option<(U256, u128)> {
         let key = format!("{}:{}:{}:{}", router_id, addr_key(token_in), addr_key(token_out), fee);
-        let pool_addr = *self.v3_by_key.get(&key)?;
+        self.quote_v3_spot_str(&key, token_in, amount_in)
+    }
+
+    /// Same as `quote_v3_spot` but accepts a pre-built key string, avoiding a
+    /// second `format!()` when the caller already computed the key for a cache check.
+    pub fn quote_v3_spot_str(
+        &self,
+        key: &str,
+        token_in: Address,
+        amount_in: U256,
+    ) -> Option<(U256, u128)> {
+        let pool_addr = *self.v3_by_key.get(key)?;
 
         let state = self.v3_by_address.get(&pool_addr)?;
 
@@ -548,7 +559,7 @@ fn stable_get_y(x0: U256, xy: U256, y_init: U256, one: U256) -> U256 {
         } else {
             (k0 - xy).checked_mul(one).and_then(|v| v.checked_div(d)).unwrap_or(U256::ZERO)
         };
-        if dy.is_zero() { break; }
+        if dy <= U256::ONE { break; }
         if k0 < xy {
             y = y.saturating_add(dy);
         } else {
