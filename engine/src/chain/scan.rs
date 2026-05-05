@@ -404,7 +404,41 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         ).await;
                     }
                     Ok(prep) => {
-                        // Pre-flight skipped: on Base, gas per revert is <$0.02 and adding
+                        if cfg.preflight_eth_call {
+                            match provider.call(prep.tx.clone()).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let detail = crate::executor::format_eth_call_transport_error(&e);
+                                    warn!(
+                                        "[{}] preflight_eth_call revert | pair={} | {}",
+                                        cfg.name, optimized.pair_id, detail
+                                    );
+                                    {
+                                        let mut exec = executor.lock().await;
+                                        exec.record_failed(false);
+                                    }
+                                    if let Some(db) = prep.db.clone() {
+                                        let cn = prep.chain_name.clone();
+                                        let cid = prep.chain_id;
+                                        let oid = prep.opp_id.clone();
+                                        let ra = prep.router_a.clone();
+                                        let rb = prep.router_b.clone();
+                                        let p = prep.profit_usd;
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, None, p, false, "", false);
+                                        });
+                                    }
+                                    handle_execution_failure(
+                                        anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
+                                        &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
+                                        consecutive_failures, cfg, shared_state, metrics, log_tx,
+                                        &ghost_profit_bits, prep.profit_usd,
+                                    ).await;
+                                    continue 'candidates;
+                                }
+                            }
+                        }
+                        // Pre-flight skipped by default: on Base, gas per revert is <$0.02 and adding
                         // an eth_call round-trip (~200ms) closes the opportunity window.
                         // The contract enforces amountIn+minProfit on-chain; reverts are atomic.
                         debug!(
@@ -731,7 +765,42 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         ).await;
                     }
                     Ok(prep) => {
-                        // Pre-flight skipped: same reasoning as 2-hop path above.
+                        if cfg.preflight_eth_call {
+                            match provider.call(prep.tx.clone()).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let detail = crate::executor::format_eth_call_transport_error(&e);
+                                    warn!(
+                                        "[{}] preflight_eth_call revert | triplet={} | {}",
+                                        cfg.name, opp.triplet_id, detail
+                                    );
+                                    {
+                                        let mut exec = executor.lock().await;
+                                        exec.record_failed(false);
+                                    }
+                                    if let Some(db) = prep.db.clone() {
+                                        let cn = prep.chain_name.clone();
+                                        let cid = prep.chain_id;
+                                        let oid = prep.opp_id.clone();
+                                        let ra = prep.router_a.clone();
+                                        let rb = prep.router_b.clone();
+                                        let rc = prep.router_c.clone();
+                                        let p = prep.profit_usd;
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, rc.as_deref(), p, false, "", false);
+                                        });
+                                    }
+                                    handle_execution_failure(
+                                        anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
+                                        &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
+                                        consecutive_failures, cfg, shared_state, metrics, log_tx,
+                                        &ghost_profit_bits, prep.profit_usd,
+                                    ).await;
+                                    continue 'candidates;
+                                }
+                            }
+                        }
+                        // Pre-flight skipped by default: same reasoning as 2-hop path above.
                         if !prep.submission_rpcs.is_empty() {
                             if let Some(raw_bytes) = prep.raw_tx.clone() {
                                 let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&raw_bytes));

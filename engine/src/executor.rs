@@ -507,7 +507,10 @@ impl Executor {
                 Err(e) => {
                     self.stats.total_failed += 1;
                     self.persist_trade(opp, "", false);
-                    return Err(anyhow!("Simulation failed: {}", e));
+                    return Err(anyhow!(
+                        "Simulation failed: {}",
+                        format_eth_call_transport_error(&e),
+                    ));
                 }
             }
         }
@@ -712,7 +715,10 @@ impl Executor {
                 }
                 Err(e) => {
                     self.stats.total_failed += 1;
-                    return Err(anyhow!("Triangular simulation failed: {}", e));
+                    return Err(anyhow!(
+                        "Triangular simulation failed: {}",
+                        format_eth_call_transport_error(&e),
+                    ));
                 }
             }
         }
@@ -961,4 +967,97 @@ impl Executor {
             }
         });
     }
+}
+
+/// Best-effort decode of standard `Error(string)` and Solidity panic selectors.
+fn decode_abi_revert(data: &[u8]) -> Option<String> {
+    use alloy::primitives::U256;
+    if data.len() < 4 {
+        return None;
+    }
+    if &data[..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        if data.len() < 4 + 64 {
+            return None;
+        }
+        let offset = usize::try_from(U256::from_be_slice(&data[4..36])).ok()?;
+        let payload_base = 4usize.checked_add(offset)?;
+        if payload_base + 32 > data.len() {
+            return None;
+        }
+        let msg_len =
+            usize::try_from(U256::from_be_slice(&data[payload_base..payload_base + 32])).ok()?;
+        let msg_start = payload_base + 32;
+        if msg_start + msg_len > data.len() {
+            return None;
+        }
+        return Some(String::from_utf8_lossy(&data[msg_start..msg_start + msg_len]).into_owned());
+    }
+    if &data[..4] == [0x4e, 0x48, 0x7b, 0x71] && data.len() >= 36 {
+        let code = u32::from_be_bytes(data[4..8].try_into().ok()?);
+        return Some(format!("Solidity panic code {code}"));
+    }
+    None
+}
+
+/// Like alloy's JSON-RPC revert spelunker, but independent of substring `"revert"` in the message
+/// (some nodes return `INVALID_ARGUMENT`, `INVALID_PARAMS`, OP Stack wrappers, etc.).
+fn spelunk_revert_hex_in_json(raw: &str) -> Option<Vec<u8>> {
+    use alloy::primitives::hex;
+    use serde_json::Value;
+
+    fn walk(v: &Value) -> Option<Vec<u8>> {
+        match v {
+            Value::String(s) => {
+                let t = s.trim();
+                let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))?;
+                hex::decode(h).ok().filter(|b| !b.is_empty())
+            }
+            Value::Object(map) => map.values().find_map(walk),
+            Value::Array(a) => a.iter().find_map(walk),
+            _ => None,
+        }
+    }
+
+    let v = serde_json::from_str(raw).ok()?;
+    walk(&v)
+}
+
+/// Format JSON-RPC failures from `eth_call`, including revert hex when the node returns it.
+pub(crate) fn format_eth_call_transport_error(e: &alloy::transports::TransportError) -> String {
+    use alloy::primitives::hex;
+    let mut parts = vec![e.to_string()];
+    if let Some(payload) = e.as_error_resp() {
+        let mut rd_opt = payload.as_revert_data();
+
+        // `ErrorPayload::as_revert_data` only parses when message contains `"revert"`.
+        if rd_opt.is_none() {
+            if let Some(raw) = payload.data.as_ref() {
+                if let Some(b) = spelunk_revert_hex_in_json(raw.get()) {
+                    rd_opt = Some(alloy::primitives::Bytes::from(b));
+                }
+            }
+        }
+
+        if let Some(rd) = rd_opt.as_ref() {
+            parts.push(format!("revert_data=0x{}", hex::encode(rd.as_ref())));
+            if let Some(msg) = decode_abi_revert(rd.as_ref()) {
+                parts.push(format!("decoded={}", msg));
+            } else if rd.len() >= 4 {
+                parts.push(format!("selector=0x{}", hex::encode(&rd[..4])));
+            }
+        } else if let Some(raw) = payload.data.as_ref() {
+            let s = raw.get().trim().trim_matches('"');
+            if let Some(hex_part) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                if let Ok(bytes) = hex::decode(hex_part) {
+                    if !bytes.is_empty() {
+                        parts.push(format!("data=0x{}", hex::encode(&bytes)));
+                        if let Some(msg) = decode_abi_revert(&bytes) {
+                            parts.push(format!("decoded={}", msg));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parts.join(" | ")
 }

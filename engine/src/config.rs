@@ -62,6 +62,13 @@ pub struct ChainConfig {
     /// Set to false to restore full QuoterV2 verification. Default: false.
     #[serde(default)]
     pub optimistic_submission: bool,
+    /// Run `eth_call` with the assembled tx immediately before `eth_sendRawTransaction`.
+    /// On simulated revert, skips broadcast (saves gas) and logs JSON-RPC revert data /
+    /// decoded `Error(string)` when the node returns it. Adds one RPC round-trip
+    /// (~100–250ms); default **false**. Enable briefly on Base while debugging when
+    /// explorers show only «Fail» and off-chain simulation tools misbehave.
+    #[serde(default)]
+    pub preflight_eth_call: bool,
     /// When false, skip the two-round adaptive size optimizer and trade at the configured
     /// trade_amount directly. Saves ~80-100ms per opportunity on FCFS chains (Base).
     /// Set to true to re-enable. Default: true (optimizer on).

@@ -50,9 +50,11 @@ chains:
     # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
     # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
     # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
-    # Diagnostic: production uses this file via CONFIG_PATH=engine/config.yaml; bestV=n/a in heartbeat
-    # while optimistic_submission=true (Phase 1.5 Quoter batch skipped for latency). opps= is last scan only.
-    optimistic_submission: true   # skip QuoterV2 verification (~80-160ms saved)
+    # Traced mined reverts on Base often show Phase-1 phantom edges vs actual V3 liquidity (sell leg <
+    # amountIn+minProfit). QuoterV2 preflight trades latency for fewer guaranteed reverts until the
+    # pipeline nets its first confirmations.
+    optimistic_submission: false  # Phase 1.5 QuoterV2 (~80–160ms) — restores bestV= in heartbeat
+    # preflight_eth_call: true     # eth_call before send — logs revert reason in engine (adds ~100–250ms latency)
     # Triangular arbs through V3 pools overestimate output via cached sqrtPriceX96
     # (tick-level liquidity not modelled). Historical data: even $0.6571 on 270 USDT
     # (0.24%) reverts on-chain → set floor to $0.80 (0.30%) to filter phantom opps.
