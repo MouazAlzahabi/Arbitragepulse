@@ -27,7 +27,13 @@ const GAS_LIMIT_TRIANGULAR: u64 = 900_000;
 /// The contract sets the **sell leg** V3 `amountOutMinimum = amountIn + minProfit`. If that sum
 /// sits exactly on the quoted edge, inclusion delay / tick crossing / competing flow causes
 /// Uniswap V3 to revert with **Too little received** even when simulation looked fine.
-const ROUTER_MIN_OUT_SLACK_BPS: u64 = 75; // 0.75%
+const ROUTER_MIN_OUT_SLACK_BPS: u64 = 200; // 2.00% — raised after repeated mined reverts on Base
+
+/// Final multiplier applied to the gas-floor `minProfit` (basis points): 6200 / 10000 = 62%.
+/// Combined with `ROUTER_MIN_OUT_SLACK_BPS`, lowers on-chain router min vs same-block pool drift.
+/// Tradeoff: `NotProfitable` also uses `minProfit`, so profitability on-chain becomes more lenient;
+/// off-chain `net profit` checks remain the economic guard.
+const SELL_LEG_MINPROFIT_MUL_BPS: u64 = 6200;
 
 // ─── TxPrep ───────────────────────────────────────────────────────────────────
 
@@ -889,6 +895,7 @@ impl Executor {
 
         let slack_mul = 10_000u64.saturating_sub(ROUTER_MIN_OUT_SLACK_BPS);
         let out = (capped.saturating_mul(U256::from(slack_mul))) / U256::from(10_000u64);
+        let out = out.saturating_mul(U256::from(SELL_LEG_MINPROFIT_MUL_BPS)) / U256::from(10_000u64);
         out.max(U256::from(1u8))
     }
 
