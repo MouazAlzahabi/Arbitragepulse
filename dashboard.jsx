@@ -57,7 +57,28 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
   const [authError, setAuthError] = useState(false);
   const wsRef = useRef(null);
   const reconnRef = useRef(null);
+  const idleRef = useRef(null);
+  const mountedRef = useRef(true);
+  const logPersistRef = useRef(null);
   const attempts = useRef(0);
+
+  const persistLogs = useCallback((next) => {
+    clearTimeout(logPersistRef.current);
+    logPersistRef.current = setTimeout(() => {
+      try { localStorage.setItem("ap_logs", JSON.stringify(next)); } catch {}
+    }, 400);
+  }, []);
+
+  const resetIdleWatchdog = useCallback(() => {
+    clearTimeout(idleRef.current);
+    // Server sends JSON pong every 15s; reconnect if we hear nothing for 45s.
+    idleRef.current = setTimeout(() => {
+      if (!mountedRef.current) return;
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.close();
+      }
+    }, 45_000);
+  }, []);
 
   const hydrateFromHttp = useCallback(async () => {
     if (!httpBaseUrl) return;
@@ -75,6 +96,15 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
       setStats(d);
     } catch {}
   }, [httpBaseUrl, apiKey]);
+
+  const scheduleReconnect = useCallback(() => {
+    if (!mountedRef.current) return;
+    attempts.current++;
+    const delay = Math.min(1000 * Math.pow(2, attempts.current), 15000);
+    reconnRef.current = setTimeout(() => connectRef.current?.(), delay);
+  }, []);
+
+  const connectRef = useRef(null);
 
   const connect = useCallback(() => {
     if (!url) return;
@@ -99,10 +129,12 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
       ws.onopen = () => {
         setStatus("connected");
         attempts.current = 0;
+        resetIdleWatchdog();
         // Server ignores WS JSON commands; hydrate counters/mode immediately via REST.
         void hydrateFromHttp();
       };
       ws.onmessage = (e) => {
+        resetIdleWatchdog();
         try {
           const d = JSON.parse(e.data);
           if (d.type === "pong") return;
@@ -112,38 +144,65 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
           const entry = { ...d, type: d.type || d.level, _id: Date.now() + Math.random() };
           setLogs((p) => {
             const next = [...p.slice(-499), entry];
-            try { localStorage.setItem("ap_logs", JSON.stringify(next)); } catch {}
+            persistLogs(next);
             return next;
           });
         } catch {}
       };
       ws.onclose = (e) => {
+        clearTimeout(idleRef.current);
+        if (!mountedRef.current) return;
         setStatus("disconnected");
-        if (e.code === 1008 || e.reason?.includes("401")) { setAuthError(true); return; }
+        // 1008 = policy violation (auth). 1006 often means handshake failed (also bad token).
+        if (e.code === 1008 || e.reason?.includes("401") || e.reason?.toLowerCase().includes("unauthorized")) {
+          setAuthError(true);
+          return;
+        }
         scheduleReconnect();
       };
       ws.onerror = () => {
-        if (wsRef.current?.readyState === WebSocket.CLOSED && apiKey) setAuthError(true);
+        // Network / proxy / engine-down errors must not be shown as auth failures.
         ws.close();
       };
     } catch { setStatus("disconnected"); scheduleReconnect(); }
-  }, [url, apiKey, hydrateFromHttp]);
+  }, [url, apiKey, hydrateFromHttp, resetIdleWatchdog, persistLogs, scheduleReconnect]);
 
-  const scheduleReconnect = useCallback(() => {
-    attempts.current++;
-    const delay = Math.min(1000 * Math.pow(2, attempts.current), 15000);
-    reconnRef.current = setTimeout(connect, delay);
-  }, [connect]);
+  connectRef.current = connect;
 
   const send = useCallback((cmd) => {
     if (wsRef.current?.readyState === 1) wsRef.current.send(JSON.stringify(cmd));
   }, []);
 
-  useEffect(() => { connect(); return () => { clearTimeout(reconnRef.current); wsRef.current?.close(); }; }, [connect]);
+  useEffect(() => {
+    mountedRef.current = true;
+    connect();
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && wsRef.current?.readyState !== WebSocket.OPEN) {
+        attempts.current = 0;
+        connect();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      mountedRef.current = false;
+      clearTimeout(reconnRef.current);
+      clearTimeout(idleRef.current);
+      clearTimeout(logPersistRef.current);
+      document.removeEventListener("visibilitychange", onVisible);
+      if (wsRef.current) {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [connect]);
 
   return {
     status, logs, stats, engineState, authError, send,
-    clearLogs: () => { setLogs([]); try { localStorage.removeItem("ap_logs"); } catch {} },
+    clearLogs: () => { clearTimeout(logPersistRef.current); setLogs([]); try { localStorage.removeItem("ap_logs"); } catch {} },
     disconnect: () => { clearTimeout(reconnRef.current); attempts.current = 999; wsRef.current?.close(); setStatus("disconnected"); },
     reconnect: () => { attempts.current = 0; connect(); },
     refreshState: () => void hydrateFromHttp(),
@@ -636,11 +695,19 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes, wsStatus }) {
         )}
         {filtered.map((l) => {
           const [clr, badge] = TYPE[l.type] || TYPE.info;
+          const scanMs = l.data?.scan_to_submit_ms ?? l.data?.pipeline_ms;
+          const confirmMs = l.data?.submit_to_confirm_ms;
+          const timingBadge = l.type === "trade" && scanMs != null ? (
+            <span style={{ flexShrink: 0, fontSize: 9, fontWeight: 700, color: scanMs < 200 ? "#34d399" : scanMs < 500 ? "#fbbf24" : "#f87171", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 3, padding: "1px 6px", marginLeft: 4 }}>
+              {scanMs}ms{confirmMs != null ? ` +${confirmMs}ms` : ""}
+            </span>
+          ) : null;
           return (
-            <div key={l._id} style={{ display: "flex", gap: 6, color: "#64748b" }}>
+            <div key={l._id} style={{ display: "flex", gap: 6, color: "#64748b", alignItems: "baseline", flexWrap: "wrap" }}>
               <span style={{ color: "#1e293b", flexShrink: 0 }}>{ts(l.timestamp * 1000)}</span>
               <span style={{ color: clr, fontWeight: 700, flexShrink: 0, width: 34, textAlign: "center", background: `${clr}12`, borderRadius: 2, fontSize: 10 }}>{badge}</span>
               <span style={{ color: clr === "#475569" ? "#475569" : "#b0bec5" }}>{l.message}</span>
+              {timingBadge}
             </div>
           );
         })}

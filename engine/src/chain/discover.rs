@@ -103,8 +103,8 @@ pub(crate) async fn discover_pools<P: Provider>(
     if pair_calls.is_empty() { return; }
     let pair_raw = discover_mc(pair_calls, provider).await;
 
-    // ── Round 3: token0 + getReserves + decimals(ta) + decimals(tb) per pool ──
-    // 4 calls per pool. The pool address from the stable=true call is a different
+    // ── Round 3: token0 + getReserves per pool; decimals fetched once per token ─
+    // The pool address from the stable=true call is a different
     // contract from stable=false, so `seen` naturally allows both.
     struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool }
     let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
@@ -116,8 +116,6 @@ pub(crate) async fn discover_pools<P: Provider>(
         if !seen.insert(pool) { continue; }
         rv_calls.push((pool, IUniswapV2Pair::token0Call {}.abi_encode()));
         rv_calls.push((pool, IUniswapV2Pair::getReservesCall {}.abi_encode()));
-        rv_calls.push((pm.ta, IERC20::decimalsCall {}.abi_encode()));
-        rv_calls.push((pm.tb, IERC20::decimalsCall {}.abi_encode()));
         pool_metas.push(PoolMeta {
             pool,
             router_id: pm.router_id.clone(),
@@ -132,17 +130,39 @@ pub(crate) async fn discover_pools<P: Provider>(
     if pool_metas.is_empty() { return; }
     let rv_raw = discover_mc(rv_calls, provider).await;
 
+    // Decimals once per unique token (USDC/WETH shared across many pools).
+    let mut unique_tokens: Vec<Address> = Vec::new();
+    let mut token_seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
+    for pm in &pool_metas {
+        for token in [pm.ta, pm.tb] {
+            if token_seen.insert(token) {
+                unique_tokens.push(token);
+            }
+        }
+    }
+    let dec_calls: Vec<(Address, Vec<u8>)> = unique_tokens
+        .iter()
+        .map(|t| (*t, IERC20::decimalsCall {}.abi_encode()))
+        .collect();
+    let dec_raw = discover_mc(dec_calls, provider).await;
+    let decimals_by_token: std::collections::HashMap<Address, u8> = unique_tokens
+        .into_iter()
+        .zip(dec_raw.into_iter())
+        .map(|(token, raw_opt)| {
+            let dec = raw_opt
+                .as_ref()
+                .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok())
+                .unwrap_or(18);
+            (token, dec)
+        })
+        .collect();
+
     // ── Insert into pool_cache ────────────────────────────────────────────────
     for (i, pm) in pool_metas.iter().enumerate() {
-        let t0_raw  = match rv_raw.get(4 * i)     { Some(Some(r)) => r, _ => continue };
-        let res_raw = match rv_raw.get(4 * i + 1) { Some(Some(r)) => r, _ => continue };
-        // Decimals are best-effort — fall back to 18 if call reverted (e.g. non-standard tokens)
-        let dec_ta: u8 = rv_raw.get(4 * i + 2).and_then(|r| r.as_ref())
-            .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok())
-            .unwrap_or(18);
-        let dec_tb: u8 = rv_raw.get(4 * i + 3).and_then(|r| r.as_ref())
-            .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok())
-            .unwrap_or(18);
+        let t0_raw  = match rv_raw.get(2 * i)     { Some(Some(r)) => r, _ => continue };
+        let res_raw = match rv_raw.get(2 * i + 1) { Some(Some(r)) => r, _ => continue };
+        let dec_ta = decimals_by_token.get(&pm.ta).copied().unwrap_or(18);
+        let dec_tb = decimals_by_token.get(&pm.tb).copied().unwrap_or(18);
 
         let token0   = match IUniswapV2Pair::token0Call::abi_decode_returns(t0_raw).ok()    { Some(t) => t, None => continue };
         let reserves = match IUniswapV2Pair::getReservesCall::abi_decode_returns(res_raw).ok() { Some(r) => r, None => continue };

@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ArbitragePulse — Technical Presentation</title>
+<style>
+  :root {
+    --bg: #0a0e1a;
+    --surface: #111827;
+    --surface2: #1f2937;
+    --accent: #6366f1;
+    --accent2: #22d3ee;
+    --green: #10b981;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --border: #1e293b;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 24px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+  #nav span { font-weight: 600; color: var(--accent2); letter-spacing:.5px; }
+  #counter { font-variant-numeric: tabular-nums; }
+  .nav-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background .15s;
+  }
+  .nav-btn:hover { background: var(--accent); }
+  .nav-btns { display: flex; gap: 8px; }
+
+  #slides { flex: 1; overflow: hidden; position: relative; }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    padding: 36px 56px;
+    animation: fadeIn .25s ease;
+  }
+  .slide.active { display: flex; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .tag {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2.5px;
+    text-transform: uppercase;
+    color: var(--accent2);
+    margin-bottom: 12px;
+  }
+  h1 { font-size: clamp(30px,5vw,54px); font-weight: 800; line-height: 1.1; }
+  h2 { font-size: clamp(20px,3vw,34px); font-weight: 700; line-height: 1.2; margin-bottom: 22px; }
+  h3 { font-size: 15px; font-weight: 600; color: var(--accent2); margin-bottom: 8px; }
+  p, li { font-size: clamp(12px,1.4vw,15px); line-height: 1.65; color: var(--muted); }
+  li { margin-bottom: 5px; }
+  strong { color: var(--text); }
+
+  .subtitle { font-size: clamp(14px,1.8vw,20px); color: var(--muted); margin-top: 12px; }
+  .accent  { color: var(--accent); }
+  .accent2 { color: var(--accent2); }
+  .green   { color: var(--green); }
+  .red     { color: var(--red); }
+  .yellow  { color: var(--yellow); }
+  .center  { text-align: center; }
+
+  .cols { display: grid; gap: 20px; width: 100%; max-width: 1120px; }
+  .cols2 { grid-template-columns: 1fr 1fr; }
+  .cols3 { grid-template-columns: 1fr 1fr 1fr; }
+  .cols-3-2 { grid-template-columns: 3fr 2fr; }
+  .cols-2-3 { grid-template-columns: 2fr 3fr; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }
+  .card.accent-border { border-color: var(--accent); }
+  .card.green-border  { border-color: var(--green); }
+  .card.red-border    { border-color: var(--red); }
+  .card.yellow-border { border-color: var(--yellow); }
+  .card.cyan-border   { border-color: var(--accent2); }
+
+  code {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    padding: 1px 7px;
+    border-radius: 4px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 12px;
+    color: var(--accent2);
+  }
+  pre {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 13px 16px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 12px;
+    color: var(--accent2);
+    line-height: 1.55;
+    overflow-x: auto;
+    width: 100%;
+  }
+  pre .c  { color: #475569; }
+  pre .g  { color: var(--green); }
+  pre .y  { color: var(--yellow); }
+  pre .r  { color: var(--red); }
+  pre .w  { color: var(--text); }
+  pre .m  { color: var(--muted); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 20px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .5px;
+    text-transform: uppercase;
+  }
+  .badge-accent  { background: rgba(99,102,241,.2);  color: var(--accent);  border:1px solid rgba(99,102,241,.4); }
+  .badge-green   { background: rgba(16,185,129,.15); color: var(--green);   border:1px solid rgba(16,185,129,.3); }
+  .badge-red     { background: rgba(239,68,68,.15);  color: var(--red);     border:1px solid rgba(239,68,68,.3); }
+  .badge-yellow  { background: rgba(245,158,11,.15); color: var(--yellow);  border:1px solid rgba(245,158,11,.3); }
+  .badge-cyan    { background: rgba(34,211,238,.15); color: var(--accent2); border:1px solid rgba(34,211,238,.3); }
+
+  .chip { display:inline-flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-top:16px; }
+
+  .stat-box { text-align: center; padding: 16px 12px; }
+  .stat-num { font-size: clamp(24px,3.5vw,44px); font-weight: 800; line-height: 1; }
+  .stat-lbl { font-size: 12px; color: var(--muted); margin-top: 5px; }
+
+  .arch {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 22px;
+    font-family: 'Cascadia Code', monospace;
+    font-size: 12px;
+    line-height: 1.75;
+    color: var(--muted);
+    width: 100%;
+  }
+  .arch .hl { color: var(--accent2); font-weight: 700; }
+  .arch .g  { color: var(--green);   font-weight: 600; }
+  .arch .y  { color: var(--yellow);  font-weight: 600; }
+  .arch .a  { color: var(--accent);  font-weight: 600; }
+  .arch .r  { color: var(--red);     font-weight: 600; }
+  .arch .d  { color: #475569; }
+
+  .bar-wrap { background: var(--surface2); border-radius: 4px; height: 7px; flex: 1; }
+  .bar-fill { height: 7px; border-radius: 4px; }
+
+  /* Slide-specific */
+  #s1  { background: radial-gradient(ellipse 80% 60% at 50% 0%,   rgba(99,102,241,.12) 0%, transparent 70%), var(--bg); }
+  #s1 h1 { background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  #s13 { background: radial-gradient(ellipse 80% 60% at 50% 100%, rgba(16,185,129,.08) 0%, transparent 70%), var(--bg); }
+
+  /* Step list */
+  .steps { display: flex; flex-direction: column; gap: 8px; }
+  .step  { display: flex; align-items: flex-start; gap: 10px; }
+  .step-num {
+    width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; margin-top: 1px;
+  }
+  .step-num.cyan   { background: rgba(34,211,238,.15);  color: var(--accent2); border: 1px solid var(--accent2); }
+  .step-num.green  { background: rgba(16,185,129,.15);  color: var(--green);   border: 1px solid var(--green); }
+  .step-num.yellow { background: rgba(245,158,11,.15);  color: var(--yellow);  border: 1px solid var(--yellow); }
+  .step-num.red    { background: rgba(239,68,68,.15);   color: var(--red);     border: 1px solid var(--red); }
+
+  /* Challenge header */
+  .ch-label {
+    display: inline-block;
+    font-size: 10px; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase; padding: 2px 10px;
+    border-radius: 4px; margin-bottom: 6px;
+  }
+  .ch-label.red    { background: rgba(239,68,68,.12);  color: var(--red);    border:1px solid rgba(239,68,68,.25); }
+  .ch-label.green  { background: rgba(16,185,129,.12); color: var(--green);  border:1px solid rgba(16,185,129,.25); }
+</style>
+</head>
+<body>
+
+<div id="nav">
+  <span>⚡ ARBITRAGEPULSE</span>
+  <div id="counter">Slide 1 / 13</div>
+  <div class="nav-btns">
+    <button class="nav-btn" onclick="go(-1)">← Prev</button>
+    <button class="nav-btn" onclick="go(1)">Next →</button>
+  </div>
+</div>
+
+<div id="slides">
+
+<!-- ══════════════════════════════════════════════════════════
+     1. TITLE
+══════════════════════════════════════════════════════════ -->
+<div class="slide active center" id="s1">
+  <div style="font-size:56px;margin-bottom:6px;">⚡</div>
+  <h1>ArbitragePulse</h1>
+  <p class="subtitle">A latency-critical, event-driven trading system<br/>that exploits price divergence across decentralized exchanges</p>
+  <div class="chip">
+    <span class="badge badge-cyan">Rust + tokio</span>
+    <span class="badge badge-accent">Solidity Smart Contract</span>
+    <span class="badge badge-green">Multi-Chain</span>
+    <span class="badge badge-yellow">Event-Sourced State</span>
+    <span class="badge badge-red">&lt;10ms Detection</span>
+  </div>
+  <div style="margin-top:28px; display:flex; gap:32px; justify-content:center;">
+    <div style="text-align:center;">
+      <div style="font-size:22px;font-weight:800;color:var(--green);">86/86</div>
+      <div style="font-size:11px;color:var(--muted);">Tests passing</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="font-size:22px;font-weight:800;color:var(--accent2);">0</div>
+      <div style="font-size:11px;color:var(--muted);">Network calls during scan</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="font-size:22px;font-weight:800;color:var(--accent);">5</div>
+      <div style="font-size:11px;color:var(--muted);">Exchange protocol types</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="font-size:22px;font-weight:800;color:var(--yellow);">-72%</div>
+      <div style="font-size:11px;color:var(--muted);">Detection latency</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     2. PROBLEM SPACE
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s2">
+  <div class="tag">Problem Space</div>
+  <h2>The Setup & The Constraint</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card cyan-border" style="margin-bottom:14px;">
+        <h3>What are Decentralized Exchanges (DEXes)?</h3>
+        <p>On-chain smart contracts that hold two token reserves <code>(x, y)</code> and price every swap deterministically by a formula — no order book, no counterparty. State is public and event-driven.</p>
+        <p style="margin-top:8px;">Price of the same token pair <strong>diverges across DEXes</strong> due to independent reserve state. The gap is the opportunity.</p>
+      </div>
+      <div class="card yellow-border">
+        <h3>The Atomicity Guarantee</h3>
+        <p>A blockchain transaction is <strong>fully atomic</strong>: if any step fails, all state changes revert. We encode a profit check inside the on-chain contract — if the net output doesn't exceed our floor, the entire tx reverts. No partial losses.</p>
+      </div>
+    </div>
+    <div>
+      <div class="card red-border" style="margin-bottom:14px;">
+        <h3>The Timing Constraint</h3>
+        <p>A new block is produced every <strong>2 seconds</strong> on our target chains. Each block is final — the price gap either exists in this block or it doesn't.</p>
+        <ul style="margin-top:10px;">
+          <li>Competing bots also subscribe to the same events</li>
+          <li>Block sequencer orders by priority fee — first submitted, first included</li>
+          <li>Detection + submission must complete in <strong>&lt;50ms</strong> to be competitive</li>
+          <li>Original JavaScript engine: <strong>600ms</strong> per evaluation cycle — 12× too slow</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Trade Shapes</h3>
+        <ul>
+          <li><strong>2-hop:</strong> A → B on DEX 1, B → A on DEX 2. Net profit if spread &gt; gas cost.</li>
+          <li><strong>Triangular:</strong> A → B → C → A across three DEXes. Loop closes richer.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     3. SYSTEM ARCHITECTURE & DATA FLOW
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s3" style="padding:28px 48px;">
+  <div class="tag">Architecture</div>
+  <h2 style="margin-bottom:14px;">Data Flow — End to End</h2>
+  <div class="arch" style="max-width:1060px;">
+<span class="hl">┌─ Blockchain (Base / Linea) — 2s block cadence ──────────────────────────────────────────┐</span><br/>
+<span class="hl">│</span>  <span class="d">WebSocket stream:</span>  <span class="g">newBlock(num, baseFee)</span>  +  <span class="g">Log(address, topics[], data)</span>  <span class="d">per Swap/Sync event</span>  <span class="hl">│</span><br/>
+<span class="hl">└────────────────────────────────────────────────┬────────────────────────────────────────┘</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="hl">│</span> <span class="d">&lt;1ms — decode + route</span><br/>
+<span class="hl">┌── Engine (Rust / tokio) ───────────────────────┴────────────────────────────────────────┐</span><br/>
+<span class="hl">│</span>  <span class="g">listener.rs</span>  →  topic0 hash dispatch  →  <span class="g">pool_cache.rs</span> <span class="d">(DashMap&lt;String,PoolInfo&gt;, shard-locked)</span>  <span class="hl">│</span><br/>
+<span class="hl">│</span>                                                                                          <span class="hl">│</span><br/>
+<span class="hl">│</span>  <span class="a">strategy::evaluate()</span>  <span class="d">— triggered per event, 0 I/O</span>                                    <span class="hl">│</span><br/>
+<span class="hl">│</span>  &nbsp;&nbsp;<span class="d">Phase 1:</span>  AMM formula  ×  (pairs × routers)  →  spread &gt; floor?                       <span class="hl">│</span><br/>
+<span class="hl">│</span>  &nbsp;&nbsp;<span class="d">Phase 1.5 (gated):</span>  QuoterV2 eth_call  →  correct tick-bounded V3 quote              <span class="hl">│</span><br/>
+<span class="hl">│</span>  &nbsp;&nbsp;<span class="d">Phase 2:</span>  pre-flight <span class="y">eth_call</span> simulation  →  revert-safe before spending gas          <span class="hl">│</span><br/>
+<span class="hl">│</span>                                                                                          <span class="hl">│</span><br/>
+<span class="hl">│</span>  <span class="y">executor.rs</span>  →  nonce fetch  →  TX build  →  secp256k1 sign  →  <span class="r">eth_sendRawTransaction</span>  <span class="hl">│</span><br/>
+<span class="hl">│</span>  <span class="g">api.rs (axum)</span>  →  REST + WebSocket → dashboard                                        <span class="hl">│</span><br/>
+<span class="hl">└────────────────────────────────────────────────┬────────────────────────────────────────┘</span><br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="hl">│</span> <span class="d">single outbound RPC per trade</span><br/>
+<span class="hl">┌─ ArbitrageExecutor.sol (on-chain) ────────────┴────────────────────────────────────────┐</span><br/>
+<span class="hl">│</span>  <span class="d">atomic:</span>  swap_A  →  profit_check  →  swap_B  →  <span class="g">require(out ≥ minProfit)</span>  or REVERT    <span class="hl">│</span><br/>
+<span class="hl">└──────────────────────────────────────────────────────────────────────────────────────────┘</span>
+  </div>
+  <div style="display:flex; gap:20px; margin-top:14px; max-width:1060px; width:100%;">
+    <div class="card" style="flex:1; padding:12px 16px;">
+      <h3 style="font-size:13px;margin-bottom:6px;">RPC Budget (per scan)</h3>
+      <p style="font-size:12px;"><span class="red" style="font-weight:700;">Before:</span> 20–40 eth_call per scan → 200–600ms latency</p>
+      <p style="font-size:12px;margin-top:4px;"><span class="green" style="font-weight:700;">After:</span> 0 eth_call during detection → &lt;1ms evaluation</p>
+    </div>
+    <div class="card" style="flex:1; padding:12px 16px;">
+      <h3 style="font-size:13px;margin-bottom:6px;">Irreducible Network Calls</h3>
+      <p style="font-size:12px;"><code>eth_sendRawTransaction</code> — one per actual trade submission</p>
+      <p style="font-size:12px;margin-top:4px;"><code>eth_call</code> (simulation) — one per candidate, read-only, free</p>
+    </div>
+    <div class="card" style="flex:1; padding:12px 16px;">
+      <h3 style="font-size:13px;margin-bottom:6px;">Concurrency Model</h3>
+      <p style="font-size:12px;">Each chain runs an independent tokio task. Shared state via <code>Arc&lt;RwLock&lt;&gt;&gt;</code>. Pool cache via <code>DashMap</code> (shard-level locking for concurrent reads).</p>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     4. EVENT-SOURCED PRICE STATE
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s4">
+  <div class="tag">Data Layer</div>
+  <h2>Event-Sourced Price State</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card red-border" style="margin-bottom:14px;">
+        <h3 class="red">Pull Model (discarded)</h3>
+        <pre><span class="c">// Per scan — blocks the hot path</span>
+<span class="r">for pair in pairs {
+  eth_call: getAmountsOut(amountIn, path)
+  eth_call: getAmountsOut(reverse)
+}</span>
+<span class="c">// 20–40 round trips × 50–200ms each
+// = 200–600ms per scan cycle</span></pre>
+      </div>
+      <div class="card green-border">
+        <h3 class="green">Push Model (adopted) — Event Sourcing</h3>
+        <pre><span class="c">// At startup: one multicall for initial state</span>
+<span class="g">discover_pools() → seed pool_cache</span>
+
+<span class="c">// On each Swap/Sync event from WS:</span>
+<span class="g">pool_cache.update(addr, reserve0, reserve1)
+pool_info.last_sync = Instant::now()</span>
+
+<span class="c">// During scan: pure in-memory math</span>
+<span class="g">pool_cache.get_amount_out(key, amt_in) → U256</span>
+<span class="c">// Zero I/O. O(1) DashMap lookup.</span></pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:14px;">
+        <h3>PoolInfo Schema</h3>
+        <pre style="font-size:11px;"><span class="w">struct PoolInfo {</span>
+  <span class="m">reserve0:   U256,</span>       <span class="c">// token A balance</span>
+  <span class="m">reserve1:   U256,</span>       <span class="c">// token B balance</span>
+  <span class="m">decimals0:  u8,</span>         <span class="c">// normalisation</span>
+  <span class="m">decimals1:  u8,</span>
+  <span class="m">is_stable:  bool,</span>       <span class="c">// curve selector</span>
+  <span class="m">fee_bps:    u32,</span>        <span class="c">// fee in basis pts</span>
+  <span class="m">last_sync:  Instant,</span>    <span class="c">// freshness guard</span>
+<span class="w">}</span></pre>
+        <p style="margin-top:8px; font-size:12px;">Cache key encodes exchange + token pair + fee tier. Built once at startup — no <code>format!()</code> in the hot path.</p>
+      </div>
+      <div class="card yellow-border">
+        <h3>Freshness Guards</h3>
+        <p>Stale state is worse than no state — it produces phantom opportunities.</p>
+        <ul style="margin-top:8px;">
+          <li><strong>Volatile pools:</strong> expire after <code>60s</code> of silence</li>
+          <li><strong>Stable pools:</strong> expire after <code>120s</code> (slower price drift)</li>
+          <li>Returns <code>None</code> when stale — never quoted</li>
+        </ul>
+        <p style="margin-top:8px; font-size:12px;">Tradeoff: a pool with no activity for 60s genuinely has no spread — safe to skip.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     5. AMM PRICING ALGORITHMS
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s5">
+  <div class="tag">Algorithms</div>
+  <h2>AMM Pricing: Two Invariant Curves</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card green-border" style="margin-bottom:14px;">
+        <h3>Curve 1 — Volatile pools: <code>xy = k</code></h3>
+        <p style="margin-bottom:8px;">Constant product. Used by: Uniswap V2, Aerodrome volatile, SyncSwap classic.</p>
+        <pre><span class="c">// Closed form: O(1)</span>
+<span class="g">dy = y · dx / (x + dx)</span>
+
+<span class="c">// After fee deduction:</span>
+<span class="g">dx_adj = dx · (10000 - fee_bps) / 10000
+dy     = y · dx_adj / (x + dx_adj)</span></pre>
+        <p style="margin-top:8px; font-size:12px;">Reserves normalized to 18 decimals before calculation, then scaled back. Exact integer arithmetic — no floats.</p>
+      </div>
+      <div class="card accent-border">
+        <h3>V3 — Concentrated Liquidity (different model)</h3>
+        <p style="font-size:12px;">Liquidity is distributed across discrete price "ticks." Local xy=k approximation <strong>breaks at tick boundaries</strong>. A large trade may cross a tick and get a significantly worse price than the spot formula predicts. This causes phantom profits — covered in Challenge 1.</p>
+      </div>
+    </div>
+    <div>
+      <div class="card yellow-border">
+        <h3>Curve 2 — Stable pools: <code>x³y + xy³ = k</code></h3>
+        <p style="margin-bottom:8px;">Designed for pegged assets (e.g. USDC/USDT). Keeps prices near-equal at low-to-mid volumes. No closed-form inverse — requires iterative solver.</p>
+        <pre><span class="c">// Newton-Raphson: find y given x, dx, k</span>
+<span class="m">f(y)  = x³y + xy³ − k</span>
+<span class="m">f'(y) = x³ + 3xy²</span>
+
+<span class="g">loop {
+    dy = f(y_n) / f'(y_n)
+    y_{n+1} = y_n − dy</span>
+    <span class="c">// stop when correction negligible</span>
+    <span class="g">if dy ≤ 1_wei { break }    </span><span class="c">// ← key fix</span>
+<span class="g">}</span>
+
+<span class="c">// Typical convergence: 5–8 iterations
+// Previous impl: fixed 255 iterations
+// Optimization: ~240 wasted iters/call saved</span></pre>
+        <p style="margin-top:8px; font-size:12px;">The <code>dy ≤ 1 wei</code> convergence fix replaced a <code>dy == 0</code> check that in normalized 10¹⁸ space almost never triggered on time.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     6. SCAN PIPELINE
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s6">
+  <div class="tag">Scan Pipeline</div>
+  <h2>Opportunity Detection Loop</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card" style="margin-bottom:14px;">
+        <h3>2-Hop Detection</h3>
+        <div class="steps" style="margin-top:6px;">
+          <div class="step"><span class="step-num cyan">1</span><p>Event received → update <code>pool_cache</code> for affected pool</p></div>
+          <div class="step"><span class="step-num cyan">2</span><p>For each (tokenA, tokenB) pair × each router pair: look up both pools in cache</p></div>
+          <div class="step"><span class="step-num cyan">3</span><p>Apply AMM formula: <code>amountOut = f(reserveA, reserveB, amountIn)</code></p></div>
+          <div class="step"><span class="step-num cyan">4</span><p>Check: <code>amountOut − amountIn &gt; gas_cost_usd + min_profit_usd</code></p></div>
+          <div class="step"><span class="step-num yellow">5</span><p><em>(gated)</em> If V3 and tick-cap suspected: run QuoterV2 eth_call to get real amountOut</p></div>
+          <div class="step"><span class="step-num green">6</span><p>Pre-flight simulation: <code>eth_call(tx)</code> — if reverts, discard with zero gas cost</p></div>
+          <div class="step"><span class="step-num green">7</span><p>Sign + broadcast <code>eth_sendRawTransaction</code></p></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:14px;">
+        <h3>Triangular (3-Hop) Detection</h3>
+        <pre style="font-size:11px;"><span class="c">// Phase 1: A → B across all routers</span>
+<span class="m">p1_entries = [</span>
+  <span class="m">{ amountB = quote(A→B, routerX), router },</span>
+  <span class="m">...</span>
+<span class="m">]</span>
+
+<span class="c">// Phase 2: B → C for each p1 result</span>
+<span class="m">p2_entries = [</span>
+  <span class="m">{ amountC = quote(B→C, routerY), ... },</span>
+  <span class="m">...</span>
+<span class="m">]</span>
+
+<span class="c">// Phase 3: C → A to close the loop</span>
+<span class="m">p3_entries = [</span>
+  <span class="m">{ amountA' = quote(C→A, routerZ), ... },</span>
+  <span class="m">...</span>
+<span class="m">]</span>
+
+<span class="c">// Profit: amountA' − amountA − gas_cost</span>
+<span class="g">if profit > floor { emit opportunity }</span></pre>
+        <p style="font-size:11px; margin-top:8px;">All three phases use local pool_cache. Zero network calls. Complexity: O(pairs × routers³) but bounded by config.</p>
+      </div>
+      <div class="card cyan-border">
+        <h3>Complexity in Practice</h3>
+        <ul>
+          <li>~13 active pairs per chain</li>
+          <li>4–6 router combinations per pair</li>
+          <li>Total candidates per event: <strong>~50–80</strong></li>
+          <li>All evaluated in <strong>&lt;1ms</strong> (pure arithmetic)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     7. ON-CHAIN SAFETY CONTRACT
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s7">
+  <div class="tag">Module — Smart Contract</div>
+  <h2>On-Chain Safety Layer (Solidity)</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card" style="margin-bottom:14px;">
+        <h3>Execution Flow (simplified)</h3>
+        <pre style="font-size:11px;"><span class="w">function executeArbitrage(</span>
+  <span class="m">tokenIn, tokenOut,</span>
+  <span class="m">amountIn, minProfit,</span>
+  <span class="m">deadline, routerA, routerB, ...</span>
+<span class="w">) external nonReentrant {</span>
+
+  <span class="c">// 1. Time guard</span>
+  <span class="g">require(block.timestamp &lt;= deadline)</span>
+
+  <span class="c">// 2. Snapshot starting balance</span>
+  <span class="m">uint256 before = tokenIn.balanceOf(this)</span>
+
+  <span class="c">// 3. Execute both legs atomically</span>
+  <span class="m">_executeSwap(routerA, tokenIn→tokenOut, amtIn)</span>
+  <span class="m">_executeSwap(routerB, tokenOut→tokenIn, amtOut)</span>
+
+  <span class="c">// 4. Profit gate — reverts entire tx if not met</span>
+  <span class="g">require(tokenIn.balanceOf(this) - before >= minProfit)</span>
+<span class="w">}</span></pre>
+      </div>
+      <div class="card yellow-border">
+        <h3>5 Exchange Protocol Dispatch</h3>
+        <p style="font-size:12px; margin-bottom:8px;">Each DEX type has a different swap interface. The contract dispatches based on a <code>RouterType</code> enum set at whitelist time:</p>
+        <ul style="font-size:12px;">
+          <li><code>V2</code> — <code>swapExactTokensForTokens()</code></li>
+          <li><code>V3</code> — <code>exactInputSingle()</code> (7-field SwapRouter02)</li>
+          <li><code>Solidly</code> — <code>swapExactTokensForTokens(routes[])</code></li>
+          <li><code>Aerodrome</code> — Solidly + extra <code>factory</code> field in route</li>
+          <li><code>SyncSwap</code> — direct transfer to pool, then <code>pool.swap()</code></li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border" style="margin-bottom:14px;">
+        <h3>Security Properties</h3>
+        <ul>
+          <li><strong>ReentrancyGuard</strong> — nonReentrant modifier; blocks re-entry via malicious token callbacks</li>
+          <li><strong>Ownable2Step</strong> — two-transaction ownership transfer; typos don't lock the contract</li>
+          <li><strong>Pausable</strong> — emergency halt without fund movement</li>
+          <li><strong>Router whitelist</strong> — only pre-approved exchange addresses can be called</li>
+          <li><strong>Approval hygiene</strong> — exact <code>approve(amount)</code> before each leg, reset to 0 after</li>
+          <li><strong>Deadline</strong> — stale pending txs expire; no replaying into changed market state</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Test Coverage</h3>
+        <p><span class="green" style="font-size:26px; font-weight:800;">86 / 86</span> Foundry tests</p>
+        <p style="margin-top:6px; font-size:12px;">Covers: all 5 protocol types, profit gate reverts, deadline expiry, reentrancy attack simulation, batch execution, 2-hop + triangular flows.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     8. CHALLENGE 1 — PHANTOM PROFITS
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s8">
+  <div class="tag">Challenge 1</div>
+  <h2>Phantom Profits: Local Math vs Reality</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card red-border" style="margin-bottom:14px;">
+        <div class="ch-label red">Root Cause</div>
+        <h3>V3 Concentrated Liquidity Tick Boundary</h3>
+        <p>Uniswap V3 distributes liquidity in discrete price "tick" ranges. Our xy=k spot formula treats liquidity as continuous — correct <em>within</em> a tick, wrong <em>across</em> a boundary.</p>
+        <p style="margin-top:8px;"><strong>Observed:</strong> V3 pool shows 4.9% spread → $0.32 profit on $100 trade.<br/><strong>Reality:</strong> trade crosses tick boundary, capped at $65. Real profit: $0.003.</p>
+        <p style="margin-top:8px; font-size:12px;">Detection signal: if <code>local_amountOut &lt; configured_trade_size</code>, the tick cap truncated the quote. The local formula is unreliable.</p>
+      </div>
+      <div class="card">
+        <div class="ch-label red">Other Phantom Sources</div>
+        <ul style="margin-top:6px;">
+          <li><strong>Non-existent pool echo</strong> — some routers return <code>amountIn == amountOut</code> for unknown pairs (0% gain disguised as a spread)</li>
+          <li><strong>Stale sqrtPriceX96</strong> — V3 spot price moved after our last event but before scan completes</li>
+          <li><strong>3-leg compounding</strong> — small overestimate at each leg multiplies into a large phantom gain</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border">
+        <div class="ch-label green">Fix: Two-Phase Verification (Phase 1.5)</div>
+        <pre style="font-size:11px;"><span class="c">// Phase 1: local AMM spot quote (0 I/O)</span>
+<span class="m">let spot = pool_cache.get_amount_out(key, amt)</span>
+
+<span class="c">// Tick-cap heuristic</span>
+<span class="y">if spot &lt; configured_trade_amount {</span>
+  <span class="c">  // Local quote is truncated — fire ONE</span>
+  <span class="c">  // batched QuoterV2 multicall at full size</span>
+  <span class="g">  let real = QuoterV2
+      .quoteExactInputSingle(full_amt)
+      .await?</span>
+  <span class="c">  // Update candidate in-place</span>
+  <span class="g">  candidate.amount_in = real</span>
+<span class="y">}</span>
+
+<span class="c">// Sanity cap: &gt;5% spread = phantom</span>
+<span class="g">if profit_pct &gt; 0.05 { discard() }</span></pre>
+        <p style="margin-top:10px; font-size:12px;">QuoterV2 is an on-chain read-only contract that simulates the exact execution path including all tick crossings. One multicall covers all V3 candidates per scan.</p>
+        <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
+          <span class="badge badge-green">Result</span>
+          <p style="font-size:12px; margin:0;">V3 revert rate dropped significantly. The 4.9% phantom now correctly resolves to $0.003 → below floor → discarded.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     9. CHALLENGE 2 — EVENT SCHEMA MISMATCH
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s9">
+  <div class="tag">Challenge 2</div>
+  <h2>Silent Data Staleness: Event Schema Mismatch</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card red-border" style="margin-bottom:14px;">
+        <div class="ch-label red">The Bug</div>
+        <h3>Same event name, different ABI type → different topic hash</h3>
+        <pre style="font-size:11px;"><span class="c">// Uniswap V2 family:</span>
+<span class="r">event Sync(uint112 reserve0, uint112 reserve1)
+keccak256("Sync(uint112,uint112)")
+→ 0x1c411e9a96e071241c2f21f7726b17ae...</span>
+
+<span class="c">// Aerodrome / Solidly family:</span>
+<span class="r">event Sync(uint256 reserve0, uint256 reserve1)
+keccak256("Sync(uint256,uint256)")
+→ 0xcf2aa50876cdfbb541206f89af0ee48b...</span>
+
+<span class="c">// Listener filtered on V2 hash only ↑</span>
+<span class="c">// Aerodrome events arrived and were DISCARDED</span></pre>
+      </div>
+      <div class="card">
+        <div class="ch-label red">Failure Mode</div>
+        <p>Aerodrome is the highest-volume exchange on Base. Its price events streamed in correctly — but the listener discarded every one as an unknown event signature.</p>
+        <p style="margin-top:8px;">After 60 seconds: <code>VOLATILE_MAX_AGE</code> expires → every Aerodrome quote returns <code>None</code>. We were <strong>completely blind to the primary source of opportunities on our main chain</strong>, with no visible error.</p>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border">
+        <div class="ch-label green">Fix</div>
+        <pre style="font-size:11px;"><span class="c">// Compute both fingerprints at startup</span>
+<span class="g">let v2_sync      = keccak256(b"Sync(uint112,uint112)")</span>
+<span class="g">let solidly_sync = keccak256(b"Sync(uint256,uint256)")</span>
+
+<span class="c">// Subscribe to BOTH topics in the WS filter</span>
+<span class="g">event_sigs.push(v2_sync)</span>
+<span class="g">event_sigs.push(solidly_sync)</span>
+
+<span class="c">// Decode raw bytes based on matched topic</span>
+<span class="g">match log.topic0 {
+  t if t == v2_sync => {
+    let r0 = U256::from_be_slice(&data[0..16])
+    let r1 = U256::from_be_slice(&data[16..32])
+    pool_cache.update(addr, r0, r1)
+  }
+  t if t == solidly_sync => {
+    let r0 = U256::from_be_slice(&data[0..32])
+    let r1 = U256::from_be_slice(&data[32..64])
+    pool_cache.update(addr, r0, r1)
+  }
+}</span></pre>
+        <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
+          <span class="badge badge-green">Result</span>
+          <p style="font-size:12px; margin:0;">Aerodrome pools stay live on every swap. Went from 0 Aerodrome hits to the majority of detected opportunities on Base.</p>
+        </div>
+        <p style="margin-top:10px; font-size:12px; color:var(--muted);">Lesson: in a binary protocol, event names are irrelevant. Identity is the keccak256 of the full ABI signature including parameter types.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     10. CHALLENGE 3 — BLOCK QUEUE RACING
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s10">
+  <div class="tag">Challenge 3</div>
+  <h2>Block Queue Racing: FCFS Sequencer</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card red-border" style="margin-bottom:14px;">
+        <div class="ch-label red">The Problem</div>
+        <h3>Base: Priority Fee Ordered Transaction Queue</h3>
+        <p>Base's sequencer processes each block's transactions strictly by <strong>gas tip (priority fee)</strong>. A bot submitting at block confirmation arrives after bots that submitted at event time — 200ms earlier.</p>
+        <ul style="margin-top:10px;">
+          <li>We were consistently landing at <strong>position 500+</strong> per block</li>
+          <li>Opportunity already taken by position 10–20</li>
+          <li>Adding a QuoterV2 verification step: +80–160ms — made it worse</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Lever 1: Tip Escalation</h3>
+        <p>Raised priority fee: 1 Mwei → 25 → 200 Mwei. Higher tip moves up the queue. But other bots escalate too — cost war is not sustainable alone.</p>
+        <h3 style="margin-top:12px;">Lever 2: Optimistic Submission</h3>
+        <p>Skip QuoterV2 on Base. Submit after Phase 1 spot quote. Accept higher revert rate in exchange for 80–160ms earlier arrival. Gas cost of failures is accounted in profit floor.</p>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border">
+        <div class="ch-label green">Key Strategy: Pending TX Mempool Monitor</div>
+        <p>Instead of waiting for block confirmation, subscribe to <code>eth_subscribe("newPendingTransactions")</code> — the unconfirmed transaction queue.</p>
+        <div class="steps" style="margin-top:12px;">
+          <div class="step"><span class="step-num cyan">1</span><p>Large swap appears in mempool (e.g. $50k USDC→ETH on Uniswap)</p></div>
+          <div class="step"><span class="step-num cyan">2</span><p>Decode calldata: identify token pair, amount, exchange</p></div>
+          <div class="step"><span class="step-num cyan">3</span><p>Simulate post-swap state: apply AMM formula to get new reserves</p></div>
+          <div class="step"><span class="step-num cyan">4</span><p>Check if our arb is profitable <em>given those new reserves</em></p></div>
+          <div class="step"><span class="step-num green">5</span><p>Submit our tx with the same tip → sequencer places us in the same block</p></div>
+        </div>
+        <p style="margin-top:12px; font-size:12px;">The large pending swap <em>creates</em> the price gap — we race it into the same block and close it atomically after it executes.</p>
+        <p style="margin-top:8px; font-size:12px;">Parses Uniswap <code>UniversalRouter (0x3593564c)</code> calldata format — covers the majority of Base swap volume.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     11. PERFORMANCE ENGINEERING
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s11">
+  <div class="tag">Performance Engineering</div>
+  <h2>Micro-Optimizations: Where They Actually Mattered</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card" style="margin-bottom:14px;">
+        <h3>Dead Code Elimination (~150 lines)</h3>
+        <p style="font-size:12px; margin-bottom:8px;">Triangular scanner had multicall infrastructure that ran empty every scan:</p>
+        <pre style="font-size:11px;"><span class="c">// Was: 3× per scan, always no-ops</span>
+<span class="r">let p1_mc: Vec&lt;(Address, Bytes)&gt; = Vec::new()
+let p2_mc: Vec&lt;(Address, Bytes)&gt; = Vec::new()
+// ...never pushed to...
+run_multicall(provider, p1_mc).await  // ← empty</span>
+
+<span class="c">// Fix: removed all multicall infrastructure</span>
+<span class="c">// Triangular is purely local — always was</span></pre>
+        <p style="font-size:12px; margin-top:8px;">Found via code audit: <code>let mc_call: Option&lt;...&gt; = None</code> was hardcoded — the push branches never executed.</p>
+      </div>
+      <div class="card">
+        <h3>Allocation Hotspots Removed</h3>
+        <ul style="font-size:12px;">
+          <li><strong>String dedup</strong> — <code>dedup_by_key(|o| format!("{}|{}", ...))</code> → <code>dedup_by(field compare)</code>: eliminates one <code>String</code> allocation per candidate</li>
+          <li><strong>Case conversion</strong> — <code>symbol.to_uppercase()</code> in token_amount_to_usd → removed. Symbols are always uppercase in config. Was 100–500 allocs/scan.</li>
+          <li><strong>RouterType Copy</strong> — unit enum, 9 <code>.clone()</code> calls in hot path → <code>Copy</code> trait, zero-cost</li>
+          <li><strong>Opportunity summary string</strong> — replaced multi-string concat with single <code>with_capacity</code> write</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:14px;">
+        <h3>Structural Wins</h3>
+        <ul style="font-size:12px;">
+          <li><strong>Pair-targeted scanning</strong> — pre-built <code>HashMap&lt;Address, Vec&lt;PairIdx&gt;&gt;</code> at startup. On event: look up affected pairs only. Was O(all pairs) → O(affected pairs) per event.</li>
+          <li><strong>Block-level gas price</strong> — baseFee arrives with every <code>newBlock</code> event. Eliminated periodic <code>eth_gasPrice</code> RPC call.</li>
+          <li><strong>SharedState read-once</strong> — <code>dry_run</code> flag pre-read once before the candidate loop, not per candidate.</li>
+          <li><strong>Signing outside lock</strong> — secp256k1 signing (~10ms) moved outside the executor <code>Mutex</code>. Lock now covers only nonce fetch + TX build.</li>
+          <li><strong>Channel buffer</strong> — swap event channel: 256 → 1024 slots. Absorbs bursts without dropping events on congested blocks.</li>
+        </ul>
+      </div>
+      <div class="card cyan-border">
+        <h3>Net Impact</h3>
+        <div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:160px; font-size:12px; color:var(--muted);">Architecture change</span>
+            <div class="bar-wrap"><div class="bar-fill" style="width:95%; background:var(--green);"></div></div>
+            <span class="green" style="font-size:12px; font-weight:700; width:60px;">600→&lt;10ms</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:160px; font-size:12px; color:var(--muted);">NR early exit</span>
+            <div class="bar-wrap"><div class="bar-fill" style="width:55%; background:var(--accent2);"></div></div>
+            <span class="accent2" style="font-size:12px; font-weight:700; width:60px;">~240 iters</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <span style="width:160px; font-size:12px; color:var(--muted);">Alloc elimination</span>
+            <div class="bar-wrap"><div class="bar-fill" style="width:35%; background:var(--accent);"></div></div>
+            <span class="accent" style="font-size:12px; font-weight:700; width:60px;">200–500µs</span>
+          </div>
+        </div>
+        <p style="font-size:11px; margin-top:10px; font-style:italic;">Micro-opts matter — but the architectural shift from polling to event-sourcing was 100× the impact.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     12. DASHBOARD
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s12" style="padding:20px 32px;justify-content:flex-start;">
+  <div class="tag" style="align-self:center;margin-bottom:8px;">Observability</div>
+  <h2 class="center" style="font-size:clamp(16px,2.2vw,26px);margin-bottom:10px;">Live Operator Dashboard — React + WebSocket + REST</h2>
+
+  <div style="width:100%;max-width:1080px;border:1px solid #1e293b;border-radius:10px;overflow:hidden;font-family:'Cascadia Code','Fira Code',monospace;font-size:11px;background:#020617;flex-shrink:0;">
+    <div style="background:#0f172a;border-bottom:1px solid #1e293b;padding:6px 14px;display:flex;align-items:center;gap:10px;">
+      <span style="font-size:13px;font-weight:700;color:#a78bfa;">⚡</span>
+      <span style="font-size:12px;font-weight:700;color:#e2e8f0;">ARBITRAGE<span style="color:#475569">PULSE</span></span>
+      <div style="display:flex;gap:0;margin-left:8px;">
+        <span style="padding:4px 12px;background:#1e293b;color:#e2e8f0;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;border-bottom:2px solid #a78bfa;">monitor</span>
+        <span style="padding:4px 12px;color:#475569;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;border-bottom:2px solid transparent;">tokens</span>
+        <span style="padding:4px 12px;color:#475569;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;border-bottom:2px solid transparent;">controls</span>
+      </div>
+      <span style="flex:1"></span>
+      <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#34d399;box-shadow:0 0 7px #34d399;"></span>
+      <span style="color:#334155;font-size:10px;">localhost:3000/ws</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:1px;background:#1e293b;">
+      <div style="background:#0f172a;padding:7px 10px;"><div style="font-size:8px;color:#475569;letter-spacing:1.2px;margin-bottom:2px;">UPTIME</div><div style="font-size:15px;font-weight:700;color:#94a3b8;">4h 12m</div></div>
+      <div style="background:#0f172a;padding:7px 10px;"><div style="font-size:8px;color:#475569;letter-spacing:1.2px;margin-bottom:2px;">CHAINS</div><div style="font-size:15px;font-weight:700;color:#a78bfa;">2</div></div>
+      <div style="background:#0f172a;padding:7px 10px;"><div style="font-size:8px;color:#475569;letter-spacing:1.2px;margin-bottom:2px;">OPPORTUNITIES</div><div style="font-size:15px;font-weight:700;color:#818cf8;">347</div></div>
+      <div style="background:#0f172a;padding:7px 10px;"><div style="font-size:8px;color:#475569;letter-spacing:1.2px;margin-bottom:2px;">TRADES</div><div style="font-size:15px;font-weight:700;color:#34d399;">12</div></div>
+      <div style="background:#0f172a;padding:7px 10px;"><div style="font-size:8px;color:#475569;letter-spacing:1.2px;margin-bottom:2px;">ERRORS</div><div style="font-size:15px;font-weight:700;color:#f87171;">3</div></div>
+      <div style="background:#0f172a;padding:7px 10px;"><div style="font-size:8px;color:#475569;letter-spacing:1.2px;margin-bottom:2px;">GHOST PROFIT</div><div style="font-size:15px;font-weight:700;color:#64748b;">$0.84</div></div>
+      <div style="background:#0f172a;padding:7px 10px;"><div style="font-size:8px;color:#475569;letter-spacing:1.2px;margin-bottom:2px;">MODE</div><div style="font-size:13px;font-weight:700;color:#ef4444;">⚡ LIVE</div></div>
+    </div>
+    <div style="display:flex;gap:20px;padding:4px 14px;background:#0a0f1a;border-bottom:1px solid #1e293b;font-size:10px;color:#475569;">
+      <span>WS latency (Base): <span style="color:#34d399;">47ms</span></span>
+      <span>WS latency (Linea): <span style="color:#fbbf24;">183ms</span></span>
+      <span>Dashboard ping: <span style="color:#34d399;">12ms</span></span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:8px;max-height:270px;overflow:hidden;">
+      <div style="display:flex;flex-direction:column;gap:7px;">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+          <div style="background:linear-gradient(135deg,#0f172a,#1e1b4b);border:1px solid #1e293b;border-radius:6px;padding:8px 10px;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-weight:700;color:#e2e8f0;font-size:11px;">Base</span><span style="font-size:8px;color:#34d399;background:#052e16;padding:1px 6px;border-radius:8px;">ACTIVE</span></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px;font-size:9px;">
+              <span style="color:#475569;">Scans <span style="color:#94a3b8;">2,841</span></span><span style="color:#475569;">Exec <span style="color:#94a3b8;">201</span></span>
+              <span style="color:#475569;">✓ <span style="color:#34d399;">9</span></span><span style="color:#475569;">$ <span style="color:#a78bfa;">$3.18</span></span>
+            </div>
+          </div>
+          <div style="background:linear-gradient(135deg,#0f172a,#1e1b4b);border:1px solid #1e293b;border-radius:6px;padding:8px 10px;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-weight:700;color:#e2e8f0;font-size:11px;">Linea</span><span style="font-size:8px;color:#34d399;background:#052e16;padding:1px 6px;border-radius:8px;">ACTIVE</span></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px;font-size:9px;">
+              <span style="color:#475569;">Scans <span style="color:#94a3b8;">1,403</span></span><span style="color:#475569;">Exec <span style="color:#94a3b8;">146</span></span>
+              <span style="color:#475569;">✓ <span style="color:#34d399;">3</span></span><span style="color:#475569;">$ <span style="color:#a78bfa;">$0.61</span></span>
+            </div>
+          </div>
+        </div>
+        <div style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;flex:1;overflow:hidden;">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 10px;border-bottom:1px solid #1e293b;">
+            <span style="font-size:8px;color:#475569;letter-spacing:1.2px;">24h PnL</span><span style="font-size:13px;color:#34d399;font-weight:700;">$3.79</span>
+          </div>
+          <svg width="100%" height="70" viewBox="0 0 240 70" preserveAspectRatio="none" style="display:block;">
+            <defs><linearGradient id="pg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#34d399" stop-opacity="0.3"/><stop offset="100%" stop-color="#34d399" stop-opacity="0"/></linearGradient></defs>
+            <path d="M0,62 L30,60 L55,55 L80,52 L100,48 L120,45 L140,32 L160,28 L185,20 L210,12 L240,8 L240,70 L0,70 Z" fill="url(#pg)"/>
+            <path d="M0,62 L30,60 L55,55 L80,52 L100,48 L120,45 L140,32 L160,28 L185,20 L210,12 L240,8" fill="none" stroke="#34d399" stroke-width="1.5"/>
+            <text x="4" y="68" fill="#334155" font-size="7">$0</text>
+            <text x="200" y="7" fill="#34d399" font-size="7" font-weight="700">$3.79</text>
+          </svg>
+        </div>
+      </div>
+      <div style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;overflow:hidden;display:flex;flex-direction:column;">
+        <div style="padding:5px 10px;border-bottom:1px solid #1e293b;font-size:8px;color:#475569;letter-spacing:1.2px;">PAIR SCAN COVERAGE</div>
+        <table style="width:100%;border-collapse:collapse;font-size:9px;">
+          <thead><tr style="border-bottom:1px solid #1e293b;"><th style="padding:3px 8px;color:#334155;text-align:left;font-size:8px;background:#0f172a;">PAIR</th><th style="padding:3px 8px;color:#334155;background:#0f172a;">DEX</th><th style="padding:3px 8px;color:#334155;text-align:right;background:#0f172a;">PATHS</th></tr></thead>
+          <tbody>
+            <tr style="border-bottom:1px solid #0f172a;"><td style="padding:3px 8px;color:#e2e8f0;">USDC/WETH</td><td style="padding:3px 8px;"><span style="color:#34d399;">●</span> 4</td><td style="padding:3px 8px;text-align:right;color:#94a3b8;">12</td></tr>
+            <tr style="border-bottom:1px solid #0f172a;"><td style="padding:3px 8px;color:#e2e8f0;">▲ USDC→WETH→OP</td><td style="padding:3px 8px;"><span style="color:#a78bfa;">●</span> 3</td><td style="padding:3px 8px;text-align:right;color:#94a3b8;">6</td></tr>
+            <tr style="border-bottom:1px solid #0f172a;"><td style="padding:3px 8px;color:#e2e8f0;">USDC/cbBTC</td><td style="padding:3px 8px;"><span style="color:#fbbf24;">●</span> 2</td><td style="padding:3px 8px;text-align:right;color:#94a3b8;">2</td></tr>
+            <tr><td style="padding:3px 8px;color:#475569;">USDC/ZORA [off]</td><td style="padding:3px 8px;color:#334155;">—</td><td style="padding:3px 8px;text-align:right;color:#334155;">0</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="background:#020617;border:1px solid #1e293b;border-radius:6px;overflow:hidden;display:flex;flex-direction:column;">
+        <div style="padding:5px 10px;border-bottom:1px solid #1e293b;font-size:8px;color:#475569;letter-spacing:1.2px;">LIVE LOG FEED <span style="color:#34d399;">● ws</span></div>
+        <div style="flex:1;overflow:hidden;display:flex;flex-direction:column;padding:2px 0;">
+          <div style="padding:2px 8px;display:flex;gap:5px;align-items:baseline;"><span style="color:#334155;flex-shrink:0;">14:37:02</span><span style="background:#052e16;color:#34d399;padding:0 4px;border-radius:2px;font-size:7px;font-weight:700;flex-shrink:0;">TRDE</span><span style="color:#34d399;font-size:9px;">[Base] tx confirmed | USDC/WETH | +$0.42</span></div>
+          <div style="padding:2px 8px;display:flex;gap:5px;align-items:baseline;"><span style="color:#334155;flex-shrink:0;">14:37:01</span><span style="background:#1e1b4b;color:#a78bfa;padding:0 4px;border-radius:2px;font-size:7px;font-weight:700;flex-shrink:0;">OPP!</span><span style="color:#a78bfa;font-size:9px;">[Base] 2-hop USDC/WETH | $0.42 | aerodrome/v3</span></div>
+          <div style="padding:2px 8px;display:flex;gap:5px;align-items:baseline;"><span style="color:#334155;flex-shrink:0;">14:36:58</span><span style="color:#475569;padding:0 4px;font-size:7px;font-weight:700;flex-shrink:0;">♥ HB</span><span style="color:#334155;font-size:9px;">[Base] active=8/13 | best=$0.42 | scans=2841</span></div>
+          <div style="padding:2px 8px;display:flex;gap:5px;align-items:baseline;"><span style="color:#334155;flex-shrink:0;">14:36:44</span><span style="background:#7f1d1d;color:#f87171;padding:0 4px;border-radius:2px;font-size:7px;font-weight:700;flex-shrink:0;">ERR!</span><span style="color:#f87171;font-size:9px;">[Base] reverted: Too little received | ghost=$0.11</span></div>
+          <div style="padding:2px 8px;display:flex;gap:5px;align-items:baseline;"><span style="color:#334155;flex-shrink:0;">14:36:38</span><span style="background:#452a04;color:#fbbf24;padding:0 4px;border-radius:2px;font-size:7px;font-weight:700;flex-shrink:0;">WARN</span><span style="color:#fbbf24;font-size:9px;">[Base] Aerodrome USDC/WETH stale (&gt;60s) — skip</span></div>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:16px;padding:4px 12px;background:#0a0f1a;border-top:1px solid #1e293b;font-size:9px;color:#334155;">
+      <span><span style="color:#34d399;">TRDE</span> confirmed on-chain</span>
+      <span><span style="color:#a78bfa;">OPP!</span> detected</span>
+      <span><span style="color:#fbbf24;">WARN</span> stale pool</span>
+      <span><span style="color:#f87171;">ERR!</span> tx reverted</span>
+      <span style="flex:1;text-align:right;color:#1e293b;">WS push · REST /stats 3s poll · SQLite PnL history</span>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
+     13. DECISIONS & NUMBERS
+══════════════════════════════════════════════════════════ -->
+<div class="slide" id="s13">
+  <div class="tag">Results</div>
+  <h2>Key Decisions & Numbers</h2>
+  <div class="cols cols2" style="max-width:1060px;">
+    <div>
+      <div class="card" style="margin-bottom:14px;">
+        <h3>Architectural Decisions</h3>
+        <ul style="font-size:12px;">
+          <li><strong>Event sourcing over polling</strong> — eliminates all I/O from the hot path. Tradeoff: staleness window, mitigated by freshness guards.</li>
+          <li><strong>Rust over Go/Python</strong> — compile-time concurrency safety caught real race conditions. Zero-cost abstractions mean no perf/safety tradeoff.</li>
+          <li><strong>Optimistic submission on FCFS chains</strong> — skip verification, accept higher revert rate, gain 80–160ms queue advantage.</li>
+          <li><strong>Pending mempool monitor</strong> — race to the same block as the price-moving trade, not the next one.</li>
+          <li><strong>Pre-flight eth_call simulation</strong> — dry-run every candidate against the node before spending gas. Catches stale-state reverts at near-zero cost.</li>
+          <li><strong>Two-phase V3 verification</strong> — local spot for speed; QuoterV2 gated fallback for accuracy when tick-cap is detected.</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="cols cols3" style="margin-bottom:14px; max-width:100%;">
+        <div class="card stat-box">
+          <div class="stat-num green">86</div>
+          <div class="stat-lbl">Tests passing (Foundry)</div>
+        </div>
+        <div class="card stat-box">
+          <div class="stat-num accent2">0</div>
+          <div class="stat-lbl">Network calls during scan</div>
+        </div>
+        <div class="card stat-box">
+          <div class="stat-num accent">5</div>
+          <div class="stat-lbl">Protocol dispatch types</div>
+        </div>
+        <div class="card stat-box">
+          <div class="stat-num yellow">-72%</div>
+          <div class="stat-lbl">Detection latency</div>
+        </div>
+        <div class="card stat-box">
+          <div class="stat-num green">2</div>
+          <div class="stat-lbl">Live chains</div>
+        </div>
+        <div class="card stat-box">
+          <div class="stat-num accent">~150</div>
+          <div class="stat-lbl">Lines dead code removed</div>
+        </div>
+      </div>
+      <div class="card accent-border">
+        <h3>Lessons Learned</h3>
+        <ul style="font-size:12px;">
+          <li>In binary protocols, event identity is the full ABI signature hash — names are cosmetic</li>
+          <li>Local math breaks at model boundaries (V3 tick caps); two-phase verification is the pattern</li>
+          <li>On priority-fee chains, the mempool is the competitive layer, not the block</li>
+          <li>The most impactful optimization was removing I/O, not shaving CPU cycles</li>
+          <li>Dead code that <em>looks</em> active (it allocates, it awaits) is harder to find than truly dead code</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /slides -->
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  let cur = 0;
+  const total = slides.length;
+
+  function show(n) {
+    slides[cur].classList.remove('active');
+    cur = (n + total) % total;
+    slides[cur].classList.add('active');
+    document.getElementById('counter').textContent = `Slide ${cur + 1} / ${total}`;
+  }
+
+  function go(dir) { show(cur + dir); }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') { e.preventDefault(); go(1); }
+    if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')                    { e.preventDefault(); go(-1); }
+    if (e.key === 'Home') show(0);
+    if (e.key === 'End')  show(total - 1);
+  });
+</script>
+</body>
+</html>

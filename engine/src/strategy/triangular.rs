@@ -1,10 +1,12 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use tracing::{debug, info, warn};
+use std::collections::HashSet;
+use tracing::{debug, warn};
 
 use crate::config::RouterType;
-use crate::pool_cache::{VOLATILE_MAX_AGE, STABLE_MAX_AGE};
+use crate::pool_cache::{PoolCache, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{PairScanInfo, TriangularOpportunity};
+use crate::util::addr_key;
 use super::{Strategy, token_amount_to_usd, parse_amount_capped, MIN_V3_LIQUIDITY};
 
 impl Strategy {
@@ -39,8 +41,10 @@ impl Strategy {
         let mut token_amounts: HashMap<String, U256> = HashMap::with_capacity(chain_pair_count);
 
         for p in self.pairs.iter().filter(|p| p.chain_id == self.chain_id) {
-            let key_in  = p.token_in.to_lowercase();
-            let key_out = p.token_out.to_lowercase();
+            let Ok(addr_in) = p.token_in.parse::<Address>() else { continue };
+            let Ok(addr_out) = p.token_out.parse::<Address>() else { continue };
+            let key_in = addr_key(addr_in);
+            let key_out = addr_key(addr_out);
             token_info.entry(key_in.clone())
                 .or_insert_with(|| (p.token_in_symbol.clone(), p.token_in_decimals));
             token_info.entry(key_out.clone())
@@ -52,20 +56,15 @@ impl Strategy {
             }
         }
 
-        // Parse unique token addresses
-        let tokens: Vec<(Address, String)> = token_info.keys()
-            .filter_map(|k| k.parse::<Address>().ok().map(|a| (a, k.clone())))
+        let tokens: Vec<(Address, String)> = token_info.iter()
+            .filter_map(|(k, _)| k.parse::<Address>().ok().map(|a| (a, k.clone())))
             .collect();
 
         if tokens.len() < 3 {
             return (vec![], 0.0);
         }
 
-        let chain_routers: Vec<&crate::config::RouterConfig> = self.routers.iter()
-            .filter(|r| r.chain_id == self.chain_id)
-            .collect();
-
-        if chain_routers.is_empty() {
+        if self.chain_router_indices.is_empty() {
             return (vec![], 0.0);
         }
 
@@ -79,6 +78,9 @@ impl Strategy {
             triplet_id: String,
         }
 
+        let filter_set: Option<HashSet<Address>> = token_filter
+            .map(|f| f.iter().copied().collect());
+
         let max_tokens = 25usize;
         let mut triplets: Vec<Triplet> = Vec::new();
 
@@ -90,11 +92,15 @@ impl Strategy {
                 if token_b == token_a { continue; }
                 let Some((sym_b, _)) = token_info.get(key_b) else { continue };
 
-                for &(token_c, ref key_c) in &tokens {
+                for &(token_c, ref _key_c) in &tokens {
                     if token_c == token_a || token_c == token_b { continue; }
-                    let Some((sym_c, _)) = token_info.get(key_c) else { continue };
+                    if let Some(ref fs) = filter_set {
+                        if !fs.contains(&token_a) && !fs.contains(&token_b) && !fs.contains(&token_c) {
+                            continue;
+                        }
+                    }
+                    let Some((sym_c, _)) = token_info.get(&addr_key(token_c)) else { continue };
 
-                    let _ = sym_c; // used only for triplet_id
                     triplets.push(Triplet {
                         token_a, key_a: key_a.clone(),
                         token_b, token_c,
@@ -103,13 +109,6 @@ impl Strategy {
                     });
                 }
             }
-        }
-
-        // Targeted scan: keep only triplets that contain at least one of the target tokens.
-        if let Some(filter) = token_filter {
-            triplets.retain(|t| {
-                filter.iter().any(|f| *f == t.token_a || *f == t.token_b || *f == t.token_c)
-            });
         }
 
         // Compute disabled directed token pairs from config — used both to filter the scan
@@ -207,41 +206,61 @@ impl Strategy {
             effective_amount_in: U256,
         }
 
-        let mut p1_entries: Vec<P1Entry> = Vec::new();
+        let mut p1_entries: Vec<P1Entry> =
+            Vec::with_capacity(triplets.len().saturating_mul(self.chain_router_indices.len()));
         let mut tri_v3_spot: usize = 0;
+        let default_v3_tiers: &[u32] = &[500, 3000, 10000];
 
         for (ti, trip) in triplets.iter().enumerate() {
-            for router in &chain_routers {
+            let ka = addr_key(trip.token_a);
+            let kb = addr_key(trip.token_b);
+            for &ri in &self.chain_router_indices {
+                let router = &self.routers[ri];
                 let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
+                let tiers: &[u32] = if router.fee_tiers.is_empty() {
+                    default_v3_tiers
+                } else {
+                    &router.fee_tiers
+                };
                 let (fee, effective_amount_in, local_ab): (u32, U256, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
-                        // Iterate all fee tiers; pick the one yielding the highest output.
-                        // No capacity cap — xy=k price impact naturally penalizes thin pools,
-                        // and pre-flight simulation catches any phantom profits.
-                        let result = router.fee_tiers.iter().filter_map(|&f| {
-                            self.pool_cache.quote_v3_spot(&router.id, trip.token_a, trip.token_b, f, trip.amount_in)
-                                .and_then(|(out, liq)| if liq < MIN_V3_LIQUIDITY { None } else { Some((out, f)) })
-                        }).max_by_key(|(out, _)| *out);
+                        let result = best_v3_spot(
+                            &self.pool_cache,
+                            &router.id,
+                            trip.token_a,
+                            trip.token_b,
+                            &ka,
+                            &kb,
+                            trip.amount_in,
+                            tiers,
+                        );
                         match result {
                             Some((out, f)) => (f, trip.amount_in, Some(out)),
                             None => continue,
                         }
                     }
-                    RouterType::V2 => (0, trip.amount_in, self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_a, trip.token_b, trip.amount_in, None,
+                    RouterType::V2 => (0, trip.amount_in, {
+                        let key = format!("{}:{}:{}", router.id, ka, kb);
+                        self.pool_cache.get_amount_out_by_key_str(
+                            &key, trip.token_a, trip.amount_in, None,
+                        )
+                    }),
+                    RouterType::Solidly | RouterType::Aerodrome => (0, trip.amount_in, solidly_out(
+                        &self.pool_cache,
+                        &self.solidly_pool_keys,
+                        &router.id,
+                        trip.token_a,
+                        trip.token_b,
+                        &ka,
+                        &kb,
+                        trip.amount_in,
                     )),
-                    RouterType::Solidly | RouterType::Aerodrome => {
-                        let vol = format!("{}::volatile", router.id);
-                        let sta = format!("{}::stable", router.id);
-                        (0, trip.amount_in, self.pool_cache.get_amount_out_by_key(
-                            &vol, trip.token_a, trip.token_b, trip.amount_in, Some(VOLATILE_MAX_AGE),
-                        ).or_else(|| self.pool_cache.get_amount_out_by_key(
-                            &sta, trip.token_a, trip.token_b, trip.amount_in, Some(STABLE_MAX_AGE),
-                        )))
-                    }
-                    RouterType::SyncSwap => (0, trip.amount_in, self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_a, trip.token_b, trip.amount_in, Some(VOLATILE_MAX_AGE),
-                    )),
+                    RouterType::SyncSwap => (0, trip.amount_in, {
+                        let key = format!("{}:{}:{}", router.id, ka, kb);
+                        self.pool_cache.get_amount_out_by_key_str(
+                            &key, trip.token_a, trip.amount_in, Some(VOLATILE_MAX_AGE),
+                        )
+                    }),
                 };
                 if local_ab.is_none() { continue; }
                 if router.router_type == RouterType::V3 { tri_v3_spot += 1; }
@@ -270,7 +289,8 @@ impl Strategy {
             effective_amount_in: U256,
         }
 
-        let mut p2_entries: Vec<P2Entry> = Vec::new();
+        let mut p2_entries: Vec<P2Entry> =
+            Vec::with_capacity(p1_entries.len().saturating_mul(self.chain_router_indices.len()));
 
         for p1e in p1_entries.iter() {
             let amount_b: U256 = match p1e.local_result.filter(|b| !b.is_zero()) {
@@ -278,35 +298,56 @@ impl Strategy {
                 None => continue,
             };
             let trip = &triplets[p1e.triplet_idx];
+            let kb = addr_key(trip.token_b);
+            let kc = addr_key(trip.token_c);
 
-            for router in &chain_routers {
+            for &ri in &self.chain_router_indices {
+                let router = &self.routers[ri];
                 let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
+                let tiers: &[u32] = if router.fee_tiers.is_empty() {
+                    default_v3_tiers
+                } else {
+                    &router.fee_tiers
+                };
                 let (fee, local_bc): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
-                        let result = router.fee_tiers.iter().filter_map(|&f| {
-                            self.pool_cache.quote_v3_spot(&router.id, trip.token_b, trip.token_c, f, amount_b)
-                                .and_then(|(out, liq)| if liq < MIN_V3_LIQUIDITY { None } else { Some((out, f)) })
-                        }).max_by_key(|(out, _)| *out);
+                        let result = best_v3_spot(
+                            &self.pool_cache,
+                            &router.id,
+                            trip.token_b,
+                            trip.token_c,
+                            &kb,
+                            &kc,
+                            amount_b,
+                            tiers,
+                        );
                         match result {
                             Some((out, f)) => (f, Some(out)),
                             None => continue,
                         }
                     }
-                    RouterType::V2 => (0, self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_b, trip.token_c, amount_b, None,
+                    RouterType::V2 => (0, {
+                        let key = format!("{}:{}:{}", router.id, kb, kc);
+                        self.pool_cache.get_amount_out_by_key_str(
+                            &key, trip.token_b, amount_b, None,
+                        )
+                    }),
+                    RouterType::Solidly | RouterType::Aerodrome => (0, solidly_out(
+                        &self.pool_cache,
+                        &self.solidly_pool_keys,
+                        &router.id,
+                        trip.token_b,
+                        trip.token_c,
+                        &kb,
+                        &kc,
+                        amount_b,
                     )),
-                    RouterType::Solidly | RouterType::Aerodrome => {
-                        let vol = format!("{}::volatile", router.id);
-                        let sta = format!("{}::stable", router.id);
-                        (0, self.pool_cache.get_amount_out_by_key(
-                            &vol, trip.token_b, trip.token_c, amount_b, Some(VOLATILE_MAX_AGE),
-                        ).or_else(|| self.pool_cache.get_amount_out_by_key(
-                            &sta, trip.token_b, trip.token_c, amount_b, Some(STABLE_MAX_AGE),
-                        )))
-                    }
-                    RouterType::SyncSwap => (0, self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_b, trip.token_c, amount_b, Some(VOLATILE_MAX_AGE),
-                    )),
+                    RouterType::SyncSwap => (0, {
+                        let key = format!("{}:{}:{}", router.id, kb, kc);
+                        self.pool_cache.get_amount_out_by_key_str(
+                            &key, trip.token_b, amount_b, Some(VOLATILE_MAX_AGE),
+                        )
+                    }),
                 };
                 if local_bc.is_none() { continue; }
                 if router.router_type == RouterType::V3 { tri_v3_spot += 1; }
@@ -341,7 +382,8 @@ impl Strategy {
             effective_amount_in: U256,
         }
 
-        let mut p3_entries: Vec<P3Entry> = Vec::new();
+        let mut p3_entries: Vec<P3Entry> =
+            Vec::with_capacity(p2_entries.len().saturating_mul(self.chain_router_indices.len()));
 
         for p2e in p2_entries.iter() {
             let amount_c: U256 = match p2e.local_result.filter(|c| !c.is_zero()) {
@@ -349,35 +391,56 @@ impl Strategy {
                 None => continue,
             };
             let trip = &triplets[p2e.triplet_idx];
+            let kc = addr_key(trip.token_c);
+            let ka = addr_key(trip.token_a);
 
-            for router in &chain_routers {
+            for &ri in &self.chain_router_indices {
+                let router = &self.routers[ri];
                 let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
+                let tiers: &[u32] = if router.fee_tiers.is_empty() {
+                    default_v3_tiers
+                } else {
+                    &router.fee_tiers
+                };
                 let (fee, local_ca): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
-                        let result = router.fee_tiers.iter().filter_map(|&f| {
-                            self.pool_cache.quote_v3_spot(&router.id, trip.token_c, trip.token_a, f, amount_c)
-                                .and_then(|(out, liq)| if liq < MIN_V3_LIQUIDITY { None } else { Some((out, f)) })
-                        }).max_by_key(|(out, _)| *out);
+                        let result = best_v3_spot(
+                            &self.pool_cache,
+                            &router.id,
+                            trip.token_c,
+                            trip.token_a,
+                            &kc,
+                            &ka,
+                            amount_c,
+                            tiers,
+                        );
                         match result {
                             Some((out, f)) => (f, Some(out)),
                             None => continue,
                         }
                     }
-                    RouterType::V2 => (0, self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_c, trip.token_a, amount_c, None,
+                    RouterType::V2 => (0, {
+                        let key = format!("{}:{}:{}", router.id, kc, ka);
+                        self.pool_cache.get_amount_out_by_key_str(
+                            &key, trip.token_c, amount_c, None,
+                        )
+                    }),
+                    RouterType::Solidly | RouterType::Aerodrome => (0, solidly_out(
+                        &self.pool_cache,
+                        &self.solidly_pool_keys,
+                        &router.id,
+                        trip.token_c,
+                        trip.token_a,
+                        &kc,
+                        &ka,
+                        amount_c,
                     )),
-                    RouterType::Solidly | RouterType::Aerodrome => {
-                        let vol = format!("{}::volatile", router.id);
-                        let sta = format!("{}::stable", router.id);
-                        (0, self.pool_cache.get_amount_out_by_key(
-                            &vol, trip.token_c, trip.token_a, amount_c, Some(VOLATILE_MAX_AGE),
-                        ).or_else(|| self.pool_cache.get_amount_out_by_key(
-                            &sta, trip.token_c, trip.token_a, amount_c, Some(STABLE_MAX_AGE),
-                        )))
-                    }
-                    RouterType::SyncSwap => (0, self.pool_cache.get_amount_out_by_key(
-                        &router.id, trip.token_c, trip.token_a, amount_c, Some(VOLATILE_MAX_AGE),
-                    )),
+                    RouterType::SyncSwap => (0, {
+                        let key = format!("{}:{}:{}", router.id, kc, ka);
+                        self.pool_cache.get_amount_out_by_key_str(
+                            &key, trip.token_c, amount_c, Some(VOLATILE_MAX_AGE),
+                        )
+                    }),
                 };
                 if local_ca.is_none() { continue; }
                 if router.router_type == RouterType::V3 { tri_v3_spot += 1; }
@@ -578,4 +641,56 @@ impl Strategy {
 
         (opportunities, best_raw_usd)
     }
+}
+
+fn best_v3_spot(
+    cache: &PoolCache,
+    router_id: &str,
+    token_in: Address,
+    token_out: Address,
+    key_in: &str,
+    key_out: &str,
+    amount_in: U256,
+    fee_tiers: &[u32],
+) -> Option<(U256, u32)> {
+    fee_tiers
+        .iter()
+        .filter_map(|&f| {
+            let key = format!("{}:{}:{}:{}", router_id, key_in, key_out, f);
+            cache
+                .quote_v3_spot_str(&key, token_in, amount_in)
+                .and_then(|(out, liq, _)| {
+                    if liq < MIN_V3_LIQUIDITY {
+                        None
+                    } else {
+                        Some((out, f))
+                    }
+                })
+        })
+        .max_by_key(|(out, _)| *out)
+}
+
+fn solidly_out(
+    cache: &PoolCache,
+    solidly_keys: &std::collections::HashMap<String, (String, String)>,
+    router_id: &str,
+    token_in: Address,
+    _token_out: Address,
+    key_in: &str,
+    key_out: &str,
+    amount_in: U256,
+) -> Option<U256> {
+    let (vol, sta) = solidly_keys.get(router_id)?;
+    let vol_key = format!("{}:{}:{}", vol, key_in, key_out);
+    cache
+        .get_amount_out_by_key_str(&vol_key, token_in, amount_in, Some(VOLATILE_MAX_AGE))
+        .or_else(|| {
+            let sta_key = format!("{}:{}:{}", sta, key_in, key_out);
+            cache.get_amount_out_by_key_str(
+                &sta_key,
+                token_in,
+                amount_in,
+                Some(STABLE_MAX_AGE),
+            )
+        })
 }

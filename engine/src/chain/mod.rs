@@ -43,6 +43,26 @@ pub(crate) const GAS_REJECT_COOLDOWN_SECS: u64 = 60;
 /// Gas-profitability rejects ("below threshold") do NOT count — they're pre-flight skips.
 pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 
+/// Non-blocking flush of WS logs queued before a scan. Uses `pool_cache` directly —
+/// avoids acquiring the strategy read lock on every block/swap scan.
+fn drain_pending_logs(
+    log_rx: &mut mpsc::Receiver<alloy::rpc::types::Log>,
+    pool_cache: &PoolCache,
+    solidly_sync_hash: alloy::primitives::B256,
+    large_swap_bps: u32,
+    large_v3_bps: u32,
+) {
+    while let Ok(log) = log_rx.try_recv() {
+        let _ = crate::listener::apply_log_to_cache(
+            &log,
+            pool_cache,
+            solidly_sync_hash,
+            large_swap_bps,
+            large_v3_bps,
+        );
+    }
+}
+
 // ─── Per-chain engine task ────────────────────────────────────────────────────
 
 pub async fn run_chain(
@@ -224,7 +244,14 @@ pub async fn run_chain(
     let swap_tx_for_sub = swap_tx.clone();
     {
         let provider_clone = (*provider).clone();
-        listener.subscribe(provider_clone, swap_tx, pool_cache.clone(), log_tx.clone()).await?;
+        listener.subscribe(
+            provider_clone,
+            swap_tx,
+            pool_cache.clone(),
+            log_tx.clone(),
+            cfg.poll_logs_fallback,
+            cfg.block_time_ms,
+        ).await?;
     }
 
     // ── Block-header subscription (drives immediate scanning on each new block) ──
@@ -264,8 +291,7 @@ pub async fn run_chain(
     let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
     let (log_tx_sub, mut log_rx) = mpsc::channel::<alloy::rpc::types::Log>(1024);
     {
-        let mut log_addrs = pool_cache.pool_addresses();
-        log_addrs.extend(pool_cache.v3_pool_addresses());
+        let log_addrs = pool_cache.watch_addresses();
         let log_filter = alloy::rpc::types::Filter::new()
             .address(log_addrs)
             .event_signature(vec![
@@ -280,6 +306,8 @@ pub async fn run_chain(
         let cache_for_sub = pool_cache.clone();
         let chain_id_sub = cfg.id;
         let cname = cfg.name.clone();
+        let large_swap_bps_sub = cfg.large_swap_threshold_bps;
+        let large_v3_bps_sub = cfg.large_v3_threshold_bps;
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
@@ -289,18 +317,20 @@ pub async fn run_chain(
                         let mut stream = sub.into_stream();
                         while let Some(log) = stream.next().await {
                             // Apply to cache immediately so pool state is fresh
-                            let applied = crate::listener::apply_log_to_cache(
-                                &log, &cache_for_sub, solidly_sync_hash_sub,
-                            );
-                            // Trigger a targeted scan immediately — no waiting for the 2s poll cycle
-                            if applied {
+                            if let Some(magnitude) = crate::listener::apply_log_to_cache(
+                                &log,
+                                &cache_for_sub,
+                                solidly_sync_hash_sub,
+                                large_swap_bps_sub,
+                                large_v3_bps_sub,
+                            ) {
                                 let pool = log.address();
                                 let block_number = log.block_number.unwrap_or(0);
                                 let _ = swap_tx_sub.try_send(crate::listener::SwapEvent {
                                     chain_id: chain_id_sub,
                                     pool,
                                     block_number,
-                                    magnitude: crate::listener::SwapMagnitude::Normal,
+                                    magnitude,
                                 });
                             }
                             // Forward raw log to log_rx for pre-scan drain (idempotent safety net)
@@ -505,10 +535,8 @@ pub async fn run_chain(
                 let active_pairs = last_active_count.load(Ordering::Relaxed);
                 let total_pairs = chain_pairs.len() as u64;
                 let opp_count = last_opp_count.load(Ordering::Relaxed);
-                let (v3_fresh, v3_total) = {
-                    let strat = strategy.read().await;
-                    strat.pool_cache.count_fresh_v3_pools(Duration::from_secs(30))
-                };
+                let (v3_fresh, v3_total) =
+                    pool_cache.count_fresh_v3_pools(Duration::from_secs(30));
                 let heartbeat_msg = format!(
                     "[{}] ♥ scans={} execs={} ok={} | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}",
                     cfg.name, scans, attempts, success, best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, v3_fresh, v3_total,
@@ -597,6 +625,7 @@ pub async fn run_chain(
                         strat.pairs = new_pairs;
                         strat.routers = new_routers;
                         strat.rebuild_token_pair_index();
+                        strat.rebuild_router_maps();
 
                         if structure_changed {
                             info!("[{}] Config structure changed — refreshing SyncSwap cache", cfg.name);
@@ -606,6 +635,7 @@ pub async fn run_chain(
                         if strat.min_profit_usd != new_min_profit || strat.min_triangular_profit_usd != new_min_tri_profit {
                             strat.min_profit_usd = new_min_profit;
                             strat.min_triangular_profit_usd = new_min_tri_profit;
+                            strat.rebuild_scan_cache();
                             info!(
                                 "[{}] Config hot-reloaded (min_profit=${:.2}, min_triangular_profit=${:.2})",
                                 cfg.name, new_min_profit, new_min_tri_profit
@@ -647,17 +677,13 @@ pub async fn run_chain(
                 };
                 if global_paused || chain_paused { continue; }
 
-                // ── Drain pending log events before scanning ──────────────────
-                // Logs from the just-mined block arrive on the WS subscription
-                // before newHeads — flush any queued updates so the scanner sees
-                // fresh pool state. try_recv() is non-blocking.
-                {
-                    let pc = strategy.read().await.pool_cache.clone();
-                    while let Ok(log) = log_rx.try_recv() {
-                        crate::listener::apply_log_to_cache(&log, &pc, solidly_sync_hash_sub);
-                    }
-                }
-                // ─────────────────────────────────────────────────────────────
+                drain_pending_logs(
+                    &mut log_rx,
+                    &pool_cache,
+                    solidly_sync_hash_sub,
+                    cfg.large_swap_threshold_bps,
+                    cfg.large_v3_threshold_bps,
+                );
 
                 scan::evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
@@ -686,6 +712,14 @@ pub async fn run_chain(
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
                 if global_paused || chain_paused { continue; }
+
+                drain_pending_logs(
+                    &mut log_rx,
+                    &pool_cache,
+                    solidly_sync_hash_sub,
+                    cfg.large_swap_threshold_bps,
+                    cfg.large_v3_threshold_bps,
+                );
 
                 scan::evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
@@ -717,28 +751,28 @@ pub async fn run_chain(
                 }
                 pool_last_scan.insert(event.pool, Instant::now());
 
-                // Identify which tokens moved in this pool (V2/Solidly/SyncSwap + V3)
-                let tokens = {
-                    let strat = strategy.read().await;
-                    strat.pool_cache.get_pool_tokens(event.pool)
-                };
-                let (tok_a, tok_b) = match tokens {
-                    Some(t) => t,
-                    None => continue, // Pool not in cache — block scan covers it
-                };
-
-                // Find which configured pairs involve these tokens.
-                // For large swaps, also collect pair IDs so we can clear stale cooldowns —
-                // a whale trade changes pool state, making previous rejections invalid.
+                // Single strategy read: pool tokens + affected pair indices.
                 let (pair_mask, token_filter, affected_pair_ids) = {
                     let strat = strategy.read().await;
+                    let (tok_a, tok_b) = match strat.pool_cache.get_pool_tokens(event.pool) {
+                        Some(t) => t,
+                        None => continue,
+                    };
                     let indices = strat.pairs_for_tokens(tok_a, tok_b);
+                    if indices.is_empty() {
+                        continue;
+                    }
                     let ids: Vec<String> = if is_large {
                         indices.iter().map(|&i| strat.pairs[i].id.clone()).collect()
-                    } else { vec![] };
-                    (indices.into_iter().collect::<HashSet<usize>>(), vec![tok_a, tok_b], ids)
+                    } else {
+                        vec![]
+                    };
+                    (
+                        indices.into_iter().collect::<HashSet<usize>>(),
+                        vec![tok_a, tok_b],
+                        ids,
+                    )
                 };
-                if pair_mask.is_empty() { continue; }
 
                 // Clear cooldowns for affected pairs. Fingerprints contain pair_id as a prefix
                 // so a simple contains() check works without any allocations per entry.
@@ -755,6 +789,14 @@ pub async fn run_chain(
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
                 if global_paused || chain_paused { continue; }
+
+                drain_pending_logs(
+                    &mut log_rx,
+                    &pool_cache,
+                    solidly_sync_hash_sub,
+                    cfg.large_swap_threshold_bps,
+                    cfg.large_v3_threshold_bps,
+                );
 
                 if is_large {
                     let msg = format!(

@@ -63,6 +63,17 @@ pub fn parse_swap_calldata(
     }
     let sel: [u8; 4] = data[..4].try_into().ok()?;
 
+    // Fast reject: skip parsing for unknown selectors (vast majority of pending txs).
+    if !matches!(
+        sel,
+        SEL_V3_EXACT_INPUT_SINGLE
+            | SEL_V2_SWAP_EXACT_TOKENS
+            | SEL_V2_SWAP_EXACT_ETH
+            | SEL_UNIVERSAL_ROUTER
+    ) {
+        return None;
+    }
+
     match sel {
         // ── V3 exactInputSingle ───────────────────────────────────────────────
         // struct ExactInputSingleParams {
@@ -415,7 +426,7 @@ pub fn spawn_pending_monitor(
                         ) {
                             matched_events += 1;
                             events_received += 1;
-                            info!(
+                            debug!(
                                 "[{}] Pending swap (full): {:?}→{:?} amount={} tip={}wei (seen={} matched={})",
                                 chain_name, event.token_in, event.token_out,
                                 event.amount_in, tip_wei, stream_events, matched_events
@@ -512,7 +523,7 @@ pub fn spawn_pending_monitor(
                                 ) {
                                     matched_events += 1;
                                     events_received += 1;
-                                    info!(
+                                    debug!(
                                         "[{}] Pending swap (hash): {:?}→{:?} amount={} tip={}wei (seen={} matched={})",
                                         chain_name, event.token_in, event.token_out,
                                         event.amount_in, tip_wei, stream_events, matched_events

@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn, debug};
@@ -163,6 +164,8 @@ pub struct Executor {
     /// EIP-1559 maxPriorityFeePerGas (tip) in Wei. Set from chain config.
     /// Higher values land earlier in the block on sequencer chains that order by gas price.
     priority_fee_wei: u128,
+    /// Cached unix second + deadline (now + 120s) — avoids syscall per prepare.
+    deadline_cache: StdMutex<(u64, U256)>,
 }
 
 impl Executor {
@@ -203,6 +206,7 @@ impl Executor {
             wallet,
             submission_rpcs,
             priority_fee_wei,
+            deadline_cache: StdMutex::new((0, U256::ZERO)),
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .pool_max_idle_per_host(4)
@@ -226,18 +230,23 @@ impl Executor {
         self.gas_price_cache = Some((base_fee_wei, Instant::now()));
     }
 
+    /// Hot-path read — block headers pre-populate this via `update_gas_price`.
+    fn cached_gas_price(&self) -> Option<u128> {
+        let (cached_price, cached_at) = self.gas_price_cache?;
+        if cached_at.elapsed() < self.gas_price_cache_ttl {
+            Some(cached_price)
+        } else {
+            None
+        }
+    }
+
     async fn get_gas_price<P: Provider>(&mut self, provider: &P) -> u128 {
-        // Check cache
-        if let Some((cached_price, cached_at)) = self.gas_price_cache {
-            if cached_at.elapsed() < self.gas_price_cache_ttl {
-                debug!(
-                    "[{}] Gas price from cache: {} wei (age: {:?})",
-                    self.chain_name,
-                    cached_price,
-                    cached_at.elapsed()
-                );
-                return cached_price;
-            }
+        if let Some(p) = self.cached_gas_price() {
+            debug!(
+                "[{}] Gas price from cache: {} wei",
+                self.chain_name, p,
+            );
+            return p;
         }
 
         // Cache miss or expired — fetch from chain
@@ -248,6 +257,13 @@ impl Executor {
             self.chain_name, gas_price, self.gas_price_cache_ttl
         );
         gas_price
+    }
+
+    async fn gas_price_for_prepare<P: Provider>(&mut self, provider: &P) -> u128 {
+        if let Some(p) = self.cached_gas_price() {
+            return p;
+        }
+        self.get_gas_price(provider).await
     }
 
     // ── Split-lock execution helpers ───────────────────────────────────────────
@@ -271,7 +287,7 @@ impl Executor {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
-        let gas_price = self.get_gas_price(provider).await;
+        let gas_price = self.gas_price_for_prepare(provider).await;
         // priority_fee (tip): use override from pending TX monitor when provided,
         // otherwise use chain config value.
         let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
@@ -349,7 +365,7 @@ impl Executor {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
-        let gas_price = self.get_gas_price(provider).await;
+        let gas_price = self.gas_price_for_prepare(provider).await;
         let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
@@ -870,7 +886,15 @@ impl Executor {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        U256::from(now + 120) // 2 min default
+        if let Ok(mut cache) = self.deadline_cache.lock() {
+            if cache.0 == now {
+                return cache.1;
+            }
+            let d = U256::from(now + 120);
+            *cache = (now, d);
+            return d;
+        }
+        U256::from(now + 120)
     }
 
     /// Convert gas cost from USD to token-in units using the same exchange rate

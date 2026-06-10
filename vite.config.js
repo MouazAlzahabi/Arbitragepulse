@@ -12,6 +12,8 @@ export default defineConfig({
     proxy: {
       "/ws": { target: engineTarget, ws: true, changeOrigin: true },
       "/stats": { target: engineTarget, changeOrigin: true },
+      "/stats/pairs": { target: engineTarget, changeOrigin: true },
+      "/stats/reset": { target: engineTarget, changeOrigin: true },
       "/trades": { target: engineTarget, changeOrigin: true },
       "/engine": { target: engineTarget, changeOrigin: true },
       "/tokens": { target: engineTarget, changeOrigin: true },

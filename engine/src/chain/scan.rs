@@ -53,20 +53,25 @@ fn broadcast_confirmed_trade(
     tx_hash: &str,
     display_id: &str,
     profit_usd: f64,
+    scan_to_submit_ms: u64,
+    submit_to_confirm_ms: u64,
 ) {
     broadcast_log(
         log_tx,
         "trade",
         &format!(
-            "[{}] Confirmed tx={} | pair={} | profit=${:.4}",
-            chain_name, tx_hash, display_id, profit_usd
+            "[{}] Confirmed tx={} | pair={} | profit=${:.4} | scan→submit={}ms | submit→confirm={}ms",
+            chain_name, tx_hash, display_id, profit_usd, scan_to_submit_ms, submit_to_confirm_ms
         ),
         Some(serde_json::json!({
-            "chain":      chain_name,
-            "pair_id":    display_id,
-            "profit_usd": profit_usd,
-            "tx_hash":    tx_hash,
-            "confirmed":  true,
+            "chain":                 chain_name,
+            "pair_id":               display_id,
+            "profit_usd":            profit_usd,
+            "tx_hash":               tx_hash,
+            "confirmed":             true,
+            "scan_to_submit_ms":     scan_to_submit_ms,
+            "submit_to_confirm_ms":  submit_to_confirm_ms,
+            "pipeline_ms":           scan_to_submit_ms,
         })),
     );
 }
@@ -102,37 +107,48 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Scan source: block | poll | swap | pending — execution telemetry (see chain/mod.rs call sites).
     trigger: &'static str,
 ) {
-    // Clone ghost_profit_bits from executor once — passed to handle_execution_failure
-    // at each callsite so gas-rejected opportunities accumulate into the metric.
-    let ghost_profit_bits = executor.lock().await.ghost_profit_usd_bits.clone();
+    // Single timestamp for scan→submit latency (one Instant per scan, zero hot-path overhead).
+    let scan_start = Instant::now();
 
     let all_opportunities = {
         let strat = strategy.read().await;
 
         // Merge targeted mask with disabled-pairs exclusion mask.
-        let final_mask: Option<HashSet<usize>> = {
-            let disabled_mask: Option<HashSet<usize>> = if disabled_set.is_empty() {
-                None
-            } else {
-                let enabled: HashSet<usize> = strat.pairs.iter().enumerate()
-                    .filter(|(_, p)| p.chain_id == cfg.id && !disabled_set.contains(&p.id))
-                    .map(|(i, _)| i)
-                    .collect();
-                Some(enabled)
-            };
-            match (targeted.as_ref().map(|(m, _)| m), disabled_mask) {
-                (None, None) => None,
-                (Some(t), None) => Some(t.clone()),
-                (None, Some(d)) => Some(d),
-                (Some(t), Some(d)) => Some(t.intersection(&d).copied().collect()),
+        // Targeted scans filter only the small mask (1–3 pairs) instead of scanning all pairs.
+        let final_mask: Option<HashSet<usize>> = if disabled_set.is_empty() {
+            targeted.as_ref().map(|(m, _)| m.clone())
+        } else {
+            match targeted.as_ref().map(|(m, _)| m) {
+                None => Some(
+                    strat
+                        .pairs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p.chain_id == cfg.id && !disabled_set.contains(&p.id))
+                        .map(|(i, _)| i)
+                        .collect(),
+                ),
+                Some(t) => Some(
+                    t.iter()
+                        .copied()
+                        .filter(|&i| !disabled_set.contains(&strat.pairs[i].id))
+                        .collect(),
+                ),
             }
         };
 
         let is_full_scan = targeted.is_none();
-        let ((opps_2hop, best_2hop, verified_spread_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) = tokio::join!(
-            strat.evaluate(provider.as_ref(), final_mask.as_ref(), is_full_scan),
-            strat.detect_triangular(provider.as_ref(), 5, targeted.as_ref().map(|(_, t)| t.as_slice()), &*disabled_set),
-        );
+        // Swap-event scans target 1–2 pairs; skip triangular (O(triplets)) to cut CPU/latency.
+        let ((opps_2hop, best_2hop, verified_spread_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) =
+            if is_full_scan {
+                tokio::join!(
+                    strat.evaluate(provider.as_ref(), final_mask.as_ref(), true),
+                    strat.detect_triangular(provider.as_ref(), 5, None, &*disabled_set),
+                )
+            } else {
+                let eval = strat.evaluate(provider.as_ref(), final_mask.as_ref(), false).await;
+                (eval, (Vec::new(), 0.0))
+            };
 
         // Update quote diagnostic counters only on full scans.
         // Targeted swap-event scans evaluate 1-2 pairs → would make heartbeat show
@@ -202,6 +218,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     }
 
     metrics.opportunities.with_label_values(&[&cfg.name]).inc();
+
+    // Only lock executor when we have candidates — avoids mutex on empty scans.
+    let ghost_profit_bits = executor.lock().await.ghost_profit_usd_bits.clone();
 
     // Read once before the loop — dry_run doesn't change mid-scan.
     let dry_run = shared_state.read().await.dry_run;
@@ -358,14 +377,14 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 exec.dry_run = true;
                 match exec.execute(provider.as_ref(), &optimized).await {
                     Ok(tx_hash) => {
-                        let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                        let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         handle_execution_success(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                            shared_state, log_tx, metrics, exec_time_ms,
+                            shared_state, log_tx, metrics, scan_to_submit_ms,
                             COOLDOWN_SECS,
                         ).await;
                         break 'candidates;
@@ -490,11 +509,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
-                                let pipeline_ms = exec_start.elapsed().as_millis() as u64;
+                                let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
+                                let submit_at = Instant::now();
+                                let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 info!(
-                                    "[{}] exec_send | route=2hop | pipeline_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
-                                    cfg.name, pipeline_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=2hop | scan_to_submit_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, exec_ms, elapsed_send, trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, optimized.pair_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
@@ -522,6 +543,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 let exec_start_bg = exec_start;
                                 let send_rpc_bg = elapsed_send;
+                                let scan_to_submit_bg = scan_to_submit_ms;
+                                let submit_at_bg = submit_at;
                                 let log_tx_bg = log_tx.clone();
                                 let metrics_bg = metrics.clone();
                                 tokio::spawn(async move {
@@ -539,6 +562,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
+                                            let submit_to_confirm_ms = submit_at_bg.elapsed().as_millis() as u64;
                                             log_exec_confirm(
                                                 &chain_name_bg,
                                                 "2hop",
@@ -567,6 +591,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &tx_hash_bg,
                                                     &opp_id_bg,
                                                     profit_bg,
+                                                    scan_to_submit_bg,
+                                                    submit_to_confirm_ms,
                                                 );
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
@@ -617,11 +643,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     drop(provider_bg);
                                 });
 
-                                let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                                 handle_execution_success(
                                     &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                                    shared_state, log_tx, metrics, exec_time_ms,
+                                    shared_state, log_tx, metrics, scan_to_submit_ms,
                                     SEND_COOLDOWN_SECS,
                                 ).await;
                                 break 'candidates;
@@ -722,14 +747,14 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 exec.dry_run = true;
                 match exec.execute_triangular(provider.as_ref(), opp).await {
                     Ok(tx_hash) => {
-                        let exec_time_ms = exec_start.elapsed().as_millis() as u64;
+                        let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         handle_execution_success(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                            shared_state, log_tx, metrics, exec_time_ms,
+                            shared_state, log_tx, metrics, scan_to_submit_ms,
                             COOLDOWN_SECS,
                         ).await;
                         break 'candidates;
@@ -839,11 +864,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
-                                let pipeline_ms = exec_start.elapsed().as_millis() as u64;
+                                let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
+                                let submit_at = Instant::now();
+                                let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 info!(
-                                    "[{}] exec_send | route=triangular | pipeline_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
-                                    cfg.name, pipeline_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=triangular | scan_to_submit_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, exec_ms, elapsed_send, trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, opp.triplet_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
@@ -872,6 +899,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 let exec_start_bg = exec_start;
                                 let send_rpc_bg = elapsed_send;
+                                let scan_to_submit_bg = scan_to_submit_ms;
+                                let submit_at_bg = submit_at;
                                 let log_tx_bg = log_tx.clone();
                                 let metrics_bg = metrics.clone();
                                 tokio::spawn(async move {
@@ -889,6 +918,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
+                                            let submit_to_confirm_ms = submit_at_bg.elapsed().as_millis() as u64;
                                             log_exec_confirm(
                                                 &chain_name_bg,
                                                 "triangular",
@@ -917,6 +947,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &tx_hash_bg,
                                                     &opp_id_bg,
                                                     profit_bg,
+                                                    scan_to_submit_bg,
+                                                    submit_to_confirm_ms,
                                                 );
                                                 if let Some(bals) = contract_balances_bg {
                                                     let token_addrs: Vec<Address> = { let b = bals.read().await; b.keys().copied().collect() };
@@ -966,11 +998,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     drop(provider_bg);
                                 });
 
-                                let exec_time_ms = exec_start.elapsed().as_millis() as u64;
                                 handle_execution_success(
                                     &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                                    shared_state, log_tx, metrics, exec_time_ms,
+                                    shared_state, log_tx, metrics, scan_to_submit_ms,
                                     SEND_COOLDOWN_SECS,
                                 ).await;
                                 break 'candidates;
@@ -1031,7 +1062,7 @@ pub(crate) async fn handle_execution_success(
     shared_state: &SharedState,
     log_tx: &LogBroadcaster,
     metrics: &Arc<Metrics>,
-    _execution_time_ms: u64,
+    scan_to_submit_ms: u64,
     cooldown_secs: u64,
 ) {
     *consecutive_failures = 0;
@@ -1053,15 +1084,17 @@ pub(crate) async fn handle_execution_success(
             log_tx,
             "trade",
             &format!(
-                "[{}] DRY-RUN ok | simulated tx={} | pair={} | profit=${:.4}",
-                cfg.name, tx_hash, display_id, profit_usd,
+                "[{}] DRY-RUN ok | simulated tx={} | pair={} | profit=${:.4} | scan→submit={}ms",
+                cfg.name, tx_hash, display_id, profit_usd, scan_to_submit_ms,
             ),
             Some(serde_json::json!({
-                "chain":      cfg.name,
-                "pair_id":    display_id,
-                "profit_usd": profit_usd,
-                "tx_hash":    tx_hash,
-                "dry_run":    true,
+                "chain":              cfg.name,
+                "pair_id":            display_id,
+                "profit_usd":         profit_usd,
+                "tx_hash":            tx_hash,
+                "dry_run":            true,
+                "scan_to_submit_ms":  scan_to_submit_ms,
+                "pipeline_ms":        scan_to_submit_ms,
             })),
         );
     } else {
@@ -1069,8 +1102,8 @@ pub(crate) async fn handle_execution_success(
             log_tx,
             "info",
             &format!(
-                "[{}] Submitted (pending) tx={} | pair={} | profit=${:.4} → cd={}s — awaiting receipt",
-                cfg.name, tx_hash, display_id, profit_usd, cooldown_secs,
+                "[{}] Submitted (pending) tx={} | pair={} | profit=${:.4} | scan→submit={}ms → cd={}s — awaiting receipt",
+                cfg.name, tx_hash, display_id, profit_usd, scan_to_submit_ms, cooldown_secs,
             ),
             Some(serde_json::json!({
                 "chain":                  cfg.name,
@@ -1078,6 +1111,8 @@ pub(crate) async fn handle_execution_success(
                 "profit_usd":             profit_usd,
                 "tx_hash":                tx_hash,
                 "pending_confirmation":   true,
+                "scan_to_submit_ms":      scan_to_submit_ms,
+                "pipeline_ms":            scan_to_submit_ms,
             })),
         );
     }

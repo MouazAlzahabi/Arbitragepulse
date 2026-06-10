@@ -32,6 +32,23 @@ pub(crate) const MIN_V3_LIQUIDITY: u128 = 1_000_000_000; // 10^9
 /// dramatically, so chunk size primarily matters for SyncSwap batches now.
 pub(crate) const MULTICALL_CHUNK_SIZE: usize = 10;
 
+/// QuoterV2 post-buffer (bps): removed from `amount_back` before profit vs `min_profit_usd`.
+/// Used in Phase 1.5/1.5b/1.5c and optimize.rs — keep all paths on this single constant.
+pub(crate) const P15_QUOTER_HAIRCUT_BPS: u64 = 15;
+
+/// Pre-parsed per-pair scan context — built once per config change, not per block.
+#[derive(Clone)]
+pub(crate) struct PairResolved {
+    pub token_in: Address,
+    pub token_out: Address,
+    pub token_in_key: String,
+    pub token_out_key: String,
+    pub amount_in: U256,
+    /// Upper bound for optimizer probes (max_trade or trade_amount, uncapped by trade_amount).
+    pub max_amount_in: U256,
+    pub min_profit_usd: f64,
+}
+
 // ─── Internal task metadata ───────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -141,10 +158,22 @@ pub struct Strategy {
     /// Populated once at construction — avoids Address::from_str() O(pairs × routers)
     /// times per scan (e.g. 50 pairs × 6 routers = 300 parses per block).
     pub router_addr_map: HashMap<String, Address>,
+    /// Per-router QuoterV2 address (router.quoter_address ?? chain quoter_v2_address).
+    pub quoter_by_router: HashMap<String, Address>,
+    /// Solidly/Aerodrome effective pool-cache IDs: router_id → (volatile, stable).
+    pub solidly_pool_keys: HashMap<String, (String, String)>,
     /// Reverse index: token address → pair indices that include that token.
     /// Populated once at construction and after config hot-reload.
     /// Replaces linear scan + Address::from_str() on every pending/swap event (~300–500µs saved).
     token_pair_index: HashMap<Address, Vec<usize>>,
+    /// Pre-parsed addresses, cache keys, and trade size per pair index.
+    pair_resolved: Vec<Option<PairResolved>>,
+    /// Pair indices on this chain — avoids filter+enumerate every full scan.
+    chain_pair_indices: Vec<usize>,
+    /// Indices into `self.routers` for this chain — avoids filter+collect every scan.
+    chain_router_indices: Vec<usize>,
+    /// pair_id → index for O(1) lookup in optimize / execution paths.
+    pair_id_to_index: HashMap<String, usize>,
 }
 
 impl Strategy {
@@ -165,9 +194,30 @@ impl Strategy {
             .filter_map(|r| r.address.parse::<Address>().ok().map(|a| (r.id.clone(), a)))
             .collect();
 
-        let token_pair_index = Self::build_token_pair_index_for(&pairs);
+        let quoter_by_router: HashMap<String, Address> = routers
+            .iter()
+            .filter_map(|r| {
+                let q = r
+                    .quoter_address
+                    .as_deref()
+                    .and_then(|s| s.parse::<Address>().ok())
+                    .or(quoter_v2_address);
+                q.map(|addr| (r.id.clone(), addr))
+            })
+            .collect();
 
-        Self {
+        let solidly_pool_keys: HashMap<String, (String, String)> = routers
+            .iter()
+            .filter(|r| matches!(r.router_type, RouterType::Solidly | RouterType::Aerodrome))
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    (format!("{}::volatile", r.id), format!("{}::stable", r.id)),
+                )
+            })
+            .collect();
+
+        let mut s = Self {
             chain_id,
             pairs,
             routers,
@@ -186,8 +236,69 @@ impl Strategy {
             optimistic_submission,
             http_provider,
             router_addr_map,
-            token_pair_index,
-        }
+            quoter_by_router,
+            solidly_pool_keys,
+            token_pair_index: HashMap::new(),
+            pair_resolved: Vec::new(),
+            chain_pair_indices: Vec::new(),
+            chain_router_indices: Vec::new(),
+            pair_id_to_index: HashMap::new(),
+        };
+        s.rebuild_scan_cache();
+        s
+    }
+
+    fn build_pair_resolved(pairs: &[PairConfig], default_min_profit: f64) -> Vec<Option<PairResolved>> {
+        use crate::util::addr_key;
+        pairs
+            .iter()
+            .map(|p| {
+                let token_in: Address = p.token_in.parse().ok()?;
+                let token_out: Address = p.token_out.parse().ok()?;
+                let amount_in = parse_amount_capped(
+                    &p.trade_amount,
+                    p.max_trade.as_deref(),
+                    p.token_in_decimals,
+                )?;
+                let cap_str = p.max_trade.as_deref().unwrap_or(&p.trade_amount);
+                let max_amount_in = parse_amount_capped(cap_str, None, p.token_in_decimals)?;
+                Some(PairResolved {
+                    token_in,
+                    token_out,
+                    token_in_key: addr_key(token_in),
+                    token_out_key: addr_key(token_out),
+                    amount_in,
+                    max_amount_in,
+                    min_profit_usd: p.min_profit_usd.unwrap_or(default_min_profit),
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild pair/router scan caches after pairs, routers, or min_profit change.
+    pub fn rebuild_scan_cache(&mut self) {
+        self.token_pair_index = Self::build_token_pair_index_for(&self.pairs);
+        self.chain_pair_indices = self
+            .pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.chain_id == self.chain_id)
+            .map(|(i, _)| i)
+            .collect();
+        self.chain_router_indices = self
+            .routers
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.chain_id == self.chain_id)
+            .map(|(i, _)| i)
+            .collect();
+        self.pair_id_to_index = self
+            .pairs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
+        self.pair_resolved = Self::build_pair_resolved(&self.pairs, self.min_profit_usd);
     }
 
     fn build_token_pair_index_for(pairs: &[PairConfig]) -> HashMap<Address, Vec<usize>> {
@@ -201,7 +312,39 @@ impl Strategy {
 
     /// Rebuild the token→pairs reverse index after `self.pairs` has been replaced (hot-reload).
     pub fn rebuild_token_pair_index(&mut self) {
-        self.token_pair_index = Self::build_token_pair_index_for(&self.pairs);
+        self.rebuild_scan_cache();
+    }
+
+    /// Rebuild router address / quoter / Solidly key maps after hot-reload.
+    pub fn rebuild_router_maps(&mut self) {
+        self.router_addr_map = self
+            .routers
+            .iter()
+            .filter_map(|r| r.address.parse::<Address>().ok().map(|a| (r.id.clone(), a)))
+            .collect();
+        self.quoter_by_router = self
+            .routers
+            .iter()
+            .filter_map(|r| {
+                let q = r
+                    .quoter_address
+                    .as_deref()
+                    .and_then(|s| s.parse::<Address>().ok())
+                    .or(self.quoter_v2_address);
+                q.map(|addr| (r.id.clone(), addr))
+            })
+            .collect();
+        self.solidly_pool_keys = self
+            .routers
+            .iter()
+            .filter(|r| matches!(r.router_type, RouterType::Solidly | RouterType::Aerodrome))
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    (format!("{}::volatile", r.id), format!("{}::stable", r.id)),
+                )
+            })
+            .collect();
     }
 
     /// Populate the SyncSwap pool address cache by calling getPool() on each factory

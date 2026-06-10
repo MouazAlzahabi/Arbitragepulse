@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>ArbitragePulse — System Design (10 min)</title>
+<title>ArbitragePulse — System Design</title>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <style>
   :root {
@@ -82,6 +82,7 @@
 
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; width: 100%; max-width: 1100px; }
   .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; width: 100%; max-width: 1100px; }
+  .grid4 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; width: 100%; max-width: 1100px; }
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -175,13 +176,81 @@
     align-items: flex-start;
   }
   .title-slide h1 { font-size: 2.6rem; }
+
+  .hero-wrap {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    gap: 36px;
+    align-items: center;
+    max-width: 1000px;
+    width: 100%;
+  }
+  .hero-accent {
+    border-left: 4px solid var(--accent);
+    padding-left: 22px;
+  }
+  .hero-stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px;
+  }
+  .hero-stat .big { font-size: 2rem; font-weight: 700; color: var(--accent2); }
+  .hero-stat .lbl { font-size: 0.85rem; color: var(--muted); margin-top: 4px; }
+
+  .steps { display: flex; flex-direction: column; gap: 10px; max-width: 960px; width: 100%; }
+  .step {
+    display: flex; gap: 14px; align-items: flex-start;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px;
+  }
+  .step .n {
+    flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-size: 0.78rem; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step > div { flex: 1; }
+  .step b { color: var(--text); display: block; margin-bottom: 3px; }
+  .step p { font-size: 0.86rem; color: var(--muted); line-height: 1.4; margin: 0; }
+  .step-check {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border: 2px solid var(--border);
+    border-radius: 4px;
+    margin-left: 12px;
+    align-self: center;
+  }
+  .step-check.checked {
+    background: var(--green);
+    border-color: var(--green);
+    color: var(--bg);
+    font-size: 0.85rem;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
+  }
+  .say { font-size: 0.8rem; color: var(--accent2); margin-top: 5px; font-style: italic; }
+
+  .scale-ladder { display: flex; align-items: stretch; gap: 8px; max-width: 1000px; width: 100%; margin-top: 8px; }
+  .scale-step {
+    flex: 1; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 12px; text-align: center;
+  }
+  .scale-step .amt { font-size: 1.1rem; font-weight: 700; color: var(--accent2); }
+  .scale-step .lbl { font-size: 0.75rem; color: var(--muted); margin-top: 6px; line-height: 1.35; }
+  .scale-arrow { display: flex; align-items: center; color: var(--accent); font-size: 1.1rem; }
+
+  .close-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; max-width: 960px; width: 100%; }
+  .close-grid .card { text-align: center; }
+  .close-grid .card h3 { font-size: 1.05rem; }
 </style>
 </head>
 <body>
 
 <nav id="nav">
   <span class="brand">ArbitragePulse · System Design</span>
-  <span id="counter">1 / 12</span>
+  <span id="counter">1 / 16</span>
   <div class="nav-btns">
     <button class="nav-btn" id="prev">← Prev</button>
     <button class="nav-btn" id="next">Next →</button>
@@ -190,413 +259,547 @@
 
 <div id="slides">
 
-  <!-- 1 ~45s -->
-  <section class="slide active title-slide" data-time="~1 min">
-    <div class="tag">~12-minute technical overview</div>
-    <h1>ArbitragePulse</h1>
-    <p class="subtitle">
-      A low-latency <strong>price-difference hunter</strong> on public blockchains:
-      detect when the same asset trades at different prices on two automated market programs,
-      then execute both legs in <strong>one atomic transaction</strong> so you either profit or cancel entirely.
-    </p>
-    <p class="lead" style="margin-top:20px">
-      Audience: strong software engineering background · <span class="highlight">no crypto assumed</span><br>
-      Focus: architecture · data flow · tradeoffs · capital path · why we built it this way
-    </p>
-    <span class="time-hint">Slide 1 · ~1 min</span>
-  </section>
-
-  <!-- 2 ~45s -->
-  <section class="slide" data-time="~1 min">
-    <div class="tag">Plain-language bridge</div>
-    <h2>Three ideas (no jargon wall)</h2>
-    <div class="grid3">
-      <div class="card">
-        <h3>Shared ledger</h3>
-        <p>Think of a blockchain as a <strong>replicated append-only database</strong> everyone agrees on. Programs (“smart contracts”) run deterministically when you submit a transaction.</p>
+  <!-- 1 Title -->
+  <section class="slide active title-slide">
+    <div class="hero-wrap">
+      <div class="hero-accent">
+        <div class="tag">System design</div>
+        <h1>ArbitragePulse</h1>
+        <p class="subtitle" style="max-width:none">
+          Watch two crypto exchanges. When the same coin has different prices,
+          buy low and sell high — <strong>in one shot</strong>, before the gap closes.
+        </p>
       </div>
-      <div class="card">
-        <h3>Automated exchanges (DEX)</h3>
-        <p>Instead of a central order book, liquidity lives in <strong>pool contracts</strong> with formulas (e.g. constant-product). Anyone can swap against them; prices move with each trade.</p>
-      </div>
-      <div class="card">
-        <h3>Atomic arbitrage</h3>
-        <p>Buy cheap on pool A, sell high on pool B <strong>inside one transaction</strong>. If the round-trip doesn’t meet profit rules, the whole thing <strong>reverts</strong>—like a database rollback (you still pay network fees).</p>
+      <div class="hero-stat">
+        <div class="big">Detect → Execute</div>
+        <div class="lbl">Rust engine + smart contract on Base<br>Built for speed, guarded on-chain</div>
       </div>
     </div>
-    <p class="lead" style="margin-top:14px">
-      Our edge is <strong>speed + correctness</strong>: see price drift early, quote accurately, submit before others, and fail safe on-chain.
-    </p>
-    <span class="time-hint">Slide 2 · ~1 min</span>
   </section>
 
-  <!-- 3 ~1 min -->
-  <section class="slide" data-time="~1 min">
-    <div class="tag">Architecture</div>
-    <h2>Four modules, one product</h2>
-    <div class="diagram">
-      <pre class="mermaid">
-flowchart TB
-  subgraph ops [Operator]
-    Human[Human / SRE]
-    Dash[Dashboard React SPA]
-  end
-  subgraph core [Application tier]
-    Eng[Rust Engine Tokio]
-    API[HTTP + WebSocket API]
-    DB[(SQLite trades.db)]
-  end
-  subgraph chain [On-chain]
-    Ex[ArbitrageExecutor Solidity]
-    R1[DEX Router A]
-    R2[DEX Router B]
-  end
-  subgraph infra [External]
-    RPC[RPC nodes WS + HTTP]
-    Seq[Network sequencer]
-  end
-  Human --> Dash
-  Dash --> API
-  Eng --> API
-  Eng --> DB
-  Eng -->|signed txs| RPC
-  RPC --> Seq
-  Seq --> Ex
-  Ex --> R1
-  Ex --> R2
-  Eng -.->|events + blocks| RPC
-      </pre>
-    </div>
-    <p class="lead">
-      <span class="pill">contract/</span><span class="pill">engine/</span><span class="pill">dashboard.jsx</span><span class="pill">lab/</span>
-      Config-driven YAML—add pairs/routers without recompiling the engine.
-    </p>
-    <span class="time-hint">Slide 3 · ~1 min</span>
-  </section>
-
-  <!-- 4 ~1 min -->
-  <section class="slide" data-time="~1 min">
-    <div class="tag">Data flow</div>
-    <h2>End-to-end path (happy path)</h2>
-    <div class="flow-row">
-      <div class="flow-box"><b>1. Ingest <span class="lat">(&lt;1ms)</span></b>WebSocket: new blocks + pool Sync/Swap events → update in-memory pool cache</div>
-      <span class="flow-arrow">→</span>
-      <div class="flow-box"><b>2. Detect <span class="lat">(1–2ms)</span></b>Strategy: forward/reverse quotes, optional QuoterV2 verify → opportunity struct</div>
-      <span class="flow-arrow">→</span>
-      <div class="flow-box"><b>3. Prepare <span class="lat">(~10ms)</span></b>Executor: gas check, build calldata, nonce, optional pre-sign</div>
-    </div>
-    <div class="flow-row">
-      <div class="flow-box"><b>4. Submit</b>Primary + parallel submission_rpcs (race to sequencer)</div>
-      <span class="flow-arrow">→</span>
-      <div class="flow-box"><b>5. Confirm</b>Background receipt task → metrics, SQLite, dashboard “trade” event</div>
-      <span class="flow-arrow">→</span>
-      <div class="flow-box"><b>6. Observe</b>Prometheus + structured logs (exec_send / exec_confirm)</div>
+  <!-- 2 Problem -->
+  <section class="slide">
+    <div class="tag">The problem</div>
+    <h2>Same coin, two prices — for seconds</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>What happens</h3>
+        <p>USDC might cost <strong>$0.9998</strong> on Exchange A and <strong>$1.0004</strong> on Exchange B. That tiny gap is profit — if you act before someone else closes it.</p>
+        <p style="margin-top:10px">Gaps appear after big trades, new listings, or slow price updates. They are <strong>small</strong> and <strong>short-lived</strong>.</p>
+      </div>
+      <div class="card">
+        <h3>What we need</h3>
+        <ul>
+          <li><strong>Monitor</strong> many token pairs 24/7</li>
+          <li><strong>Spot</strong> a gap worth more than fees</li>
+          <li><strong>Execute</strong> both legs together — profit or nothing</li>
+        </ul>
+        <p class="say">Say: “We’re not predicting the market — we’re catching pricing mistakes between venues.”</p>
+      </div>
     </div>
     <div class="diagram" style="margin-top:12px">
       <pre class="mermaid">
-sequenceDiagram
-  participant L as Listener
-  participant S as Strategy
-  participant E as Executor
-  participant P as RPC
-  participant C as On-chain contract
-  L->>S: pool state changed
-  S->>S: Phase 1 quotes + Phase 1.5 verify
-  S->>E: ArbOpportunity
-  E->>P: eth_sendRawTransaction
-  P->>C: executeArbitrage
-  C->>C: swap A then swap B
-  P-->>E: receipt status=1
-  E->>E: log + DB + WS broadcast
+flowchart LR
+  A["Exchange A\nUSDC cheap"] -->|buy| P[Profit if gap &gt; fees]
+  B["Exchange B\nUSDC expensive"] -->|sell| P
       </pre>
     </div>
-    <span class="time-hint">Slide 4 · ~1 min</span>
   </section>
 
-  <!-- 5 ~1 min -->
-  <section class="slide" data-time="~1 min">
-    <div class="tag">Detection pipeline</div>
-    <h2>Strategy phases (per scan)</h2>
+  <!-- 3 Crypto primer -->
+  <section class="slide">
+    <div class="tag">Crypto primer</div>
+    <h2>Five concepts to get onboard</h2>
+    <div class="grid3">
+      <div class="card">
+        <h3>Blockchain</h3>
+        <p>A public ledger everyone copies. You submit a <strong>transaction</strong>; if accepted, the change is permanent.</p>
+      </div>
+      <div class="card">
+        <h3>Smart contract</h3>
+        <p>Code on the ledger — like a small program that runs when you call it. Our contract runs the two swaps for us.</p>
+      </div>
+      <div class="card">
+        <h3>DEX (decentralized exchange)</h3>
+        <p>No human broker. Liquidity sits in <strong>pools</strong>; a formula sets the price. Anyone can swap against them.</p>
+      </div>
+      <div class="card">
+        <h3>Token pair</h3>
+        <p>Two assets in one pool — e.g. USDC/WETH. We compare the <strong>same pair</strong> across different pools or exchanges.</p>
+      </div>
+      <div class="card">
+        <h3>Atomic transaction</h3>
+        <p>Buy and sell in <strong>one transaction</strong>. If the round-trip isn’t profitable, everything rolls back — except the network fee you already paid.</p>
+      </div>
+      <div class="card">
+        <h3>Gas & priority fee</h3>
+        <p>You pay the network to include your transaction. A <strong>higher tip</strong> can get you earlier in the block when competition is tight.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 Challenges -->
+  <section class="slide">
+    <div class="tag">Why this is hard</div>
+    <h2>Challenges before profit</h2>
+    <div class="grid2">
+      <div class="card">
+        <h3>Market & competition</h3>
+        <ul>
+          <li><strong>Many bots</strong> hunt the same gaps — first in the block often wins</li>
+          <li><strong>Priority fees</strong> — pay more to jump the queue, but that eats margin</li>
+          <li><strong>Stale prices</strong> — by the time you trade, the gap may be gone</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>What to monitor</h3>
+        <ul>
+          <li><strong>Pair selection</strong> — thousands of pools; most never gap</li>
+          <li><strong>Thin liquidity</strong> — big trades move the price against you</li>
+          <li><strong>False positives</strong> — math says profit, chain says revert</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Engineering</h3>
+        <ul>
+          <li><strong>Latency</strong> — every extra 100 ms can mean a lost trade</li>
+          <li><strong>Correct quotes</strong> — fast estimates vs slow accurate checks</li>
+          <li><strong>Capital</strong> — need inventory in the contract to trade size</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Operations</h3>
+        <ul>
+          <li><strong>Failed txs still cost gas</strong> on many chains</li>
+          <li><strong>Config tuning</strong> — thresholds, routers, pairs change often</li>
+          <li><strong>Visibility</strong> — “submitted” ≠ “profitable”</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 Architecture -->
+  <section class="slide">
+    <div class="tag">Architecture</div>
+    <h2>Four pieces, one product</h2>
     <div class="diagram">
       <pre class="mermaid">
 flowchart LR
-  subgraph p1 [Phase 1 fast path]
-    Cache[Pool cache reserves / sqrtPrice]
-    Local[Local math V2 xy=k]
-    MC[Multicall batch V3 / exotic]
-  end
-  subgraph p15 [Phase 1.5 optional]
-    Q[QuoterV2 eth_call batches]
-    Haircut[Profit haircut bps]
-  end
-  subgraph p2 [Phase 2 optional]
-    Opt[Adaptive size optimizer]
-  end
-  Cache --> Local
-  Cache --> MC
-  Local --> Q
-  MC --> Q
-  Q --> Haircut
-  Haircut --> Opt
-  Opt --> Out[Ranked opportunities]
+  Dash[Dashboard] --> Eng[Rust Engine]
+  Eng --> RPC[Blockchain nodes]
+  Eng --> DB[(Trade history)]
+  Eng -->|send tx| RPC
+  RPC --> Contract[Our contract]
+  Contract --> PoolA[Pool A]
+  Contract --> PoolB[Pool B]
+  RPC -->|prices + blocks| Eng
       </pre>
     </div>
-    <div class="grid2" style="margin-top:12px">
+    <div class="grid2" style="margin-top:14px">
       <div class="card">
-        <h3>Design choice</h3>
-        <p>Most V2 quotes are <strong>zero-RPC</strong> (event-driven cache). That’s how we hold scan latency under block time on L2s.</p>
+        <h3>Off-chain (fast brain)</h3>
+        <p>Engine watches prices, finds gaps, builds transactions. Dashboard shows live logs and stats.</p>
       </div>
       <div class="card">
-        <h3>Tradeoff</h3>
-        <p><code>optimistic_submission: true</code> skips Quoter → faster but more on-chain reverts. Production Base config uses <strong>Quoter on</strong> until the pipeline proves consistent wins.</p>
+        <h3>On-chain (safety net)</h3>
+        <p>Smart contract only talks to approved exchanges. Profit rules are enforced in code — not trust.</p>
       </div>
     </div>
-    <span class="time-hint">Slide 5 · ~1 min</span>
   </section>
 
-  <!-- 6 ~1 min -->
-  <section class="slide" data-time="~1 min">
-    <div class="tag">Execution & safety</div>
-    <h2>On-chain contract as the safety boundary</h2>
-    <div class="grid2">
-      <div class="card">
-        <h3>What the executor sends</h3>
-        <ul>
-          <li>One call: <code>executeArbitrage</code> (2-hop) or triangular variant</li>
-          <li>Parameters: tokens, routers, fee tiers, amount, <code>minProfit</code>, deadline</li>
-          <li>Leg 2 sets router <code>amountOutMinimum = amountIn + minProfit</code></li>
-        </ul>
+  <!-- 6 Data flow -->
+  <section class="slide">
+    <div class="tag">Data flow</div>
+    <h2>From price update to confirmed trade</h2>
+    <p class="lead">Six steps on the happy path — think of it as a pipeline, not one big loop.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="n">1</span>
+        <div>
+          <b>Listen</b>
+          <p>New blocks and swap events update our in-memory price cache. (&lt;1 ms)</p>
+          <p class="say">“We react to chain events, not slow polling alone.”</p>
+        </div>
       </div>
-      <div class="card">
-        <h3>Guards (Solidity)</h3>
-        <ul>
-          <li><strong>ReentrancyGuard</strong> — callback-safe swaps</li>
-          <li><strong>Pausable / Ownable2Step</strong> — ops kill switch</li>
-          <li><strong>Router allowlist</strong> — only approved DEX programs</li>
-          <li><strong>NotProfitable</strong> — final balance check vs <code>minProfit</code></li>
-        </ul>
+      <div class="step">
+        <span class="n">2</span>
+        <div>
+          <b>Detect</b>
+          <p>Compare prices across configured pairs. If spread &gt; fees + buffer → candidate trade. (1–2 ms)</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n">3</span>
+        <div>
+          <b>Prepare</b>
+          <p>Build the transaction: which pools, how much, minimum profit, gas tip. (~10 ms)</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n">4</span>
+        <div>
+          <b>Submit</b>
+          <p>Broadcast to several RPC endpoints at once — race to reach the sequencer first.</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n">5</span>
+        <div>
+          <b>Confirm</b>
+          <p>Wait for receipt. Success = status 1 on-chain. Log to DB and push to dashboard.</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n">6</span>
+        <div>
+          <b>Learn</b>
+          <p>Metrics and logs feed the next tuning cycle — which pairs, which settings work.</p>
+        </div>
       </div>
     </div>
-    <p class="lead">
-      Off-chain engine softens encoded <code>minProfit</code> (bps slack + multiplier) to reduce “almost profitable” reverts;
-      <span class="warn">reverts still possible</span> when pool state moves between detect and inclusion (FCFS ordering).
-    </p>
-    <span class="time-hint">Slide 6 · ~1 min</span>
   </section>
 
-  <!-- 7 ~1 min — capital scale -->
-  <section class="slide" data-time="~1 min">
-    <div class="tag">Capital model</div>
-    <h2>Small capital today — scaling $1k → $100k</h2>
-    <div class="grid2">
-      <div class="card">
-        <h3>Problems at ~$1k capital today</h3>
-        <ul>
-          <li><strong>Size ceiling</strong> — YAML <code>trade_amount: "1000"</code> USDC; contract balance caps each arb</li>
-          <li><strong>Price impact</strong> — $1k already moves thin 0.01% pools; edge shrinks vs $10k+ competitors</li>
-          <li><strong>Fixed recovery bar</strong> — sell leg must return ≥ <code>amountIn + minProfit</code>; small misses → revert (see Slide 12)</li>
-          <li><strong>Gas overhead</strong> — Base L1 data fee + ~350k gas on failure dilutes micro-profits</li>
-          <li><strong>Underfunded pairs skipped</strong> — engine balance guard refuses routes the contract cannot fund</li>
-        </ul>
-      </div>
-      <div class="card">
-        <h3>Scale plan (owned inventory)</h3>
-        <ul>
-          <li><strong>Phase 1 (~$1k)</strong> — prove confirmed wins with Quoter on; tune detection vs reverts</li>
-          <li><strong>Phase 2 ($5k–20k)</strong> — reinvest profit into contract inventory</li>
-          <li><strong>Phase 3 ($50k–100k)</strong> — raise <code>trade_amount</code>, more pairs in parallel</li>
-          <li><strong>Phase 4</strong> — enable <code>optimize_size</code> where latency budget allows</li>
-        </ul>
-      </div>
-    </div>
-    <div class="diagram" style="margin-top:10px">
+  <!-- 7 Detection -->
+  <section class="slide">
+    <div class="tag">Finding opportunities</div>
+    <h2>How we decide “is this worth sending?”</h2>
+    <div class="diagram">
       <pre class="mermaid">
 flowchart LR
-  S1["Phase 1 · ~1k USDC"] --> S2["Prove wins Quoter on"]
-  S2 --> S3["5k–20k reinvest"]
-  S3 --> S4["50k–100k inventory"]
-  S4 --> S5["optimize_size + more pairs"]
+  E[Price events] --> F[Fast estimate from cache]
+  F --> G{Spread big enough?}
+  G -->|no| X[Skip]
+  G -->|yes| H[Double-check with on-chain quote]
+  H --> I{Still profitable?}
+  I -->|no| X
+  I -->|yes| J[Send to executor]
       </pre>
     </div>
-    <p class="lead">
-      <strong>Scale plan:</strong> validate pipeline at $1k → reinvest confirmed profit into contract inventory → raise <code>trade_amount</code> / enable size optimizer where latency allows → fund multiple stable pairs in parallel.
-    </p>
-    <span class="time-hint">Slide 7 · ~1 min</span>
+    <div class="grid2" style="margin-top:14px">
+      <div class="card">
+        <h3>Fast path (always on)</h3>
+        <p>We keep pool state in RAM from WebSocket events. Most math runs locally — no extra network round-trip.</p>
+        <p class="say">“Speed comes from not asking the chain on every scan.”</p>
+      </div>
+      <div class="card">
+        <h3>Safety check (Base: on)</h3>
+        <p>Before sending, we ask the chain “what would this swap actually return?” Skipping this is faster but causes more failed transactions.</p>
+      </div>
+    </div>
   </section>
 
-  <!-- 8 ~50s -->
-  <section class="slide" data-time="~50s">
-    <div class="tag">Tech stack · AI-accelerated development</div>
-    <h2>Technology decisions</h2>
+  <!-- 8 Execution -->
+  <section class="slide">
+    <div class="tag">Execution & safety</div>
+    <h2>One transaction, two swaps, strict rules</h2>
+    <div class="diagram">
+      <pre class="mermaid">
+flowchart LR
+  Start[Start with USDC] --> Buy[Buy on cheap pool]
+  Buy --> Sell[Sell on expensive pool]
+  Sell --> Check{Got back ≥ start + profit?}
+  Check -->|yes| Done[Keep profit]
+  Check -->|no| Rev[Revert all]
+      </pre>
+    </div>
+    <div class="grid3" style="margin-top:14px">
+      <div class="card">
+        <h3>Contract enforces</h3>
+        <p>Only approved routers. Pause button for ops. Reentrancy protection.</p>
+      </div>
+      <div class="card">
+        <h3>Engine optimizes</h3>
+        <p>Picks pairs, sizes, gas tip, timing. Can be wrong — contract is the final judge.</p>
+      </div>
+      <div class="card">
+        <h3>Reality check</h3>
+        <p>Prices move between detect and inclusion. A “good” opportunity can still fail on-chain.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9 Tech stack -->
+  <section class="slide">
+    <div class="tag">Tech stack</div>
+    <h2>What we built it with</h2>
     <table>
       <thead>
         <tr><th>Layer</th><th>Choice</th><th>Why</th></tr>
       </thead>
       <tbody>
-        <tr><td>Engine</td><td><strong>Rust</strong> + Tokio + Alloy</td><td>Single binary, async I/O, typed ABI, low GC pauses vs Node for hot path</td></tr>
-        <tr><td>Contract</td><td><strong>Solidity 0.8</strong> + Foundry</td><td>Industry standard for EVM; fast local tests with mocks</td></tr>
-        <tr><td>Config</td><td><strong>YAML</strong> chains/routers/pairs</td><td>Ops can tune thresholds without redeploying engine logic</td></tr>
-        <tr><td>State</td><td><strong>In-memory</strong> pool cache + SQLite</td><td>Hot path is RAM; trades persisted for dashboard history</td></tr>
-        <tr><td>UI</td><td><strong>React</strong> (Vite) served from engine</td><td>One deployment unit: API + static SPA + WS log stream</td></tr>
-        <tr><td>Lab</td><td><strong>Anvil fork</strong> + Rust scenarios</td><td>Replay production logic against mock routers before mainnet fees</td></tr>
-        <tr><td><strong>Development</strong></td><td><strong>LLMs</strong> (Claude / Cursor, Gemini)</td><td>Accelerated syntax generation—100% of engineering time on architecture, concurrency, and latency</td></tr>
+        <tr><td>Infrastructure</td><td><strong>Base</strong> (Layer 2)</td><td>Traded Mainnet liquidity for 2-second blocks and sub-cent fees. High baseline volume and EVM compatibility allow seamless scaling to other chains later.</td></tr>
+        <tr><td>Engine</td><td><strong>Rust</strong> + Tokio</td><td>Fast, one binary, great for async I/O</td></tr>
+        <tr><td>Contract</td><td><strong>Solidity</strong> + Foundry</td><td>Standard for Ethereum-style chains; easy tests</td></tr>
+        <tr><td>Config</td><td><strong>YAML</strong></td><td>Change pairs and thresholds without code changes</td></tr>
+        <tr><td>UI</td><td><strong>React</strong> dashboard</td><td>Live log stream + trade history</td></tr>
+        <tr><td>Lab</td><td><strong>Anvil fork</strong></td><td>Test against real mainnet state locally</td></tr>
+        <tr><td>Dev speed</td><td><strong>LLMs</strong> (Cursor, Claude, Gemini)</td><td>Boilerplate faster; humans own architecture</td></tr>
       </tbody>
     </table>
-    <p class="lead" style="margin-top:10px">
-      <span class="pill">AI-accelerated shield</span>
-      LLMs are a <strong>first-class toolchain layer</strong>, not a demo trick: boilerplate and ABI glue are generated; humans own system design, tradeoffs, and production tuning.
-    </p>
-    <span class="time-hint">Slide 8 · ~50s</span>
   </section>
 
-  <!-- 9 ~1 min -->
-  <section class="slide" data-time="~1 min">
-    <div class="tag">Tradeoffs · Base production path</div>
-    <h2>Latency vs correctness (the main tension)</h2>
-    <p class="lead" style="margin-bottom:8px">
-      <span class="highlight">Green</span> = active on Base today ·
-      <span class="warn">Amber</span> = available but not our current default
+  <!-- 10 Tradeoffs -->
+  <section class="slide">
+    <div class="tag">Production tuning · Base</div>
+    <h2>Speed vs accuracy — every knob explained</h2>
+    <p class="lead" style="margin-bottom:10px">
+      <span class="highlight">Green</span> = what we run today ·
+      <span class="warn">Amber</span> = optional, not default
     </p>
     <table>
       <thead>
-        <tr><th>Knob</th><th>Faster</th><th>Safer / fewer reverts</th></tr>
+        <tr><th>Setting</th><th>Plain English</th><th>Today on Base</th></tr>
       </thead>
       <tbody>
         <tr>
-          <td><strong>QuoterV2 (Phase 1.5)</strong></td>
-          <td><span class="warn">Skip</span> (<code>optimistic_submission: true</code>)</td>
-          <td><span class="highlight">On</span> — verifies V3 output before send (<code>false</code> on Base)</td>
+          <td><strong>On-chain double-check</strong><br><span style="font-size:0.78rem;color:var(--muted)">(QuoterV2)</span></td>
+          <td>Ask the chain “real output?” before we send. Slower, fewer surprise failures.</td>
+          <td><span class="highlight">On</span> — we prefer fewer bad sends</td>
         </tr>
         <tr>
-          <td><strong>Size optimizer</strong></td>
-          <td><span class="highlight"><code>optimize_size: false</code></span> — production</td>
-          <td><span class="warn">On</span> — finds better size, +80–100 ms</td>
+          <td><strong>Trade size optimizer</strong></td>
+          <td>Search for the best dollar amount per gap. Adds ~80–100 ms per scan.</td>
+          <td><span class="highlight">Off</span> — fixed size from config</td>
         </tr>
         <tr>
-          <td><strong>Preflight eth_call</strong></td>
-          <td><span class="highlight">Off</span> — production (latency)</td>
-          <td><span class="warn">On</span> — logs revert reason, skips bad broadcast</td>
+          <td><strong>Preflight simulation</strong></td>
+          <td>Dry-run the tx on RPC before broadcast. Catches revert reason early.</td>
+          <td><span class="highlight">Off</span> — saves latency</td>
         </tr>
         <tr>
-          <td><strong>Submission</strong></td>
-          <td><span class="highlight">Multi-RPC</span> (sequencer + Alchemy + LlamaRPC)</td>
-          <td><span class="highlight">Pending-tx monitor on</span> — same-block tip matching</td>
+          <td><strong>How we submit</strong></td>
+          <td>Fire the same signed tx to <strong>multiple RPC providers</strong> at once — whoever reaches the sequencer first wins.</td>
+          <td><span class="highlight">Multi-RPC</span> + watch pending txs to match competitor tips</td>
         </tr>
         <tr>
-          <td><strong>Scan trigger</strong></td>
-          <td><span class="highlight">Poll 2s + every block</span>; <code>pending_only_submission: false</code></td>
-          <td><span class="warn">Pending-only</span> — submit only from mempool path</td>
+          <td><strong>When we scan</strong></td>
+          <td>Every new block + timer. We don’t wait only for mempool hints.</td>
+          <td><span class="highlight">Block + 2s poll</span></td>
         </tr>
       </tbody>
     </table>
-    <p class="lead">Base is <strong>FCFS</strong> (first-come-first-served in block)—being 200 ms late often means worse price or revert.</p>
-    <span class="time-hint">Slide 9 · ~1 min</span>
+    <p class="lead" style="margin-top:10px">Base orders txs <strong>first-come-first-served</strong> in a block — late often means revert or no profit.</p>
   </section>
 
-  <!-- 10 ~50s -->
-  <section class="slide" data-time="~50s">
-    <div class="tag">Concurrency</div>
-    <h2>Engine runtime model</h2>
-    <div class="diagram">
-      <pre class="mermaid">
-flowchart TB
-  subgraph per_chain [Per enabled chain task]
-    WS[WS provider blocks + logs]
-    Poll[Timer scan_interval_ms]
-    Pend[Optional mempool monitor]
-    Strat[Strategy + PoolCache]
-    ExecM[Executor Mutex]
-  end
-  WS --> Strat
-  Poll --> Strat
-  Pend --> Strat
-  Strat -->|best opp| Scan[scan.rs candidate loop]
-  Scan -->|prepare lock brief| ExecM
-  ExecM -->|release lock| Send[send_raw / send_tx]
-  Send -->|spawn| Receipt[receipt waiter]
-      </pre>
-    </div>
-    <p class="lead">
-      <strong>Split-lock pattern:</strong> hold mutex only for nonce + tx build; sign and broadcast outside lock so block events aren’t starved.
-      Cooldowns per route fingerprint prevent hammering the same failing path.
-    </p>
-    <span class="time-hint">Slide 10 · ~50s</span>
-  </section>
-
-  <!-- 11 ~50s -->
-  <section class="slide" data-time="~50s">
-    <div class="tag">Observability</div>
-    <h2>How we know what happened</h2>
+  <!-- 11 Staying fast -->
+  <section class="slide">
+    <div class="tag">Staying responsive</div>
+    <h2>How the engine handles many events at once</h2>
+    <p class="lead">One long-running task per chain. Think: a newsroom that never stops listening.</p>
     <div class="grid2">
       <div class="card">
-        <h3>Structured logs</h3>
+        <h3>Always listening</h3>
         <ul>
-          <li><code>exec_send</code> — pipeline_ms, tip, pair, tx hash prefix</li>
-          <li><code>exec_confirm</code> — ok, block, tx_index, gas_used</li>
-          <li>Heartbeat — opps, bestV, quotes (Quoter path)</li>
+          <li><strong>WebSocket</strong> — new blocks and pool updates stream in</li>
+          <li><strong>Timer</strong> — backup scan every few seconds</li>
+          <li><strong>Price cache</strong> — RAM, updated on every event</li>
         </ul>
       </div>
       <div class="card">
-        <h3>Dashboard + API</h3>
+        <h3>When we find a gap</h3>
         <ul>
-          <li>WebSocket log stream (opportunities, trades, errors)</li>
-          <li>REST <code>/stats</code> with API key auth</li>
-          <li>Prometheus counters (attempts, failures, profit)</li>
-          <li>SQLite trade history for post-mortems</li>
+          <li>Pick the best candidate for this block</li>
+          <li>Build tx quickly — don’t block the listener</li>
+          <li>Send in parallel; confirm in the background</li>
+          <li>Cooldown on routes that keep failing</li>
         </ul>
       </div>
     </div>
-    <p class="lead">A “success” in the UI means <strong>receipt.status = 1</strong>—not merely “tx submitted”.</p>
-    <span class="time-hint">Slide 11 · ~50s</span>
+    <div class="diagram" style="margin-top:12px">
+      <pre class="mermaid">
+flowchart LR
+  Listen[Listen 24/7] --> Scan[Scan for gaps]
+  Scan -->|found| Send[Send tx]
+  Send --> Listen
+  Send -.->|background| Confirm[Log result]
+      </pre>
+    </div>
   </section>
 
-  <!-- 12 ~45s -->
-  <section class="slide" data-time="~45s">
-    <div class="tag">Failure modes</div>
-    <h2>What we learned in production (Base)</h2>
-    <div class="grid3">
+  <!-- 12 Lab & quality -->
+  <section class="slide">
+    <div class="tag">Quality before mainnet</div>
+    <h2>Test like prod, ship with confidence</h2>
+    <div class="grid4">
       <div class="card">
-        <h3>Symptom</h3>
+        <h3>Local lab</h3>
+        <p>Fork mainnet with <strong>Anvil</strong>. Run the same Rust engine against fake and real router bytecode — no gas cost.</p>
+      </div>
+      <div class="card">
+        <h3>Replay failures</h3>
+        <p>When a tx fails on Base, we trace it locally. Was the quote wrong? Pool too thin? Fix config before the next deploy.</p>
+      </div>
+      <div class="card">
+        <h3>Dry-run mode</h3>
+        <p>Engine starts with <code>DRY_RUN=true</code> — full detection and tx build on real RPCs, <strong>no mainnet submits</strong>. Validate pair tuning without gas. Flip live only when metrics look right.</p>
+      </div>
+      <div class="card">
+        <h3>Gradual rollout</h3>
+        <p>After dry-run looks good, go live with stricter checks first — on-chain quote double-check, then optional preflight simulation — when accuracy matters more than raw speed.</p>
+      </div>
+    </div>
+    <p class="lead" style="margin-top:14px">
+      Engineering lesson: <strong>latency and correctness are a dial, not a one-time choice.</strong> We tune per chain as we learn what wins.
+    </p>
+  </section>
+
+  <!-- 13 Observability -->
+  <section class="slide">
+    <div class="tag">Observability</div>
+    <h2>How we know if we actually made money</h2>
+    <div class="steps">
+      <div class="step">
+        <span class="n">1</span>
+        <div>
+          <b>Live dashboard</b>
+          <p>WebSocket stream: opportunities spotted, txs sent, errors. Shows <strong>dry-run vs live</strong> so ops know if we’re shadowing or broadcasting.</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n">2</span>
+        <div>
+          <b>Structured logs</b>
+          <p><code>exec_send</code> = we broadcast (or log “would send” in <strong>dry-run</strong>). <code>exec_confirm</code> = chain answered. Each line has pair, timing, gas.</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n">3</span>
+        <div>
+          <b>Success definition</b>
+          <p><strong>Submitted ≠ won.</strong> We only count profit when the receipt says success (status = 1).</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n">4</span>
+        <div>
+          <b>History & metrics</b>
+          <p>SQLite for post-mortems; Prometheus counters for attempts, failures, and P&amp;L — all tagged <code>dry_run=true/false</code> so shadow runs don’t mix with live.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 14 Capital -->
+  <section class="slide">
+    <div class="tag">Capital</div>
+    <h2>Start small, scale with proof</h2>
+    <p class="lead">Today ~$1k USDC in the contract. Plan: prove wins, reinvest, grow size.</p>
+    <div class="scale-ladder">
+      <div class="scale-step">
+        <div class="amt">~$1k</div>
+        <div class="lbl">Prove pipeline<br>Quoter on, tune pairs</div>
+      </div>
+      <span class="scale-arrow">→</span>
+      <div class="scale-step">
+        <div class="amt">$5–20k</div>
+        <div class="lbl">Reinvest<br>confirmed profit</div>
+      </div>
+      <span class="scale-arrow">→</span>
+      <div class="scale-step">
+        <div class="amt">$50–100k</div>
+        <div class="lbl">Larger trades<br>more pairs</div>
+      </div>
+      <span class="scale-arrow">→</span>
+      <div class="scale-step">
+        <div class="amt">Optimize</div>
+        <div class="lbl">Size optimizer<br>when latency allows</div>
+      </div>
+    </div>
+    <div class="grid2" style="margin-top:16px">
+      <div class="card">
+        <h3>Why $1k hurts today</h3>
         <ul>
-          <li>Explorer shows “Fail”, no revert string</li>
-          <li>Many submits, zero confirmed profits</li>
+          <li>Thin pools — our trade moves the price</li>
+          <li>Competitors trade 10× size</li>
+          <li>Failed txs still burn gas fees</li>
         </ul>
       </div>
       <div class="card">
-        <h3>Root cause (example)</h3>
+        <h3>What unlocks at scale</h3>
         <ul>
-          <li>Sell leg returned ~999.44 USDC vs on-chain min ~1000.02 USDC</li>
-          <li>Phase-1 quote optimistic vs thin 0.01% fee pool</li>
-          <li>Fix path: Quoter on + tighter detection buffers</li>
-        </ul>
-      </div>
-      <div class="card" style="border-color: var(--green);">
-        <h3>Prevention (Lab)</h3>
-        <ul>
-          <li>All edge cases reproduced in the <strong>local lab / CLI</strong> against an <strong>Anvil mainnet fork</strong> before deploying engine updates</li>
-          <li>Rust scenarios + mock routers for regression; production calldata replayed with <code>cast run</code></li>
-          <li>Optional <code>preflight_eth_call</code> + RPC revert hex parsing in engine</li>
+          <li>Bigger gaps captured per trade</li>
+          <li>More pairs funded in parallel</li>
+          <li>Margin absorbs priority-fee races</li>
         </ul>
       </div>
     </div>
-    <p class="lead">Post-mortem on-chain: fork trace when a mined tx still surprises us—never the first time we see a path.</p>
-    <span class="time-hint">Slide 12 · ~45s</span>
   </section>
 
-  <!-- 13 ~30s -->
-  <section class="slide title-slide" data-time="~30s">
-    <div class="tag">Close</div>
-    <h1>Summary</h1>
-    <ul class="lead" style="list-style:none; padding:0;">
-      <li style="margin-bottom:10px">✓ <strong>Problem:</strong> exploit transient price gaps across automated pools—safely and fast.</li>
-      <li style="margin-bottom:10px">✓ <strong>Shape:</strong> Rust detector + Solidity executor + React ops plane + YAML config.</li>
-      <li style="margin-bottom:10px">✓ <strong>Core tradeoff:</strong> milliseconds vs quote fidelity on competitive L2 sequencers.</li>
-      <li style="margin-bottom:10px">✓ <strong>Trust boundary:</strong> smart contract atomicity; engine is optimization layer only.</li>
-      <li style="margin-bottom:10px">✓ <strong>Capital path:</strong> ~$1k inventory today; scale to $100k by reinvesting confirmed wins into the contract.</li>
-      <li style="margin-bottom:10px">✓ <strong>The startup transfer:</strong> the core engineering challenge here—managing asynchronous, event-driven concurrency and handling messy data under strict time constraints—maps directly to building scalable backend ingestion engines (e.g. Fastalyze logistics document pipelines).</li>
-    </ul>
-    <p class="subtitle" style="margin-top:24px">Open: <code>presentation-system-design.html</code> in browser · Arrow keys or buttons · ~12–13 minutes at ~1 min/slide</p>
-    <span class="time-hint">Slide 13 · Q&A</span>
+  <!-- 15 Roadmap -->
+  <section class="slide">
+    <div class="tag">Where we go from here</div>
+    <h2>Next steps</h2>
+    <div class="steps">
+      <div class="step">
+        <span class="n">1</span>
+        <div>
+          <b>Validate in dry-run on Base</b>
+          <p>Run with <code>DRY_RUN=true</code> on real RPCs — full detection and tx build, no submits. Tune pairs and buffers until “would send” volume and spreads look sane.</p>
+        </div>
+        <span class="step-check checked" aria-label="Done">✓</span>
+      </div>
+      <div class="step">
+        <span class="n">2</span>
+        <div>
+          <b>First confirmed wins on Base</b>
+          <p>Flip live. Stable pairs, Quoter on — tune until receipt.status = 1 is routine, not rare.</p>
+        </div>
+        <span class="step-check checked" aria-label="Done">✓</span>
+      </div>
+      <div class="step">
+        <span class="n">3</span>
+        <div>
+          <b>80% success rate on submitted txs</b>
+          <p>Tune pairs, Quoter, and buffers until ~8 in 10 broadcasts confirm on-chain — not occasional lucky wins.</p>
+        </div>
+        <span class="step-check" aria-label="Todo"></span>
+      </div>
+      <div class="step">
+        <span class="n">4</span>
+        <div>
+          <b>Reinvest & scale capital</b>
+          <p>Move from ~$1k toward $20k+ inventory; add pairs that survive lab replay.</p>
+        </div>
+        <span class="step-check" aria-label="Todo"></span>
+      </div>
+      <div class="step">
+        <span class="n">5</span>
+        <div>
+          <b>Smarter pair selection</b>
+          <p>Rank pools by historical gap frequency, liquidity depth, and revert rate — monitor fewer, better targets.</p>
+        </div>
+        <span class="step-check" aria-label="Todo"></span>
+      </div>
+      <div class="step">
+        <span class="n">6</span>
+        <div>
+          <b>Multi-chain</b>
+          <p>Same engine shape on other L2s where FCFS or sequencer rules differ — config per chain.</p>
+        </div>
+        <span class="step-check" aria-label="Todo"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 16 Close -->
+  <section class="slide title-slide">
+    <div class="tag">Takeaways</div>
+    <h1>Three things to remember</h1>
+    <div class="close-grid">
+      <div class="card">
+        <h3>Problem</h3>
+        <p>Tiny price gaps between automated exchanges — monitor fast, act atomically.</p>
+      </div>
+      <div class="card">
+        <h3>Shape</h3>
+        <p>Rust finds gaps; Solidity enforces profit; dashboard proves what landed on-chain.</p>
+      </div>
+      <div class="card">
+        <h3>Edge</h3>
+        <p>Milliseconds + honest quotes + ops discipline — same skills required for high-throughput data ingestion and processing pipelines.</p>
+      </div>
+    </div>
+    <p class="subtitle" style="margin-top:28px">Questions?</p>
   </section>
 
 </div>

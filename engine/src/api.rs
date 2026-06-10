@@ -107,7 +107,8 @@ pub struct ApiServer {
 
 impl ApiServer {
     pub fn new(port: u16, api_key: String, db: Option<Arc<Database>>, metrics: Arc<Metrics>, dry_run: bool) -> Self {
-        let (log_tx, _) = broadcast::channel(1024);
+        // Large buffer: burst logging during scans must not lag slow WS clients.
+        let (log_tx, _) = broadcast::channel(8192);
         Self {
             port,
             api_key,
@@ -567,11 +568,13 @@ async fn handle_ws(mut socket: WebSocket, log_tx: LogBroadcaster) {
     let mut rx = log_tx.subscribe();
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     heartbeat.tick().await; // consume the first immediate tick
+    let mut lag_warned = false;
     loop {
         tokio::select! {
             result = rx.recv() => {
                 match result {
                     Ok(entry) => {
+                        lag_warned = false;
                         if let Ok(msg) = serde_json::to_string(&entry) {
                             if socket.send(Message::Text(msg.into())).await.is_err() {
                                 break;
@@ -579,12 +582,23 @@ async fn handle_ws(mut socket: WebSocket, log_tx: LogBroadcaster) {
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        if !lag_warned {
+                            tracing::debug!("WS client lagged — dropped {n} log entries");
+                            lag_warned = true;
+                        }
+                        continue;
+                    }
                 }
             }
             _ = heartbeat.tick() => {
-                // Send a ping to keep the connection alive and confirm to the browser
-                // that the engine is still running even when no log entries are emitted.
+                // JSON pong is visible to the dashboard JS (protocol Ping/Pong is not).
+                // Lets the client detect half-open connections and reconnect.
+                let pong = serde_json::json!({ "type": "pong", "timestamp": now_secs() });
+                if socket.send(Message::Text(pong.to_string().into())).await.is_err() {
+                    break;
+                }
+                // Protocol-level ping for proxies that only track WS ping frames.
                 if socket.send(Message::Ping(vec![].into())).await.is_err() {
                     break;
                 }

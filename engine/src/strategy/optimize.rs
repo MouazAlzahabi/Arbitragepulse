@@ -7,9 +7,10 @@ use tracing::debug;
 
 use crate::abi::{IAerodromeRouter, IQuoterV2, ISolidlyRouter, IUniswapV2Router02};
 use crate::config::RouterType;
+use crate::pool_cache::{VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::ArbOpportunity;
-use crate::util::u256_to_f64;
-use super::{Strategy, parse_amount_capped};
+use crate::util::{addr_key, u256_to_f64};
+use super::{Strategy, P15_QUOTER_HAIRCUT_BPS};
 
 impl Strategy {
     /// Two-round adaptive size optimizer (~2 RTTs, ~200ms).
@@ -59,13 +60,10 @@ impl Strategy {
         // amount_in ($6 → $12), blocking the optimizer from probing up to $100.
         let double_amount = opp.amount_in * U256::from(2u32);
         let max_amount = self
-            .pairs
-            .iter()
-            .find(|p| p.id == opp.pair_id)
-            .and_then(|p| {
-                let cap_str = p.max_trade.as_deref().unwrap_or(&p.trade_amount);
-                parse_amount_capped(cap_str, None, p.token_in_decimals)
-            })
+            .pair_id_to_index
+            .get(&opp.pair_id)
+            .and_then(|&pi| self.pair_resolved.get(pi).and_then(|o| o.as_ref()))
+            .map(|r| r.max_amount_in)
             .unwrap_or(double_amount);
 
         // Also cap by the contract's known token_in balance (from periodic refresh).
@@ -84,24 +82,15 @@ impl Strategy {
             return opp.clone();
         }
 
-        // ── Resolve per-router QuoterV2 addresses ────────────────────────────
-        // RouterConfig.quoter_address overrides the chain-level quoter_v2_address.
-        // PancakeV3 and UniswapV3 have different QuoterV2 contracts on Linea.
-        let quoter_a: Option<Address> = self.routers.iter()
-            .find(|r| r.id == opp.router_a_id)
-            .and_then(|r| r.quoter_address.as_deref())
-            .and_then(|s| s.parse().ok())
-            .or(self.quoter_v2_address);
-        let quoter_b: Option<Address> = self.routers.iter()
-            .find(|r| r.id == opp.router_b_id)
-            .and_then(|r| r.quoter_address.as_deref())
-            .and_then(|s| s.parse().ok())
-            .or(self.quoter_v2_address);
+        let quoter_a = self.quoter_by_router.get(&opp.router_a_id).copied();
+        let quoter_b = self.quoter_by_router.get(&opp.router_b_id).copied();
 
         // ── Round 1: Coarse scan across full range ────────────────────────────
         let coarse_winner = probe_range(
             opp,
             provider,
+            &self.pool_cache,
+            &self.solidly_pool_keys,
             quoter_a,
             quoter_b,
             min_amount,
@@ -122,6 +111,8 @@ impl Strategy {
         let fine_winner = probe_range(
             opp,
             provider,
+            &self.pool_cache,
+            &self.solidly_pool_keys,
             quoter_a,
             quoter_b,
             fine_min,
@@ -137,11 +128,9 @@ impl Strategy {
             .max_by_key(|(amt, back)| *back - *amt)
             .unwrap_or((opp.amount_in, opp.amount_in + opp.expected_profit));
 
-        // Apply 0.08% slippage buffer to opt_back: the optimizer uses live QuoterV2/RPC quotes
-        // at probe time, but the tx executes ~60-130ms later. In that window, V3 and Aerodrome
-        // pools can move (~0.02-0.04% per 2s block). Without this buffer, the optimizer strips
-        // the buffer that evaluate.rs applied, allowing thin-margin upgrades that fail on-chain.
-        let opt_back = (opt_back_raw * U256::from(9992)) / U256::from(10000);
+        // Same haircut as evaluate Phase 1.5 — optimizer must not strip detection buffer.
+        let opt_back = (opt_back_raw * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS))
+            / U256::from(10_000u32);
 
         let opt_profit = if opt_back > opt_amount {
             opt_back - opt_amount
@@ -183,8 +172,10 @@ impl Strategy {
 async fn probe_range<P: Provider + Clone + 'static>(
     opp: &ArbOpportunity,
     provider: &P,
-    quoter_a: Option<Address>, // QuoterV2 for router A (leg 1 — token_in → token_out)
-    quoter_b: Option<Address>, // QuoterV2 for router B (leg 2 — token_out → token_in)
+    pool_cache: &crate::pool_cache::PoolCache,
+    solidly_keys: &std::collections::HashMap<String, (String, String)>,
+    quoter_a: Option<Address>,
+    quoter_b: Option<Address>,
     min_amount: U256,
     max_amount: U256,
     steps: usize,
@@ -202,12 +193,22 @@ async fn probe_range<P: Provider + Clone + 'static>(
     let rb_type = opp.router_b_type.clone();
     let fa = opp.fee_a;
     let fb = opp.fee_b;
+    let router_a_id = opp.router_a_id.clone();
+    let router_b_id = opp.router_b_id.clone();
+    let ti_key = addr_key(token_in);
+    let to_key = addr_key(token_out);
 
     type BoxFut = Pin<Box<dyn Future<Output = Option<(U256, U256)>> + Send>>;
     let mut futs: Vec<BoxFut> = Vec::with_capacity(steps);
 
     for i in 0..steps {
         let p = provider.clone();
+        let cache = pool_cache.clone();
+        let solidly = solidly_keys.clone();
+        let rid_a = router_a_id.clone();
+        let rid_b = router_b_id.clone();
+        let ti_k = ti_key.clone();
+        let to_k = to_key.clone();
         let probe_amount = if steps == 1 {
             (min_amount + max_amount) / U256::from(2u32)
         } else {
@@ -218,34 +219,66 @@ async fn probe_range<P: Provider + Clone + 'static>(
 
         futs.push(Box::pin(async move {
             let mid = match ra_t {
-                RouterType::V2 => quote_v2(&p, ra, probe_amount, token_in, token_out).await,
+                RouterType::V2 => {
+                    let key = format!("{}:{}:{}", rid_a, ti_k, to_k);
+                    cache.get_amount_out_by_key_str(
+                        &key, token_in, probe_amount, Some(VOLATILE_MAX_AGE),
+                    )
+                }
                 RouterType::V3 => match quoter_a {
                     Some(q) => quote_v3(&p, q, probe_amount, token_in, token_out, fa).await,
                     None => None,
                 },
-                RouterType::Solidly => {
-                    quote_solidly(&p, ra, probe_amount, token_in, token_out, fa).await
+                RouterType::Solidly | RouterType::Aerodrome => {
+                    local_solidly(&cache, &solidly, &rid_a, token_in, token_out, &ti_k, &to_k, probe_amount, fa)
                 }
-                RouterType::Aerodrome => {
-                    quote_aerodrome(&p, ra, probe_amount, token_in, token_out, fa).await
+                RouterType::SyncSwap => {
+                    let key = format!("{}:{}:{}", rid_a, ti_k, to_k);
+                    cache.get_amount_out_by_key_str(
+                        &key, token_in, probe_amount, Some(VOLATILE_MAX_AGE),
+                    )
                 }
-                RouterType::SyncSwap => None, // pool address not available in probe_range
+            };
+            let mid = match mid {
+                Some(m) if !m.is_zero() => Some(m),
+                _ => match ra_t {
+                    RouterType::V2 => quote_v2(&p, ra, probe_amount, token_in, token_out).await,
+                    RouterType::Solidly => quote_solidly(&p, ra, probe_amount, token_in, token_out, fa).await,
+                    RouterType::Aerodrome => quote_aerodrome(&p, ra, probe_amount, token_in, token_out, fa).await,
+                    _ => None,
+                },
             };
             let mid = mid.filter(|m| !m.is_zero())?;
 
             let back = match rb_t {
-                RouterType::V2 => quote_v2(&p, rb, mid, token_out, token_in).await,
+                RouterType::V2 => {
+                    let key = format!("{}:{}:{}", rid_b, to_k, ti_k);
+                    cache.get_amount_out_by_key_str(
+                        &key, token_out, mid, Some(VOLATILE_MAX_AGE),
+                    )
+                }
                 RouterType::V3 => match quoter_b {
                     Some(q) => quote_v3(&p, q, mid, token_out, token_in, fb).await,
                     None => None,
                 },
-                RouterType::Solidly => {
-                    quote_solidly(&p, rb, mid, token_out, token_in, fb).await
+                RouterType::Solidly | RouterType::Aerodrome => {
+                    local_solidly(&cache, &solidly, &rid_b, token_out, token_in, &to_k, &ti_k, mid, fb)
                 }
-                RouterType::Aerodrome => {
-                    quote_aerodrome(&p, rb, mid, token_out, token_in, fb).await
+                RouterType::SyncSwap => {
+                    let key = format!("{}:{}:{}", rid_b, to_k, ti_k);
+                    cache.get_amount_out_by_key_str(
+                        &key, token_out, mid, Some(VOLATILE_MAX_AGE),
+                    )
                 }
-                RouterType::SyncSwap => None,
+            };
+            let back = match back {
+                Some(b) if !b.is_zero() => Some(b),
+                _ => match rb_t {
+                    RouterType::V2 => quote_v2(&p, rb, mid, token_out, token_in).await,
+                    RouterType::Solidly => quote_solidly(&p, rb, mid, token_out, token_in, fb).await,
+                    RouterType::Aerodrome => quote_aerodrome(&p, rb, mid, token_out, token_in, fb).await,
+                    _ => None,
+                },
             };
             back.filter(|&b| b > probe_amount).map(|b| (probe_amount, b))
         }));
@@ -259,6 +292,31 @@ async fn probe_range<P: Provider + Clone + 'static>(
 }
 
 // ─── Quote helpers ────────────────────────────────────────────────────────────
+
+fn local_solidly(
+    cache: &crate::pool_cache::PoolCache,
+    solidly_keys: &std::collections::HashMap<String, (String, String)>,
+    router_id: &str,
+    token_in: Address,
+    token_out: Address,
+    key_in: &str,
+    key_out: &str,
+    amount_in: U256,
+    fee: u32,
+) -> Option<U256> {
+    if fee != 0 {
+        let sta = solidly_keys.get(router_id)?.1.clone();
+        let key = format!("{}:{}:{}", sta, key_in, key_out);
+        return cache.get_amount_out_by_key_str(
+            &key, token_in, amount_in, Some(STABLE_MAX_AGE),
+        );
+    }
+    let vol = solidly_keys.get(router_id)?.0.clone();
+    let vol_key = format!("{}:{}:{}", vol, key_in, key_out);
+    cache.get_amount_out_by_key_str(
+        &vol_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
+    )
+}
 
 async fn quote_v2<P: Provider>(
     provider: &P,

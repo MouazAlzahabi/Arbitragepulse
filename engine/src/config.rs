@@ -95,6 +95,11 @@ pub struct ChainConfig {
     /// Scans still run (pool state stays fresh). Default: false.
     #[serde(default)]
     pub pending_only_submission: bool,
+    /// Poll `eth_getLogs` on an interval as a fallback when WS `eth_subscribe(logs)` is
+    /// unavailable or unreliable (e.g. some Linea providers). On Base with Alchemy WS,
+    /// leave **false** — WS updates are faster and avoid duplicate RPC + cache writes.
+    #[serde(default)]
+    pub poll_logs_fallback: bool,
     /// Minimum detected profit in USD required to submit a triangular arb.
     /// Triangular V3 routes overestimate output via cached sqrtPriceX96 (tick-level
     /// liquidity not modelled). This floor filters phantom opportunities before they

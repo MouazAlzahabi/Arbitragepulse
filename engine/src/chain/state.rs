@@ -9,6 +9,8 @@ pub(crate) async fn update_native_price<P: Provider>(
     cfg: &ChainConfig,
 ) {
     use crate::abi::{IUniswapV2Router02, IQuoterV2};
+    use crate::pool_cache::VOLATILE_MAX_AGE;
+    use crate::util::addr_key;
     use alloy::primitives::{U256, Uint};
     use crate::config::RouterType;
 
@@ -43,7 +45,32 @@ pub(crate) async fn update_native_price<P: Provider>(
     let probe_scale = 100_u128; // multiply back to get per-1-ETH price
     let decimal_scale = 10_f64.powi(stable_pair.token_out_decimals as i32);
 
-    // ── Try V3 QuoterV2 first (more accurate on chains with thin V2 pools) ──
+    // ── Try local V2 pool cache first (zero RPC on the 60s tick) ────────────
+    {
+        let strat = strategy.read().await;
+        let w_key = addr_key(wrapped_native);
+        let s_key = addr_key(token_out);
+        for router in routers.iter().filter(|r| r.chain_id == cfg.id && r.router_type == RouterType::V2) {
+            let key = format!("{}:{}:{}", router.id, w_key, s_key);
+            if let Some(out) = strat.pool_cache.get_amount_out_by_key_str(
+                &key,
+                wrapped_native,
+                probe_amount,
+                Some(VOLATILE_MAX_AGE),
+            ) {
+                if !out.is_zero() {
+                    let price = out.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
+                    debug!("[{}] {} price (V2 cache) router={} → ${:.2}", cfg.name, cfg.native_currency, router.id, price);
+                    drop(strat);
+                    { let mut strat = strategy.write().await; strat.update_native_price(price); }
+                    { let mut exec = executor.lock().await; exec.update_native_price(price); }
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Try V3 QuoterV2 (more accurate on chains with thin V2 pools) ──
     // Iterate ALL V3 routers, each using its own quoter (per-router takes priority
     // over chain-level). Keep the HIGHEST price across all routers and fee tiers —
     // the deepest pool gives the most accurate market price.
@@ -117,7 +144,7 @@ pub(crate) async fn update_native_price<P: Provider>(
 /// Called at startup and every 30s by the balance_tick timer. The balance map
 /// is keyed by token address and initialised to U256::ZERO at startup; this
 /// function overwrites each entry with the live on-chain value.
-pub(crate) async fn refresh_contract_balances<P: Provider>(
+pub(crate) async fn refresh_contract_balances<P: Provider + Clone>(
     provider: &P,
     contract_addr: Address,
     balances: &Arc<RwLock<HashMap<Address, U256>>>,
@@ -126,10 +153,26 @@ pub(crate) async fn refresh_contract_balances<P: Provider>(
         let b = balances.read().await;
         b.keys().copied().collect()
     };
-    for token in token_addrs {
-        match IERC20::new(token, provider).balanceOf(contract_addr).call().await {
+    if token_addrs.is_empty() {
+        return;
+    }
+
+    // Fetch all balances concurrently, then write-lock once (same pattern as receipt handler).
+    let results = futures::future::join_all(token_addrs.iter().map(|&token| {
+        let p = provider.clone();
+        async move {
+            (
+                token,
+                IERC20::new(token, &p).balanceOf(contract_addr).call().await,
+            )
+        }
+    }))
+    .await;
+
+    let mut b = balances.write().await;
+    for (token, result) in results {
+        match result {
             Ok(bal) => {
-                let mut b = balances.write().await;
                 b.insert(token, bal);
             }
             Err(e) => {

@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, U256};
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::util::addr_key;
@@ -107,6 +108,22 @@ const Q96: U256 = U256::from_limbs([0, 4_294_967_296u64, 0, 0]);
 /// V3 fee denominator: 1_000_000 ppm.
 const FEE_DENOM_V3: U256 = U256::from_limbs([1_000_000u64, 0, 0, 0]);
 
+/// Max fraction of input-side virtual reserve for V3 spot quotes (single-tick safe).
+/// Trades larger than this fraction of `vr_in` can cross ticks where L=0 and overestimate output.
+const V3_SPOT_MAX_VR_FRACTION_BPS: u64 = 200; // 2% of vr_in
+
+fn cap_v3_spot_amount_in(vr_in: U256, amount_in: U256) -> U256 {
+    if vr_in.is_zero() {
+        return amount_in;
+    }
+    let max_in =
+        vr_in.saturating_mul(U256::from(V3_SPOT_MAX_VR_FRACTION_BPS)) / U256::from(10_000u64);
+    if max_in.is_zero() {
+        return amount_in;
+    }
+    amount_in.min(max_in)
+}
+
 /// V2/Solidly fee denominator: 10_000 bps.
 const FEE_DENOM_V2: U256 = U256::from_limbs([10_000u64, 0, 0, 0]);
 
@@ -154,17 +171,58 @@ const SCALE: [U256; 19] = [
 /// * `v3_by_key`     — "router_id:token_in_lower:token_out_lower:fee" → pool_address
 ///
 /// Both directions are stored under separate keys (same pool address).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PoolCache {
     pub by_address: Arc<DashMap<Address, PoolInfo>>,
     pub by_key: Arc<DashMap<String, Address>>,
     pub v3_by_address: Arc<DashMap<Address, V3PoolState>>,
     pub v3_by_key: Arc<DashMap<String, Address>>,
+    /// Cached union of V2 + V3 pool addresses for log filters / listeners.
+    watch_addrs: Arc<RwLock<Vec<Address>>>,
+    watch_addrs_dirty: Arc<AtomicBool>,
+}
+
+impl Default for PoolCache {
+    fn default() -> Self {
+        Self {
+            by_address: Arc::new(DashMap::new()),
+            by_key: Arc::new(DashMap::new()),
+            v3_by_address: Arc::new(DashMap::new()),
+            v3_by_key: Arc::new(DashMap::new()),
+            watch_addrs: Arc::new(RwLock::new(Vec::new())),
+            watch_addrs_dirty: Arc::new(AtomicBool::new(true)),
+        }
+    }
 }
 
 impl PoolCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn mark_watch_addrs_dirty(&self) {
+        self.watch_addrs_dirty.store(true, Ordering::Release);
+    }
+
+    fn rebuild_watch_addrs_if_dirty(&self) {
+        if !self.watch_addrs_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut addrs: Vec<Address> = self.by_address.iter().map(|e| *e.key()).collect();
+        addrs.extend(self.v3_by_address.iter().map(|e| *e.key()));
+        if let Ok(mut guard) = self.watch_addrs.write() {
+            *guard = addrs;
+        }
+    }
+
+    /// All pool addresses (V2 + V3) for eth_subscribe / getLogs filters.
+    /// Rebuilt only when pools are inserted or pruned — avoids O(n) collect per poll.
+    pub fn watch_addresses(&self) -> Vec<Address> {
+        self.rebuild_watch_addrs_if_dirty();
+        self.watch_addrs
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     /// Insert a pool and register both directional keys.
@@ -179,6 +237,7 @@ impl PoolCache {
         self.by_key.insert(format!("{}:{}:{}", rid, t0, t1), pool);
         self.by_key.insert(format!("{}:{}:{}", rid, t1, t0), pool);
         self.by_address.insert(pool, info);
+        self.mark_watch_addrs_dirty();
     }
 
     /// Update reserves from a Sync event and stamp freshness.
@@ -274,12 +333,12 @@ impl PoolCache {
     /// Used by the targeted-scan path to identify which tokens moved on a Swap event.
     pub fn get_pool_tokens(&self, pool: Address) -> Option<(Address, Address)> {
         if let Some(info) = self.by_address.get(&pool) {
-            return Some((info.token0, info.token1));
+            Some((info.token0, info.token1))
+        } else if let Some(v3) = self.v3_by_address.get(&pool) {
+            Some((v3.token0, v3.token1))
+        } else {
+            None
         }
-        if let Some(v3) = self.v3_by_address.get(&pool) {
-            return Some((v3.token0, v3.token1));
-        }
-        None
     }
 
     // ── V3 methods ────────────────────────────────────────────────────────────
@@ -296,6 +355,7 @@ impl PoolCache {
         self.v3_by_key.insert(format!("{}:{}:{}:{}", rid, t0, t1, fee), pool);
         self.v3_by_key.insert(format!("{}:{}:{}:{}", rid, t1, t0, fee), pool);
         self.v3_by_address.insert(pool, state);
+        self.mark_watch_addrs_dirty();
     }
 
     /// Update sqrtPriceX96 and liquidity from a V3 Swap event.
@@ -352,6 +412,10 @@ impl PoolCache {
             self.v3_by_key.remove(&format!("{}:{}:{}:{}", rid, t1, t0, fee));
         }
 
+        if !stale_v2.is_empty() || !stale_v3.is_empty() {
+            self.mark_watch_addrs_dirty();
+        }
+
         (stale_v2.len(), stale_v3.len())
     }
 
@@ -376,19 +440,22 @@ impl PoolCache {
         token_out: Address,
         fee: u32,
         amount_in: U256,
-    ) -> Option<(U256, u128)> {
+    ) -> Option<(U256, u128, U256)> {
         let key = format!("{}:{}:{}:{}", router_id, addr_key(token_in), addr_key(token_out), fee);
         self.quote_v3_spot_str(&key, token_in, amount_in)
     }
 
     /// Same as `quote_v3_spot` but accepts a pre-built key string, avoiding a
     /// second `format!()` when the caller already computed the key for a cache check.
+    ///
+    /// Returns `(amount_out, liquidity, effective_amount_in)`. `effective_amount_in` may be
+    /// less than `amount_in` when capped to ~2% of the input-side virtual reserve.
     pub fn quote_v3_spot_str(
         &self,
         key: &str,
         token_in: Address,
         amount_in: U256,
-    ) -> Option<(U256, u128)> {
+    ) -> Option<(U256, u128, U256)> {
         let pool_addr = *self.v3_by_key.get(key)?;
 
         let state = self.v3_by_address.get(&pool_addr)?;
@@ -408,16 +475,18 @@ impl PoolCache {
             (vr1, vr0)
         };
 
+        let effective_in = cap_v3_spot_amount_in(vr_in, amount_in);
+
         // xy=k with ppm fee:  out = ai×fee_num×vr_out / (vr_in×FEE_DENOM + ai×fee_num)
         // fee_num = 1_000_000 − fee, precomputed in refresh_vr().
-        let ai_fee = amount_in.checked_mul(state.fee_num_v3)?;
+        let ai_fee = effective_in.checked_mul(state.fee_num_v3)?;
         let num    = ai_fee.checked_mul(vr_out)?;
         let den    = vr_in.checked_mul(FEE_DENOM_V3)?.checked_add(ai_fee)?;
         if den.is_zero() {
             return None;
         }
 
-        Some((num / den, state.liquidity))
+        Some((num / den, state.liquidity, effective_in))
     }
 
 }

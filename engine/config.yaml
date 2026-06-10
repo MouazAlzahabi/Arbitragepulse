@@ -63,6 +63,7 @@ chains:
     priority_fee_wei: 10000000    # 10 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei (trigger_tip dominates for pending path)
     pending_tx_monitoring: true   # monitor mempool for large swaps before they confirm → same-block arb
     pending_only_submission: false # only submit TXs from pending monitor path; block/poll scans detect but don't submit (avoids pos 500+ failures)
+    poll_logs_fallback: false     # Alchemy WS logs are live — skip duplicate eth_getLogs polling
 
   - id: 42161
     name: "Arbitrum"
