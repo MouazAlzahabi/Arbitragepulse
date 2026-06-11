@@ -107,8 +107,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Scan source: block | poll | swap | pending — execution telemetry (see chain/mod.rs call sites).
     trigger: &'static str,
 ) {
-    // Single timestamp for scan→submit latency (one Instant per scan, zero hot-path overhead).
-    let scan_start = Instant::now();
+    // Detection phase timer (evaluate + triangular) — shared across all candidates this scan.
+    let detect_start = Instant::now();
 
     let all_opportunities = {
         let strat = strategy.read().await;
@@ -138,7 +138,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         };
 
         let is_full_scan = targeted.is_none();
-        // Swap-event scans target 1–2 pairs; skip triangular (O(triplets)) to cut CPU/latency.
+        // Targeted scans: 2-hop on pair mask; triangular only on swap/pending tokens (not full O(N³)).
+        let token_filter = targeted.as_ref().map(|(_, tokens)| tokens.as_slice());
         let ((opps_2hop, best_2hop, verified_spread_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) =
             if is_full_scan {
                 tokio::join!(
@@ -146,8 +147,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     strat.detect_triangular(provider.as_ref(), 5, None, &*disabled_set),
                 )
             } else {
-                let eval = strat.evaluate(provider.as_ref(), final_mask.as_ref(), false).await;
-                (eval, (Vec::new(), 0.0))
+                tokio::join!(
+                    strat.evaluate(provider.as_ref(), final_mask.as_ref(), false),
+                    strat.detect_triangular(provider.as_ref(), 5, token_filter, &*disabled_set),
+                )
             };
 
         // Update quote diagnostic counters only on full scans.
@@ -197,6 +200,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
         merged
     };
+    let detect_ms = detect_start.elapsed().as_millis() as u64;
 
     // Track opp count for heartbeat display
     last_opp_count.store(all_opportunities.len() as u64, Ordering::Relaxed);
@@ -315,6 +319,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     }
 
     // ── Dispatch based on opportunity type ────────────────────────────────────
+    // Per-candidate timer — excludes time spent on prior failed attempts this scan.
+    let candidate_start = Instant::now();
 
     match best_opp {
         Opportunity::TwoHop(opp) => {
@@ -377,7 +383,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 exec.dry_run = true;
                 match exec.execute(provider.as_ref(), &optimized).await {
                     Ok(tx_hash) => {
-                        let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
+                        let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
@@ -509,13 +515,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
-                                let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
+                                let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                                 let submit_at = Instant::now();
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 info!(
-                                    "[{}] exec_send | route=2hop | scan_to_submit_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
-                                    cfg.name, scan_to_submit_ms, exec_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=2hop | scan_to_submit_ms={} | detect_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, detect_ms, exec_ms, elapsed_send, trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, optimized.pair_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
@@ -747,7 +753,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 exec.dry_run = true;
                 match exec.execute_triangular(provider.as_ref(), opp).await {
                     Ok(tx_hash) => {
-                        let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
+                        let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
@@ -864,13 +870,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
-                                let scan_to_submit_ms = scan_start.elapsed().as_millis() as u64;
+                                let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                                 let submit_at = Instant::now();
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
                                 info!(
-                                    "[{}] exec_send | route=triangular | scan_to_submit_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
-                                    cfg.name, scan_to_submit_ms, exec_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=triangular | scan_to_submit_ms={} | detect_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, detect_ms, exec_ms, elapsed_send, trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, opp.triplet_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );

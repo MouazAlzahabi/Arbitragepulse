@@ -585,6 +585,16 @@ async fn handle_ws(mut socket: WebSocket, log_tx: LogBroadcaster) {
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         if !lag_warned {
                             tracing::debug!("WS client lagged — dropped {n} log entries");
+                            let lag_msg = serde_json::json!({
+                                "level": "warn",
+                                "message": format!(
+                                    "[ENGINE] Live feed lag — {n} log entries skipped (clear logs or reconnect)"
+                                ),
+                                "timestamp": now_secs(),
+                            });
+                            let _ = socket
+                                .send(Message::Text(lag_msg.to_string().into()))
+                                .await;
                             lag_warned = true;
                         }
                         continue;

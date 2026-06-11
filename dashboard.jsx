@@ -149,14 +149,25 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
           });
         } catch {}
       };
-      ws.onclose = (e) => {
+      ws.onclose = async (e) => {
         clearTimeout(idleRef.current);
         if (!mountedRef.current) return;
         setStatus("disconnected");
-        // 1008 = policy violation (auth). 1006 often means handshake failed (also bad token).
         if (e.code === 1008 || e.reason?.includes("401") || e.reason?.toLowerCase().includes("unauthorized")) {
           setAuthError(true);
           return;
+        }
+        // 1006/1002 often mean failed handshake (bad token) — verify via REST before reconnect loop.
+        if (apiKey && httpBaseUrl && (e.code === 1006 || e.code === 1002)) {
+          try {
+            const r = await fetch(`${httpBaseUrl}/stats`, {
+              headers: { Authorization: `Bearer ${apiKey}` },
+            });
+            if (r.status === 401) {
+              setAuthError(true);
+              return;
+            }
+          } catch {}
         }
         scheduleReconnect();
       };

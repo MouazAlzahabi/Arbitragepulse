@@ -250,18 +250,46 @@ impl Strategy {
 
     fn build_pair_resolved(pairs: &[PairConfig], default_min_profit: f64) -> Vec<Option<PairResolved>> {
         use crate::util::addr_key;
+        use tracing::warn;
         pairs
             .iter()
             .map(|p| {
-                let token_in: Address = p.token_in.parse().ok()?;
-                let token_out: Address = p.token_out.parse().ok()?;
-                let amount_in = parse_amount_capped(
+                let token_in: Address = match p.token_in.parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        warn!("Pair {} skipped — invalid token_in address", p.id);
+                        return None;
+                    }
+                };
+                let token_out: Address = match p.token_out.parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        warn!("Pair {} skipped — invalid token_out address", p.id);
+                        return None;
+                    }
+                };
+                let amount_in = match parse_amount_capped(
                     &p.trade_amount,
                     p.max_trade.as_deref(),
                     p.token_in_decimals,
-                )?;
+                ) {
+                    Some(a) => a,
+                    None => {
+                        warn!(
+                            "Pair {} skipped — invalid trade_amount/max_trade ({}/{:?})",
+                            p.id, p.trade_amount, p.max_trade
+                        );
+                        return None;
+                    }
+                };
                 let cap_str = p.max_trade.as_deref().unwrap_or(&p.trade_amount);
-                let max_amount_in = parse_amount_capped(cap_str, None, p.token_in_decimals)?;
+                let max_amount_in = match parse_amount_capped(cap_str, None, p.token_in_decimals) {
+                    Some(a) => a,
+                    None => {
+                        warn!("Pair {} skipped — invalid max_trade cap", p.id);
+                        return None;
+                    }
+                };
                 Some(PairResolved {
                     token_in,
                     token_out,

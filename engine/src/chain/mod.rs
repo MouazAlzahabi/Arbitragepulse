@@ -622,8 +622,14 @@ pub async fn run_chain(
                         let structure_changed = strat.pairs.len() != new_pairs.len()
                             || strat.routers.len() != new_routers.len();
 
+                        let profit_changed = strat.min_profit_usd != new_min_profit
+                            || strat.min_triangular_profit_usd != new_min_tri_profit;
+
                         strat.pairs = new_pairs;
                         strat.routers = new_routers;
+                        strat.min_profit_usd = new_min_profit;
+                        strat.min_triangular_profit_usd = new_min_tri_profit;
+                        // Single rebuild with updated pairs, routers, and profit floors.
                         strat.rebuild_token_pair_index();
                         strat.rebuild_router_maps();
 
@@ -632,10 +638,7 @@ pub async fn run_chain(
                             strat.populate_syncswap_pools(provider.as_ref()).await;
                         }
 
-                        if strat.min_profit_usd != new_min_profit || strat.min_triangular_profit_usd != new_min_tri_profit {
-                            strat.min_profit_usd = new_min_profit;
-                            strat.min_triangular_profit_usd = new_min_tri_profit;
-                            strat.rebuild_scan_cache();
+                        if profit_changed {
                             info!(
                                 "[{}] Config hot-reloaded (min_profit=${:.2}, min_triangular_profit=${:.2})",
                                 cfg.name, new_min_profit, new_min_tri_profit
