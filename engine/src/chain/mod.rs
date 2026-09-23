@@ -453,6 +453,17 @@ pub async fn run_chain(
                 let now = Instant::now();
                 cooldowns.retain(|_, expire_at| *expire_at > now);
 
+                let (pruned_v2, pruned_v3) = pool_cache.prune_stale(
+                    Duration::from_secs(45 * 60),
+                    Duration::from_secs(45 * 60),
+                );
+                if pruned_v2 > 0 || pruned_v3 > 0 {
+                    debug!(
+                        "[{}] pruned stale pool cache entries: v2={} v3={}",
+                        cfg.name, pruned_v2, pruned_v3
+                    );
+                }
+
                 // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
                 let rpc_ping_start = Instant::now();
                 let rpc_latency_ms = match provider.get_block_number().await {

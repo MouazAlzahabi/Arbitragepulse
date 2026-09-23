@@ -1,10 +1,46 @@
 use alloy::primitives::{Address, U256};
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::util::addr_key;
+// ─── Structured pool lookup keys (no per-quote format! / string hashing) ────────
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct V2PoolKey {
+    pub router_id: Arc<str>,
+    pub token_in: Address,
+    pub token_out: Address,
+}
+
+impl V2PoolKey {
+    pub fn new(router_id: &str, token_in: Address, token_out: Address) -> Self {
+        Self {
+            router_id: Arc::from(router_id),
+            token_in,
+            token_out,
+        }
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct V3PoolKey {
+    pub router_id: Arc<str>,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub fee: u32,
+}
+
+impl V3PoolKey {
+    pub fn new(router_id: &str, token_in: Address, token_out: Address, fee: u32) -> Self {
+        Self {
+            router_id: Arc::from(router_id),
+            token_in,
+            token_out,
+            fee,
+        }
+    }
+}
 
 // ─── Pool state ───────────────────────────────────────────────────────────────
 
@@ -174,12 +210,16 @@ const SCALE: [U256; 19] = [
 #[derive(Clone)]
 pub struct PoolCache {
     pub by_address: Arc<DashMap<Address, PoolInfo>>,
-    pub by_key: Arc<DashMap<String, Address>>,
+    pub by_key: Arc<DashMap<V2PoolKey, Address>>,
     pub v3_by_address: Arc<DashMap<Address, V3PoolState>>,
-    pub v3_by_key: Arc<DashMap<String, Address>>,
+    pub v3_by_key: Arc<DashMap<V3PoolKey, Address>>,
     /// Cached union of V2 + V3 pool addresses for log filters / listeners.
     watch_addrs: Arc<RwLock<Vec<Address>>>,
     watch_addrs_dirty: Arc<AtomicBool>,
+    /// Heartbeat v3 fresh/total — recomputed when `v3_metrics_dirty` is set.
+    v3_metrics_dirty: Arc<AtomicBool>,
+    cached_v3_fresh: Arc<AtomicUsize>,
+    cached_v3_total: Arc<AtomicUsize>,
 }
 
 impl Default for PoolCache {
@@ -191,6 +231,9 @@ impl Default for PoolCache {
             v3_by_key: Arc::new(DashMap::new()),
             watch_addrs: Arc::new(RwLock::new(Vec::new())),
             watch_addrs_dirty: Arc::new(AtomicBool::new(true)),
+            v3_metrics_dirty: Arc::new(AtomicBool::new(true)),
+            cached_v3_fresh: Arc::new(AtomicUsize::new(0)),
+            cached_v3_total: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -202,6 +245,10 @@ impl PoolCache {
 
     fn mark_watch_addrs_dirty(&self) {
         self.watch_addrs_dirty.store(true, Ordering::Release);
+    }
+
+    fn mark_v3_metrics_dirty(&self) {
+        self.v3_metrics_dirty.store(true, Ordering::Release);
     }
 
     fn rebuild_watch_addrs_if_dirty(&self) {
@@ -230,12 +277,9 @@ impl PoolCache {
     /// never calls U256::from() per quote call.
     pub fn insert(&self, pool: Address, mut info: PoolInfo) {
         info.fee_num = FEE_DENOM_V2.saturating_sub(U256::from(info.fee_bps));
-        let t0 = addr_key(info.token0);
-        let t1 = addr_key(info.token1);
-        let rid = &info.router_id;
-
-        self.by_key.insert(format!("{}:{}:{}", rid, t0, t1), pool);
-        self.by_key.insert(format!("{}:{}:{}", rid, t1, t0), pool);
+        let rid = info.router_id.as_str();
+        self.by_key.insert(V2PoolKey::new(rid, info.token0, info.token1), pool);
+        self.by_key.insert(V2PoolKey::new(rid, info.token1, info.token0), pool);
         self.by_address.insert(pool, info);
         self.mark_watch_addrs_dirty();
     }
@@ -272,7 +316,7 @@ impl PoolCache {
         amount_in: U256,
         max_age: Option<Duration>,
     ) -> Option<U256> {
-        let key = format!("{}:{}:{}", router_id, addr_key(token_in), addr_key(token_out));
+        let key = V2PoolKey::new(router_id, token_in, token_out);
         let pool = *self.by_key.get(&key)?;
         if let Some(age) = max_age {
             let info = self.by_address.get(&pool)?;
@@ -290,9 +334,9 @@ impl PoolCache {
     /// Same as `get_amount_out_by_key` but accepts a caller-supplied key to avoid
     /// the `format!("{}:{}:{}", ...)` allocation inside the hot scan loop.
     /// Use when the key has already been built once per pair (not once per router).
-    pub fn get_amount_out_by_key_str(
+    pub fn get_amount_out_by_v2_key(
         &self,
-        key: &str,
+        key: &V2PoolKey,
         token_in: Address,
         amount_in: U256,
         max_age: Option<Duration>,
@@ -309,6 +353,23 @@ impl PoolCache {
         }
     }
 
+    /// Legacy string-key lookup — builds a [`V2PoolKey`] (router id must not need parsing).
+    pub fn get_amount_out_by_key_str(
+        &self,
+        router_id: &str,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        max_age: Option<Duration>,
+    ) -> Option<U256> {
+        self.get_amount_out_by_v2_key(
+            &V2PoolKey::new(router_id, token_in, token_out),
+            token_in,
+            amount_in,
+            max_age,
+        )
+    }
+
     /// All V2/Solidly/SyncSwap pool addresses currently in the cache.
     pub fn pool_addresses(&self) -> Vec<Address> {
         self.by_address.iter().map(|e| *e.key()).collect()
@@ -322,11 +383,22 @@ impl PoolCache {
     /// Count V3 pools updated within `window`. Returns (fresh, total).
     /// fresh = pools that received at least one Swap event within the window.
     pub fn count_fresh_v3_pools(&self, window: Duration) -> (usize, usize) {
-        let total = self.v3_by_address.len();
-        let fresh = self.v3_by_address.iter()
-            .filter(|e| e.last_updated.elapsed() <= window)
-            .count();
-        (fresh, total)
+        let total_live = self.v3_by_address.len();
+        let cached_total = self.cached_v3_total.load(Ordering::Relaxed);
+        if self.v3_metrics_dirty.swap(false, Ordering::AcqRel) || cached_total != total_live {
+            let fresh = self
+                .v3_by_address
+                .iter()
+                .filter(|e| e.last_updated.elapsed() <= window)
+                .count();
+            self.cached_v3_fresh.store(fresh, Ordering::Relaxed);
+            self.cached_v3_total.store(total_live, Ordering::Relaxed);
+            return (fresh, total_live);
+        }
+        (
+            self.cached_v3_fresh.load(Ordering::Relaxed),
+            self.cached_v3_total.load(Ordering::Relaxed),
+        )
     }
 
     /// Returns (token0, token1) for any watched pool — V2/Solidly/SyncSwap or V3.
@@ -347,15 +419,16 @@ impl PoolCache {
     /// Key format: "router_id:token_in_lower:token_out_lower:fee"
     pub fn insert_v3(&self, pool: Address, mut state: V3PoolState) {
         state.refresh_vr(); // precompute vr0, vr1, fee_num_v3 once at insert
-        let t0 = addr_key(state.token0);
-        let t1 = addr_key(state.token1);
         let fee = state.fee;
-        let rid = &state.router_id;
+        let rid = state.router_id.as_str();
 
-        self.v3_by_key.insert(format!("{}:{}:{}:{}", rid, t0, t1, fee), pool);
-        self.v3_by_key.insert(format!("{}:{}:{}:{}", rid, t1, t0, fee), pool);
+        self.v3_by_key
+            .insert(V3PoolKey::new(rid, state.token0, state.token1, fee), pool);
+        self.v3_by_key
+            .insert(V3PoolKey::new(rid, state.token1, state.token0, fee), pool);
         self.v3_by_address.insert(pool, state);
         self.mark_watch_addrs_dirty();
+        self.mark_v3_metrics_dirty();
     }
 
     /// Update sqrtPriceX96 and liquidity from a V3 Swap event.
@@ -367,6 +440,7 @@ impl PoolCache {
             e.liquidity = liquidity;
             e.last_updated = Instant::now();
             e.refresh_vr();
+            self.mark_v3_metrics_dirty();
         }
     }
 
@@ -387,11 +461,11 @@ impl PoolCache {
 
         for (pool, info) in &stale_v2 {
             self.by_address.remove(pool);
-            let t0 = addr_key(info.token0);
-            let t1 = addr_key(info.token1);
-            let rid = &info.router_id;
-            self.by_key.remove(&format!("{}:{}:{}", rid, t0, t1));
-            self.by_key.remove(&format!("{}:{}:{}", rid, t1, t0));
+            let rid = info.router_id.as_str();
+            self.by_key
+                .remove(&V2PoolKey::new(rid, info.token0, info.token1));
+            self.by_key
+                .remove(&V2PoolKey::new(rid, info.token1, info.token0));
         }
 
         // ── V3 ───────────────────────────────────────────────────────────────
@@ -404,16 +478,17 @@ impl PoolCache {
 
         for (pool, state) in &stale_v3 {
             self.v3_by_address.remove(pool);
-            let t0 = addr_key(state.token0);
-            let t1 = addr_key(state.token1);
-            let rid = &state.router_id;
+            let rid = state.router_id.as_str();
             let fee = state.fee;
-            self.v3_by_key.remove(&format!("{}:{}:{}:{}", rid, t0, t1, fee));
-            self.v3_by_key.remove(&format!("{}:{}:{}:{}", rid, t1, t0, fee));
+            self.v3_by_key
+                .remove(&V3PoolKey::new(rid, state.token0, state.token1, fee));
+            self.v3_by_key
+                .remove(&V3PoolKey::new(rid, state.token1, state.token0, fee));
         }
 
         if !stale_v2.is_empty() || !stale_v3.is_empty() {
             self.mark_watch_addrs_dirty();
+            self.mark_v3_metrics_dirty();
         }
 
         (stale_v2.len(), stale_v3.len())
@@ -441,18 +516,14 @@ impl PoolCache {
         fee: u32,
         amount_in: U256,
     ) -> Option<(U256, u128, U256)> {
-        let key = format!("{}:{}:{}:{}", router_id, addr_key(token_in), addr_key(token_out), fee);
-        self.quote_v3_spot_str(&key, token_in, amount_in)
+        let key = V3PoolKey::new(router_id, token_in, token_out, fee);
+        self.quote_v3_spot_key(&key, token_in, amount_in)
     }
 
-    /// Same as `quote_v3_spot` but accepts a pre-built key string, avoiding a
-    /// second `format!()` when the caller already computed the key for a cache check.
-    ///
-    /// Returns `(amount_out, liquidity, effective_amount_in)`. `effective_amount_in` may be
-    /// less than `amount_in` when capped to ~2% of the input-side virtual reserve.
-    pub fn quote_v3_spot_str(
+    /// Same as `quote_v3_spot` but accepts a pre-built [`V3PoolKey`].
+    pub fn quote_v3_spot_key(
         &self,
-        key: &str,
+        key: &V3PoolKey,
         token_in: Address,
         amount_in: U256,
     ) -> Option<(U256, u128, U256)> {

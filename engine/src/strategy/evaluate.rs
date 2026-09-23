@@ -5,9 +5,9 @@ use tracing::{debug, info, warn};
 
 use crate::abi::IQuoterV2;
 use crate::config::RouterType;
-use crate::pool_cache::{VOLATILE_MAX_AGE, STABLE_MAX_AGE};
+use crate::pool_cache::{V2PoolKey, V3PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{ArbOpportunity, PairScanInfo};
-use crate::util::{addr_key, u256_to_f64};
+use crate::util::u256_to_f64;
 use super::{ForwardTask, ReverseTask, Strategy, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY, P15_QUOTER_HAIRCUT_BPS};
 
 impl Strategy {
@@ -72,9 +72,6 @@ impl Strategy {
             let token_in = resolved.token_in;
             let token_out = resolved.token_out;
             let amount_in = resolved.amount_in;
-            let token_in_key = &resolved.token_in_key;
-            let token_out_key = &resolved.token_out_key;
-
             for &ri in &self.chain_router_indices {
                 let router = &self.routers[ri];
                 let router_addr: Address = match self.router_addr_map.get(&router.id) {
@@ -90,9 +87,9 @@ impl Strategy {
                         // last trade 10+ minutes ago produce phantom opportunities — the local
                         // xy=k formula is exact given correct reserves, but stale reserves
                         // overestimate output and cause on-chain "too little received" reverts.
-                        let fwd_key = format!("{}:{}:{}", router.id, token_in_key, token_out_key);
-                        if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
-                            &fwd_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
+                        let v2_key = V2PoolKey::new(&router.id, token_in, token_out);
+                        if let Some(out) = self.pool_cache.get_amount_out_by_v2_key(
+                            &v2_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
                         ) {
                             pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(self.chain_router_indices.len() * 2)).push(ForwardTask {
                                 pair_idx: pi,
@@ -105,6 +102,10 @@ impl Strategy {
                                 token_in,
                                 token_out,
                                 quoter_addr: None,
+                                v2_key: Some(v2_key),
+                                v3_key: None,
+                                rev_v2_key: Some(V2PoolKey::new(&router.id, token_out, token_in)),
+                                rev_v3_key: None,
                             });
                         }
                         // Cache miss = pool not discovered at startup = doesn't exist → skip
@@ -128,10 +129,8 @@ impl Strategy {
                             // Cap the input to a single-tick safe amount so the xy=k formula
                             // is exact. Without the cap, a trade crossing into a tick with
                             // L=0 would cause the formula to overestimate output.
-                            // Key built once here — passed to quote_v3_spot_str to avoid
-                            // a second format!() + addr_key() pair inside pool_cache.
-                            let v3_key = format!("{}:{}:{}:{}", router.id, token_in_key, token_out_key, fee);
-                            if let Some((spot_out, liquidity, effective_in)) = self.pool_cache.quote_v3_spot_str(
+                            let v3_key = V3PoolKey::new(&router.id, token_in, token_out, fee);
+                            if let Some((spot_out, liquidity, effective_in)) = self.pool_cache.quote_v3_spot_key(
                                 &v3_key, token_in, amount_in,
                             ) {
                                 if liquidity < MIN_V3_LIQUIDITY {
@@ -149,6 +148,10 @@ impl Strategy {
                                     token_in,
                                     token_out,
                                     quoter_addr: Some(quoter),
+                                    v2_key: None,
+                                    v3_key: Some(v3_key.clone()),
+                                    rev_v2_key: None,
+                                    rev_v3_key: Some(V3PoolKey::new(&router.id, token_out, token_in, fee)),
                                 });
                                 v3_cached += 1;
                             } else {
@@ -172,9 +175,9 @@ impl Strategy {
                             (vol_id.as_str(), 0u32, VOLATILE_MAX_AGE),
                             (sta_id.as_str(), 1u32, STABLE_MAX_AGE),
                         ] {
-                            let sol_fwd_key = format!("{}:{}:{}", eff_id, token_in_key, token_out_key);
-                            if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
-                                &sol_fwd_key, token_in, amount_in, Some(max_age),
+                            let v2_key = V2PoolKey::new(eff_id, token_in, token_out);
+                            if let Some(out) = self.pool_cache.get_amount_out_by_v2_key(
+                                &v2_key, token_in, amount_in, Some(max_age),
                             ) {
                                 pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(self.chain_router_indices.len() * 2)).push(ForwardTask {
                                     pair_idx: pi,
@@ -187,6 +190,10 @@ impl Strategy {
                                     token_in,
                                     token_out,
                                     quoter_addr: None,
+                                    v2_key: Some(v2_key),
+                                    v3_key: None,
+                                    rev_v2_key: Some(V2PoolKey::new(eff_id, token_out, token_in)),
+                                    rev_v3_key: None,
                                 });
                             }
                         }
@@ -195,9 +202,9 @@ impl Strategy {
                         // SyncSwap pools are now seeded into pool_cache at startup
                         // (populate_syncswap_pools also calls pool_cache.insert).
                         // Use local reserve state with freshness check (0 eth_call).
-                        let ss_fwd_key = format!("{}:{}:{}", router.id, token_in_key, token_out_key);
-                        if let Some(out) = self.pool_cache.get_amount_out_by_key_str(
-                            &ss_fwd_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
+                        let v2_key = V2PoolKey::new(&router.id, token_in, token_out);
+                        if let Some(out) = self.pool_cache.get_amount_out_by_v2_key(
+                            &v2_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
                         ) {
                             pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(self.chain_router_indices.len() * 2)).push(ForwardTask {
                                 pair_idx: pi,
@@ -210,6 +217,10 @@ impl Strategy {
                                 token_in,
                                 token_out,
                                 quoter_addr: None,
+                                v2_key: Some(v2_key),
+                                v3_key: None,
+                                rev_v2_key: Some(V2PoolKey::new(&router.id, token_out, token_in)),
+                                rev_v3_key: None,
                             });
                         }
                     }
@@ -286,39 +297,27 @@ impl Strategy {
                     let token_out = q_a.token_out;
                     let rb_addr = q_b.router_addr;
                     let fee_b = q_b.fee;
-                    let (t_out_key, t_in_key) = match self.pair_resolved.get(*pi).and_then(|o| o.as_ref()) {
-                        Some(r) => (&r.token_out_key, &r.token_in_key),
-                        None => continue,
-                    };
 
-                    // Try local reverse quote — pre-built cache keys avoid format! in pool_cache.
+                    // Try local reverse quote — keys carried on ForwardTask from phase 1.
                     let local_back = match q_b.router_type {
-                        RouterType::V2 => {
-                            let key = format!("{}:{}:{}", q_b.router_id, t_out_key, t_in_key);
-                            self.pool_cache.get_amount_out_by_key_str(
-                                &key, token_out, token_out_amount, Some(VOLATILE_MAX_AGE),
+                        RouterType::V2 | RouterType::SyncSwap => q_b.rev_v2_key.as_ref().and_then(|k| {
+                            self.pool_cache.get_amount_out_by_v2_key(
+                                k, token_out, token_out_amount, Some(VOLATILE_MAX_AGE),
                             )
-                        }
+                        }),
                         RouterType::Solidly | RouterType::Aerodrome => {
-                            // router_id is already "id::volatile" or "id::stable" from Phase 1.
                             let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
-                            let key = format!("{}:{}:{}", q_b.router_id, t_out_key, t_in_key);
-                            self.pool_cache.get_amount_out_by_key_str(
-                                &key, token_out, token_out_amount, Some(max_age),
-                            )
+                            q_b.rev_v2_key.as_ref().and_then(|k| {
+                                self.pool_cache.get_amount_out_by_v2_key(
+                                    k, token_out, token_out_amount, Some(max_age),
+                                )
+                            })
                         }
-                        RouterType::V3 => {
-                            let key = format!("{}:{}:{}:{}", q_b.router_id, t_out_key, t_in_key, fee_b);
-                            self.pool_cache.quote_v3_spot_str(
-                                &key, token_out, token_out_amount,
-                            ).map(|(spot_out, _, _)| spot_out)
-                        }
-                        RouterType::SyncSwap => {
-                            let key = format!("{}:{}:{}", q_b.router_id, t_out_key, t_in_key);
-                            self.pool_cache.get_amount_out_by_key_str(
-                                &key, token_out, token_out_amount, Some(VOLATILE_MAX_AGE),
-                            )
-                        }
+                        RouterType::V3 => q_b.rev_v3_key.as_ref().and_then(|k| {
+                            self.pool_cache
+                                .quote_v3_spot_key(k, token_out, token_out_amount)
+                                .map(|(spot_out, _, _)| spot_out)
+                        }),
                     };
 
                     // All DEX types: stale/absent cache = no recent activity = no arb → skip.
@@ -509,11 +508,10 @@ impl Strategy {
                 };
                 let quoter = match fwd_task.quoter_addr { Some(q) => q, None => continue };
 
-                // Cache key matches pool_cache.v3_by_key format (pre-built in pair_resolved).
-                let v3_cache_key = format!(
-                    "{}:{}:{}:{}",
-                    router_a_id, resolved.token_in_key, resolved.token_out_key, fee_a
-                );
+                let v3_cache_key = fwd_task
+                    .v3_key
+                    .clone()
+                    .unwrap_or_else(|| V3PoolKey::new(router_a_id, fwd_task.token_in, fwd_task.token_out, *fee_a));
 
                 // Hit condition: current sqrtPriceX96 == sqrtPriceX96 stored in p15_cache.
                 // A V3 Swap event updates pool_cache.sqrt_price_x96 → cache auto-invalidates.
@@ -586,9 +584,7 @@ impl Strategy {
                                 .filter(|r| !r.amountOut.is_zero())
                                 .map(|r| r.amountOut)
                                 .unwrap_or(U256::ZERO);
-                            // Update p15_cache: store result under current sqrtPriceX96.
-                            let key = format!("{}:{}:{}:{}", router_a_id,
-                                addr_key(*token_in), addr_key(*token_out), fee_a);
+                            let key = V3PoolKey::new(router_a_id, *token_in, *token_out, *fee_a);
                             if let Some(sqrtp) = self.pool_cache.v3_by_key.get(&key)
                                 .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
                                 .map(|s| s.sqrt_price_x96)
@@ -629,8 +625,10 @@ impl Strategy {
                         // Hit requires BOTH pool B sqrtPrice AND quoter_out (input) to match.
                         if matches!(q_b.router_type, RouterType::V3) {
                             if let Some(quoter_b) = q_b.quoter_addr {
-                                let p15b_key = format!("{}:{}:{}:{}", q_b.router_id,
-                                    addr_key(token_out), addr_key(token_in), fee_b);
+                                let p15b_key = q_b
+                                    .rev_v3_key
+                                    .clone()
+                                    .unwrap_or_else(|| V3PoolKey::new(&q_b.router_id, token_out, token_in, fee_b));
                                 let cached_b = self.pool_cache.v3_by_key.get(&p15b_key)
                                     .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
                                     .and_then(|state| {
@@ -659,18 +657,19 @@ impl Strategy {
                             continue;
                         }
                         let local_back = match q_b.router_type {
-                            RouterType::V2 => self.pool_cache.get_amount_out_by_key(
-                                &q_b.router_id, token_out, token_in, quoter_out, Some(VOLATILE_MAX_AGE),
-                            ),
+                            RouterType::V2 | RouterType::SyncSwap => q_b.rev_v2_key.as_ref().and_then(|k| {
+                                self.pool_cache.get_amount_out_by_v2_key(
+                                    k, token_out, quoter_out, Some(VOLATILE_MAX_AGE),
+                                )
+                            }),
                             RouterType::Solidly | RouterType::Aerodrome => {
                                 let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
-                                self.pool_cache.get_amount_out_by_key(
-                                    &q_b.router_id, token_out, token_in, quoter_out, Some(max_age),
-                                )
+                                q_b.rev_v2_key.as_ref().and_then(|k| {
+                                    self.pool_cache.get_amount_out_by_v2_key(
+                                        k, token_out, quoter_out, Some(max_age),
+                                    )
+                                })
                             }
-                            RouterType::SyncSwap => self.pool_cache.get_amount_out_by_key(
-                                &q_b.router_id, token_out, token_in, quoter_out, Some(VOLATILE_MAX_AGE),
-                            ),
                             RouterType::V3 => unreachable!(),
                         };
                         let amount_back = match local_back.filter(|b| !b.is_zero()) {
@@ -844,9 +843,10 @@ impl Strategy {
                         .filter(|r| !r.amountOut.is_zero())
                         .map(|r| r.amountOut)
                         .unwrap_or(U256::ZERO);
-                    // Write to p15b_cache keyed on pool B sqrtPrice + quoter_out input.
-                    let p15b_key = format!("{}:{}:{}:{}", q_b.router_id,
-                        addr_key(token_out), addr_key(token_in), q_b.fee);
+                    let p15b_key = q_b
+                        .rev_v3_key
+                        .clone()
+                        .unwrap_or_else(|| V3PoolKey::new(&q_b.router_id, token_out, token_in, q_b.fee));
                     if let Some(sqrtp_b) = self.pool_cache.v3_by_key.get(&p15b_key)
                         .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
                         .map(|s| s.sqrt_price_x96)

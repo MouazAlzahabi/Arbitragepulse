@@ -10,7 +10,6 @@ pub(crate) async fn update_native_price<P: Provider>(
 ) {
     use crate::abi::{IUniswapV2Router02, IQuoterV2};
     use crate::pool_cache::VOLATILE_MAX_AGE;
-    use crate::util::addr_key;
     use alloy::primitives::{U256, Uint};
     use crate::config::RouterType;
 
@@ -48,13 +47,11 @@ pub(crate) async fn update_native_price<P: Provider>(
     // ── Try local V2 pool cache first (zero RPC on the 60s tick) ────────────
     {
         let strat = strategy.read().await;
-        let w_key = addr_key(wrapped_native);
-        let s_key = addr_key(token_out);
         for router in routers.iter().filter(|r| r.chain_id == cfg.id && r.router_type == RouterType::V2) {
-            let key = format!("{}:{}:{}", router.id, w_key, s_key);
             if let Some(out) = strat.pool_cache.get_amount_out_by_key_str(
-                &key,
+                &router.id,
                 wrapped_native,
+                token_out,
                 probe_amount,
                 Some(VOLATILE_MAX_AGE),
             ) {

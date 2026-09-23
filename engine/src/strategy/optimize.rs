@@ -7,9 +7,9 @@ use tracing::debug;
 
 use crate::abi::{IAerodromeRouter, IQuoterV2, ISolidlyRouter, IUniswapV2Router02};
 use crate::config::RouterType;
-use crate::pool_cache::{VOLATILE_MAX_AGE, STABLE_MAX_AGE};
+use crate::pool_cache::{V2PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::ArbOpportunity;
-use crate::util::{addr_key, u256_to_f64};
+use crate::util::u256_to_f64;
 use super::{Strategy, P15_QUOTER_HAIRCUT_BPS};
 
 impl Strategy {
@@ -195,8 +195,6 @@ async fn probe_range<P: Provider + Clone + 'static>(
     let fb = opp.fee_b;
     let router_a_id = opp.router_a_id.clone();
     let router_b_id = opp.router_b_id.clone();
-    let ti_key = addr_key(token_in);
-    let to_key = addr_key(token_out);
 
     type BoxFut = Pin<Box<dyn Future<Output = Option<(U256, U256)>> + Send>>;
     let mut futs: Vec<BoxFut> = Vec::with_capacity(steps);
@@ -207,8 +205,6 @@ async fn probe_range<P: Provider + Clone + 'static>(
         let solidly = solidly_keys.clone();
         let rid_a = router_a_id.clone();
         let rid_b = router_b_id.clone();
-        let ti_k = ti_key.clone();
-        let to_k = to_key.clone();
         let probe_amount = if steps == 1 {
             (min_amount + max_amount) / U256::from(2u32)
         } else {
@@ -219,25 +215,25 @@ async fn probe_range<P: Provider + Clone + 'static>(
 
         futs.push(Box::pin(async move {
             let mid = match ra_t {
-                RouterType::V2 => {
-                    let key = format!("{}:{}:{}", rid_a, ti_k, to_k);
-                    cache.get_amount_out_by_key_str(
-                        &key, token_in, probe_amount, Some(VOLATILE_MAX_AGE),
-                    )
-                }
+                RouterType::V2 => cache.get_amount_out_by_v2_key(
+                    &V2PoolKey::new(&rid_a, token_in, token_out),
+                    token_in,
+                    probe_amount,
+                    Some(VOLATILE_MAX_AGE),
+                ),
                 RouterType::V3 => match quoter_a {
                     Some(q) => quote_v3(&p, q, probe_amount, token_in, token_out, fa).await,
                     None => None,
                 },
                 RouterType::Solidly | RouterType::Aerodrome => {
-                    local_solidly(&cache, &solidly, &rid_a, token_in, token_out, &ti_k, &to_k, probe_amount, fa)
+                    local_solidly(&cache, &solidly, &rid_a, token_in, token_out, probe_amount, fa)
                 }
-                RouterType::SyncSwap => {
-                    let key = format!("{}:{}:{}", rid_a, ti_k, to_k);
-                    cache.get_amount_out_by_key_str(
-                        &key, token_in, probe_amount, Some(VOLATILE_MAX_AGE),
-                    )
-                }
+                RouterType::SyncSwap => cache.get_amount_out_by_v2_key(
+                    &V2PoolKey::new(&rid_a, token_in, token_out),
+                    token_in,
+                    probe_amount,
+                    Some(VOLATILE_MAX_AGE),
+                ),
             };
             let mid = match mid {
                 Some(m) if !m.is_zero() => Some(m),
@@ -251,25 +247,25 @@ async fn probe_range<P: Provider + Clone + 'static>(
             let mid = mid.filter(|m| !m.is_zero())?;
 
             let back = match rb_t {
-                RouterType::V2 => {
-                    let key = format!("{}:{}:{}", rid_b, to_k, ti_k);
-                    cache.get_amount_out_by_key_str(
-                        &key, token_out, mid, Some(VOLATILE_MAX_AGE),
-                    )
-                }
+                RouterType::V2 => cache.get_amount_out_by_v2_key(
+                    &V2PoolKey::new(&rid_b, token_out, token_in),
+                    token_out,
+                    mid,
+                    Some(VOLATILE_MAX_AGE),
+                ),
                 RouterType::V3 => match quoter_b {
                     Some(q) => quote_v3(&p, q, mid, token_out, token_in, fb).await,
                     None => None,
                 },
                 RouterType::Solidly | RouterType::Aerodrome => {
-                    local_solidly(&cache, &solidly, &rid_b, token_out, token_in, &to_k, &ti_k, mid, fb)
+                    local_solidly(&cache, &solidly, &rid_b, token_out, token_in, mid, fb)
                 }
-                RouterType::SyncSwap => {
-                    let key = format!("{}:{}:{}", rid_b, to_k, ti_k);
-                    cache.get_amount_out_by_key_str(
-                        &key, token_out, mid, Some(VOLATILE_MAX_AGE),
-                    )
-                }
+                RouterType::SyncSwap => cache.get_amount_out_by_v2_key(
+                    &V2PoolKey::new(&rid_b, token_out, token_in),
+                    token_out,
+                    mid,
+                    Some(VOLATILE_MAX_AGE),
+                ),
             };
             let back = match back {
                 Some(b) if !b.is_zero() => Some(b),
@@ -299,22 +295,24 @@ fn local_solidly(
     router_id: &str,
     token_in: Address,
     token_out: Address,
-    key_in: &str,
-    key_out: &str,
     amount_in: U256,
     fee: u32,
 ) -> Option<U256> {
     if fee != 0 {
-        let sta = solidly_keys.get(router_id)?.1.clone();
-        let key = format!("{}:{}:{}", sta, key_in, key_out);
-        return cache.get_amount_out_by_key_str(
-            &key, token_in, amount_in, Some(STABLE_MAX_AGE),
+        let sta = solidly_keys.get(router_id)?.1.as_str();
+        return cache.get_amount_out_by_v2_key(
+            &V2PoolKey::new(sta, token_in, token_out),
+            token_in,
+            amount_in,
+            Some(STABLE_MAX_AGE),
         );
     }
-    let vol = solidly_keys.get(router_id)?.0.clone();
-    let vol_key = format!("{}:{}:{}", vol, key_in, key_out);
-    cache.get_amount_out_by_key_str(
-        &vol_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
+    let vol = solidly_keys.get(router_id)?.0.as_str();
+    cache.get_amount_out_by_v2_key(
+        &V2PoolKey::new(vol, token_in, token_out),
+        token_in,
+        amount_in,
+        Some(VOLATILE_MAX_AGE),
     )
 }
 

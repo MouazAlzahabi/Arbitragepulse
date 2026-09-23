@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::abi::{IERC20, IMulticall3, ISyncSwapClassicPoolFactory, IUniswapV2Pair};
 use crate::config::{PairConfig, RouterConfig, RouterType};
-use crate::pool_cache::{PoolCache, PoolInfo};
+use crate::pool_cache::{PoolCache, PoolInfo, V2PoolKey, V3PoolKey};
 pub use crate::types::*;
 use crate::util::u256_to_f64;
 
@@ -68,6 +68,11 @@ pub(crate) struct ForwardTask {
     /// V3 only: the QuoterV2 address used for this task's quote.
     /// Carried through so the reverse phase uses the same quoter for that router.
     pub quoter_addr: Option<Address>,
+    /// Pre-built pool cache lookup keys (forward + reverse for phase 2).
+    pub v2_key: Option<V2PoolKey>,
+    pub v3_key: Option<V3PoolKey>,
+    pub rev_v2_key: Option<V2PoolKey>,
+    pub rev_v3_key: Option<V3PoolKey>,
 }
 
 #[derive(Clone)]
@@ -136,7 +141,7 @@ pub struct Strategy {
     ///
     /// Effect: reduces Phase 1.5 from 1 QuoterV2 call per scan (~100–200/min) to
     /// 1 call per V3 Swap event per pool — typically 5–20× fewer HTTP requests.
-    pub p15_cache: Arc<DashMap<String, (U256, U256)>>,
+    pub p15_cache: Arc<DashMap<V3PoolKey, (U256, U256)>>,
     /// Phase 1.5b QuoterV2 result cache, keyed on reverse V3 pool state + input amount.
     /// Key:   "router_b_id:token_out_lower:token_in_lower:fee_b" (reverse leg direction)
     /// Value: (sqrtPriceX96_b at cache time, quoter_out_input_used, amount_back)
@@ -144,7 +149,7 @@ pub struct Strategy {
     /// Cache hit condition: current sqrt_price_b == stored AND quoter_out == stored input.
     /// Both conditions ensure the cache is invalidated when either pool trades.
     /// Eliminates the second HTTP round trip (~80ms) for stable V3→V3 pairs.
-    pub p15b_cache: Arc<DashMap<String, (U256, U256, U256)>>,
+    pub p15b_cache: Arc<DashMap<V3PoolKey, (U256, U256, U256)>>,
     /// When true: skip QuoterV2 verification entirely (phases 1.5/1.5b/1.5c) and
     /// submit immediately after Phase 1 local spot quotes. Saves ~80-160ms —
     /// enough to land in the same block on FCFS chains (Base).
@@ -174,6 +179,10 @@ pub struct Strategy {
     chain_router_indices: Vec<usize>,
     /// pair_id → index for O(1) lookup in optimize / execution paths.
     pair_id_to_index: HashMap<String, usize>,
+    /// Bumped on `rebuild_scan_cache()` — invalidates triangular disabled-leg cache.
+    scan_cache_generation: std::sync::atomic::AtomicU64,
+    /// Cached (generation, disabled fingerprint) → disabled directed legs for triangular.
+    tri_disabled_legs_cache: Mutex<Option<(u64, u64, std::collections::HashSet<(Address, Address)>)>>,
 }
 
 impl Strategy {
@@ -243,9 +252,55 @@ impl Strategy {
             chain_pair_indices: Vec::new(),
             chain_router_indices: Vec::new(),
             pair_id_to_index: HashMap::new(),
+            scan_cache_generation: std::sync::atomic::AtomicU64::new(0),
+            tri_disabled_legs_cache: Mutex::new(None),
         };
         s.rebuild_scan_cache();
         s
+    }
+
+    fn disabled_triplets_fingerprint(disabled: &std::collections::HashSet<String>) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut v: Vec<_> = disabled.iter().collect();
+        v.sort();
+        let mut h = DefaultHasher::new();
+        v.hash(&mut h);
+        h.finish()
+    }
+
+    fn build_disabled_legs_for(&self, disabled_triplets: &std::collections::HashSet<String>) -> std::collections::HashSet<(Address, Address)> {
+        if disabled_triplets.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        self.pairs
+            .iter()
+            .filter(|p| p.chain_id == self.chain_id && disabled_triplets.contains(&p.id))
+            .filter_map(|p| {
+                let ti: Address = p.token_in.parse().ok()?;
+                let to: Address = p.token_out.parse().ok()?;
+                Some((ti, to))
+            })
+            .collect()
+    }
+
+    pub(crate) fn get_or_build_disabled_legs(
+        &self,
+        disabled_triplets: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<(Address, Address)> {
+        let gen = self.scan_cache_generation.load(std::sync::atomic::Ordering::Acquire);
+        let fp = Self::disabled_triplets_fingerprint(disabled_triplets);
+        {
+            let guard = self.tri_disabled_legs_cache.lock().unwrap();
+            if let Some((g, f, legs)) = guard.as_ref() {
+                if *g == gen && *f == fp {
+                    return legs.clone();
+                }
+            }
+        }
+        let legs = self.build_disabled_legs_for(disabled_triplets);
+        *self.tri_disabled_legs_cache.lock().unwrap() = Some((gen, fp, legs.clone()));
+        legs
     }
 
     fn build_pair_resolved(pairs: &[PairConfig], default_min_profit: f64) -> Vec<Option<PairResolved>> {
@@ -327,6 +382,9 @@ impl Strategy {
             .map(|(i, p)| (p.id.clone(), i))
             .collect();
         self.pair_resolved = Self::build_pair_resolved(&self.pairs, self.min_profit_usd);
+        self.scan_cache_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        *self.tri_disabled_legs_cache.lock().unwrap() = None;
     }
 
     fn build_token_pair_index_for(pairs: &[PairConfig]) -> HashMap<Address, Vec<usize>> {

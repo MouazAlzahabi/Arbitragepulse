@@ -110,8 +110,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Detection phase timer (evaluate + triangular) — shared across all candidates this scan.
     let detect_start = Instant::now();
 
-    let all_opportunities = {
+    let (all_opportunities, optimistic_submission) = {
         let strat = strategy.read().await;
+        let optimistic_submission = strat.optimistic_submission;
 
         // Merge targeted mask with disabled-pairs exclusion mask.
         // Targeted scans filter only the small mask (1–3 pairs) instead of scanning all pairs.
@@ -191,14 +192,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         merged.extend(opps_2hop.into_iter().map(Opportunity::TwoHop));
         merged.extend(opps_tri.into_iter().map(Opportunity::Triangular));
 
-        // Sort by profit_usd descending
-        merged.sort_by(|a, b| {
-            b.profit_usd()
-                .partial_cmp(&a.profit_usd())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if merged.len() > 1 {
+            merged.sort_by(|a, b| {
+                b.profit_usd()
+                    .partial_cmp(&a.profit_usd())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
-        merged
+        (merged, optimistic_submission)
     };
     let detect_ms = detect_start.elapsed().as_millis() as u64;
 
@@ -331,13 +333,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             };
             // Skip optimizer in optimistic mode — each round costs ~100ms of QuoterV2 calls.
             // On FCFS chains (Base), 200ms of optimizer latency = ~65 positions lost.
-            let optimized = {
-                let strat = strategy.read().await;
-                if strat.optimistic_submission || !cfg.optimize_size {
-                    opp.clone()
-                } else {
-                    strat.optimize(opp, provider.as_ref(), max_bal).await
-                }
+            let optimized = if optimistic_submission || !cfg.optimize_size {
+                opp.clone()
+            } else {
+                strategy.read().await.optimize(opp, provider.as_ref(), max_bal).await
             };
 
             // Log the opportunity first so detection is always visible.
