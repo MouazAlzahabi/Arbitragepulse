@@ -470,6 +470,7 @@ impl Strategy {
                 Some(a) if !a.is_zero() => a,
                 _ => continue,
             };
+            let amount_a_final = super::apply_exec_quote_haircut(amount_a_final);
             let trip = &triplets[p3e.triplet_idx];
 
             // Track best triangular spread (even negative) for diagnostics

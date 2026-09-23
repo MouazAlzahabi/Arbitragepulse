@@ -36,6 +36,11 @@ pub(crate) const MULTICALL_CHUNK_SIZE: usize = 10;
 /// Used in Phase 1.5/1.5b/1.5c and optimize.rs — keep all paths on this single constant.
 pub(crate) const P15_QUOTER_HAIRCUT_BPS: u64 = 15;
 
+/// Detection / execution buffer applied to quoted output before profit checks (Phase 1.1).
+pub(crate) fn apply_exec_quote_haircut(amount_out: U256) -> U256 {
+    (amount_out * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS)) / U256::from(10_000u32)
+}
+
 /// Pre-parsed per-pair scan context — built once per config change, not per block.
 #[derive(Clone)]
 pub(crate) struct PairResolved {

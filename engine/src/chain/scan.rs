@@ -1,7 +1,25 @@
 use super::*;
 use alloy::network::ReceiptResponse;
+use alloy::primitives::B256;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+async fn diagnose_and_count_revert<P: Provider>(
+    provider: &P,
+    metrics: &Metrics,
+    chain_name: &str,
+    tx_hash: &B256,
+    block_number: Option<u64>,
+    sell_leg_is_v3: bool,
+) -> crate::revert::RevertDiagnosis {
+    let diagnosis =
+        crate::revert::diagnose_mined_revert(provider, tx_hash, block_number, sell_leg_is_v3).await;
+    metrics
+        .reverts_on_chain
+        .with_label_values(&[chain_name, diagnosis.class.as_str()])
+        .inc();
+    diagnosis
+}
 
 /// Structured receipt line for grep / dashboards: timing, trigger, tip, block position.
 fn log_exec_confirm(
@@ -16,6 +34,10 @@ fn log_exec_confirm(
     profit_usd: f64,
     opp_id: &str,
     tx_hash: &str,
+    revert_class: Option<&str>,
+    scan_to_submit_ms: Option<u64>,
+    router_a_type: &str,
+    router_b_type: &str,
 ) {
     let block = receipt.block_number();
     let tx_index = receipt.transaction_index();
@@ -23,10 +45,14 @@ fn log_exec_confirm(
     let eff_gas = receipt.effective_gas_price();
     let total_ms = exec_start.elapsed().as_millis() as u64;
     let msg = format!(
-        "[{}] exec_confirm | route={} | ok={} | block={:?} | tx_index={:?} | gas_used={} | eff_gas_price_wei={} | total_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | profit_usd={:.4} | opp={} | tx={}",
+        "[{}] exec_confirm | route={} | ok={} | revert_class={} | scan_to_submit_ms={} | router_a={} | router_b={} | block={:?} | tx_index={:?} | gas_used={} | eff_gas_price_wei={} | total_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | profit_usd={:.4} | opp={} | tx={}",
         chain,
         route,
         ok,
+        revert_class.unwrap_or("-"),
+        scan_to_submit_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+        router_a_type,
+        router_b_type,
         block,
         tx_index,
         gas_used,
@@ -432,7 +458,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             match provider.call(prep.tx.clone()).await {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    let detail = crate::executor::format_eth_call_transport_error(&e);
+                                    let detail = crate::revert::format_eth_call_transport_error(&e);
                                     warn!(
                                         "[{}] preflight_eth_call revert | pair={} | {}",
                                         cfg.name, optimized.pair_id, detail
@@ -530,7 +556,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
                                 // Fire-and-forget receipt task using cloned prep fields
                                 let tx_hash_bg = tx_hash.clone();
+                                let tx_hash_b256 = pending.tx_hash().clone();
                                 let provider_bg = provider.clone();
+                                let ra_type_bg = crate::revert::router_type_label(&optimized.router_a_type);
+                                let rb_type_bg = crate::revert::router_type_label(&optimized.router_b_type);
+                                let sell_leg_v3_bg = matches!(optimized.router_b_type, RouterType::V3);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
                                 let confirmed_failed_bg = prep.confirmed_failed.clone();
                                 let confirmed_profit_bg = prep.confirmed_profit_bits.clone();
@@ -568,6 +598,25 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         Ok(receipt) => {
                                             let ok = receipt.status();
                                             let submit_to_confirm_ms = submit_at_bg.elapsed().as_millis() as u64;
+                                            let block_num = receipt.block_number();
+                                            let revert_class_str: Option<&str>;
+                                            let revert_detail: Option<String>;
+                                            if ok {
+                                                revert_class_str = None;
+                                                revert_detail = None;
+                                            } else {
+                                                let diagnosis = diagnose_and_count_revert(
+                                                    provider_bg.as_ref(),
+                                                    &metrics_bg,
+                                                    &chain_name_bg,
+                                                    &tx_hash_b256,
+                                                    block_num,
+                                                    sell_leg_v3_bg,
+                                                )
+                                                .await;
+                                                revert_class_str = Some(diagnosis.class.as_str());
+                                                revert_detail = diagnosis.detail;
+                                            }
                                             log_exec_confirm(
                                                 &chain_name_bg,
                                                 "2hop",
@@ -580,6 +629,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 detected_profit_bg,
                                                 &opp_id_bg,
                                                 &tx_hash_bg,
+                                                revert_class_str,
+                                                Some(scan_to_submit_bg),
+                                                ra_type_bg,
+                                                rb_type_bg,
                                             );
                                             if ok {
                                                 confirmed_success_bg.fetch_add(1, Ordering::Relaxed);
@@ -621,22 +674,46 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &log_tx_bg,
                                                     "warn",
                                                     &format!(
-                                                        "[{}] tx reverted on-chain | pair={} | profit=${:.4} | tx={}",
-                                                        chain_name_bg, opp_id_bg, profit_bg, tx_hash_bg,
+                                                        "[{}] tx reverted on-chain | revert_class={} | pair={} | profit=${:.4} | scan_to_submit_ms={} | tx={}",
+                                                        chain_name_bg,
+                                                        revert_class_str.unwrap_or("unknown"),
+                                                        opp_id_bg,
+                                                        profit_bg,
+                                                        scan_to_submit_bg,
+                                                        tx_hash_bg,
                                                     ),
                                                     Some(serde_json::json!({
-                                                        "chain":      chain_name_bg,
-                                                        "pair_id":    opp_id_bg,
-                                                        "profit_usd": profit_bg,
-                                                        "tx_hash":    tx_hash_bg,
-                                                        "success":    false,
+                                                        "chain":               chain_name_bg,
+                                                        "pair_id":             opp_id_bg,
+                                                        "profit_usd":          profit_bg,
+                                                        "tx_hash":             tx_hash_bg,
+                                                        "success":             false,
+                                                        "revert_class":        revert_class_str,
+                                                        "revert_detail":       revert_detail,
+                                                        "scan_to_submit_ms":   scan_to_submit_bg,
+                                                        "router_a_type":       ra_type_bg,
+                                                        "router_b_type":       rb_type_bg,
                                                     })),
                                                 );
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
+                                                let revert_db = revert_class_str.map(String::from);
                                                 let _ = tokio::task::spawn_blocking(move || {
-                                                    let _ = db.insert_trade(chain_id_bg, &chain_name_bg, &opp_id_bg, &router_a_bg, &router_b_bg, None, profit_bg, success, &tx_hash_bg, false);
+                                                    let _ = db.insert_trade_extended(
+                                                        chain_id_bg,
+                                                        &chain_name_bg,
+                                                        &opp_id_bg,
+                                                        &router_a_bg,
+                                                        &router_b_bg,
+                                                        None,
+                                                        profit_bg,
+                                                        success,
+                                                        &tx_hash_bg,
+                                                        false,
+                                                        revert_db.as_deref(),
+                                                        Some(scan_to_submit_bg),
+                                                    );
                                                 }).await;
                                             }
                                         }
@@ -799,7 +876,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             match provider.call(prep.tx.clone()).await {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    let detail = crate::executor::format_eth_call_transport_error(&e);
+                                    let detail = crate::revert::format_eth_call_transport_error(&e);
                                     warn!(
                                         "[{}] preflight_eth_call revert | triplet={} | {}",
                                         cfg.name, opp.triplet_id, detail
@@ -885,7 +962,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
                                 // Fire-and-forget receipt task
                                 let tx_hash_bg = tx_hash.clone();
+                                let tx_hash_b256 = pending.tx_hash().clone();
                                 let provider_bg = provider.clone();
+                                let ra_type_bg = crate::revert::router_type_label(&opp.router_ab_type);
+                                let rb_type_bg = crate::revert::router_type_label(&opp.router_ca_type);
+                                let sell_leg_v3_bg = crate::revert::triangular_sell_leg_is_v3(opp);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
                                 let confirmed_failed_bg = prep.confirmed_failed.clone();
                                 let confirmed_profit_bg = prep.confirmed_profit_bits.clone();
@@ -924,6 +1005,25 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         Ok(receipt) => {
                                             let ok = receipt.status();
                                             let submit_to_confirm_ms = submit_at_bg.elapsed().as_millis() as u64;
+                                            let block_num = receipt.block_number();
+                                            let revert_class_str: Option<&str>;
+                                            let revert_detail: Option<String>;
+                                            if ok {
+                                                revert_class_str = None;
+                                                revert_detail = None;
+                                            } else {
+                                                let diagnosis = diagnose_and_count_revert(
+                                                    provider_bg.as_ref(),
+                                                    &metrics_bg,
+                                                    &chain_name_bg,
+                                                    &tx_hash_b256,
+                                                    block_num,
+                                                    sell_leg_v3_bg,
+                                                )
+                                                .await;
+                                                revert_class_str = Some(diagnosis.class.as_str());
+                                                revert_detail = diagnosis.detail;
+                                            }
                                             log_exec_confirm(
                                                 &chain_name_bg,
                                                 "triangular",
@@ -936,6 +1036,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 detected_profit_bg,
                                                 &opp_id_bg,
                                                 &tx_hash_bg,
+                                                revert_class_str,
+                                                Some(scan_to_submit_bg),
+                                                ra_type_bg,
+                                                rb_type_bg,
                                             );
                                             if ok {
                                                 confirmed_success_bg.fetch_add(1, Ordering::Relaxed);
@@ -976,22 +1080,46 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &log_tx_bg,
                                                     "warn",
                                                     &format!(
-                                                        "[{}] triangular tx reverted on-chain | pair={} | profit=${:.4} | tx={}",
-                                                        chain_name_bg, opp_id_bg, profit_bg, tx_hash_bg,
+                                                        "[{}] triangular tx reverted on-chain | revert_class={} | pair={} | profit=${:.4} | scan_to_submit_ms={} | tx={}",
+                                                        chain_name_bg,
+                                                        revert_class_str.unwrap_or("unknown"),
+                                                        opp_id_bg,
+                                                        profit_bg,
+                                                        scan_to_submit_bg,
+                                                        tx_hash_bg,
                                                     ),
                                                     Some(serde_json::json!({
-                                                        "chain":      chain_name_bg,
-                                                        "pair_id":    opp_id_bg,
-                                                        "profit_usd": profit_bg,
-                                                        "tx_hash":    tx_hash_bg,
-                                                        "success":    false,
+                                                        "chain":               chain_name_bg,
+                                                        "pair_id":             opp_id_bg,
+                                                        "profit_usd":          profit_bg,
+                                                        "tx_hash":             tx_hash_bg,
+                                                        "success":             false,
+                                                        "revert_class":        revert_class_str,
+                                                        "revert_detail":       revert_detail,
+                                                        "scan_to_submit_ms":   scan_to_submit_bg,
+                                                        "router_a_type":       ra_type_bg,
+                                                        "router_b_type":       rb_type_bg,
                                                     })),
                                                 );
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
+                                                let revert_db = revert_class_str.map(String::from);
                                                 let _ = tokio::task::spawn_blocking(move || {
-                                                    let _ = db.insert_trade(chain_id_bg, &chain_name_bg, &opp_id_bg, &router_a_bg, &router_b_bg, router_c_bg.as_deref(), profit_bg, success, &tx_hash_bg, false);
+                                                    let _ = db.insert_trade_extended(
+                                                        chain_id_bg,
+                                                        &chain_name_bg,
+                                                        &opp_id_bg,
+                                                        &router_a_bg,
+                                                        &router_b_bg,
+                                                        router_c_bg.as_deref(),
+                                                        profit_bg,
+                                                        success,
+                                                        &tx_hash_bg,
+                                                        false,
+                                                        revert_db.as_deref(),
+                                                        Some(scan_to_submit_bg),
+                                                    );
                                                 }).await;
                                             }
                                         }

@@ -8,7 +8,7 @@ use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, V3PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
-use super::{ForwardTask, ReverseTask, Strategy, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY, P15_QUOTER_HAIRCUT_BPS};
+use super::{ForwardTask, ReverseTask, Strategy, apply_exec_quote_haircut, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY};
 
 impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
@@ -412,6 +412,7 @@ impl Strategy {
                 }
             }
 
+            let amount_back = apply_exec_quote_haircut(amount_back);
             if amount_back > task.amount_in {
                 let profit = amount_back - task.amount_in;
                 let profit_usd = token_amount_to_usd(
@@ -690,8 +691,7 @@ impl Strategy {
                         // Apply P15_QUOTER_HAIRCUT_BPS buffer (Phase 1.5: V3 forward + Aerodrome/V2 reverse).
                         // Aerodrome reverse uses local pool cache (VOLATILE_MAX_AGE=120s).
                         // Active pools get Sync events every few blocks; haircut covers quote→inclusion drift.
-                        let amount_back = (amount_back * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS))
-                            / U256::from(10_000u32);
+                        let amount_back = apply_exec_quote_haircut(amount_back);
 
                         // Track verified spread for ALL non-phantom results, including losses
                         // (negative value shows QuoterV2 confirmed the spread is a loss).
@@ -866,9 +866,7 @@ impl Strategy {
                     continue;
                 }
 
-                // Same haircut as Phase 1.5 / 1.5c (P15_QUOTER_HAIRCUT_BPS).
-                let amount_back = (amount_back * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS))
-                    / U256::from(10_000u32);
+                let amount_back = apply_exec_quote_haircut(amount_back);
 
                 // Track verified spread for ALL non-phantom results (including losses).
                 // Both legs are QuoterV2-confirmed here — most accurate signal available.
@@ -933,10 +931,8 @@ impl Strategy {
                 continue;
             }
 
-            // Apply P15_QUOTER_HAIRCUT_BPS (Phase 1.5c: Aerodrome/V2 forward + V3 reverse).
             // Forward leg uses local pool cache (VOLATILE_MAX_AGE=120s); V3 reverse is QuoterV2-exact.
-            let amount_back = (amount_back * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS))
-                / U256::from(10_000u32);
+            let amount_back = apply_exec_quote_haircut(amount_back);
 
             let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
             if v_spread > best_verified_spread { best_verified_spread = v_spread; }

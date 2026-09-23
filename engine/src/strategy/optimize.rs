@@ -10,7 +10,7 @@ use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::ArbOpportunity;
 use crate::util::u256_to_f64;
-use super::{Strategy, P15_QUOTER_HAIRCUT_BPS};
+use super::{Strategy, apply_exec_quote_haircut};
 
 impl Strategy {
     /// Two-round adaptive size optimizer (~2 RTTs, ~200ms).
@@ -129,8 +129,7 @@ impl Strategy {
             .unwrap_or((opp.amount_in, opp.amount_in + opp.expected_profit));
 
         // Same haircut as evaluate Phase 1.5 — optimizer must not strip detection buffer.
-        let opt_back = (opt_back_raw * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS))
-            / U256::from(10_000u32);
+        let opt_back = apply_exec_quote_haircut(opt_back_raw);
 
         let opt_profit = if opt_back > opt_amount {
             opt_back - opt_amount

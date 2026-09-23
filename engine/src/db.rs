@@ -20,6 +20,10 @@ pub struct TradeRecord {
     pub success: bool,
     pub tx_hash: String,
     pub dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revert_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_to_submit_ms: Option<u64>,
 }
 
 // ─── Per-pair stat (for /stats/pairs endpoint) ────────────────────────────────
@@ -64,6 +68,8 @@ impl Database {
 
         // Migration: Add router_c column if it doesn't exist (for existing databases)
         let _ = conn.execute("ALTER TABLE trades ADD COLUMN router_c TEXT", []);
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN revert_class TEXT", []);
+        let _ = conn.execute("ALTER TABLE trades ADD COLUMN scan_to_submit_ms INTEGER", []);
 
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -81,6 +87,37 @@ impl Database {
         tx_hash: &str,
         dry_run: bool,
     ) -> Result<()> {
+        self.insert_trade_extended(
+            chain_id,
+            chain_name,
+            pair_id,
+            router_a,
+            router_b,
+            router_c,
+            profit_usd,
+            success,
+            tx_hash,
+            dry_run,
+            None,
+            None,
+        )
+    }
+
+    pub fn insert_trade_extended(
+        &self,
+        chain_id: u64,
+        chain_name: &str,
+        pair_id: &str,
+        router_a: &str,
+        router_b: &str,
+        router_c: Option<&str>,
+        profit_usd: f64,
+        success: bool,
+        tx_hash: &str,
+        dry_run: bool,
+        revert_class: Option<&str>,
+        scan_to_submit_ms: Option<u64>,
+    ) -> Result<()> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -89,8 +126,8 @@ impl Database {
         conn.execute(
             "INSERT INTO trades
              (ts, chain_id, chain_name, pair_id, router_a, router_b, router_c,
-              profit_usd, success, tx_hash, dry_run)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+              profit_usd, success, tx_hash, dry_run, revert_class, scan_to_submit_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 ts,
                 chain_id as i64,
@@ -102,7 +139,9 @@ impl Database {
                 profit_usd,
                 success as i64,
                 tx_hash,
-                dry_run as i64
+                dry_run as i64,
+                revert_class,
+                scan_to_submit_ms.map(|v| v as i64),
             ],
         )?;
         Ok(())
@@ -113,7 +152,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, ts, chain_id, chain_name, pair_id, router_a, router_b, router_c,
-                    profit_usd, success, tx_hash, dry_run
+                    profit_usd, success, tx_hash, dry_run, revert_class, scan_to_submit_ms
              FROM trades WHERE dry_run=0 ORDER BY ts DESC LIMIT ?1",
         )?;
         let records = stmt
@@ -131,6 +170,10 @@ impl Database {
                     success: row.get::<_, i64>(9)? != 0,
                     tx_hash: row.get(10)?,
                     dry_run: row.get::<_, i64>(11)? != 0,
+                    revert_class: row.get(12)?,
+                    scan_to_submit_ms: row
+                        .get::<_, Option<i64>>(13)?
+                        .map(|v| v as u64),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

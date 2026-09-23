@@ -11,6 +11,8 @@ pub struct Metrics {
     pub executed: CounterVec,
     /// Total execution failures (gas check, simulation, tx revert), labelled by chain.
     pub failures: CounterVec,
+    /// Mined on-chain reverts, labelled by chain and revert_class (Phase 0 telemetry).
+    pub reverts_on_chain: CounterVec,
     /// Running USD profit total from successful live trades, labelled by chain.
     pub profit_usd: GaugeVec,
     /// 1 = RPC is reachable for this chain, 0 = down/unknown.
@@ -43,6 +45,12 @@ impl Metrics {
         )?;
         registry.register(Box::new(failures.clone()))?;
 
+        let reverts_on_chain = CounterVec::new(
+            Opts::new("arb_reverts_on_chain_total", "Mined transaction reverts by class"),
+            &["chain", "revert_class"],
+        )?;
+        registry.register(Box::new(reverts_on_chain.clone()))?;
+
         let profit_usd = GaugeVec::new(
             Opts::new("arb_profit_usd_total", "Cumulative USD profit from live arbs"),
             &["chain"],
@@ -65,6 +73,7 @@ impl Metrics {
             opportunities,
             executed,
             failures,
+            reverts_on_chain,
             profit_usd,
             rpc_connected,
             last_block,
