@@ -64,15 +64,15 @@ round-trip (V3 spot, stale V2 reserves, buy-leg `amountOutMin = 0` in the contra
 
 ### Phase 1.4 implementation (done)
 
-- `Strategy::verify_v3_triangular()` in `engine/src/strategy/triangular.rs`. Runs **before** the top-N truncate (on up to 2 × N V3-leg routes, ranked by USD profit), so dropped routes are backfilled by lower-ranked ones. Afterwards, one route is kept per path (triplet + routers), the most profitable fee-tier variant.
-- Quotes are **always live** via the shared `Strategy::quote_v3_legs()` (batched, deduplicated within the batch, no cross-scan cache — verification must not trust local pool state).
-- **Rounds (≤ 3):** round 1 quotes every V3 leg at an upper-bound input `s` (earlier V3 legs chained at marginal price). Real amounts are then chained; a V3 leg whose real input `a` is within 10 bps of `s` uses `quote(s) × a / s` (a tight lower bound by concavity). Larger gaps are re-quoted at `a` in the next round — only those legs. The last round falls back to the lower bound, so results stay conservative.
-- The 15 bps haircut and the 5% sanity cap apply to the verified output; routes below `min_triangular_profit_usd` are dropped.
-- The heartbeat's best triangular profit counts V3-leg routes only once verified.
-- Quoter health: a router whose QuoterV2 never returned a quote is warned after 5 failed batches (likely wrong address/ABI); one that worked before is warned after 60 failed batches in a row.
-- With `optimistic_submission: true` (no QuoterV2), V3-leg routes are submitted on spot quotes after deducting the 0.30% V3 overestimate, and a startup warning says so.
-- 2-hop Phase 1.5/1.5b share one `QuoteCache` rule: a cached quote is served only while the pool's local price **and** liquidity are unchanged and it is ≤ 6 s old (bounds the damage of a missed event).
-- Aerodrome Slipstream is disabled in `config.yaml`: its factory reverts Uniswap's `getPool(…, uint24 fee)`, so no pools were ever discovered. Real support needs a Slipstream router type in the contract.
+- `Strategy::verify_v3_triangular()` in `engine/src/strategy/triangular.rs`. Candidates are deduplicated to one route per path (best fee-tier variant) and ranked by USD profit **before** verification, which runs on up to 2 × N V3-leg routes so dropped routes are backfilled.
+- Quotes are **always live** via the shared `Strategy::quote_v3_legs()` (batched, deduplicated within the batch, no cross-scan cache).
+- **One round trip normally:** each V3 leg's upper-bound input `s` comes from chaining earlier V3 legs at marginal price. A leg whose input depends on an earlier V3 leg is quoted at `s` and `s × (1 − 1%)`; the real input usually falls between, where the chord between the two quotes is a tight lower bound (output is concave). Outside the bracket, the nearest point gives a conservative bound; it is re-quoted next round only if more than 10 bps off (≤ 3 rounds). Verified on a Base fork: 0 extra rounds across all scans.
+- The 15 bps haircut and the 5% sanity cap apply to the verified output; routes below `min_triangular_profit_usd` are dropped, with the reason logged at debug.
+- With `optimistic_submission: true` (no QuoterV2), V3-leg routes are submitted on spot quotes after deducting 0.30% **per V3 leg**, before the 5% cap and the spread diagnostic.
+- Quoter health: warned once when every call has failed for 30 s (never worked; likely address/ABI) or 300 s (worked before), with at least 5 failed batches.
+- 2-hop Phase 1.5/1.5b share one `QuoteCache`: an entry stores the pool state from when the quote was **requested**, is served only while the pool still matches and is ≤ 6 s old, and failures are cached only when the rest of the batch succeeded (a transport error never suppresses a pool).
+- Multicall chunks time out after 3 s, so a hung RPC request no longer freezes the chain's scan loop.
+- Aerodrome Slipstream is disabled in `config.yaml`: its factory reverts Uniswap's `getPool(…, uint24 fee)`. Real support needs a Slipstream router type in the contract.
 - This let Base's `min_triangular_profit_usd` drop from $0.80 to $0.15: the floor now applies to verified profit rather than absorbing the V3 spot overestimate.
 
 ---

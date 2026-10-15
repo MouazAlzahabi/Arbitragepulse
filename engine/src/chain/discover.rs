@@ -278,16 +278,17 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
 
     // A factory whose every getPool(A, B, uint24 fee) call fails gets no pools, so its
     // router is silently inactive — say so once at startup. A failure is None whether the
-    // call reverted or the RPC failed, so blame the factory only when other factories
-    // answered in the same run (the RPC was fine); if none answered, blame the RPC.
+    // call reverted or the RPC failed, so tell them apart: the RPC is healthy if another
+    // factory answered, or (e.g. a chain with a single V3 router) if it answers a probe.
     let router_failed = |id: &str| pool_queries.iter().zip(pool_raw.iter())
         .filter(|(pq, _)| pq.router_id == id)
         .all(|(_, raw)| raw.is_none());
     let failed: Vec<&V3Router> = v3_routers.iter().filter(|vr| router_failed(&vr.id)).collect();
-    if failed.len() == v3_routers.len() {
+    let rpc_ok = failed.len() < v3_routers.len() || provider.get_block_number().await.is_ok();
+    if !failed.is_empty() && !rpc_ok {
         tracing::warn!(
-            "V3 pool discovery: no factory answered any getPool call — check RPC health. \
-             V3 routers have no pools until the next restart."
+            "V3 pool discovery: no factory answered any getPool call and the RPC is not \
+             answering — check RPC health. V3 routers have no pools until the next restart."
         );
     } else {
         for vr in failed {

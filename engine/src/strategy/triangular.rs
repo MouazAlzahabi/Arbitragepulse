@@ -9,19 +9,26 @@ use crate::types::{PairScanInfo, TriangularOpportunity};
 use crate::util::addr_key;
 use super::{Strategy, V3LegQuote, apply_exec_quote_haircut, token_amount_to_usd, parse_amount_capped, MIN_V3_LIQUIDITY};
 
-/// Max QuoterV2 round trips when verifying V3-leg triangular routes. Round 1 quotes every
-/// V3 leg at an upper-bound input; later rounds re-quote only legs whose real input
-/// turned out more than [`VERIFY_MAX_GAP_BPS`] below that.
+/// Max QuoterV2 round trips when verifying V3-leg triangular routes. Round 1 brackets
+/// every V3 leg (see [`VERIFY_BRACKET_BPS`]), so later rounds are only needed when a real
+/// input lands well outside its bracket.
 const VERIFY_MAX_ROUNDS: usize = 3;
 
-/// A V3 leg quoted at input `s` is reused for a smaller real input `a` (scaled as
-/// `quote(s) × a / s`) only when `a` is within this many bps of `s`; otherwise the price
-/// impact baked into `quote(s)` would understate the leg and drop real edges.
+/// A V3 leg whose input depends on earlier legs is quoted at two points in round 1: its
+/// upper-bound input `s` and `s × (1 − this)`. The real input normally falls between them
+/// (earlier legs' impact + tick crossings, ~30 bps on Base), where the chord between the
+/// two quotes is a tight lower bound — so one round trip usually suffices.
+const VERIFY_BRACKET_BPS: u64 = 100;
+
+/// Outside its quoted points, a V3 leg's real input is bounded by the nearest point
+/// (chord through the origin below it, flat output above it). Accepted when within this
+/// many bps of that point; otherwise the leg is re-quoted at its real input next round.
+/// In the last round the bound is used regardless — every bound is conservative.
 const VERIFY_MAX_GAP_BPS: u64 = 10;
 
-/// How much cached V3 spot quotes overstate a triangular route's output (tick crossings
-/// aren't modelled) — historical Base data: ~0.30% on a 270 USDT trade. Deducted from
-/// V3-leg routes' spot profit in optimistic mode, where they aren't QuoterV2-verified.
+/// How much one V3 leg's cached spot quote overstates output (tick crossings aren't
+/// modelled) — historical Base data: ~0.30% on a 270 USDT trade. In optimistic mode, where
+/// V3-leg routes aren't QuoterV2-verified, this is deducted once per V3 leg.
 const V3_SPOT_OVERESTIMATE_BPS: u64 = 30;
 
 /// Outcome of chaining a route through its legs during V3 verification.
@@ -30,8 +37,37 @@ enum RouteWalk {
     Done(U256),
     /// This V3 leg must be re-quoted at this input before the route can be resolved.
     Requote(usize, U256),
-    /// A leg failed or has no liquidity.
-    Dead,
+    /// A leg failed or has no liquidity (reason for the debug log).
+    Dead(&'static str),
+}
+
+/// Lower bound on a V3 leg's output at `amt` from QuoterV2 points `(input, output)` sorted
+/// by input, using that output is increasing and concave in input (zero at zero).
+/// Returns the bound and whether it is tight (exact, inside the points, or within
+/// [`VERIFY_MAX_GAP_BPS`] of the nearest point).
+fn v3_leg_lower_bound(points: &[(U256, U256)], amt: U256) -> Option<(U256, bool)> {
+    let gap_ok = |near: U256, far: U256| {
+        near.abs_diff(far).saturating_mul(U256::from(10_000u32))
+            <= near.saturating_mul(U256::from(VERIFY_MAX_GAP_BPS))
+    };
+    let &(lo_in, lo_out) = points.first()?;
+    let &(hi_in, hi_out) = points.last()?;
+    if let Some(&(_, out)) = points.iter().find(|(i, _)| *i == amt) {
+        return Some((out, true));
+    }
+    if amt < lo_in {
+        // Chord from the origin to the lowest point lies below the curve.
+        return Some((lo_out * amt / lo_in, gap_ok(lo_in, amt)));
+    }
+    if amt > hi_in {
+        // Output is increasing, so output at the highest point is a lower bound.
+        return Some((hi_out, gap_ok(amt, hi_in)));
+    }
+    // Between two points: the chord between them lies below the concave curve.
+    let w = points.windows(2).find(|w| w[0].0 < amt && amt < w[1].0)?;
+    let ((a_in, a_out), (b_in, b_out)) = (w[0], w[1]);
+    let rise = b_out.saturating_sub(a_out) * (amt - a_in) / (b_in - a_in);
+    Some((a_out + rise, true))
 }
 
 impl Strategy {
@@ -434,6 +470,18 @@ impl Strategy {
             };
             let amount_a_final = apply_exec_quote_haircut(amount_a_final);
             let trip = &triplets[p3e.triplet_idx];
+            let v3_legs = v3_leg_count(p3e.router_ab_type, p3e.router_bc_type, p3e.router_ca_type);
+            let v3_route = v3_legs > 0;
+            // Optimistic mode submits V3-leg routes unverified: deduct the known V3 spot
+            // overestimate (per V3 leg — each leg overstates independently) BEFORE the
+            // spread diagnostic, the 5% cap and the floor, so all see a realistic output.
+            let amount_a_final = if self.optimistic_submission && v3_route {
+                let overestimate = p3e.effective_amount_in
+                    * U256::from(V3_SPOT_OVERESTIMATE_BPS * v3_legs) / U256::from(10_000u32);
+                amount_a_final.saturating_sub(overestimate)
+            } else {
+                amount_a_final
+            };
 
             // Track best triangular spread (even negative) for diagnostics
             let tri_spread = if !p3e.effective_amount_in.is_zero() {
@@ -458,18 +506,7 @@ impl Strategy {
                 continue;
             }
 
-            let v3_route = any_v3(p3e.router_ab_type, p3e.router_bc_type, p3e.router_ca_type);
-            let mut profit = amount_a_final - p3e.effective_amount_in;
-            // Optimistic mode submits V3-leg routes unverified: deduct the known V3 spot
-            // overestimate so the floor applies to a realistic profit, not a phantom one.
-            if self.optimistic_submission && v3_route {
-                let overestimate = p3e.effective_amount_in
-                    * U256::from(V3_SPOT_OVERESTIMATE_BPS) / U256::from(10_000u32);
-                match profit.checked_sub(overestimate).filter(|p| !p.is_zero()) {
-                    Some(p) => profit = p,
-                    None => continue,
-                }
-            }
+            let profit = amount_a_final - p3e.effective_amount_in;
 
             // Use correct decimals for profit-to-USD conversion (token_a may be USDC, WETH, etc.)
             let (sym_a, dec_a) = match token_info.get(&trip.key_a) {
@@ -521,6 +558,14 @@ impl Strategy {
         // Rank by USD, not raw expected_profit: start tokens differ in decimals, so raw
         // units would rank a $0.30 WETH-start route above a $5 USDC-start route.
         opportunities.sort_by(|a, b| b.profit_usd.total_cmp(&a.profit_usd));
+        // One route per path (triplet + 3 routers), keeping the most profitable fee-tier
+        // variant: they compete for the same liquidity, so submitting several is a double
+        // send. Done BEFORE verification so variants don't use up its 2 × N budget.
+        // HashSet, not dedup_by — after sorting by profit, variants aren't adjacent.
+        let mut seen_paths: HashSet<(String, String, String, String)> = HashSet::new();
+        opportunities.retain(|o| seen_paths.insert((
+            o.triplet_id.clone(), o.router_ab_id.clone(), o.router_bc_id.clone(), o.router_ca_id.clone(),
+        )));
 
         // ── Revert plan 1.4: verify routes with a V3 leg before submit ───────────
         // Cached sqrtPriceX96 ignores tick crossings, so V3 legs overstate output
@@ -540,13 +585,6 @@ impl Strategy {
             rest.sort_by(|a, b| b.profit_usd.total_cmp(&a.profit_usd));
             opportunities = rest;
         }
-        // One route per path (triplet + 3 routers), keeping the most profitable fee-tier
-        // variant: they compete for the same liquidity, so submitting several is a double
-        // send. HashSet, not dedup_by — after sorting by profit, variants aren't adjacent.
-        let mut seen_paths: HashSet<(String, String, String, String)> = HashSet::new();
-        opportunities.retain(|o| seen_paths.insert((
-            o.triplet_id.clone(), o.router_ab_id.clone(), o.router_bc_id.clone(), o.router_ca_id.clone(),
-        )));
         opportunities.truncate(max_opportunities);
 
         // ── Update triangular scan snapshot ──────────────────────────────────────
@@ -633,17 +671,16 @@ impl Strategy {
     /// QuoterV2-verify triangular routes that have at least one V3 leg (revert plan 1.4).
     ///
     /// Always quotes live through [`Strategy::quote_v3_legs`] (batched, deduplicated, no
-    /// cross-scan cache), in at most [`VERIFY_MAX_ROUNDS`] round trips:
+    /// cross-scan cache), normally in ONE round trip, at most [`VERIFY_MAX_ROUNDS`]:
     ///
-    /// 1. Every V3 leg is first quoted at an upper-bound input `s`: the route's input chained
-    ///    through earlier legs at V3 *marginal* price (no impact, no tick cap — an upper
-    ///    bound on output) and exact local quotes for non-V3 legs.
-    /// 2. Real amounts are chained leg by leg. A V3 leg whose real input `a` is within
-    ///    [`VERIFY_MAX_GAP_BPS`] of the input it was quoted at uses `quote(s) × a / s` — a
-    ///    lower bound (swap output is concave with zero output at zero input) that is tight
-    ///    for a small gap. A larger gap means `quote(s)` carries price impact the real trade
-    ///    won't pay, so that leg is re-quoted at `a` in the next round (only those legs).
-    ///    In the last round the lower bound is used regardless, so results stay conservative.
+    /// 1. Each V3 leg's upper-bound input `s` is the route's input chained through earlier
+    ///    legs at V3 *marginal* price (no impact, no tick cap — an upper bound on output)
+    ///    and exact local quotes for non-V3 legs. A V3 leg whose input is exact (no earlier
+    ///    V3 leg) is quoted at `s`; otherwise at `s` and `s × (1 − VERIFY_BRACKET_BPS)`.
+    /// 2. Real amounts are chained leg by leg; each V3 leg uses
+    ///    [`v3_leg_lower_bound`] over its quoted points. A loose bound (real input far
+    ///    outside the points) is re-quoted at the real input next round; the last round
+    ///    accepts the bound, which is always conservative.
     ///
     /// A route is dropped when a V3 leg has no quoter or its quote fails, any leg has no
     /// liquidity, verified profit is ≤ 0 or > 5% of input (bad quote), or it is below
@@ -657,10 +694,14 @@ impl Strategy {
     ) -> (Vec<TriangularOpportunity>, f64) {
         // Drop routes with a V3 leg that has no quoter before spending any RPC on them.
         let opportunities: Vec<TriangularOpportunity> = opportunities.into_iter().filter(|opp| {
-            (0..3).all(|leg| {
+            let ok = (0..3).all(|leg| {
                 let (router_id, router_type, ..) = leg_params(opp, leg);
                 router_type != RouterType::V3 || self.quoter_by_router.contains_key(router_id)
-            })
+            });
+            if !ok {
+                debug!("[{}] Triangular V3 verify dropped: {} | V3 leg has no quoter", self.chain_id, opp.triplet_id);
+            }
+            ok
         }).collect();
 
         // Pool key per V3 leg, built once and reused for marginal quotes and QuoterV2.
@@ -671,43 +712,62 @@ impl Strategy {
             })
         }).collect();
 
-        // Round-1 request: every V3 leg at its upper-bound input. None = route has a leg
-        // with no cached liquidity → dropped.
+        // Round-1 requests: every V3 leg at its upper-bound input, plus the bracket's lower
+        // point when an earlier V3 leg makes the input uncertain.
         let mut alive: Vec<bool> = vec![true; opportunities.len()];
         let mut requests: Vec<(usize, usize, U256)> = Vec::new(); // (route, leg, amount_in)
         for (i, opp) in opportunities.iter().enumerate() {
             let mut amt = opp.amount_in;
+            let mut input_uncertain = false;
             for (leg, key) in keys[i].iter().enumerate() {
                 let (router_id, router_type, _, token_in, token_out) = leg_params(opp, leg);
                 let next = match key {
                     Some(key) => {
                         requests.push((i, leg, amt));
+                        if input_uncertain {
+                            let lo = amt * U256::from(10_000 - VERIFY_BRACKET_BPS) / U256::from(10_000u32);
+                            requests.push((i, leg, lo));
+                        }
+                        input_uncertain = true;
                         self.pool_cache.quote_v3_marginal(key, token_in, amt)
                     }
                     None => self.local_leg_out(router_id, router_type, token_in, token_out, amt),
                 };
                 match next.filter(|a| !a.is_zero()) {
                     Some(a) => amt = a,
-                    None => { alive[i] = false; break; }
+                    None => {
+                        debug!("[{}] Triangular V3 verify dropped: {} | leg {} has no cached liquidity",
+                               self.chain_id, opp.triplet_id, leg);
+                        alive[i] = false;
+                        break;
+                    }
                 }
             }
         }
         requests.retain(|(i, ..)| alive[*i]);
 
-        // (amount quoted at, QuoterV2 output) per route and leg.
-        let mut quotes: Vec<[Option<(U256, U256)>; 3]> = vec![[None; 3]; opportunities.len()];
+        // QuoterV2 points (input, output) per route and leg, kept sorted by input.
+        let mut points: Vec<[Vec<(U256, U256)>; 3]> = vec![Default::default(); opportunities.len()];
         let mut final_amounts: Vec<Option<U256>> = vec![None; opportunities.len()];
         for round in 0..VERIFY_MAX_ROUNDS {
-            let legs: Vec<V3LegQuote> = requests.iter().map(|&(i, leg, amount_in)| {
-                let (router_id, _, fee, token_in, token_out) = leg_params(&opportunities[i], leg);
-                let key = keys[i][leg].as_ref().expect("requests are V3 legs");
-                V3LegQuote { router_id, key, token_in, token_out, fee, amount_in }
+            let legs: Vec<V3LegQuote> = requests.iter().map(|&(i, leg, amount_in)| V3LegQuote {
+                key: keys[i][leg].as_ref().expect("requests are V3 legs"),
+                amount_in,
             }).collect();
             let results = self.quote_v3_legs(provider, &legs).await;
             for (&(i, leg, amount_in), q) in requests.iter().zip(results) {
                 match q {
-                    Some(out) => quotes[i][leg] = Some((amount_in, out)),
-                    None => alive[i] = false,
+                    Some(out) => {
+                        let pts = &mut points[i][leg];
+                        pts.push((amount_in, out));
+                        pts.sort_by(|a, b| a.0.cmp(&b.0));
+                    }
+                    None if alive[i] => {
+                        debug!("[{}] Triangular V3 verify dropped: {} | QuoterV2 failed on leg {}",
+                               self.chain_id, opportunities[i].triplet_id, leg);
+                        alive[i] = false;
+                    }
+                    None => {}
                 }
             }
 
@@ -715,13 +775,17 @@ impl Strategy {
             requests.clear();
             for (i, opp) in opportunities.iter().enumerate() {
                 if !alive[i] || final_amounts[i].is_some() { continue; }
-                match self.walk_verified_route(opp, &quotes[i], last_round) {
+                match self.walk_verified_route(opp, &points[i], last_round) {
                     RouteWalk::Done(amt) => final_amounts[i] = Some(amt),
                     RouteWalk::Requote(leg, amt) => requests.push((i, leg, amt)),
-                    RouteWalk::Dead => alive[i] = false,
+                    RouteWalk::Dead(why) => {
+                        debug!("[{}] Triangular V3 verify dropped: {} | {}", self.chain_id, opp.triplet_id, why);
+                        alive[i] = false;
+                    }
                 }
             }
             if requests.is_empty() { break; }
+            debug!("[{}] Triangular V3 verify: round {} re-quotes {} leg(s)", self.chain_id, round + 2, requests.len());
         }
 
         let mut best_verified_usd: f64 = 0.0;
@@ -756,37 +820,30 @@ impl Strategy {
         (kept, best_verified_usd)
     }
 
-    /// Chain a route's real amounts through its legs using the V3 quotes gathered so far
-    /// (see [`Strategy::verify_v3_triangular`] for the bound used on each V3 leg).
+    /// Chain a route's real amounts through its legs using the V3 points gathered so far.
     fn walk_verified_route(
         &self,
         opp: &TriangularOpportunity,
-        quotes: &[Option<(U256, U256)>; 3],
+        points: &[Vec<(U256, U256)>; 3],
         last_round: bool,
     ) -> RouteWalk {
         let mut amt = opp.amount_in;
-        for (leg, quote) in quotes.iter().enumerate() {
+        for (leg, pts) in points.iter().enumerate() {
             let (router_id, router_type, _, token_in, token_out) = leg_params(opp, leg);
             let next = if router_type == RouterType::V3 {
-                let Some((quoted_in, quoted_out)) = *quote else { return RouteWalk::Dead };
-                let gap_ok = amt <= quoted_in
-                    && (quoted_in - amt).saturating_mul(U256::from(10_000u32))
-                        <= quoted_in.saturating_mul(U256::from(VERIFY_MAX_GAP_BPS));
-                if amt == quoted_in {
-                    Some(quoted_out)
-                } else if gap_ok || (last_round && amt < quoted_in) {
-                    Some(quoted_out * amt / quoted_in)
-                } else if last_round {
-                    return RouteWalk::Dead;
-                } else {
+                let Some((bound, tight)) = v3_leg_lower_bound(pts, amt) else {
+                    return RouteWalk::Dead("V3 leg has no quote");
+                };
+                if !tight && !last_round {
                     return RouteWalk::Requote(leg, amt);
                 }
+                Some(bound)
             } else {
                 self.local_leg_out(router_id, router_type, token_in, token_out, amt)
             };
             match next.filter(|a| !a.is_zero()) {
                 Some(a) => amt = a,
-                None => return RouteWalk::Dead,
+                None => return RouteWalk::Dead("leg has no liquidity"),
             }
         }
         RouteWalk::Done(amt)
@@ -827,14 +884,14 @@ impl Strategy {
     }
 }
 
-/// True if any leg is a V3 router — the one place that decides which routes need
-/// QuoterV2 verification (cached V3 spot quotes can be phantom).
-fn any_v3(ab: RouterType, bc: RouterType, ca: RouterType) -> bool {
-    [ab, bc, ca].contains(&RouterType::V3)
+/// Number of V3 legs in a route — the one place that decides which routes need QuoterV2
+/// verification (cached V3 spot quotes can be phantom).
+fn v3_leg_count(ab: RouterType, bc: RouterType, ca: RouterType) -> u64 {
+    [ab, bc, ca].iter().filter(|t| **t == RouterType::V3).count() as u64
 }
 
 fn has_v3_leg(opp: &TriangularOpportunity) -> bool {
-    any_v3(opp.router_ab_type, opp.router_bc_type, opp.router_ca_type)
+    v3_leg_count(opp.router_ab_type, opp.router_bc_type, opp.router_ca_type) > 0
 }
 
 /// (router_id, router_type, fee, token_in, token_out) for leg 0 (A→B), 1 (B→C) or 2 (C→A).
