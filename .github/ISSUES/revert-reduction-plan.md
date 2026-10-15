@@ -50,9 +50,9 @@ round-trip (V3 spot, stale V2 reserves, buy-leg `amountOutMin = 0` in the contra
 | # | Change | Status |
 |---|--------|--------|
 | **1.1** | Apply **`P15_QUOTER_HAIRCUT_BPS` (15 bps)** to **all** opportunities at detection push, including **Phase 2 V2→V2** and **triangular** (Phase 1.5 paths use shared helper — no double haircut). | **Done** |
-| **1.2** | Raise Base **`min_profit_usd`** / per-pair floors for thin routes ($0.30–$0.80). | Open |
-| **1.3** | **`ROUTER_MIN_OUT_SLACK_BPS` 200 → 250** if Phase 0 shows persistent V3 sell reverts after 1.1–1.2. | Open — see [router-min-out-slack-bps.md](./router-min-out-slack-bps.md) |
-| **1.4** | Triangular: block or quoter-verify any route with a **V3 leg** before submit. | Open |
+| **1.2** | Raise Base **`min_profit_usd`** / per-pair floors for thin routes ($0.30–$0.80). | **Deferred** — skip while trading ~$1k/cycle; absolute $ floors hide most real edges. Prefer **1.1 haircut** + revert telemetry; revisit when size or win rate justifies fewer sends. |
+| **1.3** | **`ROUTER_MIN_OUT_SLACK_BPS` 200 → 250** if Phase 0 shows persistent V3 sell reverts after 1.1 and 1.4 (1.2 is deferred, so it no longer gates this). | Open — see [router-min-out-slack-bps.md](./router-min-out-slack-bps.md) |
+| **1.4** | Triangular: block or quoter-verify any route with a **V3 leg** before submit. | **Done** |
 | **1.5** | Skip or re-quote if **`scan_to_submit_ms`** &gt; threshold (e.g. 300–500 ms on Base). | Open |
 | **1.6** | Revert-aware cooldown on **fingerprint + pool key**. | Open |
 
@@ -61,6 +61,16 @@ round-trip (V3 spot, stale V2 reserves, buy-leg `amountOutMin = 0` in the contra
 - Helper: `Strategy::apply_exec_quote_haircut()` in `engine/src/strategy/mod.rs`.
 - Applied in `evaluate.rs` (Phase 2 direct path; Phase 1.5/1.5b/1.5c refactored to same helper).
 - Applied in `triangular.rs` before profit / threshold checks.
+
+### Phase 1.4 implementation (done)
+
+- `Strategy::verify_v3_triangular()` in `engine/src/strategy/triangular.rs`. Runs **before** the top-N truncate (on up to 2 × N V3-leg routes), so dropped routes are backfilled by lower-ranked ones.
+- **One round trip:** every V3 leg is quoted in a single QuoterV2 multicall at its spot chained input. Real amounts are then chained; a V3 leg whose real input `a` differs from its spot input `s` is taken as `quote(s) × min(a, s) / s` — a lower bound, since swap output is increasing and concave. Non-V3 legs are re-quoted exactly from the local cache.
+- The 15 bps haircut and the 5% sanity cap apply to the verified output; routes below `min_triangular_profit_usd` are dropped.
+- The heartbeat's best triangular profit counts V3-leg routes only once verified, so phantom spot profits no longer show up there.
+- A failing quoter is warned once per router (e.g. Aerodrome Slipstream — its quoter uses `int24 tickSpacing`, so Uniswap-ABI quotes revert).
+- With `optimistic_submission: true` (no QuoterV2), V3-leg routes are blocked; a warning is logged at startup.
+- This let Base's `min_triangular_profit_usd` drop from $0.80 to $0.15: the floor now applies to verified profit rather than absorbing the V3 spot overestimate.
 
 ---
 

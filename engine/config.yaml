@@ -34,7 +34,10 @@ chains:
     block_time_ms: 2000
     contract_address: "0xF8aa9d575CEccdFed211383Cd3979241d9C6E0c2"
     min_native_balance: 0.005
-    min_profit_usd: 0.0001  # near-zero threshold for pipeline verification — the 0.25% slippage buffer in evaluate.rs filters marginal routes
+    # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
+    # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
+    # deliberately loosened (62% of gas floor, 2% router slack), so it does NOT filter thin edges.
+    min_profit_usd: 0.0001
     deadline_seconds: 120
     quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
     scan_interval_ms: 2000
@@ -55,10 +58,13 @@ chains:
     # pipeline nets its first confirmations.
     optimistic_submission: false  # Phase 1.5 QuoterV2 (~80–160ms) — restores bestV= in heartbeat
     # preflight_eth_call: true     # eth_call before send — logs revert reason in engine (adds ~100–250ms latency)
-    # Triangular arbs through V3 pools overestimate output via cached sqrtPriceX96
-    # (tick-level liquidity not modelled). Historical data: even $0.6571 on 270 USDT
-    # (0.24%) reverts on-chain → set floor to $0.80 (0.30%) to filter phantom opps.
-    min_triangular_profit_usd: 0.80
+    # Applies to EVERY triangular route. V3-leg routes are QuoterV2-verified first (revert plan 1.4),
+    # so for them this is checked against verified profit and no longer absorbs the ~0.30% V3 spot
+    # overestimate the old $0.80 covered. V2/Solidly/Aerodrome-only routes are NOT re-verified: they
+    # rely on event-sourced reserves (exact xy=k / stable curve) + 15 bps haircut + 5% sanity cap.
+    # If those routes start reverting, raise this floor — it is the only extra guard they have.
+    # Requires optimistic_submission: false — optimistic mode blocks V3-leg routes.
+    min_triangular_profit_usd: 0.15
     optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
     priority_fee_wei: 10000000    # 10 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei (trigger_tip dominates for pending path)
     pending_tx_monitoring: true   # monitor mempool for large swaps before they confirm → same-block arb

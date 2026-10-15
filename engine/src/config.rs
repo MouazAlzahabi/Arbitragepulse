@@ -100,11 +100,10 @@ pub struct ChainConfig {
     /// leave **false** — WS updates are faster and avoid duplicate RPC + cache writes.
     #[serde(default)]
     pub poll_logs_fallback: bool,
-    /// Minimum detected profit in USD required to submit a triangular arb.
-    /// Triangular V3 routes overestimate output via cached sqrtPriceX96 (tick-level
-    /// liquidity not modelled). This floor filters phantom opportunities before they
-    /// reach the sequencer and revert. Default: same as min_profit_usd.
-    /// Recommended on Base: 0.80 (covers ~0.30% overestimate on a 270 USDT trade).
+    /// Minimum profit in USD required to submit a triangular arb. Default: same as min_profit_usd.
+    /// Routes with a V3 leg are QuoterV2-verified first (cached sqrtPriceX96 overestimates
+    /// by ~0.30%), so this compares against verified profit. With `optimistic_submission`
+    /// those routes are blocked instead, since they can't be verified.
     #[serde(default)]
     pub min_triangular_profit_usd: Option<f64>,
 }
