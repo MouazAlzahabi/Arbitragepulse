@@ -15,6 +15,7 @@ use tracing::{info, warn, debug};
 
 use crate::abi::{ArbitrageExecutor, IERC20};
 use crate::db::Database;
+use crate::util::{transport_timeout, RPC_READ_TIMEOUT, RPC_SEND_TIMEOUT, RPC_SIMULATE_TIMEOUT};
 use crate::strategy::{ArbOpportunity, TriangularOpportunity};
 
 // Hardcoded gas limit — 700k covers any 2-hop arb including PancakeV3 SmartRouter
@@ -250,7 +251,8 @@ impl Executor {
         }
 
         // Cache miss or expired — fetch from chain
-        let gas_price = provider.get_gas_price().await.unwrap_or(5_000_000_000u128);
+        let gas_price = transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await
+            .unwrap_or(5_000_000_000u128);
         self.gas_price_cache = Some((gas_price, Instant::now()));
         debug!(
             "[{}] Gas price fetched: {} wei (cached for {:?})",
@@ -314,8 +316,7 @@ impl Executor {
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
-            None => provider
-                .get_transaction_count(self.signer_address)
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -390,8 +391,7 @@ impl Executor {
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
-            None => provider
-                .get_transaction_count(self.signer_address)
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -457,7 +457,7 @@ impl Executor {
     /// RPC overhead. Called at startup and can be called after reverts to avoid
     /// the ~50ms nonce fetch on the next submission.
     pub async fn prefetch_nonce<P: Provider + Clone>(&mut self, provider: &P) {
-        match provider.get_transaction_count(self.signer_address).await {
+        match transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address)).await {
             Ok(n) => {
                 self.nonce = Some(n);
                 debug!("Executor: nonce pre-fetched = {}", n);
@@ -507,7 +507,7 @@ impl Executor {
 
         // ── Dry-run: simulate only ─────────────────────────────────────────────
         if self.dry_run {
-            match provider.call(tx_base).await {
+            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(tx_base)).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =
@@ -536,8 +536,7 @@ impl Executor {
         // mutex can be released immediately after send (not after receipt).
         let nonce = match self.nonce {
             Some(n) => n,
-            None => provider
-                .get_transaction_count(self.signer_address)
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -580,7 +579,7 @@ impl Executor {
             });
         }
 
-        match provider.send_transaction(tx).await {
+        match transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(tx)).await {
             Ok(pending) => {
                 // Nonce consumed — update counter immediately so next tx can use nonce+1
                 // even while this receipt is still pending.
@@ -717,7 +716,7 @@ impl Executor {
         self.stats.total_attempts += 1;
 
         if self.dry_run {
-            match provider.call(tx_base).await {
+            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(tx_base)).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =
@@ -741,8 +740,7 @@ impl Executor {
 
         let nonce = match self.nonce {
             Some(n) => n,
-            None => provider
-                .get_transaction_count(self.signer_address)
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -778,7 +776,7 @@ impl Executor {
             });
         }
 
-        match provider.send_transaction(tx).await {
+        match transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(tx)).await {
             Ok(pending) => {
                 self.nonce = Some(nonce + 1);
                 let tx_hash = format!("{:?}", pending.tx_hash());

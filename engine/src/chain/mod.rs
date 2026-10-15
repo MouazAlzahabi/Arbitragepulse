@@ -7,7 +7,7 @@ use alloy::transports::ws::WsConnect;
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -18,6 +18,7 @@ use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory,
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
+use crate::util::{rpc_timeout, RPC_READ_TIMEOUT};
 use crate::executor::{Executor, TxPrep};
 use crate::listener::{Listener, SwapEvent, SwapMagnitude};
 use crate::metrics::Metrics;
@@ -433,6 +434,10 @@ pub async fn run_chain(
     let mut price_tick    = tokio::time::interval(Duration::from_secs(60));
     let mut config_tick   = tokio::time::interval(Duration::from_secs(30));
     let mut balance_tick  = tokio::time::interval(Duration::from_secs(30));
+    // Native-price and balance refreshes run as background tasks so their RPC calls never
+    // delay a scan. Each flag stops a slow refresh from overlapping with the next tick.
+    let price_refresh_busy   = Arc::new(AtomicBool::new(false));
+    let balance_refresh_busy = Arc::new(AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -445,7 +450,15 @@ pub async fn run_chain(
 
             // ── Periodic price update + cache cleanup + status log ────────────
             _ = price_tick.tick() => {
-                state::update_native_price(&strategy, &executor, &provider, &chain_routers, &chain_pairs, &cfg).await;
+                if !price_refresh_busy.swap(true, Ordering::AcqRel) {
+                    let (strategy, executor, provider) = (strategy.clone(), executor.clone(), provider.clone());
+                    let (routers, pairs, cfg) = (chain_routers.clone(), chain_pairs.clone(), cfg.clone());
+                    let busy = price_refresh_busy.clone();
+                    tokio::spawn(async move {
+                        state::update_native_price(&strategy, &executor, &provider, &routers, &pairs, &cfg).await;
+                        busy.store(false, Ordering::Release);
+                    });
+                }
 
                 // Prune expired cooldown entries. Entries are cleaned up lazily when
                 // the same fingerprint is looked up, but one-off fingerprints (different
@@ -466,7 +479,7 @@ pub async fn run_chain(
 
                 // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
                 let rpc_ping_start = Instant::now();
-                let rpc_latency_ms = match provider.get_block_number().await {
+                let rpc_latency_ms = match rpc_timeout(RPC_READ_TIMEOUT, provider.get_block_number()).await {
                     Ok(_) => rpc_ping_start.elapsed().as_millis() as f64,
                     Err(_) => 0.0,
                 };
@@ -607,7 +620,14 @@ pub async fn run_chain(
 
             // ── Periodic contract balance refresh ─────────────────────────────
             _ = balance_tick.tick() => {
-                state::refresh_contract_balances(provider.as_ref(), contract_addr, &contract_balances).await;
+                if !balance_refresh_busy.swap(true, Ordering::AcqRel) {
+                    let (provider, balances) = (provider.clone(), contract_balances.clone());
+                    let busy = balance_refresh_busy.clone();
+                    tokio::spawn(async move {
+                        state::refresh_contract_balances(provider.as_ref(), contract_addr, &balances).await;
+                        busy.store(false, Ordering::Release);
+                    });
+                }
             }
 
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::{rpc_timeout, RPC_READ_TIMEOUT};
 
 pub(crate) async fn update_native_price<P: Provider>(
     strategy: &Arc<RwLock<Strategy>>,
@@ -85,17 +86,15 @@ pub(crate) async fn update_native_price<P: Provider>(
             const DEFAULT_TIERS: &[u32] = &[500, 3000];
             let tiers: &[u32] = if router.fee_tiers.is_empty() { DEFAULT_TIERS } else { &router.fee_tiers };
             for fee in tiers {
-                if let Ok(r) = IQuoterV2::new(quoter, provider.as_ref())
-                    .quoteExactInputSingle(IQuoterV2::QuoteExactInputSingleParams {
-                        tokenIn: wrapped_native,
-                        tokenOut: token_out,
-                        amountIn: probe_amount,
-                        fee: Uint::from(*fee),
-                        sqrtPriceLimitX96: Uint::ZERO,
-                    })
-                    .call()
-                    .await
-                {
+                let quoter_v2 = IQuoterV2::new(quoter, provider.as_ref());
+                let quote = quoter_v2.quoteExactInputSingle(IQuoterV2::QuoteExactInputSingleParams {
+                    tokenIn: wrapped_native,
+                    tokenOut: token_out,
+                    amountIn: probe_amount,
+                    fee: Uint::from(*fee),
+                    sqrtPriceLimitX96: Uint::ZERO,
+                });
+                if let Ok(r) = rpc_timeout(RPC_READ_TIMEOUT, quote.call()).await {
                     if !r.amountOut.is_zero() {
                         let price = r.amountOut.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
                         debug!("[{}] {} price V3 router={} fee={} → ${:.2}", cfg.name, cfg.native_currency, router.id, fee, price);
@@ -116,11 +115,9 @@ pub(crate) async fn update_native_price<P: Provider>(
     for router in routers.iter().filter(|r| r.chain_id == cfg.id && r.router_type == RouterType::V2) {
         let router_addr: Address = match router.address.parse() { Ok(a) => a, Err(_) => continue };
 
-        if let Ok(amounts) = IUniswapV2Router02::new(router_addr, provider.as_ref())
-            .getAmountsOut(probe_amount, vec![wrapped_native, token_out])
-            .call()
-            .await
-        {
+        let v2_router = IUniswapV2Router02::new(router_addr, provider.as_ref());
+        let amounts_call = v2_router.getAmountsOut(probe_amount, vec![wrapped_native, token_out]);
+        if let Ok(amounts) = rpc_timeout(RPC_READ_TIMEOUT, amounts_call.call()).await {
             if let Some(&out) = amounts.last() {
                 if !out.is_zero() {
                     let price = out.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
@@ -160,7 +157,7 @@ pub(crate) async fn refresh_contract_balances<P: Provider + Clone>(
         async move {
             (
                 token,
-                IERC20::new(token, &p).balanceOf(contract_addr).call().await,
+                rpc_timeout(RPC_READ_TIMEOUT, IERC20::new(token, &p).balanceOf(contract_addr).call()).await,
             )
         }
     }))

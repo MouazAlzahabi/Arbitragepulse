@@ -1,6 +1,7 @@
 use super::*;
 use alloy::network::ReceiptResponse;
 use alloy::primitives::B256;
+use crate::util::{transport_timeout, RPC_SEND_TIMEOUT, RPC_SIMULATE_TIMEOUT};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -455,7 +456,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match provider.call(prep.tx.clone()).await {
+                            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
@@ -532,9 +533,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         let send_start = std::time::Instant::now();
                         // Use pre-signed raw bytes when available (skips re-signing in WalletFiller).
                         let send_result = if let Some(ref raw) = prep.raw_tx {
-                            provider.send_raw_transaction(raw).await
+                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_raw_transaction(raw)).await
                         } else {
-                            provider.send_transaction(prep.tx.clone()).await
+                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(prep.tx.clone())).await
                         };
                         match send_result {
                             Ok(pending) => {
@@ -736,7 +737,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Err(e) => {
                                 {
                                     let err_str = e.to_string().to_lowercase();
+                                    // "outcome unknown" = send timed out: the tx may have been
+                                    // broadcast, so never reuse its nonce.
                                     let nonce_consumed = err_str.contains("nonce too low")
+                                        || err_str.contains("outcome unknown")
                                         || err_str.contains("already known")
                                         || err_str.contains("replacement transaction");
                                     let mut exec = executor.lock().await;
@@ -873,7 +877,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match provider.call(prep.tx.clone()).await {
+                            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
@@ -938,9 +942,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         }
                         let send_start = std::time::Instant::now();
                         let send_result = if let Some(ref raw) = prep.raw_tx {
-                            provider.send_raw_transaction(raw).await
+                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_raw_transaction(raw)).await
                         } else {
-                            provider.send_transaction(prep.tx.clone()).await
+                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(prep.tx.clone())).await
                         };
                         match send_result {
                             Ok(pending) => {
@@ -1142,7 +1146,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Err(e) => {
                                 {
                                     let err_str = e.to_string().to_lowercase();
+                                    // "outcome unknown" = send timed out: the tx may have been
+                                    // broadcast, so never reuse its nonce.
                                     let nonce_consumed = err_str.contains("nonce too low")
+                                        || err_str.contains("outcome unknown")
                                         || err_str.contains("already known")
                                         || err_str.contains("replacement transaction");
                                     let mut exec = executor.lock().await;
