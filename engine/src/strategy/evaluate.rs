@@ -1,14 +1,12 @@
-use alloy::primitives::{Address, Uint, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolCall;
 use tracing::{debug, info, warn};
 
-use crate::abi::IQuoterV2;
 use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, V3PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
-use super::{ForwardTask, ReverseTask, Strategy, apply_exec_quote_haircut, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY};
+use super::{ForwardTask, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, encode_v3_quote, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY};
 
 impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
@@ -531,16 +529,7 @@ impl Strategy {
                     p15_pre.push(cached);       // cache hit — no HTTP call needed
                 } else {
                     p15_pre.push(None);         // cache miss — queue for MC
-                    let cd = IQuoterV2::quoteExactInputSingleCall {
-                        params: IQuoterV2::QuoteExactInputSingleParams {
-                            tokenIn: fwd_task.token_in,
-                            tokenOut: fwd_task.token_out,
-                            amountIn: full_amount,
-                            fee: Uint::from(*fee_a),
-                            sqrtPriceLimitX96: Uint::ZERO,
-                        },
-                    }.abi_encode();
-                    p15_mc.push((quoter, cd));
+                    p15_mc.push((quoter, encode_v3_quote(fwd_task.token_in, fwd_task.token_out, *fee_a, full_amount)));
                 }
             }
 
@@ -580,11 +569,7 @@ impl Strategy {
                             *cached_val  // served from cache — 0 HTTP
                         } else {
                             let raw_opt = mc_raw_iter.next().unwrap_or(None);
-                            let result = raw_opt.as_ref()
-                                .and_then(|raw| IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw).ok())
-                                .filter(|r| !r.amountOut.is_zero())
-                                .map(|r| r.amountOut)
-                                .unwrap_or(U256::ZERO);
+                            let result = decode_v3_quote(raw_opt.as_ref()).unwrap_or(U256::ZERO);
                             let key = V3PoolKey::new(router_a_id, *token_in, *token_out, *fee_a);
                             if let Some(sqrtp) = self.pool_cache.v3_by_key.get(&key)
                                 .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
@@ -643,16 +628,7 @@ impl Strategy {
                                     p15b_pre.push(cached_b);
                                 } else {
                                     p15b_pre.push(None);
-                                    let cd = IQuoterV2::quoteExactInputSingleCall {
-                                        params: IQuoterV2::QuoteExactInputSingleParams {
-                                            tokenIn: token_out,
-                                            tokenOut: token_in,
-                                            amountIn: quoter_out,
-                                            fee: Uint::from(fee_b),
-                                            sqrtPriceLimitX96: Uint::ZERO,
-                                        },
-                                    }.abi_encode();
-                                    p15b_mc.push((quoter_b, cd));
+                                    p15b_mc.push((quoter_b, encode_v3_quote(token_out, token_in, fee_b, quoter_out)));
                                 }
                             }
                             continue;
@@ -775,16 +751,7 @@ impl Strategy {
                     Some(q) => q, None => continue,
                 };
 
-                let cd = IQuoterV2::quoteExactInputSingleCall {
-                    params: IQuoterV2::QuoteExactInputSingleParams {
-                        tokenIn:           task.token_out,
-                        tokenOut:          task.token_in,
-                        amountIn:          task.token_out_amount,
-                        fee:               Uint::from(task.fee_b),
-                        sqrtPriceLimitX96: Uint::from(0u8),
-                    },
-                };
-                p15c_mc.push((quoter_b, cd.abi_encode()));
+                p15c_mc.push((quoter_b, encode_v3_quote(task.token_out, task.token_in, task.fee_b, task.token_out_amount)));
                 p15c_candidates.push((
                     task.pair_idx,
                     task.router_a_id.clone(), task.fee_a, task.router_a_addr,
@@ -838,11 +805,7 @@ impl Strategy {
                     cached_val
                 } else {
                     let raw_opt = mc_iter.next().unwrap_or(None);
-                    let result = raw_opt.as_ref()
-                        .and_then(|raw| IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw).ok())
-                        .filter(|r| !r.amountOut.is_zero())
-                        .map(|r| r.amountOut)
-                        .unwrap_or(U256::ZERO);
+                    let result = decode_v3_quote(raw_opt.as_ref()).unwrap_or(U256::ZERO);
                     let p15b_key = q_b
                         .rev_v3_key
                         .clone()
@@ -917,11 +880,7 @@ impl Strategy {
         for ((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id), raw_opt)
             in p15c_candidates.into_iter().zip(p15c_raw.into_iter())
         {
-            let raw = match raw_opt { Some(r) => r, None => continue };
-            let amount_back = match IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(&raw) {
-                Ok(r) if !r.amountOut.is_zero() => r.amountOut,
-                _ => continue,
-            };
+            let Some(amount_back) = decode_v3_quote(raw_opt.as_ref()) else { continue };
 
             // Phantom check first (>5% positive spread = physically impossible)
             if amount_back > full_amount

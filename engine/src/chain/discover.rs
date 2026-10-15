@@ -276,6 +276,22 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     }
     let pool_raw = discover_mc(pool_calls, provider).await;
 
+    // A factory that reverts every Uniswap-style getPool(A, B, uint24 fee) call isn't a
+    // Uniswap V3 factory (e.g. Aerodrome Slipstream keys pools by int24 tickSpacing), so
+    // the router gets no pools and is silently inactive. Say so once at startup.
+    for vr in &v3_routers {
+        let all_reverted = pool_queries.iter().zip(pool_raw.iter())
+            .filter(|(pq, _)| pq.router_id == vr.id)
+            .all(|(_, raw)| raw.is_none());
+        if all_reverted {
+            tracing::warn!(
+                "V3 router {}: every factory getPool(tokenA, tokenB, uint24 fee) call reverted — \
+                 factory {} is not Uniswap-V3 compatible, so this router finds no pools and is inactive.",
+                vr.id, vr.factory,
+            );
+        }
+    }
+
     // ── Round 2: slot0() + liquidity() per discovered pool ────────────────────
     struct StateQuery { pool: Address, router_id: String, ta: Address, tb: Address, fee: u32 }
     let mut state_calls: Vec<(Address, Vec<u8>)> = Vec::new();

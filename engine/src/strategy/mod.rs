@@ -1,14 +1,14 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Uint, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use dashmap::DashMap;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
-use crate::abi::{IERC20, IMulticall3, ISyncSwapClassicPoolFactory, IUniswapV2Pair};
+use crate::abi::{IERC20, IMulticall3, IQuoterV2, ISyncSwapClassicPoolFactory, IUniswapV2Pair};
 use crate::config::{PairConfig, RouterConfig, RouterType};
 use crate::pool_cache::{PoolCache, PoolInfo, V2PoolKey, V3PoolKey};
 pub use crate::types::*;
@@ -39,6 +39,43 @@ pub(crate) const P15_QUOTER_HAIRCUT_BPS: u64 = 15;
 /// Detection / execution buffer applied to quoted output before profit checks (Phase 1.1).
 pub(crate) fn apply_exec_quote_haircut(amount_out: U256) -> U256 {
     (amount_out * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS)) / U256::from(10_000u32)
+}
+
+/// QuoterV2 `quoteExactInputSingle` calldata (Uniswap V3 ABI, `uint24 fee`).
+/// Shared by every QuoterV2 batch so the encoding lives in one place.
+pub(crate) fn encode_v3_quote(token_in: Address, token_out: Address, fee: u32, amount_in: U256) -> Vec<u8> {
+    IQuoterV2::quoteExactInputSingleCall {
+        params: IQuoterV2::QuoteExactInputSingleParams {
+            tokenIn: token_in,
+            tokenOut: token_out,
+            amountIn: amount_in,
+            fee: Uint::from(fee),
+            sqrtPriceLimitX96: Uint::ZERO,
+        },
+    }.abi_encode()
+}
+
+/// Decode one QuoterV2 result from [`run_multicall`]. None = call failed or quoted 0.
+pub(crate) fn decode_v3_quote(raw: Option<&Vec<u8>>) -> Option<U256> {
+    raw.and_then(|r| IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(r).ok())
+        .map(|r| r.amountOut)
+        .filter(|a| !a.is_zero())
+}
+
+/// Warn when every QuoterV2 call for a router fails in this many batches in a row.
+/// A streak (not a single failure) separates a broken quoter from an RPC blip.
+const QUOTER_FAIL_WARN_STREAK: u32 = 5;
+
+/// Entry cap for [`Strategy::v3_quote_cache`]; cleared wholesale when exceeded.
+const V3_QUOTE_CACHE_MAX: usize = 4096;
+
+/// One V3 leg to quote via QuoterV2 — see [`Strategy::quote_v3_legs`].
+pub(crate) struct V3LegQuote<'a> {
+    pub router_id: &'a str,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub fee: u32,
+    pub amount_in: U256,
 }
 
 /// Pre-parsed per-pair scan context — built once per config change, not per block.
@@ -188,6 +225,11 @@ pub struct Strategy {
     scan_cache_generation: std::sync::atomic::AtomicU64,
     /// Cached (generation, disabled fingerprint) → disabled directed legs for triangular.
     tri_disabled_legs_cache: Mutex<Option<(u64, u64, std::collections::HashSet<(Address, Address)>)>>,
+    /// [`Strategy::quote_v3_legs`] cache: (pool key, amount_in) → (pool sqrtPriceX96,
+    /// liquidity, amountOut). Reused while the pool's price and liquidity are unchanged.
+    v3_quote_cache: DashMap<(V3PoolKey, U256), (U256, u128, U256)>,
+    /// Router ID → consecutive QuoterV2 batches in which every call for it failed.
+    quoter_fail_streak: DashMap<String, u32>,
 }
 
 impl Strategy {
@@ -235,8 +277,9 @@ impl Strategy {
             && routers.iter().any(|r| r.chain_id == chain_id && r.router_type == RouterType::V3)
         {
             warn!(
-                "[{}] optimistic_submission is on: triangular routes with a V3 leg are blocked \
-                 (they can't be QuoterV2-verified). Set optimistic_submission: false to trade them.",
+                "[{}] optimistic_submission is on: triangular routes with a V3 leg are submitted on \
+                 cached spot quotes WITHOUT QuoterV2 verification (V3 spot overstates output ~0.30%). \
+                 Keep min_triangular_profit_usd high enough to cover that, or set optimistic_submission: false.",
                 chain_id,
             );
         }
@@ -269,6 +312,8 @@ impl Strategy {
             pair_id_to_index: HashMap::new(),
             scan_cache_generation: std::sync::atomic::AtomicU64::new(0),
             tri_disabled_legs_cache: Mutex::new(None),
+            v3_quote_cache: DashMap::new(),
+            quoter_fail_streak: DashMap::new(),
         };
         s.rebuild_scan_cache();
         s
@@ -615,6 +660,94 @@ impl Strategy {
         out
     }
 
+    /// Quote V3 legs via QuoterV2 in one batched multicall. Results are in input order;
+    /// None = router has no quoter, the call failed, or it quoted 0.
+    ///
+    /// - Identical legs (same pool and amount) are sent once.
+    /// - Results are cached per (pool, amount) and reused while the pool's sqrtPriceX96
+    ///   and liquidity are unchanged, so repeat scans of a quiet pool cost no RPC.
+    /// - A router whose every call fails in [`QUOTER_FAIL_WARN_STREAK`] batches in a row
+    ///   is warned (wrong quoter address/ABI, or a persistent RPC problem); the streak
+    ///   resets on success, so a later breakage is warned again.
+    pub(crate) async fn quote_v3_legs<P: Provider + Clone>(
+        &self,
+        provider: &P,
+        legs: &[V3LegQuote<'_>],
+    ) -> Vec<Option<U256>> {
+        let mut out: Vec<Option<U256>> = vec![None; legs.len()];
+        let mut mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        // Per multicall slot: cache key, pool state when sent, router, and legs it answers.
+        let mut sent: Vec<((V3PoolKey, U256), Option<(U256, u128)>, &str, Vec<usize>)> = Vec::new();
+        let mut dedup: HashMap<(V3PoolKey, U256), usize> = HashMap::new();
+
+        for (i, leg) in legs.iter().enumerate() {
+            let Some(&quoter) = self.quoter_by_router.get(leg.router_id) else { continue };
+            let pool_key = V3PoolKey::new(leg.router_id, leg.token_in, leg.token_out, leg.fee);
+            let state = self.pool_cache.v3_price_state(&pool_key);
+            let cache_key = (pool_key, leg.amount_in);
+            if let (Some((sqrtp, liq)), Some(hit)) = (state, self.v3_quote_cache.get(&cache_key)) {
+                if hit.0 == sqrtp && hit.1 == liq {
+                    out[i] = Some(hit.2);
+                    continue;
+                }
+            }
+            match dedup.entry(cache_key) {
+                Entry::Occupied(e) => sent[*e.get()].3.push(i),
+                Entry::Vacant(e) => {
+                    let cache_key = e.key().clone();
+                    e.insert(sent.len());
+                    mc.push((quoter, encode_v3_quote(leg.token_in, leg.token_out, leg.fee, leg.amount_in)));
+                    sent.push((cache_key, state, leg.router_id, vec![i]));
+                }
+            }
+        }
+        if mc.is_empty() {
+            return out;
+        }
+
+        let raw = match self.http_provider {
+            Some(ref hp) => run_multicall(hp, mc, self.rpc_concurrency).await,
+            None => run_multicall(provider, mc, self.rpc_concurrency).await,
+        };
+        if self.v3_quote_cache.len() > V3_QUOTE_CACHE_MAX {
+            self.v3_quote_cache.clear();
+        }
+        // Router → whether any of its calls succeeded in this batch.
+        let mut router_ok: HashMap<&str, bool> = HashMap::new();
+        for ((cache_key, state, router_id, slots), r) in sent.into_iter().zip(raw) {
+            let q = decode_v3_quote(r.as_ref());
+            *router_ok.entry(router_id).or_insert(false) |= q.is_some();
+            if let (Some(amount_out), Some((sqrtp, liq))) = (q, state) {
+                self.v3_quote_cache.insert(cache_key, (sqrtp, liq, amount_out));
+            }
+            for i in slots {
+                out[i] = q;
+            }
+        }
+        for (router_id, ok) in router_ok {
+            self.note_quoter_batch(router_id, ok);
+        }
+        out
+    }
+
+    fn note_quoter_batch(&self, router_id: &str, ok: bool) {
+        if ok {
+            self.quoter_fail_streak.remove(router_id);
+            return;
+        }
+        let mut streak = self.quoter_fail_streak.entry(router_id.to_string()).or_insert(0);
+        *streak += 1;
+        if *streak == QUOTER_FAIL_WARN_STREAK {
+            warn!(
+                "[{}] QuoterV2 for router {} failed in {} batches in a row — its V3 quotes are \
+                 dropped. Check the router's quoter_address/ABI (Uniswap QuoterV2, uint24 fee) or RPC health.",
+                self.chain_id, router_id, QUOTER_FAIL_WARN_STREAK,
+            );
+        } else {
+            debug!("[{}] QuoterV2 batch failed for router {} (streak {})", self.chain_id, router_id, *streak);
+        }
+    }
+
     pub fn update_native_price(&mut self, price: f64) {
         self.native_price_usd = price;
     }
@@ -648,8 +781,9 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
         .map(|c| c.to_vec())
         .collect();
 
-    // Run at most MULTICALL_MAX_CONCURRENT chunks at a time; buffer_unordered smooths
-    // the Alchemy CU burst that firing everything with join_all caused.
+    // Run at most `concurrency` chunks at a time (smooths the Alchemy CU burst that firing
+    // everything with join_all caused). `buffered`, NOT `buffer_unordered`: callers zip the
+    // flattened results against their input order, so chunks must come back in order.
     let chunk_raw: Vec<Option<_>> = futures::stream::iter(owned_chunks.into_iter().map(|chunk| {
         let mc_calls: Vec<IMulticall3::Call3> = chunk
             .iter()
@@ -664,7 +798,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
         let p = provider.clone();
         async move { p.call(tx).await.ok() }
     }))
-    .buffer_unordered(concurrency.max(1))
+    .buffered(concurrency.max(1))
     .collect()
     .await;
 

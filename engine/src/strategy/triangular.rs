@@ -1,16 +1,13 @@
-use alloy::primitives::{Address, Uint, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolCall;
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 use tracing::{debug, warn};
 
-use crate::abi::IQuoterV2;
 use crate::config::RouterType;
 use crate::pool_cache::{PoolCache, V2PoolKey, V3PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{PairScanInfo, TriangularOpportunity};
 use crate::util::addr_key;
-use super::{Strategy, apply_exec_quote_haircut, run_multicall, token_amount_to_usd, parse_amount_capped, MIN_V3_LIQUIDITY};
+use super::{Strategy, V3LegQuote, apply_exec_quote_haircut, token_amount_to_usd, parse_amount_capped, MIN_V3_LIQUIDITY};
 
 impl Strategy {
     /// Detect triangular arbitrage opportunities (A → B → C → A loops).
@@ -445,11 +442,11 @@ impl Strategy {
             let profit_usd = token_amount_to_usd(profit, *dec_a, sym_a, self.native_price_usd);
 
             // Track best profit seen regardless of threshold (for status logging).
-            // V3-leg routes count only once verified below — their spot profit can be phantom.
-            let v3_route = p3e.router_ab_type == RouterType::V3
-                || p3e.router_bc_type == RouterType::V3
-                || p3e.router_ca_type == RouterType::V3;
-            if !v3_route && profit_usd > best_raw_usd {
+            // V3-leg routes are verified below, and count only once verified — their spot
+            // profit can be phantom. In optimistic mode they're submitted on spot, so count it.
+            let verified_later = !self.optimistic_submission
+                && any_v3(p3e.router_ab_type, p3e.router_bc_type, p3e.router_ca_type);
+            if !verified_later && profit_usd > best_raw_usd {
                 best_raw_usd = profit_usd;
             }
 
@@ -485,7 +482,9 @@ impl Strategy {
             });
         }
 
-        opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
+        // Rank by USD, not raw expected_profit: start tokens differ in decimals, so raw
+        // units would rank a $0.30 WETH-start route above a $5 USDC-start route.
+        opportunities.sort_by(|a, b| b.profit_usd.total_cmp(&a.profit_usd));
         // Deduplicate identical paths (same triplet + same 3 routers)
         opportunities.dedup_by(|a, b| {
             a.triplet_id == b.triplet_id
@@ -498,20 +497,18 @@ impl Strategy {
         // Cached sqrtPriceX96 ignores tick crossings, so V3 legs overstate output
         // (~0.30% on a 270 USDT trade) by more than the 15 bps haircut recovers.
         // Runs before the truncate so routes dropped here are backfilled by lower-ranked ones.
-        // Optimistic mode skips QuoterV2, so those routes can't be verified → blocked
-        // (warned once at Strategy construction).
-        if opportunities.iter().any(has_v3_leg) {
+        // Optimistic mode skips QuoterV2 (like 2-hop): V3-leg routes go out on spot quotes,
+        // warned once at Strategy construction.
+        if !self.optimistic_submission && opportunities.iter().any(has_v3_leg) {
             let (mut v3_routes, mut rest): (Vec<_>, Vec<_>) =
                 opportunities.into_iter().partition(has_v3_leg);
-            if !self.optimistic_submission {
-                // Bounded batch: ≤ 2 × max routes × 3 legs QuoterV2 calls in one multicall round.
-                v3_routes.truncate(max_opportunities.saturating_mul(2));
-                let (verified, best_verified_usd) =
-                    self.verify_v3_triangular(provider, v3_routes, &token_info).await;
-                best_raw_usd = best_raw_usd.max(best_verified_usd);
-                rest.extend(verified);
-                rest.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
-            }
+            // Bounded batch: ≤ 2 × max routes × 3 legs QuoterV2 calls in one multicall round.
+            v3_routes.truncate(max_opportunities.saturating_mul(2));
+            let (verified, best_verified_usd) =
+                self.verify_v3_triangular(provider, v3_routes, &token_info).await;
+            best_raw_usd = best_raw_usd.max(best_verified_usd);
+            rest.extend(verified);
+            rest.sort_by(|a, b| b.profit_usd.total_cmp(&a.profit_usd));
             opportunities = rest;
         }
         opportunities.truncate(max_opportunities);
@@ -599,12 +596,15 @@ impl Strategy {
 
     /// QuoterV2-verify triangular routes that have at least one V3 leg (revert plan 1.4).
     ///
-    /// One round trip: every V3 leg of every route is quoted in a single multicall at its
-    /// *spot* chained input, since waiting leg-by-leg would cost up to 3 serial RPCs on the
-    /// hot path. Real amounts are then chained leg by leg. When a V3 leg's real input `a`
-    /// differs from the spot input `s` it was quoted at, its output is taken as
-    /// `quote(s) × min(a, s) / s` — a lower bound, because swap output is increasing and
-    /// concave in input. Non-V3 legs are quoted exactly from the local cache.
+    /// One round trip: every V3 leg of every route is quoted in a single
+    /// [`Strategy::quote_v3_legs`] batch (deduplicated, cached on pool state), since
+    /// waiting leg-by-leg would cost up to 3 serial RPCs on the hot path.
+    ///
+    /// Each V3 leg is quoted at an upper-bound input `s`: the route's input chained through
+    /// the earlier legs at V3 *marginal* price (no impact, no tick cap — an upper bound on
+    /// output) and exact local quotes for non-V3 legs. Real amounts are then chained; a V3
+    /// leg's real input `a` is ≤ `s`, so its output is taken as `quote(s) × a / s`, a lower
+    /// bound because swap output is concave in input with zero output at zero input.
     ///
     /// A route is dropped when a V3 leg has no quoter or its quote fails, any leg has no
     /// liquidity, verified profit is ≤ 0 or > 5% of input (bad quote), or it is below
@@ -616,17 +616,25 @@ impl Strategy {
         opportunities: Vec<TriangularOpportunity>,
         token_info: &std::collections::HashMap<String, (String, u8)>,
     ) -> (Vec<TriangularOpportunity>, f64) {
-        // Spot input of each leg per route; None = a leg has no cached liquidity.
-        let spot_inputs: Vec<Option<[U256; 3]>> = opportunities.iter().map(|opp| {
+        // Drop routes with a V3 leg that has no quoter before spending any RPC on them.
+        let opportunities: Vec<TriangularOpportunity> = opportunities.into_iter().filter(|opp| {
+            (0..3).all(|leg| {
+                let (router_id, router_type, ..) = leg_params(opp, leg);
+                router_type != RouterType::V3 || self.quoter_by_router.contains_key(router_id)
+            })
+        }).collect();
+
+        // Upper-bound input of each leg per route; None = a leg has no cached liquidity.
+        let upper_inputs: Vec<Option<[U256; 3]>> = opportunities.iter().map(|opp| {
             let mut inputs = [U256::ZERO; 3];
             let mut amt = opp.amount_in;
             for (leg, input) in inputs.iter_mut().enumerate() {
                 *input = amt;
                 let (router_id, router_type, fee, token_in, token_out) = leg_params(opp, leg);
                 amt = if router_type == RouterType::V3 {
-                    self.pool_cache
-                        .quote_v3_spot_key(&V3PoolKey::new(router_id, token_in, token_out, fee), token_in, amt)
-                        .map(|(out, _, _)| out)
+                    self.pool_cache.quote_v3_marginal(
+                        &V3PoolKey::new(router_id, token_in, token_out, fee), token_in, amt,
+                    )
                 } else {
                     self.local_leg_out(router_id, router_type, token_in, token_out, amt)
                 }.filter(|a| !a.is_zero())?;
@@ -634,60 +642,31 @@ impl Strategy {
             Some(inputs)
         }).collect();
 
-        let mut mc: Vec<(Address, Vec<u8>)> = Vec::new();
-        let mut mc_slot: Vec<(usize, usize)> = Vec::new(); // (route index, leg)
-        let mut no_quoter = vec![false; opportunities.len()];
+        let mut legs: Vec<V3LegQuote> = Vec::new();
+        let mut leg_slot: Vec<(usize, usize)> = Vec::new(); // (route index, leg)
         for (i, opp) in opportunities.iter().enumerate() {
-            let Some(inputs) = spot_inputs[i] else { continue };
-            for (leg, &input) in inputs.iter().enumerate() {
+            let Some(inputs) = upper_inputs[i] else { continue };
+            for (leg, &amount_in) in inputs.iter().enumerate() {
                 let (router_id, router_type, fee, token_in, token_out) = leg_params(opp, leg);
                 if router_type != RouterType::V3 { continue; }
-                let Some(&quoter) = self.quoter_by_router.get(router_id) else {
-                    no_quoter[i] = true;
-                    continue;
-                };
-                let cd = IQuoterV2::quoteExactInputSingleCall {
-                    params: IQuoterV2::QuoteExactInputSingleParams {
-                        tokenIn: token_in,
-                        tokenOut: token_out,
-                        amountIn: input,
-                        fee: Uint::from(fee),
-                        sqrtPriceLimitX96: Uint::ZERO,
-                    },
-                }.abi_encode();
-                mc.push((quoter, cd));
-                mc_slot.push((i, leg));
+                legs.push(V3LegQuote { router_id, token_in, token_out, fee, amount_in });
+                leg_slot.push((i, leg));
             }
         }
-
-        let raw = if mc.is_empty() {
-            vec![]
-        } else if let Some(ref hp) = self.http_provider {
-            run_multicall(hp, mc, self.rpc_concurrency).await
-        } else {
-            run_multicall(provider, mc, self.rpc_concurrency).await
-        };
         let mut quotes: Vec<[Option<U256>; 3]> = vec![[None; 3]; opportunities.len()];
-        for ((i, leg), r) in mc_slot.into_iter().zip(raw) {
-            let q = r.as_ref()
-                .and_then(|raw| IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(raw).ok())
-                .map(|r| r.amountOut)
-                .filter(|a| !a.is_zero());
-            if q.is_none() {
-                self.warn_quoter_failure_once(leg_params(&opportunities[i], leg).0);
-            }
+        for ((i, leg), q) in leg_slot.into_iter().zip(self.quote_v3_legs(provider, &legs).await) {
             quotes[i][leg] = q;
         }
+        drop(legs);
 
         let mut best_verified_usd: f64 = 0.0;
         let kept: Vec<TriangularOpportunity> = opportunities.into_iter().enumerate().filter_map(|(i, mut opp)| {
-            if no_quoter[i] { return None; }
-            let inputs = spot_inputs[i]?;
+            let inputs = upper_inputs[i]?;
             let mut amt = opp.amount_in;
-            for (leg, &spot_in) in inputs.iter().enumerate() {
+            for (leg, &upper_in) in inputs.iter().enumerate() {
                 let (router_id, router_type, _, token_in, token_out) = leg_params(&opp, leg);
                 amt = if router_type == RouterType::V3 {
-                    quotes[i][leg]? * amt.min(spot_in) / spot_in
+                    quotes[i][leg]? * amt.min(upper_in) / upper_in
                 } else {
                     self.local_leg_out(router_id, router_type, token_in, token_out, amt)?
                 };
@@ -721,23 +700,6 @@ impl Strategy {
             Some(opp)
         }).collect();
         (kept, best_verified_usd)
-    }
-
-    /// Warn once per router when its QuoterV2 call fails; repeats go to debug.
-    /// Persistent failures usually mean the quoter has a different ABI — e.g. Aerodrome
-    /// Slipstream's quoter takes `int24 tickSpacing`, not Uniswap's `uint24 fee`.
-    fn warn_quoter_failure_once(&self, router_id: &str) {
-        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-        let key = format!("{}:{}", self.chain_id, router_id);
-        if WARNED.get_or_init(Default::default).lock().unwrap().insert(key) {
-            warn!(
-                "[{}] QuoterV2 call failed for router {} — its triangular routes are dropped. \
-                 If this persists, the router's quoter likely uses a different ABI.",
-                self.chain_id, router_id,
-            );
-        } else {
-            debug!("[{}] QuoterV2 call failed for router {}", self.chain_id, router_id);
-        }
     }
 
     /// Local pool-cache quote for one non-V3 triangular leg.
@@ -775,10 +737,14 @@ impl Strategy {
     }
 }
 
+/// True if any leg is a V3 router — the one place that decides which routes need
+/// QuoterV2 verification (cached V3 spot quotes can be phantom).
+fn any_v3(ab: RouterType, bc: RouterType, ca: RouterType) -> bool {
+    [ab, bc, ca].contains(&RouterType::V3)
+}
+
 fn has_v3_leg(opp: &TriangularOpportunity) -> bool {
-    opp.router_ab_type == RouterType::V3
-        || opp.router_bc_type == RouterType::V3
-        || opp.router_ca_type == RouterType::V3
+    any_v3(opp.router_ab_type, opp.router_bc_type, opp.router_ca_type)
 }
 
 /// (router_id, router_type, fee, token_in, token_out) for leg 0 (A→B), 1 (B→C) or 2 (C→A).

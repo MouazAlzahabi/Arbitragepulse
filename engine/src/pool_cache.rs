@@ -560,6 +560,38 @@ impl PoolCache {
         Some((num / den, state.liquidity, effective_in))
     }
 
+    /// Output at the pool's current marginal price (after fee), with no tick cap and no
+    /// price impact: `amount_in × vr_out / vr_in × (1 − fee)`. Swap output is increasing
+    /// and concave in input, so this is an **upper bound** on the real output for any
+    /// `amount_in`.
+    pub fn quote_v3_marginal(
+        &self,
+        key: &V3PoolKey,
+        token_in: Address,
+        amount_in: U256,
+    ) -> Option<U256> {
+        let pool_addr = *self.v3_by_key.get(key)?;
+        let state = self.v3_by_address.get(&pool_addr)?;
+        let (vr_in, vr_out) = if token_in == state.token0 {
+            (state.vr0, state.vr1)
+        } else {
+            (state.vr1, state.vr0)
+        };
+        if vr_in.is_zero() || vr_out.is_zero() {
+            return None;
+        }
+        let num = amount_in.checked_mul(state.fee_num_v3)?.checked_mul(vr_out)?;
+        let den = vr_in.checked_mul(FEE_DENOM_V3)?;
+        Some(num / den)
+    }
+
+    /// Current (sqrtPriceX96, active liquidity) of the pool behind `key`, if cached.
+    /// Changes whenever the pool trades or liquidity is added/removed in range.
+    pub fn v3_price_state(&self, key: &V3PoolKey) -> Option<(U256, u128)> {
+        let pool_addr = *self.v3_by_key.get(key)?;
+        self.v3_by_address.get(&pool_addr).map(|s| (s.sqrt_price_x96, s.liquidity))
+    }
+
 }
 
 // ─── AMM math ─────────────────────────────────────────────────────────────────

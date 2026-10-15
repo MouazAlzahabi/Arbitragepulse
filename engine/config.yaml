@@ -63,7 +63,8 @@ chains:
     # overestimate the old $0.80 covered. V2/Solidly/Aerodrome-only routes are NOT re-verified: they
     # rely on event-sourced reserves (exact xy=k / stable curve) + 15 bps haircut + 5% sanity cap.
     # If those routes start reverting, raise this floor — it is the only extra guard they have.
-    # Requires optimistic_submission: false — optimistic mode blocks V3-leg routes.
+    # With optimistic_submission: true, V3-leg routes are submitted UNVERIFIED on spot quotes — this
+    # floor must then cover the ~0.30% overestimate again (the old $0.80).
     min_triangular_profit_usd: 0.15
     optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
     priority_fee_wei: 10000000    # 10 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei (trigger_tip dominates for pending path)
@@ -216,6 +217,11 @@ routers:
     #   executor.setAllowedRouter(0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43, true)
     #   executor.setRouterType(0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43, 4)   # 4 = Aerodrome
 
+  # INACTIVE: Slipstream keys pools by int24 tickSpacing, not uint24 fee. Its factory reverts
+  # the Uniswap getPool(…, uint24) the engine uses (no pools discovered — warned at startup),
+  # its quoter takes int24 tickSpacing, and its router's exactInputSingle selector differs
+  # from SwapRouter02's, which ArbitrageExecutor has no RouterType for. Real support needs a
+  # Slipstream RouterType in the contract (+ redeploy), tickSpacing discovery, and quoting.
   - id: "aerodrome-slipstream-base"
     name: "Aerodrome Slipstream CL (Base)"
     chain_id: 8453
