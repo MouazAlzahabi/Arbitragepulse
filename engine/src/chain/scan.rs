@@ -735,6 +735,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 break 'candidates;
                             }
                             Err(e) => {
+                                warn!(
+                                    "[{}] Send failed | pair={} | {}{}",
+                                    cfg.name, display_id, e,
+                                    if e.to_string().contains("outcome unknown") {
+                                        " — tx may still land; nonce will be re-fetched"
+                                    } else { "" },
+                                );
                                 {
                                     let err_str = e.to_string().to_lowercase();
                                     // "outcome unknown" = send timed out: the tx may have been
@@ -1144,6 +1151,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 break 'candidates;
                             }
                             Err(e) => {
+                                warn!(
+                                    "[{}] Send failed | pair={} | {}{}",
+                                    cfg.name, display_id, e,
+                                    if e.to_string().contains("outcome unknown") {
+                                        " — tx may still land; nonce will be re-fetched"
+                                    } else { "" },
+                                );
                                 {
                                     let err_str = e.to_string().to_lowercase();
                                     // "outcome unknown" = send timed out: the tx may have been

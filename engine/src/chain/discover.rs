@@ -284,7 +284,8 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
         .filter(|(pq, _)| pq.router_id == id)
         .all(|(_, raw)| raw.is_none());
     let failed: Vec<&V3Router> = v3_routers.iter().filter(|vr| router_failed(&vr.id)).collect();
-    let rpc_ok = failed.len() < v3_routers.len() || provider.get_block_number().await.is_ok();
+    let rpc_ok = failed.len() < v3_routers.len()
+        || crate::util::rpc_timeout(crate::util::RPC_READ_TIMEOUT, provider.get_block_number()).await.is_ok();
     if !failed.is_empty() && !rpc_ok {
         tracing::warn!(
             "V3 pool discovery: no factory answered any getPool call and the RPC is not \
@@ -388,6 +389,10 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
 ///   • New: 5 × 20 = 5 Multicall3 calls, ~5 × 26 CU = 130 CU spread over ~150ms
 const DISCOVER_CHUNK: usize = 20;
 
+/// Timeout for one discovery Multicall3 chunk. Longer than the scan-path timeout: startup
+/// batches are bigger and a cold node may need to load state first.
+const DISCOVER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub(crate) async fn discover_mc<P: Provider>(
     calls: Vec<(Address, Vec<u8>)>,
     provider: &P,
@@ -417,7 +422,16 @@ pub(crate) async fn discover_mc<P: Provider>(
         let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
         let tx = TransactionRequest::default().to(mc3).input(calldata.into());
 
-        if let Ok(raw) = provider.call(tx).await {
+        // Bounded: a hung RPC otherwise blocks startup forever (seen on a cold fork).
+        let Ok(call_result) = tokio::time::timeout(DISCOVER_CALL_TIMEOUT, provider.call(tx)).await else {
+            // Timed out: the RPC is stuck, so skip the sequential fallback (more calls would
+            // only stall longer) and count the chunk as failed — discovery warns per router.
+            tracing::warn!("Pool discovery multicall timed out after {:?} — {} call(s) counted as failed",
+                           DISCOVER_CALL_TIMEOUT, chunk.len());
+            results.extend(std::iter::repeat_n(None, chunk.len()));
+            continue;
+        };
+        if let Ok(raw) = call_result {
             if let Ok(ret) = crate::abi::IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
                 results.extend(
                     ret.into_iter()
@@ -431,7 +445,8 @@ pub(crate) async fn discover_mc<P: Provider>(
             let tx2 = TransactionRequest::default()
                 .to(*target)
                 .input(data.clone().into());
-            results.push(provider.call(tx2).await.ok().map(|b| b.to_vec()));
+            let r = tokio::time::timeout(crate::util::RPC_READ_TIMEOUT, provider.call(tx2)).await;
+            results.push(r.ok().and_then(|r| r.ok()).map(|b| b.to_vec()));
         }
     }
 

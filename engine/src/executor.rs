@@ -22,6 +22,14 @@ use crate::strategy::{ArbOpportunity, TriangularOpportunity};
 // which is more gas-intensive than UniV3 SwapRouter02 (observed 496K/500K = 99.3% on Base).
 const GAS_LIMIT: u64 = 700_000;
 
+/// When a gas-price fetch fails, the last real price is reused with this margin (bps)
+/// on top, covering fees that rose since it was observed (~a few blocks on Base).
+const GAS_FALLBACK_MARGIN_BPS: u128 = 2_500; // +25%
+
+/// The last real gas price is only reused if it is at most this old; otherwise the
+/// candidate is skipped rather than priced on a guess.
+const GAS_FALLBACK_MAX_AGE: Duration = Duration::from_secs(120);
+
 // Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
 const GAS_LIMIT_TRIANGULAR: u64 = 900_000;
 
@@ -241,29 +249,48 @@ impl Executor {
         }
     }
 
-    async fn get_gas_price<P: Provider>(&mut self, provider: &P) -> u128 {
+    async fn get_gas_price<P: Provider>(&mut self, provider: &P) -> Result<u128> {
         if let Some(p) = self.cached_gas_price() {
             debug!(
                 "[{}] Gas price from cache: {} wei",
                 self.chain_name, p,
             );
-            return p;
+            return Ok(p);
         }
 
         // Cache miss or expired — fetch from chain
-        let gas_price = transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await
-            .unwrap_or(5_000_000_000u128);
-        self.gas_price_cache = Some((gas_price, Instant::now()));
-        debug!(
-            "[{}] Gas price fetched: {} wei (cached for {:?})",
-            self.chain_name, gas_price, self.gas_price_cache_ttl
-        );
-        gas_price
+        match transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await {
+            Ok(gas_price) => {
+                self.gas_price_cache = Some((gas_price, Instant::now()));
+                debug!(
+                    "[{}] Gas price fetched: {} wei (cached for {:?})",
+                    self.chain_name, gas_price, self.gas_price_cache_ttl
+                );
+                Ok(gas_price)
+            }
+            Err(e) => {
+                // Fetch failed (RPC error or timeout): fall back to the last real price plus
+                // a margin for fees having risen since. The inflated value is NOT written
+                // back, so the margin never compounds. Without a recent price, skip rather
+                // than guess — a hard-coded default was ~1000× Base fees and wrecked the
+                // net-profit estimate.
+                let Some((last, at)) = self.gas_price_cache.filter(|(_, at)| at.elapsed() <= GAS_FALLBACK_MAX_AGE)
+                else {
+                    return Err(anyhow!("gas price unavailable ({}) and no price from the last {:?}", e, GAS_FALLBACK_MAX_AGE));
+                };
+                let gas_price = last.saturating_mul(10_000 + GAS_FALLBACK_MARGIN_BPS) / 10_000;
+                warn!(
+                    "[{}] Gas price fetch failed ({}) — using last known {} wei from {:.0?} ago + {}% = {} wei",
+                    self.chain_name, e, last, at.elapsed(), GAS_FALLBACK_MARGIN_BPS / 100, gas_price
+                );
+                Ok(gas_price)
+            }
+        }
     }
 
-    async fn gas_price_for_prepare<P: Provider>(&mut self, provider: &P) -> u128 {
+    async fn gas_price_for_prepare<P: Provider>(&mut self, provider: &P) -> Result<u128> {
         if let Some(p) = self.cached_gas_price() {
-            return p;
+            return Ok(p);
         }
         self.get_gas_price(provider).await
     }
@@ -289,7 +316,7 @@ impl Executor {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
-        let gas_price = self.gas_price_for_prepare(provider).await;
+        let gas_price = self.gas_price_for_prepare(provider).await?;
         // priority_fee (tip): use override from pending TX monitor when provided,
         // otherwise use chain config value.
         let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
@@ -316,7 +343,7 @@ impl Executor {
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -366,7 +393,7 @@ impl Executor {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
-        let gas_price = self.gas_price_for_prepare(provider).await;
+        let gas_price = self.gas_price_for_prepare(provider).await?;
         let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
@@ -391,7 +418,7 @@ impl Executor {
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -455,9 +482,11 @@ impl Executor {
 
     /// Pre-fetch and cache the on-chain nonce so the first submission has zero
     /// RPC overhead. Called at startup and can be called after reverts to avoid
-    /// the ~50ms nonce fetch on the next submission.
+    /// the ~50ms nonce fetch on the next submission. All nonce fetches use the PENDING
+    /// count, so a tx still in the mempool (e.g. a send that timed out but was broadcast)
+    /// is counted and its nonce is never handed out again.
     pub async fn prefetch_nonce<P: Provider + Clone>(&mut self, provider: &P) {
-        match transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address)).await {
+        match transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending()).await {
             Ok(n) => {
                 self.nonce = Some(n);
                 debug!("Executor: nonce pre-fetched = {}", n);
@@ -479,7 +508,7 @@ impl Executor {
         }
 
         // ── Gas price (cached with TTL = 2× block_time, reused for cost check + fee tuning) ───
-        let gas_price = self.get_gas_price(provider).await;
+        let gas_price = self.get_gas_price(provider).await?;
 
         // ── Gas profitability check (300k hardcoded — no eth_estimateGas) ─────
         let gas_cost_usd = {
@@ -536,7 +565,7 @@ impl Executor {
         // mutex can be released immediately after send (not after receipt).
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -690,7 +719,7 @@ impl Executor {
         }
 
         // Use cached gas price (TTL = 2× block_time)
-        let gas_price = self.get_gas_price(provider).await;
+        let gas_price = self.get_gas_price(provider).await?;
 
         let gas_cost_usd = {
             let cost_wei = gas_price * GAS_LIMIT_TRIANGULAR as u128;
@@ -740,7 +769,7 @@ impl Executor {
 
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address))
+            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
