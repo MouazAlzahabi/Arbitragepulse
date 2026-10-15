@@ -263,39 +263,14 @@ I've researched and verified all router addresses. Copy this to `engine/config.y
 
 ## 6. SYSTEMD SERVICE (Auto-Restart)
 
-Create `/etc/systemd/system/arbitragepulse.service`:
+Don't hand-write the unit. The canonical one is [scripts/server/arbitragepulse.service](scripts/server/arbitragepulse.service): it reads secrets from `engine/.env` via `EnvironmentFile`, restarts only on failure, shuts down gracefully, and caps memory (`MemoryMax=2G`). Install it with the setup script, which also creates the log directory, installs logrotate, and enables the service:
 
-```ini
-[Unit]
-Description=ArbitragePulse Multi-Chain Engine
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/arbitragepulse
-Environment="PRIVATE_KEY=0xYOUR_KEY_HERE"
-Environment="CONFIG_PATH=/root/arbitragepulse/engine/config.yaml"
-Environment="LOG_LEVEL=info"
-Environment="PORT=3000"
-ExecStart=/root/arbitragepulse/target/release/engine
-Restart=always
-RestartSec=10
-StandardOutput=append:/var/log/arbitragepulse/engine.log
-StandardError=append:/var/log/arbitragepulse/engine.log
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Enable & start**:
 ```bash
-mkdir -p /var/log/arbitragepulse
-systemctl daemon-reload
-systemctl enable arbitragepulse
-systemctl start arbitragepulse
+sudo bash /home/botadmin/Arbitragepulse/scripts/server/setup.sh
 systemctl status arbitragepulse
 ```
+
+The script assumes the repo lives at `/home/botadmin/Arbitragepulse` and runs as `botadmin`; edit `SCRIPTS_DIR`/`SERVICE_USER` in the script and the paths in the unit if yours differ.
 
 ---
 

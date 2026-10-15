@@ -231,6 +231,16 @@ impl Strategy {
             })
             .collect();
 
+        if optimistic_submission
+            && routers.iter().any(|r| r.chain_id == chain_id && r.router_type == RouterType::V3)
+        {
+            warn!(
+                "[{}] optimistic_submission is on: triangular routes with a V3 leg are blocked \
+                 (they can't be QuoterV2-verified). Set optimistic_submission: false to trade them.",
+                chain_id,
+            );
+        }
+
         let mut s = Self {
             chain_id,
             pairs,

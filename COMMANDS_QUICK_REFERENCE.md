@@ -213,37 +213,9 @@ EOF
 
 ### Systemd Service (Auto-Restart)
 ```bash
-# Create service file
-cat > /etc/systemd/system/arbitragepulse.service <<EOF
-[Unit]
-Description=ArbitragePulse Multi-Chain Engine
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/arbitragepulse
-Environment="PRIVATE_KEY=0xYOUR_KEY"
-Environment="CONFIG_PATH=/root/arbitragepulse/engine/config.yaml"
-Environment="LOG_LEVEL=info"
-Environment="PORT=3000"
-ExecStart=/root/arbitragepulse/target/release/engine
-Restart=always
-RestartSec=10
-StandardOutput=append:/var/log/arbitragepulse/engine.log
-StandardError=append:/var/log/arbitragepulse/engine.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Create log directory
-mkdir -p /var/log/arbitragepulse
-
-# Enable and start service
-systemctl daemon-reload
-systemctl enable arbitragepulse
-systemctl start arbitragepulse
+# Install the canonical unit (scripts/server/arbitragepulse.service) + log dir + logrotate,
+# then enable and start the engine. Secrets come from engine/.env — don't put keys in the unit.
+sudo bash /home/botadmin/Arbitragepulse/scripts/server/setup.sh
 
 # Check status
 systemctl status arbitragepulse

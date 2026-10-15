@@ -440,7 +440,7 @@ Before moving to mainnet, ensure:
 After testnet validation:
 
 1. **Mainnet Deployment**
-   - Follow [PRODUCTION_READINESS.md](./PRODUCTION_READINESS.md)
+   - Follow [PRODUCTION_DEPLOYMENT_GUIDE.md](./PRODUCTION_DEPLOYMENT_GUIDE.md)
    - Start with $100-500 per chain
    - Run dry-run for 24h before going live
 
