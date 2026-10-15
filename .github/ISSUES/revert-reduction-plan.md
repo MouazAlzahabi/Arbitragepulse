@@ -64,13 +64,15 @@ round-trip (V3 spot, stale V2 reserves, buy-leg `amountOutMin = 0` in the contra
 
 ### Phase 1.4 implementation (done)
 
-- `Strategy::verify_v3_triangular()` in `engine/src/strategy/triangular.rs`. Runs **before** the top-N truncate (on up to 2 × N V3-leg routes, ranked by USD profit), so dropped routes are backfilled by lower-ranked ones.
-- **One round trip:** every V3 leg is quoted in a single batch via the shared `Strategy::quote_v3_legs()` (deduplicated, cached per pool + amount while the pool's price and liquidity are unchanged). Each V3 leg is quoted at an upper-bound input `s` (earlier V3 legs chained at marginal price, which over-estimates output). Real amounts are then chained; a V3 leg's real input `a` ≤ `s`, so its output is taken as `quote(s) × a / s` — a lower bound, since swap output is concave with zero output at zero input. Non-V3 legs are re-quoted exactly from the local cache.
+- `Strategy::verify_v3_triangular()` in `engine/src/strategy/triangular.rs`. Runs **before** the top-N truncate (on up to 2 × N V3-leg routes, ranked by USD profit), so dropped routes are backfilled by lower-ranked ones. Afterwards, one route is kept per path (triplet + routers), the most profitable fee-tier variant.
+- Quotes are **always live** via the shared `Strategy::quote_v3_legs()` (batched, deduplicated within the batch, no cross-scan cache — verification must not trust local pool state).
+- **Rounds (≤ 3):** round 1 quotes every V3 leg at an upper-bound input `s` (earlier V3 legs chained at marginal price). Real amounts are then chained; a V3 leg whose real input `a` is within 10 bps of `s` uses `quote(s) × a / s` (a tight lower bound by concavity). Larger gaps are re-quoted at `a` in the next round — only those legs. The last round falls back to the lower bound, so results stay conservative.
 - The 15 bps haircut and the 5% sanity cap apply to the verified output; routes below `min_triangular_profit_usd` are dropped.
-- The heartbeat's best triangular profit counts V3-leg routes only once verified, so phantom spot profits no longer show up there.
-- A router whose quoter fails in 5 batches in a row is warned (streak resets on success, so a transient RPC blip doesn't trigger it).
-- With `optimistic_submission: true` (no QuoterV2), V3-leg routes are submitted on spot quotes, as 2-hop is; a warning is logged at startup.
-- Aerodrome Slipstream is inactive: its factory reverts Uniswap's `getPool(…, uint24 fee)`, so no pools are discovered (warned at startup). Real support needs a Slipstream router type in the contract.
+- The heartbeat's best triangular profit counts V3-leg routes only once verified.
+- Quoter health: a router whose QuoterV2 never returned a quote is warned after 5 failed batches (likely wrong address/ABI); one that worked before is warned after 60 failed batches in a row.
+- With `optimistic_submission: true` (no QuoterV2), V3-leg routes are submitted on spot quotes after deducting the 0.30% V3 overestimate, and a startup warning says so.
+- 2-hop Phase 1.5/1.5b share one `QuoteCache` rule: a cached quote is served only while the pool's local price **and** liquidity are unchanged and it is ≤ 6 s old (bounds the damage of a missed event).
+- Aerodrome Slipstream is disabled in `config.yaml`: its factory reverts Uniswap's `getPool(…, uint24 fee)`, so no pools were ever discovered. Real support needs a Slipstream router type in the contract.
 - This let Base's `min_triangular_profit_usd` drop from $0.80 to $0.15: the floor now applies to verified profit rather than absorbing the V3 spot overestimate.
 
 ---

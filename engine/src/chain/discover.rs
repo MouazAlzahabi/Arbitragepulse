@@ -276,17 +276,25 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     }
     let pool_raw = discover_mc(pool_calls, provider).await;
 
-    // A factory that reverts every Uniswap-style getPool(A, B, uint24 fee) call isn't a
-    // Uniswap V3 factory (e.g. Aerodrome Slipstream keys pools by int24 tickSpacing), so
-    // the router gets no pools and is silently inactive. Say so once at startup.
-    for vr in &v3_routers {
-        let all_reverted = pool_queries.iter().zip(pool_raw.iter())
-            .filter(|(pq, _)| pq.router_id == vr.id)
-            .all(|(_, raw)| raw.is_none());
-        if all_reverted {
+    // A factory whose every getPool(A, B, uint24 fee) call fails gets no pools, so its
+    // router is silently inactive — say so once at startup. A failure is None whether the
+    // call reverted or the RPC failed, so blame the factory only when other factories
+    // answered in the same run (the RPC was fine); if none answered, blame the RPC.
+    let router_failed = |id: &str| pool_queries.iter().zip(pool_raw.iter())
+        .filter(|(pq, _)| pq.router_id == id)
+        .all(|(_, raw)| raw.is_none());
+    let failed: Vec<&V3Router> = v3_routers.iter().filter(|vr| router_failed(&vr.id)).collect();
+    if failed.len() == v3_routers.len() {
+        tracing::warn!(
+            "V3 pool discovery: no factory answered any getPool call — check RPC health. \
+             V3 routers have no pools until the next restart."
+        );
+    } else {
+        for vr in failed {
             tracing::warn!(
-                "V3 router {}: every factory getPool(tokenA, tokenB, uint24 fee) call reverted — \
-                 factory {} is not Uniswap-V3 compatible, so this router finds no pools and is inactive.",
+                "V3 router {}: every factory getPool(tokenA, tokenB, uint24 fee) call failed while other \
+                 factories answered — factory {} is likely not Uniswap-V3 compatible (e.g. Aerodrome \
+                 Slipstream uses int24 tickSpacing), so this router finds no pools and is inactive.",
                 vr.id, vr.factory,
             );
         }

@@ -6,7 +6,7 @@ use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, V3PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
 use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
-use super::{ForwardTask, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, encode_v3_quote, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY};
+use super::{ForwardTask, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, encode_v3_quote, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY};
 
 impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
@@ -512,15 +512,8 @@ impl Strategy {
                     .clone()
                     .unwrap_or_else(|| V3PoolKey::new(router_a_id, fwd_task.token_in, fwd_task.token_out, *fee_a));
 
-                // Hit condition: current sqrtPriceX96 == sqrtPriceX96 stored in p15_cache.
-                // A V3 Swap event updates pool_cache.sqrt_price_x96 → cache auto-invalidates.
-                let cached = self.pool_cache.v3_by_key.get(&v3_cache_key)
-                    .and_then(|pool_addr| self.pool_cache.v3_by_address.get(&*pool_addr))
-                    .and_then(|state| {
-                        self.p15_cache.get(&v3_cache_key)
-                            .filter(|e| e.0 == state.sqrt_price_x96)
-                            .map(|e| e.1)
-                    });
+                // Shared QuoteCache rule: pool price + liquidity unchanged and entry fresh.
+                let cached = self.quote_cache.get(&self.pool_cache, &v3_cache_key, full_amount);
 
                 p15_list.push((*pi, router_a_id.clone(), *fee_a, fwd_task.router_addr,
                                fwd_task.token_in, fwd_task.token_out, full_amount));
@@ -559,28 +552,27 @@ impl Strategy {
                 t_after_p15 = scan_start.elapsed().as_millis();
 
                 // Merge cache hits + MC results into final quoter_outs.
-                // MC results are also stored in p15_cache keyed on current sqrtPriceX96
-                // so the next scan with unchanged pool state gets a free cache hit.
+                // MC results are also stored in quote_cache so the next scan with unchanged
+                // pool state gets a free cache hit (within QUOTE_CACHE_MAX_AGE).
                 let mut mc_raw_iter = p15_raw.into_iter();
+                let mut p15_health = QuoterBatchHealth::default();
                 let p15_quoter_outs: Vec<U256> = p15_list.iter()
                     .zip(p15_pre.iter())
-                    .map(|((_, router_a_id, fee_a, _, token_in, token_out, _), pre)| {
+                    .map(|((_, router_a_id, fee_a, _, token_in, token_out, full_amount), pre)| {
                         if let Some(cached_val) = pre {
                             *cached_val  // served from cache — 0 HTTP
                         } else {
                             let raw_opt = mc_raw_iter.next().unwrap_or(None);
-                            let result = decode_v3_quote(raw_opt.as_ref()).unwrap_or(U256::ZERO);
+                            let quote = decode_v3_quote(raw_opt.as_ref());
+                            p15_health.record(router_a_id, quote.is_some());
+                            let result = quote.unwrap_or(U256::ZERO);
                             let key = V3PoolKey::new(router_a_id, *token_in, *token_out, *fee_a);
-                            if let Some(sqrtp) = self.pool_cache.v3_by_key.get(&key)
-                                .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
-                                .map(|s| s.sqrt_price_x96)
-                            {
-                                self.p15_cache.insert(key, (sqrtp, result));
-                            }
+                            self.quote_cache.insert(&self.pool_cache, key, *full_amount, result);
                             result
                         }
                     })
                     .collect();
+                self.note_quoter_health(p15_health);
 
                 // V3 router_b candidates that need a second QuoterV2 pass.
                 // Local sqrtPriceX96 approximation overestimates V3 reverse legs by 0.01–0.1%,
@@ -605,23 +597,17 @@ impl Strategy {
 
                     for q_b in q_b_list {
                         let fee_b = q_b.fee;
-                        // V3 router_b: check p15b_cache first, otherwise defer to
+                        // V3 router_b: check quote_cache first, otherwise defer to
                         // Phase 1.5b QuoterV2 batch. Cache key matches v3_by_key format
                         // for the reverse direction (tokenIn=token_out, tokenOut=token_in).
-                        // Hit requires BOTH pool B sqrtPrice AND quoter_out (input) to match.
+                        // Keyed on (pool B, quoter_out input); shared QuoteCache validity rule.
                         if matches!(q_b.router_type, RouterType::V3) {
                             if let Some(quoter_b) = q_b.quoter_addr {
                                 let p15b_key = q_b
                                     .rev_v3_key
                                     .clone()
                                     .unwrap_or_else(|| V3PoolKey::new(&q_b.router_id, token_out, token_in, fee_b));
-                                let cached_b = self.pool_cache.v3_by_key.get(&p15b_key)
-                                    .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
-                                    .and_then(|state| {
-                                        self.p15b_cache.get(&p15b_key)
-                                            .filter(|e| e.0 == state.sqrt_price_x96 && e.1 == quoter_out)
-                                            .map(|e| e.2)
-                                    });
+                                let cached_b = self.quote_cache.get(&self.pool_cache, &p15b_key, quoter_out);
                                 p15b_candidates.push((pi, router_a_id.clone(), fee_a, router_a_addr,
                                                       token_in, token_out, full_amount, q_b.clone(), quoter_out));
                                 if cached_b.is_some() {
@@ -797,6 +783,7 @@ impl Strategy {
         // ── Process Phase 1.5b results ────────────────────────────────────────────────
         {
             let mut mc_iter = p15b_raw_mc.into_iter();
+            let mut p15b_health = QuoterBatchHealth::default();
             for ((pi, router_a_id, fee_a, router_a_addr, token_in, token_out, full_amount, q_b, quoter_out), pre)
                 in p15b_candidates.into_iter().zip(p15b_pre.into_iter())
             {
@@ -805,17 +792,14 @@ impl Strategy {
                     cached_val
                 } else {
                     let raw_opt = mc_iter.next().unwrap_or(None);
-                    let result = decode_v3_quote(raw_opt.as_ref()).unwrap_or(U256::ZERO);
+                    let quote = decode_v3_quote(raw_opt.as_ref());
+                    p15b_health.record(&q_b.router_id, quote.is_some());
+                    let result = quote.unwrap_or(U256::ZERO);
                     let p15b_key = q_b
                         .rev_v3_key
                         .clone()
                         .unwrap_or_else(|| V3PoolKey::new(&q_b.router_id, token_out, token_in, q_b.fee));
-                    if let Some(sqrtp_b) = self.pool_cache.v3_by_key.get(&p15b_key)
-                        .and_then(|pa| self.pool_cache.v3_by_address.get(&*pa))
-                        .map(|s| s.sqrt_price_x96)
-                    {
-                        self.p15b_cache.insert(p15b_key, (sqrtp_b, quoter_out, result));
-                    }
+                    self.quote_cache.insert(&self.pool_cache, p15b_key, quoter_out, result);
                     if result.is_zero() { continue; }
                     result
                 };
@@ -874,13 +858,17 @@ impl Strategy {
                     });
                 }
             }
+            self.note_quoter_health(p15b_health);
         }
 
         // ── Process Phase 1.5c results ────────────────────────────────────────────────
+        let mut p15c_health = QuoterBatchHealth::default();
         for ((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id), raw_opt)
             in p15c_candidates.into_iter().zip(p15c_raw.into_iter())
         {
-            let Some(amount_back) = decode_v3_quote(raw_opt.as_ref()) else { continue };
+            let quote = decode_v3_quote(raw_opt.as_ref());
+            p15c_health.record(&router_b_id, quote.is_some());
+            let Some(amount_back) = quote else { continue };
 
             // Phantom check first (>5% positive spread = physically impossible)
             if amount_back > full_amount
@@ -930,6 +918,7 @@ impl Strategy {
                 });
             }
         }
+        self.note_quoter_health(p15c_health);
 
         opportunities.sort_by(|a, b| b.expected_profit.cmp(&a.expected_profit));
 

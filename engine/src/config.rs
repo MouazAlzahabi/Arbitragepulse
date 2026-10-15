@@ -103,7 +103,7 @@ pub struct ChainConfig {
     /// Minimum profit in USD required to submit a triangular arb. Default: same as min_profit_usd.
     /// Routes with a V3 leg are QuoterV2-verified first (cached sqrtPriceX96 overestimates
     /// by ~0.30%), so this compares against verified profit. With `optimistic_submission`
-    /// they're submitted unverified on spot quotes, so the floor must cover that overestimate.
+    /// they're submitted unverified on spot quotes, after deducting the ~0.30% overestimate.
     #[serde(default)]
     pub min_triangular_profit_usd: Option<f64>,
 }
