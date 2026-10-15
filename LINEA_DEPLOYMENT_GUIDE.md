@@ -332,7 +332,7 @@ watch -n 600 'curl -s http://localhost:3000/stats | jq'
 
 ### Expected Results (24 hours)
 
-Based on [LINEA_SCROLL_GNOSIS_ANALYSIS.md](LINEA_SCROLL_GNOSIS_ANALYSIS.md):
+Pre-launch projections (not measured results):
 
 | Metric | Conservative | Realistic | Optimistic |
 |--------|-------------|-----------|------------|
@@ -417,7 +417,7 @@ If your 24h test shows **>100% ROI** (profit >$60):
 
 ### Phase 2: Production Deployment ($20k)
 
-Follow the full [LINEA_SCROLL_GNOSIS_ANALYSIS.md](LINEA_SCROLL_GNOSIS_ANALYSIS.md) deployment plan:
+Follow [PRODUCTION_DEPLOYMENT_GUIDE.md](PRODUCTION_DEPLOYMENT_GUIDE.md) with this capital split:
 
 1. **Deploy $8k on Linea** (proven profitable)
 2. **Deploy $7k on Gnosis** (stable xDAI, low gas)
