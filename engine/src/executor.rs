@@ -263,17 +263,21 @@ impl Executor {
             return Ok(p);
         }
 
-        // Cache miss or expired — fetch from chain, unless the RPC is known to be down
-        // (backoff running): then go straight to the last-known fallback, no 5 s wait.
-        let fetched = if crate::util::backoff_state(&self.rpc_backoff) == Some(true) {
-            Err(alloy::transports::TransportErrorKind::custom_str("RPC backoff active"))
-        } else {
-            transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await
-        };
+        // Cache miss or expired. If the RPC is known to be down (backoff running), stop:
+        // this candidate's simulation and send would hit the same dead node.
+        if crate::util::backoff_state(&self.rpc_backoff) == Some(true) {
+            return Err(anyhow!("gas price not fetched: {}", crate::util::RPC_BACKOFF_MARKER));
+        }
+        let fetched = transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await;
         if let Err(e) = &fetched {
-            if crate::util::classify_rpc_failure(&e.to_string()) == crate::util::RpcFailure::Timeout {
-                // The fallback hides the outage from the caller, so signal it here.
+            let kind = crate::util::classify_rpc_failure(&e.to_string());
+            if matches!(kind, crate::util::RpcFailure::Timeout | crate::util::RpcFailure::Unreachable) {
+                // Node hanging or down: start the chain backoff and stop this candidate
+                // instead of falling back — its simulation/send would wait out the same
+                // timeouts. The error keeps the RPC marker, so the scan treats it as an
+                // outage (no circuit-breaker count).
                 crate::util::backoff_start(&self.rpc_backoff);
+                return Err(anyhow!("gas price fetch failed: {}", e));
             }
         }
         match fetched {
@@ -286,7 +290,8 @@ impl Executor {
                 Ok(gas_price)
             }
             Err(e) => {
-                // Fetch failed (RPC error or timeout): fall back to the last real price plus
+                // Fetch failed with a non-outage error (node answered with an error, rate
+                // limit): fall back to the last real price plus
                 // a margin for fees having risen since. The inflated value is NOT written
                 // back, so the margin never compounds. Without a recent price, skip rather
                 // than guess — a hard-coded default was ~1000× Base fees and wrecked the

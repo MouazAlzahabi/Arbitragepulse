@@ -270,21 +270,14 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // guard, detect-only) so higher-ranked blocked pairs don't starve the rest.
     // Chain-level RPC backoff: after an outage-class failure, skip EXECUTION for
     // RPC_BACKOFF instead of having every scan wait out 10–15 s of timeouts on its next
-    // candidate. Opportunities are still logged/broadcast. When the backoff expires, one
-    // cheap probe (≤ 1 s) decides whether to resume.
+    // candidate. Opportunities are still logged/broadcast. When the backoff expires, a
+    // background probe decides whether to resume; execution stays skipped until it does.
     let mut skip_execution = match crate::util::backoff_state(&rpc_backoff) {
         None => false,
         Some(true) => true,
         Some(false) => {
-            let healthy = crate::util::rpc_timeout(crate::util::RPC_PROBE_TIMEOUT, provider.get_block_number()).await.is_ok();
-            if healthy {
-                crate::util::backoff_clear(&rpc_backoff);
-                info!("[{}] RPC answering again — resuming execution", cfg.name);
-            } else {
-                crate::util::backoff_start(&rpc_backoff);
-                warn!("[{}] RPC still not answering — skipping execution for {:?}", cfg.name, crate::util::RPC_BACKOFF);
-            }
-            !healthy
+            spawn_backoff_probe(provider.clone(), rpc_backoff.clone(), cfg.name.clone());
+            true
         }
     };
 
@@ -397,7 +390,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             };
             // Skip optimizer in optimistic mode — each round costs ~100ms of QuoterV2 calls.
             // On FCFS chains (Base), 200ms of optimizer latency = ~65 positions lost.
-            let optimized = if optimistic_submission || !cfg.optimize_size {
+            // Also skipped during an RPC backoff: it makes its own QuoterV2 multicalls, and
+            // the candidate won't be executed anyway.
+            let optimized = if optimistic_submission || !cfg.optimize_size || skip_execution {
                 opp.clone()
             } else {
                 strategy.read().await.optimize(opp, provider.as_ref(), max_bal).await
@@ -796,7 +791,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     // Only re-fetch nonce from chain when it was consumed by
                                     // another TX. For network/gas failures the pre-incremented
                                     // nonce was reclaimed by record_failed — no RPC needed.
-                                    if nonce_consumed {
+                                    // Not after an RPC-class failure: the node is hanging or down,
+                                    // and nonce=None already makes the next send re-fetch it.
+                                    if nonce_consumed && crate::util::classify_rpc_failure(&err_str) == RpcFailure::None {
                                         exec.prefetch_nonce(provider.as_ref()).await;
                                     }
                                 }
@@ -1213,7 +1210,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         || err_str.contains("replacement transaction");
                                     let mut exec = executor.lock().await;
                                     exec.record_failed(nonce_consumed);
-                                    if nonce_consumed {
+                                    // Not after an RPC-class failure: the node is hanging or down,
+                                    // and nonce=None already makes the next send re-fetch it.
+                                    if nonce_consumed && crate::util::classify_rpc_failure(&err_str) == RpcFailure::None {
                                         exec.prefetch_nonce(provider.as_ref()).await;
                                     }
                                 }
@@ -1249,6 +1248,44 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         crate::util::backoff_start(&rpc_backoff);
     }
 
+}
+
+/// Probe an RPC whose backoff has expired, off the scan loop. The backoff is restarted
+/// first, so later scans keep skipping execution (and don't spawn more probes) while it
+/// runs; the probe's 5 s timeout is shorter than the backoff. A slow-but-working node
+/// (say 1.2 s per call) ends the backoff; a dead one leaves it running.
+fn spawn_backoff_probe<P: Provider + Clone + 'static>(
+    provider: Arc<P>,
+    rpc_backoff: crate::util::RpcBackoff,
+    chain: String,
+) {
+    crate::util::backoff_start(&rpc_backoff);
+    tokio::spawn(async move {
+        let healthy = crate::util::rpc_timeout(crate::util::RPC_READ_TIMEOUT, provider.get_block_number())
+            .await
+            .is_ok();
+        if healthy {
+            crate::util::backoff_clear(&rpc_backoff);
+            info!("[{}] RPC answering again — resuming execution", chain);
+        } else {
+            crate::util::backoff_start(&rpc_backoff);
+            warn!("[{}] RPC still not answering — skipping execution for {:?}", chain, crate::util::RPC_BACKOFF);
+        }
+    });
+}
+
+/// Minimum interval between rate-limit reports per chain.
+const RATE_LIMIT_LOG_EVERY: Duration = Duration::from_secs(30);
+
+/// True at most once per [`RATE_LIMIT_LOG_EVERY`] for a chain.
+fn rate_limit_log_due(chain_id: u64) -> bool {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, Instant>>> = std::sync::OnceLock::new();
+    let mut last = LAST.get_or_init(Default::default).lock().unwrap();
+    let due = last.get(&chain_id).is_none_or(|t| t.elapsed() >= RATE_LIMIT_LOG_EVERY);
+    if due {
+        last.insert(chain_id, Instant::now());
+    }
+    due
 }
 
 /// Scan duration above which [`SlowScanGuard`] warns (normal scans take < 100 ms).
@@ -1368,16 +1405,21 @@ pub(crate) async fn handle_execution_failure(
     // Simulation / pre-flight failures, matched on the engine's own message prefixes.
     let is_sim_failure = crate::util::is_sim_failure(&err_str);
     let rpc = crate::util::classify_rpc_failure(&err_str);
-    // One simulation timeout = that candidate is stale. Two in a scan = the node is
-    // hanging (in dry-run / pre-flight mode the simulation is the only RPC call).
+    // One simulation timeout = that candidate is stale. Two in a row = the node is
+    // hanging (in dry-run / pre-flight mode the simulation is the only RPC call). Any
+    // other outcome means the node answered, so the streak resets.
     if is_sim_failure && rpc == RpcFailure::Timeout {
         *sim_timeouts += 1;
+    } else {
+        *sim_timeouts = 0;
     }
-    // Node hanging, down or rate-limiting: the caller stops executing further candidates
-    // and backs off, since each would hit the same wall (seen: a 150 s outage held the
-    // scan loop for the whole outage, 10–15 s per candidate).
+    // Node hanging or down: the caller stops executing further candidates and backs off,
+    // since each would hit the same wall (seen: a 150 s outage held the scan loop for the
+    // whole outage, 10–15 s per candidate). A rate limit is often one heavy call's burst,
+    // so it only cools down this pair (below) rather than pausing the whole chain.
     let rpc_stalled = match rpc {
-        RpcFailure::Unreachable | RpcFailure::RateLimited => true,
+        RpcFailure::Unreachable => true,
+        RpcFailure::RateLimited => false,
         RpcFailure::Timeout => !is_sim_failure || *sim_timeouts >= 2,
         RpcFailure::None => false,
     };
@@ -1400,7 +1442,20 @@ pub(crate) async fn handle_execution_failure(
     // RPC rate-limits and outages (timeout / unreachable) are infra issues, not strategy
     // failures. Don't increment the circuit-breaker counter — just log and cool down.
     // Counting them would pause the chain (manual resume) after a few minutes' outage.
-    // Logged at most once per backoff: the scan stops executing after this failure.
+    if rpc == RpcFailure::RateLimited && !is_sim_failure {
+        // Can hit every candidate on every scan while it lasts: report at most once per
+        // RATE_LIMIT_LOG_EVERY per chain, the rest at debug.
+        debug!("[{}] Execute failed (rate limited): {} | pair={}", cfg.name, error, pair_id);
+        if rate_limit_log_due(cfg.id) {
+            warn!("[{}] RPC rate limiting — affected pairs cool down {}s (further reports muted {:?})",
+                  cfg.name, effective_cooldown, RATE_LIMIT_LOG_EVERY);
+            broadcast_log(log_tx, "warn",
+                &format!("[{}] RPC rate limited: {} → cd={}s", cfg.name, error, effective_cooldown), None);
+        }
+        return rpc_stalled;
+    }
+
+    // Outages: logged at most once per backoff, since the scan stops executing after this.
     if rpc != RpcFailure::None && !is_sim_failure {
         warn!("[{}] Execute failed (RPC {:?}): {} | pair={} → cd={}s", cfg.name, rpc, error, pair_id, effective_cooldown);
         broadcast_log(

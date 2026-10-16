@@ -72,9 +72,6 @@ pub async fn transport_timeout<T>(
 /// After an RPC outage-class failure, scans skip execution this long before probing.
 pub const RPC_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Timeout for the cheap eth_blockNumber probe that ends an RPC backoff.
-pub const RPC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Chain-level RPC backoff deadline, shared lock-free between the scan loop and the
 /// executor: milliseconds since process start (+1), 0 = no backoff.
 pub type RpcBackoff = std::sync::Arc<std::sync::atomic::AtomicU64>;
@@ -101,6 +98,10 @@ pub fn backoff_state(b: &RpcBackoff) -> Option<bool> {
         until => Some(monotonic_ms() < until),
     }
 }
+
+/// Text of the error returned when a call is skipped because the backoff is running.
+/// Classified as [`RpcFailure::Unreachable`], so it never counts toward the breaker.
+pub const RPC_BACKOFF_MARKER: &str = "rpc backoff active";
 
 /// Text every timeout error from [`rpc_timeout`] / [`transport_timeout`] contains.
 /// [`classify_rpc_failure`] matches on it, so producer and classifier share one string.
@@ -139,6 +140,7 @@ pub fn classify_rpc_failure(err: &str) -> RpcFailure {
         "failed to lookup address",
         "backend connection task has stopped",
         "pubsub service dropped",
+        RPC_BACKOFF_MARKER,
     ].iter().any(|m| e.contains(m)) {
         RpcFailure::Unreachable
     } else if contains_status_429(&e) || e.contains("too many requests")

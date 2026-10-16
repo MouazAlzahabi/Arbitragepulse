@@ -718,10 +718,7 @@ pub async fn run_chain(
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
                 if global_paused || chain_paused {
-                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
-                    // also right after resume), and any RPC backoff from before is stale.
-                    last_scan_at = Instant::now();
-                    crate::util::backoff_clear(&rpc_backoff);
+                    on_paused(&mut last_scan_at, &rpc_backoff);
                     continue;
                 }
 
@@ -760,10 +757,7 @@ pub async fn run_chain(
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
                 if global_paused || chain_paused {
-                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
-                    // also right after resume), and any RPC backoff from before is stale.
-                    last_scan_at = Instant::now();
-                    crate::util::backoff_clear(&rpc_backoff);
+                    on_paused(&mut last_scan_at, &rpc_backoff);
                     continue;
                 }
 
@@ -843,10 +837,7 @@ pub async fn run_chain(
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
                 if global_paused || chain_paused {
-                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
-                    // also right after resume), and any RPC backoff from before is stale.
-                    last_scan_at = Instant::now();
-                    crate::util::backoff_clear(&rpc_backoff);
+                    on_paused(&mut last_scan_at, &rpc_backoff);
                     continue;
                 }
 
@@ -895,10 +886,7 @@ pub async fn run_chain(
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
                 if global_paused || chain_paused {
-                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
-                    // also right after resume), and any RPC backoff from before is stale.
-                    last_scan_at = Instant::now();
-                    crate::util::backoff_clear(&rpc_backoff);
+                    on_paused(&mut last_scan_at, &rpc_backoff);
                     continue;
                 }
 
@@ -942,6 +930,14 @@ pub async fn run_chain(
 /// All URLs should be WebSocket endpoints (wss:// or ws://).
 /// HTTP fallback URLs in ws_rpc_fallbacks will connect successfully for eth_call
 /// but subscription-based events will fail gracefully — periodic poll scanning continues.
+/// A scan trigger fired while the chain is paused: no scan is expected (keeps the
+/// heartbeat's stall check quiet, also right after resume), and any RPC backoff from
+/// before the pause is stale.
+fn on_paused(last_scan_at: &mut Instant, rpc_backoff: &crate::util::RpcBackoff) {
+    *last_scan_at = Instant::now();
+    crate::util::backoff_clear(rpc_backoff);
+}
+
 async fn connect_with_fallback(
     cfg: &ChainConfig,
     wallet: EthereumWallet,
