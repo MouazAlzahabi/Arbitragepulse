@@ -262,7 +262,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // pre-flight failure, fall through to the next candidate. On a successful send or
     // dry-run, break. `continue 'candidates` is used for cheap skips (cooldown, balance
     // guard, detect-only) so higher-ranked blocked pairs don't starve the rest.
+    // Set when a candidate fails on an RPC timeout — see handle_execution_failure.
+    let mut rpc_stalled = false;
     'candidates: for best_opp in &all_opportunities {
+        if rpc_stalled {
+            warn!("[{}] RPC timed out — skipping remaining candidates this scan", cfg.name);
+            break 'candidates;
+        }
     let fingerprint = best_opp.fingerprint();
     let display_id = best_opp.pair_id();
 
@@ -423,11 +429,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Err(e) => {
                         drop(exec);
-                        handle_execution_failure(
+                        if handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, optimized.profit_usd,
-                        ).await;
+                        ).await { rpc_stalled = true; }
                         // fall through: try next candidate
                     }
                 }
@@ -448,11 +454,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 };
                 match prep_result {
                     Err(e) => {
-                        handle_execution_failure(
+                        if handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, optimized.profit_usd,
-                        ).await;
+                        ).await { rpc_stalled = true; }
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
@@ -479,12 +485,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, None, p, false, "", false);
                                         });
                                     }
-                                    handle_execution_failure(
+                                    if handle_execution_failure(
                                         anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
                                         &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
                                         consecutive_failures, cfg, shared_state, metrics, log_tx,
                                         &ghost_profit_bits, prep.profit_usd,
-                                    ).await;
+                                    ).await { rpc_stalled = true; }
                                     continue 'candidates;
                                 }
                             }
@@ -770,12 +776,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, None, p, false, "", false);
                                     });
                                 }
-                                handle_execution_failure(
+                                if handle_execution_failure(
                                     anyhow::anyhow!("Send failed: {}", e),
                                     &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
                                     consecutive_failures, cfg, shared_state, metrics, log_tx,
                                     &ghost_profit_bits, prep.profit_usd,
-                                ).await;
+                                ).await { rpc_stalled = true; }
                                 // fall through: try next candidate
                             }
                         }
@@ -854,11 +860,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Err(e) => {
                         drop(exec);
-                        handle_execution_failure(
+                        if handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, opp.profit_usd,
-                        ).await;
+                        ).await { rpc_stalled = true; }
                         // fall through: try next candidate
                     }
                 }
@@ -876,11 +882,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 };
                 match prep_result {
                     Err(e) => {
-                        handle_execution_failure(
+                        if handle_execution_failure(
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, opp.profit_usd,
-                        ).await;
+                        ).await { rpc_stalled = true; }
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
@@ -908,12 +914,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, rc.as_deref(), p, false, "", false);
                                         });
                                     }
-                                    handle_execution_failure(
+                                    if handle_execution_failure(
                                         anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
                                         &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
                                         consecutive_failures, cfg, shared_state, metrics, log_tx,
                                         &ghost_profit_bits, prep.profit_usd,
-                                    ).await;
+                                    ).await { rpc_stalled = true; }
                                     continue 'candidates;
                                 }
                             }
@@ -1184,12 +1190,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         let _ = db.insert_trade(cid, &cn, &oid, &ra, &rb, rc.as_deref(), p, false, "", false);
                                     });
                                 }
-                                handle_execution_failure(
+                                if handle_execution_failure(
                                     anyhow::anyhow!("Triangular send failed: {}", e),
                                     &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
                                     consecutive_failures, cfg, shared_state, metrics, log_tx,
                                     &ghost_profit_bits, prep.profit_usd,
-                                ).await;
+                                ).await { rpc_stalled = true; }
                                 // fall through: try next candidate
                             }
                         }
@@ -1287,7 +1293,7 @@ pub(crate) async fn handle_execution_failure(
     log_tx: &LogBroadcaster,
     ghost_profit_bits: &Arc<AtomicU64>,
     opportunity_profit_usd: f64,
-) {
+) -> bool {
     pending_pairs.remove(pair_id);
 
     // Gas-profitability rejects: route has a real spread but profit < gas cost.
@@ -1295,6 +1301,10 @@ pub(crate) async fn handle_execution_failure(
     // route doesn't spam the log every 15s. Gas prices are stable on L2s, and the
     // spread is unlikely to change in 15s — there's no value in retrying sooner.
     let err_str = error.to_string();
+    // An RPC timeout means the node is stuck: the caller stops trying further candidates
+    // this scan, since each would wait out the same timeouts (seen: a 150 s outage held
+    // the scan loop for the whole outage, 10–15 s per candidate).
+    let rpc_stalled = err_str.contains("timed out");
     let is_gas_reject = err_str.contains("below threshold") || err_str.contains("negative after gas");
     let effective_cooldown = if is_gas_reject { GAS_REJECT_COOLDOWN_SECS } else { cooldown_secs };
     cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(effective_cooldown));
@@ -1308,22 +1318,25 @@ pub(crate) async fn handle_execution_failure(
         broadcast_log(log_tx, "info",
             &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4}, cooldown={}s)", cfg.name, pair_id, opportunity_profit_usd, GAS_REJECT_COOLDOWN_SECS),
             None);
-        return;
+        return rpc_stalled;
     }
 
-    // RPC rate-limit (429) is an infra issue, not a strategy failure.
-    // Don't increment the circuit-breaker counter — just log and cool down.
-    if err_str.contains("429")
+    // RPC rate-limit (429) and RPC timeouts are infra issues, not strategy failures.
+    // Don't increment the circuit-breaker counter — just log and cool down. Counting
+    // timeouts would pause the chain (manual resume) after a ~5 min RPC outage.
+    if rpc_stalled
+        || err_str.contains("429")
         || err_str.contains("compute units")
         || err_str.contains("rate limit")
     {
+        warn!("[{}] Execute failed (RPC): {} | pair={} → cd={}s", cfg.name, error, pair_id, effective_cooldown);
         broadcast_log(
             log_tx,
             "error",
             &format!("[{}] Execute failed: {} → cd={}s", cfg.name, error, effective_cooldown),
             None,
         );
-        return;
+        return rpc_stalled;
     }
 
     // Pre-flight simulation failures are expected — the opportunity closed between
@@ -1336,7 +1349,7 @@ pub(crate) async fn handle_execution_failure(
             &format!("[{}] Pre-flight failed (skipping): {} → cd={}s", cfg.name, error, effective_cooldown),
             None,
         );
-        return;
+        return rpc_stalled;
     }
 
     *consecutive_failures += 1;
@@ -1374,4 +1387,5 @@ pub(crate) async fn handle_execution_failure(
         &format!("[{}] Execute failed: {} → cd={}s", cfg.name, error, effective_cooldown),
         None,
     );
+    rpc_stalled
 }

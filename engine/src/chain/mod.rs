@@ -562,11 +562,17 @@ pub async fn run_chain(
                 let (v3_fresh, v3_total) =
                     pool_cache.count_fresh_v3_pools(Duration::from_secs(30));
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}",
-                    cfg.name, scans, attempts, success, best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, v3_fresh, v3_total,
+                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}",
+                    cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, v3_fresh, v3_total,
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
-                info!("{}", heartbeat_msg);
+                // A full scan normally runs every block (~2 s); a long gap means scanning has
+                // stalled (e.g. RPC outage), which the counters alone don't show.
+                if total_scans > 0 && last_scan_at.elapsed() > Duration::from_secs(30) {
+                    warn!("{}", heartbeat_msg);
+                } else {
+                    info!("{}", heartbeat_msg);
+                }
                 broadcast_log(&log_tx, "heartbeat", &heartbeat_msg, None);
 
                 // Publish per-pair scan snapshot to shared_state (read by dashboard /pair-scan).
