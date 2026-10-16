@@ -115,6 +115,8 @@ pub async fn run_chain(
         cfg.priority_fee_wei,
         db,
     )));
+    // Shared RPC backoff flag — cleared on pause so a resume starts executing at once.
+    let rpc_backoff = executor.lock().await.rpc_backoff.clone();
 
     // ── Strategy ──
     let chain_pairs: Vec<PairConfig> = pairs
@@ -521,12 +523,11 @@ pub async fn run_chain(
                     }
                     ok
                 };
-                let (attempts, success) = {
+                let (attempts, success, paused) = {
                     let state = shared_state.read().await;
-                    state.chains.iter()
-                        .find(|c| c.chain_id == cfg.id)
-                        .map(|c| (c.total_attempts, c.total_success))
-                        .unwrap_or((0, confirmed_ok))
+                    let chain = state.chains.iter().find(|c| c.chain_id == cfg.id);
+                    let (a, s) = chain.map(|c| (c.total_attempts, c.total_success)).unwrap_or((0, confirmed_ok));
+                    (a, s, state.paused || chain.is_some_and(|c| c.paused))
                 };
                 let total_scans = scan_count.load(Ordering::Relaxed);
                 let scans = total_scans.saturating_sub(last_hb_scans);
@@ -568,7 +569,8 @@ pub async fn run_chain(
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 // A full scan normally runs every block (~2 s); a long gap means scanning has
                 // stalled (e.g. RPC outage), which the counters alone don't show.
-                if total_scans > 0 && last_scan_at.elapsed() > Duration::from_secs(30) {
+                // Paused chains don't scan, so a long gap there is expected, not a stall.
+                if !paused && total_scans > 0 && last_scan_at.elapsed() > Duration::from_secs(30) {
                     warn!("{}", heartbeat_msg);
                 } else {
                     info!("{}", heartbeat_msg);
@@ -715,7 +717,13 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
-                if global_paused || chain_paused { continue; }
+                if global_paused || chain_paused {
+                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
+                    // also right after resume), and any RPC backoff from before is stale.
+                    last_scan_at = Instant::now();
+                    crate::util::backoff_clear(&rpc_backoff);
+                    continue;
+                }
 
                 drain_pending_logs(
                     &mut log_rx,
@@ -751,7 +759,13 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
-                if global_paused || chain_paused { continue; }
+                if global_paused || chain_paused {
+                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
+                    // also right after resume), and any RPC backoff from before is stale.
+                    last_scan_at = Instant::now();
+                    crate::util::backoff_clear(&rpc_backoff);
+                    continue;
+                }
 
                 drain_pending_logs(
                     &mut log_rx,
@@ -828,7 +842,13 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
-                if global_paused || chain_paused { continue; }
+                if global_paused || chain_paused {
+                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
+                    // also right after resume), and any RPC backoff from before is stale.
+                    last_scan_at = Instant::now();
+                    crate::util::backoff_clear(&rpc_backoff);
+                    continue;
+                }
 
                 drain_pending_logs(
                     &mut log_rx,
@@ -874,7 +894,13 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
-                if global_paused || chain_paused { continue; }
+                if global_paused || chain_paused {
+                    // Paused: no scan is expected (keeps the heartbeat stall check quiet,
+                    // also right after resume), and any RPC backoff from before is stale.
+                    last_scan_at = Instant::now();
+                    crate::util::backoff_clear(&rpc_backoff);
+                    continue;
+                }
 
                 // Build targeted mask for pairs involving the pending swap's tokens
                 let (pair_mask, token_filter) = {

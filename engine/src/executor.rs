@@ -135,6 +135,10 @@ pub struct Executor {
     pub signer_address: Address,
     pub dry_run: bool,
     pub paused: bool,
+    /// Chain-level RPC backoff (see util::RpcBackoff), shared with the scan loop. Set
+    /// here too: a timed-out gas fetch is an outage signal even though the last-known
+    /// fallback lets the candidate continue.
+    pub rpc_backoff: crate::util::RpcBackoff,
     pub stats: ExecutorStats,
     /// ETH/USD price — updated from the price-tick handler each minute.
     pub native_price_usd: f64,
@@ -206,6 +210,7 @@ impl Executor {
             nonce: None,
             db,
             gas_price_cache: None,
+            rpc_backoff: Default::default(),
             gas_price_cache_ttl,
             confirmed_success: Arc::new(AtomicU64::new(0)),
             confirmed_failed: Arc::new(AtomicU64::new(0)),
@@ -258,8 +263,20 @@ impl Executor {
             return Ok(p);
         }
 
-        // Cache miss or expired — fetch from chain
-        match transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await {
+        // Cache miss or expired — fetch from chain, unless the RPC is known to be down
+        // (backoff running): then go straight to the last-known fallback, no 5 s wait.
+        let fetched = if crate::util::backoff_state(&self.rpc_backoff) == Some(true) {
+            Err(alloy::transports::TransportErrorKind::custom_str("RPC backoff active"))
+        } else {
+            transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await
+        };
+        if let Err(e) = &fetched {
+            if crate::util::classify_rpc_failure(&e.to_string()) == crate::util::RpcFailure::Timeout {
+                // The fallback hides the outage from the caller, so signal it here.
+                crate::util::backoff_start(&self.rpc_backoff);
+            }
+        }
+        match fetched {
             Ok(gas_price) => {
                 self.gas_price_cache = Some((gas_price, Instant::now()));
                 debug!(
