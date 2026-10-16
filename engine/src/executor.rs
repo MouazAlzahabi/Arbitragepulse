@@ -264,7 +264,7 @@ impl Executor {
 
         // Cache miss or expired. If the RPC is known to be down (backoff running), stop:
         // this candidate's simulation and send would hit the same dead node.
-        if self.rpc_health.backoff_state() == Some(true) {
+        if self.rpc_health.is_degraded() {
             return Err(anyhow!("gas price not fetched: {}", crate::util::RPC_BACKOFF_MARKER));
         }
         let fetched = transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await;
@@ -279,7 +279,9 @@ impl Executor {
                 // same way. The error keeps the RPC marker, so the scan treats it as an
                 // outage (no circuit-breaker count). A failure that may be one-off
                 // (connection reset, rate limit) uses the fallback below.
-                self.rpc_health.backoff_start();
+                if let Some(hold) = self.rpc_health.mark_outage() {
+                    warn!("[{}] RPC outage on gas fetch — execution off, at least {:?}", self.chain_name, hold);
+                }
                 return Err(anyhow!("gas price fetch failed: {}", e));
             }
         }

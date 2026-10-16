@@ -69,21 +69,56 @@ pub async fn transport_timeout<T>(
     }
 }
 
-/// After an RPC outage-class failure, scans skip execution this long before probing.
-pub const RPC_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+// ─── RPC health ───────────────────────────────────────────────────────────────
+// One rule set, one writer per transition:
+//   • a scan or the executor reports an outage → degraded (execution off, detection on)
+//   • a per-chain monitor task probes while degraded and clears it once the node is fast
+//     again and the hold has passed
+//   • pausing the chain clears it; while paused it is never reported
+// No state depends on scans happening, so a quiet market can't leave it stuck.
 
-/// Per-chain RPC health, shared lock-free by the scan loop and the executor (one per
-/// chain; held by the Executor).
+/// Hold after an outage before the monitor may clear it.
+pub const RPC_HOLD_BASE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest hold (repeated relapses double it: 10, 20, 40, 80 s).
+pub const RPC_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(80);
+/// Degrading again within this long after recovering counts as a relapse (the probe
+/// passed but execution still failed), so the hold doubles instead of resetting.
+pub const RPC_RELAPSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the monitor probes a degraded chain.
+pub const RPC_MONITOR_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The node counts as healthy when a plain eth_call (the method simulations use)
+/// succeeds within this — the simulation timeout, since a node slower than that can't
+/// complete a simulation (seen on a fork at 1.5 s latency: execution flapped every
+/// ~15 s and nothing ran). Any error, including a gateway's JSON-RPC "upstream timeout",
+/// is unhealthy; a rate limit is healthy (the node is up — pairs cool down separately).
+pub const RPC_PROBE_HEALTHY: std::time::Duration = RPC_SIMULATE_TIMEOUT;
+
+/// Hold for an outage starting now, given the previous hold and how long ago the chain
+/// last recovered (`None` = never, or not since the last pause).
+pub fn next_hold(prev: std::time::Duration, since_recovery: Option<std::time::Duration>) -> std::time::Duration {
+    match since_recovery {
+        Some(t) if t < RPC_RELAPSE_WINDOW => (prev * 2).clamp(RPC_HOLD_BASE, RPC_HOLD_MAX),
+        _ => RPC_HOLD_BASE,
+    }
+}
+
+#[derive(Debug, Default)]
+struct HealthState {
+    /// Some = degraded (execution off) since then, for `hold`.
+    degraded_since: Option<std::time::Instant>,
+    hold: std::time::Duration,
+    last_recovered: Option<std::time::Instant>,
+}
+
+/// Per-chain RPC health, shared by the scan loop, the executor, the monitor task and the
+/// API (one per chain run; held by the Executor). A plain mutex: a few uncontended
+/// accesses per scan, never held across an await.
 #[derive(Debug, Default)]
 pub struct RpcHealth {
-    /// Backoff deadline: milliseconds since process start (+1), 0 = no backoff.
-    backoff_until: std::sync::atomic::AtomicU64,
-    /// When a rate limit was last reported (same clock), for log throttling.
-    rate_limit_logged: std::sync::atomic::AtomicU64,
-    /// Backoffs started since execution last succeeded; each doubles the next backoff
-    /// (see [`backoff_len`]), so a node that passes the probe but still can't execute
-    /// doesn't flap every 10 s.
-    strikes: std::sync::atomic::AtomicU32,
+    state: std::sync::Mutex<HealthState>,
+    /// Last rate-limit report, for log throttling.
+    rate_limit_logged: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 pub type SharedRpcHealth = std::sync::Arc<RpcHealth>;
@@ -91,111 +126,63 @@ pub type SharedRpcHealth = std::sync::Arc<RpcHealth>;
 /// Minimum interval between rate-limit reports per chain.
 pub const RATE_LIMIT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn monotonic_ms() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
-}
-
-/// Longest backoff after repeated outages (10 s doubling: 10, 20, 40, 80).
-pub const RPC_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(80);
-
-/// Backoff length after `strikes` outages without an execution succeeding in between.
-pub fn backoff_len(strikes: u32) -> std::time::Duration {
-    let base = RPC_BACKOFF.as_millis() as u64;
-    let ms = base.saturating_mul(1u64 << strikes.saturating_sub(1).min(8));
-    std::time::Duration::from_millis(ms.min(RPC_BACKOFF_MAX.as_millis() as u64))
-}
-
 impl RpcHealth {
-    /// Deadline for a backoff starting now — the one place its length is decided.
-    fn deadline(&self) -> u64 {
-        let strikes = self.strikes.load(std::sync::atomic::Ordering::Relaxed).max(1);
-        monotonic_ms() + backoff_len(strikes).as_millis() as u64
+    fn lock(&self) -> std::sync::MutexGuard<'_, HealthState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Start a backoff after an outage (counts a strike, so repeats back off longer).
-    /// If one is already running (e.g. the executor's gas fetch started it earlier in the
-    /// same scan), it's the same outage: no extra strike, deadline left as is.
-    pub fn backoff_start(&self) -> u64 {
-        if self.backoff_state() == Some(true) {
-            return self.backoff_until.load(std::sync::atomic::Ordering::Relaxed);
+    /// Report an outage. Returns the hold if this started a new degraded period, `None`
+    /// if the chain was already degraded (same outage — e.g. the gas fetch reported it
+    /// earlier in this scan), so callers log once per outage.
+    pub fn mark_outage(&self) -> Option<std::time::Duration> {
+        let mut st = self.lock();
+        if st.degraded_since.is_some() {
+            return None;
         }
-        self.strikes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.backoff_hold()
+        st.hold = next_hold(st.hold, st.last_recovered.map(|t| t.elapsed()));
+        st.degraded_since = Some(std::time::Instant::now());
+        Some(st.hold)
     }
 
-    /// (Re)start the backoff without counting a strike — while a probe runs, or when a
-    /// probe finds the node still down. Returns the new deadline, which
-    /// [`RpcHealth::backoff_resolve`] uses to act only on its own backoff.
-    pub fn backoff_hold(&self) -> u64 {
-        let until = self.deadline();
-        self.backoff_until.store(until, std::sync::atomic::Ordering::Relaxed);
-        until
+    /// Execution is off.
+    pub fn is_degraded(&self) -> bool {
+        self.lock().degraded_since.is_some()
     }
 
-    /// An execution reached the node and succeeded (a pre-flight passed, a dry run or a
-    /// send went through): the node is usable, so the next outage starts short again.
-    pub fn note_success(&self) {
-        self.strikes.store(0, std::sync::atomic::Ordering::Relaxed);
+    /// Degraded and the hold has passed: the monitor should probe.
+    pub fn probe_due(&self) -> bool {
+        let st = self.lock();
+        st.degraded_since.is_some_and(|t| t.elapsed() >= st.hold)
     }
 
-    /// Length of the backoff currently in force (for logs).
-    pub fn current_backoff_len(&self) -> std::time::Duration {
-        backoff_len(self.strikes.load(std::sync::atomic::Ordering::Relaxed).max(1))
+    /// The monitor found the node healthy after the hold: execution back on.
+    /// Returns how long the chain was degraded (None if it no longer was).
+    pub fn recover(&self) -> Option<std::time::Duration> {
+        let mut st = self.lock();
+        let since = st.degraded_since.take()?;
+        st.last_recovered = Some(std::time::Instant::now());
+        Some(since.elapsed())
     }
 
-    /// Backoff running or expired-but-not-yet-probed: execution is off either way.
-    pub fn execution_off(&self) -> bool {
-        self.backoff_state().is_some()
-    }
-
-    /// Clear the backoff and its strikes (the chain was paused/resumed: start fresh).
-    pub fn backoff_clear(&self) {
-        self.backoff_until.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.strikes.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// `None` = no backoff; `Some(true)` = running; `Some(false)` = expired (probe due).
-    pub fn backoff_state(&self) -> Option<bool> {
-        match self.backoff_until.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => None,
-            until => Some(monotonic_ms() < until),
-        }
-    }
-
-    /// Resolve the backoff a probe started (deadline `started`): clear it if the node is
-    /// healthy, restart it if not. A no-op if anything changed it since (a pause cleared
-    /// it, or an execution failure restarted it) — the probe's result is stale then.
-    /// Returns whether it applied.
-    pub fn backoff_resolve(&self, started: u64, healthy: bool) -> bool {
-        let next = if healthy { 0 } else { self.deadline() };
-        self.backoff_until
-            .compare_exchange(started, next, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
-            .is_ok()
+    /// The chain was paused: drop any degraded state and its escalation (start fresh).
+    pub fn clear(&self) {
+        *self.lock() = HealthState::default();
     }
 
     /// True at most once per [`RATE_LIMIT_LOG_EVERY`].
     pub fn rate_limit_log_due(&self) -> bool {
-        let now = monotonic_ms();
-        let last = self.rate_limit_logged.load(std::sync::atomic::Ordering::Relaxed);
-        (last == 0 || now.saturating_sub(last) >= RATE_LIMIT_LOG_EVERY.as_millis() as u64)
-            && self.rate_limit_logged
-                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
-                .is_ok()
+        let mut last = self.rate_limit_logged.lock().unwrap_or_else(|e| e.into_inner());
+        let due = last.is_none_or(|t| t.elapsed() >= RATE_LIMIT_LOG_EVERY);
+        if due {
+            *last = Some(std::time::Instant::now());
+        }
+        due
     }
 }
 
-/// A backoff probe counts the node as healthy only if its eth_call answers within this —
-/// the simulation timeout, since a node slower than that can't complete a simulation (seen
-/// on a fork at 1.5 s latency: backoff flapping every ~15 s, nothing executed). The probe
-/// is an eth_call (same method as simulations) with one retry for jitter. If simulations
-/// still time out after a pass, repeated backoffs double ([`backoff_len`]), so flapping
-/// dies down instead of repeating every 10 s.
-pub const RPC_PROBE_HEALTHY: std::time::Duration = RPC_SIMULATE_TIMEOUT;
-
-/// Text of the error returned when a call is skipped because the backoff is running.
+/// Text of the error returned when a call is skipped because the chain is degraded.
 /// Classified as [`RpcFailure::Unreachable`], so it never counts toward the breaker.
-pub const RPC_BACKOFF_MARKER: &str = "rpc backoff active";
+pub const RPC_BACKOFF_MARKER: &str = "rpc degraded";
 
 /// Unreachable markers meaning the node is definitely down (refusing connections, the WS
 /// backend gone): nothing will get through until it comes back.
@@ -213,13 +200,6 @@ const TRANSIENT_UNREACHABLE_MARKERS: [&str; 6] = [
 pub fn is_hard_down(err: &str) -> bool {
     let e = err.to_lowercase();
     HARD_DOWN_MARKERS.iter().any(|m| e.contains(m))
-}
-
-/// Whether the node itself answered (with a JSON-RPC error), as opposed to the request
-/// failing locally or at a gateway (502/503, signer, filler). alloy writes this prefix for
-/// every JSON-RPC error response.
-pub fn node_answered(err: &str) -> bool {
-    err.to_lowercase().contains("server returned an error response")
 }
 
 /// Text every timeout error from [`rpc_timeout`] / [`transport_timeout`] contains.
@@ -281,4 +261,73 @@ pub const SIM_FAILURE_PREFIXES: [&str; 3] =
 pub fn is_sim_failure(err: &str) -> bool {
     let e = err.trim_start().to_lowercase();
     SIM_FAILURE_PREFIXES.iter().any(|p| e.starts_with(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn hold_starts_at_base_and_doubles_only_on_relapse() {
+        let s = Duration::from_secs;
+        assert_eq!(next_hold(Duration::ZERO, None), RPC_HOLD_BASE);
+        // Relapse within the window doubles…
+        assert_eq!(next_hold(s(10), Some(s(5))), s(20));
+        assert_eq!(next_hold(s(40), Some(s(59))), s(80));
+        // …capped…
+        assert_eq!(next_hold(s(80), Some(s(1))), RPC_HOLD_MAX);
+        // …and a healthy stretch resets it, however long the previous hold was.
+        assert_eq!(next_hold(s(80), Some(RPC_RELAPSE_WINDOW)), RPC_HOLD_BASE);
+        // A first relapse after a zero/short hold never goes below base.
+        assert_eq!(next_hold(Duration::ZERO, Some(s(1))), RPC_HOLD_BASE);
+    }
+
+    #[test]
+    fn one_outage_marks_once_and_recover_clears() {
+        let h = RpcHealth::default();
+        assert!(!h.is_degraded());
+        assert_eq!(h.mark_outage(), Some(RPC_HOLD_BASE));
+        assert!(h.is_degraded());
+        assert_eq!(h.mark_outage(), None, "same outage must not be reported twice");
+        assert!(!h.probe_due(), "hold has not passed yet");
+        assert!(h.recover().is_some());
+        assert!(!h.is_degraded());
+        assert!(h.recover().is_none());
+        // Relapse right after recovering: hold doubles.
+        assert_eq!(h.mark_outage(), Some(RPC_HOLD_BASE * 2));
+        h.clear();
+        assert!(!h.is_degraded());
+        assert_eq!(h.mark_outage(), Some(RPC_HOLD_BASE), "pause resets escalation");
+    }
+
+    #[test]
+    fn classifies_rpc_failures() {
+        assert_eq!(classify_rpc_failure("Send failed: RPC request timed out after 5s (outcome unknown)"), RpcFailure::Timeout);
+        assert_eq!(classify_rpc_failure("error sending request for url"), RpcFailure::Unreachable);
+        assert_eq!(classify_rpc_failure("dns error: failed to lookup address"), RpcFailure::Unreachable);
+        assert_eq!(classify_rpc_failure(&format!("gas price not fetched: {}", RPC_BACKOFF_MARKER)), RpcFailure::Unreachable);
+        assert_eq!(classify_rpc_failure("HTTP error 429 Too Many Requests"), RpcFailure::RateLimited);
+        assert_eq!(classify_rpc_failure("exceeded compute units per second"), RpcFailure::RateLimited);
+        // "429" inside hex revert data is not a rate limit.
+        assert_eq!(classify_rpc_failure("execution reverted, data: 0xa4291f00"), RpcFailure::None);
+        assert_eq!(classify_rpc_failure("server returned an error response: nonce too low"), RpcFailure::None);
+    }
+
+    #[test]
+    fn hard_down_excludes_one_off_failures() {
+        assert!(is_hard_down("Connection refused (os error 61)"));
+        assert!(is_hard_down("backend connection task has stopped"));
+        assert!(!is_hard_down("connection reset by peer"));
+        assert!(!is_hard_down("dns error"), "a resolver blip may be one-off");
+        assert!(!is_hard_down(RPC_BACKOFF_MARKER));
+    }
+
+    #[test]
+    fn sim_failures_match_only_engine_prefixes() {
+        assert!(is_sim_failure("Simulation failed: execution reverted"));
+        assert!(is_sim_failure("Triangular simulation failed: x"));
+        assert!(is_sim_failure("Pre-flight eth_call rejected: x"));
+        assert!(!is_sim_failure("Send failed: node said: simulation failed"));
+    }
 }

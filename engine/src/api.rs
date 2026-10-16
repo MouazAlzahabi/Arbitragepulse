@@ -67,10 +67,6 @@ pub struct ChainStats {
     pub last_block: u64,
     /// Latest eth_blockNumber round-trip latency in ms (measured once per heartbeat interval). 0 = not yet measured.
     pub rpc_latency_ms: f64,
-    /// True while the chain's RPC backoff is active: opportunities are still detected,
-    /// but none are executed (node hanging, down, or too slow to simulate on). Filled in
-    /// live from [`EngineState::rpc_health`] when served, not stored.
-    pub rpc_backoff: bool,
 }
 
 #[derive(Debug, Default)]
@@ -101,9 +97,23 @@ pub struct EngineState {
 pub type SharedState = Arc<RwLock<EngineState>>;
 
 impl EngineState {
-    /// Whether the chain's RPC backoff is in force right now (execution off).
+    /// Whether the chain is in RPC backoff right now: degraded (execution off, detection
+    /// on) and not paused. A paused chain isn't trying to execute, so it never reports
+    /// backoff — which is also what makes a pause show up immediately.
     pub fn backoff_active(&self, chain_id: u64) -> bool {
-        self.rpc_health.get(&chain_id).is_some_and(|h| h.execution_off())
+        let paused = self.paused || self.chains.iter().any(|c| c.chain_id == chain_id && c.paused);
+        !paused && self.rpc_health.get(&chain_id).is_some_and(|h| h.is_degraded())
+    }
+
+    /// Chain stats as served by /stats: each entry plus its live `rpc_backoff`.
+    fn chains_json(&self) -> Vec<serde_json::Value> {
+        self.chains.iter().map(|c| {
+            let mut v = serde_json::to_value(c).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("rpc_backoff".into(), self.backoff_active(c.chain_id).into());
+            }
+            v
+        }).collect()
     }
 }
 pub type LogBroadcaster = broadcast::Sender<LogEntry>;
@@ -313,11 +323,8 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = state.engine.read().await;
-    let chains: Vec<ChainStats> = engine.chains.iter().cloned()
-        .map(|mut c| { c.rpc_backoff = engine.backoff_active(c.chain_id); c })
-        .collect();
     Json(serde_json::json!({
-        "chains": chains,
+        "chains": engine.chains_json(),
         "dry_run": engine.dry_run,
         "paused": engine.paused,
         "uptime_seconds": now_secs() - engine.uptime_start,

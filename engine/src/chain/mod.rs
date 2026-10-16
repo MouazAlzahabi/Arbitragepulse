@@ -234,7 +234,6 @@ pub async fn run_chain(
                 rpc_ok: true,   // we just connected successfully
                 last_block: 0,
                 rpc_latency_ms: 0.0,
-                rpc_backoff: false,
             });
         } else if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
             chain.rpc_ok = true;
@@ -242,6 +241,7 @@ pub async fn run_chain(
         // Register this run's RPC health (replacing a previous run's after a reconnect).
         state.rpc_health.insert(cfg.id, rpc_health.clone());
     }
+    spawn_rpc_monitor(&provider, &rpc_health, cfg.name.clone());
     metrics.rpc_connected.with_label_values(&[&cfg.name]).set(1.0);
 
     // ── Swap event listener ──
@@ -929,12 +929,59 @@ pub async fn run_chain(
 
 // ─── RPC connection with fallback ─────────────────────────────────────────────
 
+/// The chain's RPC monitor: while degraded and past the hold, probe every
+/// [`crate::util::RPC_MONITOR_EVERY`] with a plain eth_call (Multicall3.getBlockNumber,
+/// the method simulations use) and clear the degraded state once it succeeds within
+/// [`crate::util::RPC_PROBE_HEALTHY`]. The only writer of "recovered", and independent of
+/// scans, so a quiet market can't leave a chain stuck. Holds weak references: it exits
+/// when this chain run's provider or health object is dropped (shutdown / reconnect).
+fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
+    provider: &Arc<P>,
+    rpc_health: &crate::util::SharedRpcHealth,
+    chain: String,
+) {
+    use crate::util::{rpc_timeout, classify_rpc_failure, RpcFailure, RPC_MONITOR_EVERY, RPC_PROBE_HEALTHY};
+    const MULTICALL3: Address = alloy::primitives::address!("cA11bde05977b3631167028862bE2a173976CA11");
+    const GET_BLOCK_NUMBER: [u8; 4] = [0x42, 0xcb, 0xb1, 0x5c]; // getBlockNumber()
+    let (provider, health) = (Arc::downgrade(provider), Arc::downgrade(rpc_health));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RPC_MONITOR_EVERY);
+        let mut slow_logged = false;
+        loop {
+            tick.tick().await;
+            let (Some(provider), Some(health)) = (provider.upgrade(), health.upgrade()) else { return };
+            if !health.probe_due() {
+                slow_logged = false;
+                continue;
+            }
+            let tx = alloy::rpc::types::TransactionRequest::default()
+                .to(MULTICALL3)
+                .input(alloy::primitives::Bytes::from_static(&GET_BLOCK_NUMBER).into());
+            let t = Instant::now();
+            let result = rpc_timeout(RPC_PROBE_HEALTHY, provider.call(tx)).await;
+            let took = t.elapsed();
+            let rate_limited = result.as_ref().err().is_some_and(|e| classify_rpc_failure(e) == RpcFailure::RateLimited);
+            if result.is_ok() || rate_limited {
+                if let Some(was) = health.recover() {
+                    info!("[{}] RPC healthy again ({:.2}s{}) — execution back on after {:.0?}",
+                          chain, took.as_secs_f64(), if rate_limited { ", rate limited" } else { "" }, was);
+                }
+            } else if !slow_logged {
+                // Once per degraded period: the probe itself keeps running every 2 s.
+                warn!("[{}] RPC not healthy yet ({}) — execution stays off, probing every {:?}",
+                      chain, result.err().unwrap_or_default(), RPC_MONITOR_EVERY);
+                slow_logged = true;
+            }
+        }
+    });
+}
+
 /// A scan trigger fired while the chain is paused: no scan is expected (keeps the
 /// heartbeat's stall check quiet, also right after resume), and any RPC backoff from
 /// before the pause is stale.
 fn on_paused(last_scan_at: &mut Instant, rpc_health: &crate::util::RpcHealth) {
     *last_scan_at = Instant::now();
-    rpc_health.backoff_clear();
+    rpc_health.clear();
 }
 
 /// Try `cfg.ws_rpc` first, then each entry in `cfg.ws_rpc_fallbacks` in order.
