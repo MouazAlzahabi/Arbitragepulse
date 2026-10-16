@@ -43,8 +43,8 @@ pub async fn run_setup<P: Provider>(
 ) -> Result<LabState> {
     info!("=== Lab Setup ===");
 
-    // ── Token addresses on Optimism fork ──
-    let usdc: Address = "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85".parse()?;
+    // ── Token addresses on the Base fork ──
+    let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse()?;
     let weth: Address = "0x4200000000000000000000000000000000000006".parse()?;
 
     // ── Ensure deployer has USDC (impersonate whale if needed) ──
@@ -52,8 +52,9 @@ pub async fn run_setup<P: Provider>(
     info!("Deployer USDC balance: {} (units)", usdc_balance);
     // Need 500k for RouterB seed + 50k for executor = 550k minimum; re-fund if below 600k
     if usdc_balance < U256::from(600_000_000_000u128) {
-        // Fund deployer from a known USDC whale via Anvil impersonation
-        let whale: Address = "0xf89d7b9c864f589bbF53a82105107622B35EaA40".parse()?;
+        // Fund deployer from a known USDC holder via Anvil impersonation (fork only):
+        // the Aave v3 aBasUSDC token, which holds ~19.5M USDC on Base.
+        let whale: Address = "0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB".parse()?;
         info!("Deployer has no USDC — impersonating whale {:?} to fund deployer", whale);
 
         // anvil_impersonateAccount
@@ -61,6 +62,11 @@ pub async fn run_setup<P: Provider>(
             .raw_request("anvil_impersonateAccount".into(), serde_json::json!([format!("{whale:?}")]))
             .await
             .map_err(|e| anyhow!("anvil_impersonateAccount failed: {}", e))?;
+        // The holder is a contract with no ETH — give it gas money (fork only).
+        let _: serde_json::Value = provider
+            .raw_request("anvil_setBalance".into(), serde_json::json!([format!("{whale:?}"), "0xDE0B6B3A7640000"]))
+            .await
+            .map_err(|e| anyhow!("anvil_setBalance failed: {}", e))?;
 
         // Transfer 1,000,000 USDC from whale to deployer (covers RouterB seed + executor)
         let fund_amount = U256::from(1_000_000_000_000u128); // 1,000,000 USDC (6 decimals)

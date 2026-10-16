@@ -45,7 +45,7 @@ impl V3PoolKey {
 // ─── Pool state ───────────────────────────────────────────────────────────────
 
 /// Current on-chain state of one V2 / Solidly-volatile / Solidly-stable /
-/// SyncSwap pool, kept fresh from `Sync(reserve0, reserve1)` events.
+/// pool, kept fresh from `Sync(reserve0, reserve1)` events.
 #[derive(Debug, Clone)]
 pub struct PoolInfo {
     /// token0 = lower address (EVM convention).
@@ -57,8 +57,8 @@ pub struct PoolInfo {
     pub fee_bps: u32,
     /// The router ID that routes through this pool (for key lookup).
     pub router_id: String,
-    /// True for Solidly-stable / SyncSwap-stable pools (x³y+xy³=k curve).
-    /// False for V2 / Solidly-volatile / SyncSwap-classic pools (xy=k curve).
+    /// True for Aerodrome-stable pools (x³y+xy³=k curve).
+    /// False for V2 / Aerodrome-volatile pools (xy=k curve).
     pub is_stable: bool,
     /// Token decimals — needed to normalise reserves for the stable curve.
     pub decimals0: u8,
@@ -128,13 +128,13 @@ impl V3PoolState {
 /// imbalanced like stable pools can. Lower-volume pairs (BRETT, DEGEN, doginme) may
 /// not trade every 60s; a 60s TTL makes their pools go stale and disappear from Phase 1.
 /// 120s keeps them in scope for detection without adding phantom-spread risk.
-pub const VOLATILE_MAX_AGE: Duration = Duration::from_secs(120);
+pub fn volatile_max_age() -> Duration { crate::config::tuning().volatile_pool_max_age() }
 
-/// How long a Solidly-stable / SyncSwap-stable pool reserve is considered fresh.
+/// How long an Aerodrome-stable pool reserve is considered fresh.
 /// 30s: If a stable pool gets one-sided arb'd to near-zero, it stops receiving Sync events
 /// (no one trades terrible rates). A missed Sync event would keep the cache stale forever
 /// at 120s. 30s ensures the pool falls out of scope within one scan cycle if events stop.
-pub const STABLE_MAX_AGE: Duration = Duration::from_secs(30);
+pub fn stable_max_age() -> Duration { crate::config::tuning().stable_pool_max_age() }
 
 /// Q96 = 2^96, used for V3 sqrtPriceX96 ↔ virtual-reserve conversion.
 /// Stored as a const to avoid `U256::from(1u128) << 96` on every quote call.
@@ -146,14 +146,14 @@ const FEE_DENOM_V3: U256 = U256::from_limbs([1_000_000u64, 0, 0, 0]);
 
 /// Max fraction of input-side virtual reserve for V3 spot quotes (single-tick safe).
 /// Trades larger than this fraction of `vr_in` can cross ticks where L=0 and overestimate output.
-const V3_SPOT_MAX_VR_FRACTION_BPS: u64 = 200; // 2% of vr_in
+fn v3_spot_max_vr_fraction_bps() -> u64 { crate::config::tuning().v3_spot_max_vr_fraction_bps }
 
 fn cap_v3_spot_amount_in(vr_in: U256, amount_in: U256) -> U256 {
     if vr_in.is_zero() {
         return amount_in;
     }
     let max_in =
-        vr_in.saturating_mul(U256::from(V3_SPOT_MAX_VR_FRACTION_BPS)) / U256::from(10_000u64);
+        vr_in.saturating_mul(U256::from(v3_spot_max_vr_fraction_bps())) / U256::from(10_000u64);
     if max_in.is_zero() {
         return amount_in;
     }
@@ -192,7 +192,7 @@ const SCALE: [U256; 19] = [
 
 /// Thread-safe pool reserve cache.
 ///
-/// **V2/Solidly/SyncSwap** (xy=k or x³y+xy³=k):
+/// **V2/Aerodrome** (xy=k or x³y+xy³=k):
 /// * `by_address` — pool_address → PoolInfo (reserves updated live from Sync events)
 /// * `by_key`     — "router_id:token_in_lower:token_out_lower" → pool_address
 ///
@@ -200,7 +200,6 @@ const SCALE: [U256; 19] = [
 ///   - V2:               `"router_id:0x...:0x..."`
 ///   - Solidly volatile: `"router_id::volatile:0x...:0x..."`
 ///   - Solidly stable:   `"router_id::stable:0x...:0x..."`
-///   - SyncSwap:         `"router_id:0x...:0x..."`
 ///
 /// **V3** (concentrated liquidity):
 /// * `v3_by_address` — pool_address → V3PoolState
@@ -307,7 +306,7 @@ impl PoolCache {
     /// `max_age`: if `Some(d)`, returns `None` when the pool's reserves were last
     /// synced more than `d` ago — prevents phantom profits from stale startup state.
     /// Pass `None` for V2 pools (startup reserves are trustworthy for xy=k).
-    /// Pass `Some(VOLATILE_MAX_AGE)` / `Some(STABLE_MAX_AGE)` for Solidly/SyncSwap.
+    /// Pass `Some(volatile_max_age())` / `Some(stable_max_age())` for Aerodrome.
     pub fn get_amount_out_by_key(
         &self,
         router_id: &str,
@@ -370,7 +369,7 @@ impl PoolCache {
         )
     }
 
-    /// All V2/Solidly/SyncSwap pool addresses currently in the cache.
+    /// All V2/Aerodrome pool addresses currently in the cache.
     pub fn pool_addresses(&self) -> Vec<Address> {
         self.by_address.iter().map(|e| *e.key()).collect()
     }
@@ -401,7 +400,7 @@ impl PoolCache {
         )
     }
 
-    /// Returns (token0, token1) for any watched pool — V2/Solidly/SyncSwap or V3.
+    /// Returns (token0, token1) for any watched pool — V2/Aerodrome or V3.
     /// Used by the targeted-scan path to identify which tokens moved on a Swap event.
     pub fn get_pool_tokens(&self, pool: Address) -> Option<(Address, Address)> {
         if let Some(info) = self.by_address.get(&pool) {
@@ -451,7 +450,7 @@ impl PoolCache {
     /// became inactive or were removed from a DEX. Both `by_key` indexes are cleaned
     /// up by reconstructing the keys from the evicted pool's metadata.
     pub fn prune_stale(&self, v2_ttl: Duration, v3_ttl: Duration) -> (usize, usize) {
-        // ── V2 / Solidly / SyncSwap ──────────────────────────────────────────
+        // ── V2 / Aerodrome ───────────────────────────────────────────────────
         let stale_v2: Vec<(Address, PoolInfo)> = self
             .by_address
             .iter()
@@ -616,7 +615,7 @@ fn compute_amount_out(info: &PoolInfo, token_in: Address, amount_in: U256) -> Op
 }
 
 /// Standard V2 xy=k constant-product output formula.
-/// Also correct for Solidly-volatile and SyncSwap-classic pools.
+/// Also correct for Aerodrome-volatile pools.
 ///
 /// fee_num: precomputed 10_000 − fee_bps (from PoolInfo.fee_num).
 pub fn amount_out_v2(
@@ -633,10 +632,10 @@ pub fn amount_out_v2(
 
 /// Solidly stable AMM: f(x,y) = x³y + xy³ = k  (Newton-Raphson solver).
 ///
-/// Both Solidly-stable and SyncSwap-stable pools use this curve.
+/// Aerodrome-stable pools use this curve.
 /// Reserves are normalised to 18 decimals before solving, then de-normalised.
 ///
-/// fee_bps: typically 4 (0.04%) for Solidly stable, 10 (0.10%) for SyncSwap stable.
+/// fee_bps: 1 (0.01%) for Aerodrome stable pools on Base.
 pub fn amount_out_stable(
     amount_in: U256,
     reserve_in: U256,

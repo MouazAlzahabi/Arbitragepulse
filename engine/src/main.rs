@@ -41,17 +41,17 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     });
 
-    let enabled_chains: Vec<_> = cfg.chains.iter().filter(|c| c.enabled).collect();
-    if enabled_chains.is_empty() {
-        tracing::error!("No enabled chains in config");
-        std::process::exit(1);
-    }
-
+    // One instance = one chain (see config::AppConfig).
+    config::install_tuning(cfg.tuning.clone(), cfg.chain.block_time_ms);
     info!(
-        "Loaded {} chains, {} routers, {} pairs",
-        enabled_chains.len(),
-        cfg.routers.len(),
-        cfg.pairs.len()
+        "Loaded chain {} (id {}), {} routers, {} pairs — block time {} ms",
+        cfg.chain.name, cfg.chain.id, cfg.routers.len(), cfg.pairs.len(), cfg.chain.block_time_ms
+    );
+    let t = config::tuning();
+    info!(
+        "Tuning: simulate timeout {:?}, quote-cache age {:?}, RPC monitor every {:?}, hold {:?}–{:?}, breaker after {} failures",
+        t.rpc_simulate_timeout(), t.quote_cache_max_age(), t.health_monitor_every(),
+        t.health_hold_base(), t.health_hold_max(), t.max_consecutive_failures,
     );
 
     // ── Metrics ──
@@ -61,13 +61,13 @@ async fn main() -> Result<()> {
     });
 
     // ── Database ──
-    let db = match db::Database::open("trades.db") {
+    let db = match db::Database::open(&env.db_path) {
         Ok(d) => {
-            info!("SQLite database opened (trades.db)");
+            info!("SQLite database opened ({})", env.db_path);
             Some(Arc::new(d))
         }
         Err(e) => {
-            tracing::warn!("Could not open trades.db: {} — running without persistence", e);
+            tracing::warn!("Could not open {}: {} — running without persistence", env.db_path, e);
             None
         }
     };
@@ -84,19 +84,17 @@ async fn main() -> Result<()> {
     let log_tx = api_server.log_sender();
     let shared_state = api_server.shared_state();
 
-    // Seed initial chain stats from DB — only for chains currently enabled in config.
-    // Chains that were active in a previous session but are no longer configured would
-    // otherwise appear with rpc_ok=false, making status "degraded" on every startup.
-    let enabled_chain_ids: std::collections::HashSet<u64> =
-        enabled_chains.iter().map(|c| c.id).collect();
+    // Seed initial chain stats from DB — only for this instance's chain. Other chains in
+    // an old shared DB would otherwise appear with rpc_ok=false ("degraded").
+    let this_chain_id = cfg.chain.id;
     if let Some(ref db_ref) = db {
         let db_for_seed = Arc::clone(db_ref);
         match tokio::task::spawn_blocking(move || db_for_seed.get_chain_stats()).await {
             Ok(Ok(rows)) => {
                 let mut state = shared_state.write().await;
                 for (chain_id, chain_name, attempts, successes, profit) in rows {
-                    if !enabled_chain_ids.contains(&chain_id) {
-                        continue; // skip chains no longer in config
+                    if chain_id != this_chain_id {
+                        continue; // another chain's rows
                     }
                     state.chains.push(api::ChainStats {
                         chain_id,
@@ -132,7 +130,7 @@ async fn main() -> Result<()> {
                 (&pair.token_in_symbol, &pair.token_in, pair.token_in_decimals),
                 (&pair.token_out_symbol, &pair.token_out, pair.token_out_decimals),
             ] {
-                let key = (pair.chain_id, addr.to_lowercase());
+                let key = (cfg.chain.id, addr.to_lowercase());
                 if seen.insert(key, ()).is_none() {
                     let category = if ["USDC", "USDT", "DAI", "FRAX", "LUSD", "USDC.E", "USDBC"].contains(&symbol.as_str()) {
                         "stable"
@@ -144,7 +142,7 @@ async fn main() -> Result<()> {
                     state.tokens.push(api::Token {
                         symbol: symbol.clone(),
                         address: addr.clone(),
-                        chain_id: pair.chain_id,
+                        chain_id: cfg.chain.id,
                         decimals,
                         trusted: true,
                         category: category.to_string(),
@@ -165,11 +163,11 @@ async fn main() -> Result<()> {
     // Broadcast a `()` to signal all chain engines to stop gracefully.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    // ── Chain engines ──
+    // ── Chain engine (one per instance) ──
     let mut handles = Vec::new();
 
-    for chain_cfg in enabled_chains {
-        let chain_cfg = chain_cfg.clone();
+    {
+        let chain_cfg = cfg.chain.clone();
         let routers = cfg.routers.clone();
         let pairs = cfg.pairs.clone();
         let private_key = env.private_key.clone();
@@ -219,7 +217,7 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
-    info!("All chain engines started. API at http://0.0.0.0:{}", env.port);
+    info!("Chain engine started. API at http://0.0.0.0:{}", env.port);
 
     // ── Graceful shutdown: wait for SIGTERM or Ctrl-C ──
     tokio::select! {

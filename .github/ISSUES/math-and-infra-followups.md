@@ -31,7 +31,7 @@ pool entries and stale `by_key` indexes.
 
 **Suggested TTLs:**
 
-- V2/Solidly/SyncSwap: 30–60 min without `Sync`
+- V2/Aerodrome: 30–60 min without `Sync`
 - V3: 30–60 min without `Swap`
 
 Log evicted counts at `debug!` level.

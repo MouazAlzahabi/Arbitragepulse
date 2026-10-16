@@ -8,9 +8,9 @@ use std::collections::{hash_map::Entry, HashMap};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
-use crate::abi::{IERC20, IMulticall3, IQuoterV2, ISyncSwapClassicPoolFactory, IUniswapV2Pair};
+use crate::abi::{IMulticall3, IQuoterV2};
 use crate::config::{PairConfig, RouterConfig, RouterType};
-use crate::pool_cache::{PoolCache, PoolInfo, V2PoolKey, V3PoolKey};
+use crate::pool_cache::{PoolCache, V2PoolKey, V3PoolKey};
 pub use crate::types::*;
 use crate::util::u256_to_f64;
 
@@ -21,24 +21,22 @@ pub mod optimize;
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// Minimum active-tick liquidity for a V3 pool to be considered tradeable.
-/// Real Linea pools: 10^15 – 10^20. Dead/empty pools: near zero.
+/// Real pools: 10^15 – 10^20. Dead/empty pools: near zero.
 /// This filters out uninitialized pools and ghost liquidity without needing USD valuation.
-pub(crate) const MIN_V3_LIQUIDITY: u128 = 1_000_000_000; // 10^9
+pub(crate) fn min_v3_liquidity() -> u128 { crate::config::tuning().min_v3_liquidity }
 
 /// Max calls per Multicall3 batch.
 /// 10 keeps each batch well under ~30M gas (Alchemy eth_call limit) even with expensive
 /// V3 quoteExactInputSingle calls that can reach 5M gas/call when tracing ticks.
-/// After pool-existence filtering (Changes 3 & 4) the V3/Solidly entry count drops
-/// dramatically, so chunk size primarily matters for SyncSwap batches now.
-pub(crate) const MULTICALL_CHUNK_SIZE: usize = 10;
+pub(crate) fn multicall_chunk_size() -> usize { crate::config::tuning().multicall_chunk_size }
 
 /// QuoterV2 post-buffer (bps): removed from `amount_back` before profit vs `min_profit_usd`.
 /// Used in Phase 1.5/1.5b/1.5c and optimize.rs — keep all paths on this single constant.
-pub(crate) const P15_QUOTER_HAIRCUT_BPS: u64 = 15;
+pub(crate) fn quoter_haircut_bps() -> u64 { crate::config::tuning().quoter_haircut_bps }
 
 /// Detection / execution buffer applied to quoted output before profit checks (Phase 1.1).
 pub(crate) fn apply_exec_quote_haircut(amount_out: U256) -> U256 {
-    (amount_out * U256::from(10_000 - P15_QUOTER_HAIRCUT_BPS)) / U256::from(10_000u32)
+    (amount_out * U256::from(10_000 - quoter_haircut_bps())) / U256::from(10_000u32)
 }
 
 /// QuoterV2 `quoteExactInputSingle` calldata (Uniswap V3 ABI, `uint24 fee`).
@@ -63,31 +61,31 @@ pub(crate) fn decode_v3_quote(raw: Option<&Vec<u8>>) -> Option<U256> {
 }
 
 /// Warn when a router's QuoterV2 has never returned a quote and every batch for it has
-/// failed for this long (and at least [`QUOTER_WARN_MIN_BATCHES`] batches) — most likely a
+/// failed for this long (and at least [`quoter_warn_min_batches()`] batches) — most likely a
 /// wrong quoter address or ABI. Time-based: one scan runs several batches (1.5, 1.5b,
 /// 1.5c, triangular), so a batch count alone trips within ~2 s.
-const QUOTER_NEVER_OK_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+fn quoter_never_ok_warn_after() -> std::time::Duration { crate::config::tuning().quoter_never_ok_warn_after() }
 
 /// Same, for a router that HAS returned quotes before. Longer: thin pools quoted at large
 /// inputs revert in QuoterV2 legitimately, and RPC blips fail whole batches.
-const QUOTER_BROKEN_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+fn quoter_broken_warn_after() -> std::time::Duration { crate::config::tuning().quoter_broken_warn_after() }
 
 /// Minimum consecutive failed batches before either warning.
-const QUOTER_WARN_MIN_BATCHES: u32 = 5;
+fn quoter_warn_min_batches() -> u32 { crate::config::tuning().quoter_warn_min_batches }
 
 /// Max age of a cached 2-hop QuoterV2 result ([`QuoteCache`]). Cached quotes are also
 /// invalidated when the pool's local sqrtPriceX96 or liquidity changes; the age bound
 /// limits the damage when a Swap/Mint/Burn event is missed (WS reconnect, dropped log)
 /// and the local state goes stale. ~3 blocks on Base.
-pub(crate) const QUOTE_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6);
+pub(crate) fn quote_cache_max_age() -> std::time::Duration { crate::config::tuning().quote_cache_max_age() }
 
 /// Pool cap for [`QuoteCache`]; cleared wholesale when exceeded.
-const QUOTE_CACHE_MAX_POOLS: usize = 1024;
+fn quote_cache_max_pools() -> usize { crate::config::tuning().quote_cache_max_pools }
 
 /// Timeout for one Multicall3 chunk in [`run_multicall`]. Without it a hung RPC request
 /// blocks the chain's scan loop forever (seen on a cold Anvil fork). QuoterV2 batches
 /// normally take ~80–160 ms; on timeout the chunk's calls count as failed.
-const MULTICALL_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+fn multicall_chunk_timeout() -> std::time::Duration { crate::config::tuning().multicall_chunk_timeout() }
 
 /// One V3 leg to quote via QuoterV2 — see [`Strategy::quote_v3_legs`]. Router, tokens and
 /// fee all come from `key`, so dedup and calldata can't disagree.
@@ -109,7 +107,7 @@ impl QuoterBatchHealth {
 /// QuoterV2 result cache for the 2-hop Phase 1.5/1.5b paths, keyed on pool then amount_in.
 /// One invalidation rule for every user: an entry is served only while the pool's local
 /// (sqrtPriceX96, liquidity) equals the state captured when the quote was REQUESTED and
-/// it is younger than [`QUOTE_CACHE_MAX_AGE`].
+/// it is younger than [`quote_cache_max_age()`].
 #[derive(Default)]
 pub struct QuoteCache {
     pools: DashMap<V3PoolKey, HashMap<U256, CachedQuote>>,
@@ -123,7 +121,7 @@ impl QuoteCache {
         let (sqrtp, liq) = pools.v3_price_state(key)?;
         let by_amount = self.pools.get(key)?;
         let e = by_amount.get(&amount_in)?;
-        (e.0 == sqrtp && e.1 == liq && e.3.elapsed() <= QUOTE_CACHE_MAX_AGE).then_some(e.2)
+        (e.0 == sqrtp && e.1 == liq && e.3.elapsed() <= quote_cache_max_age()).then_some(e.2)
     }
 
     /// Store a result (ZERO = the quoter reverted / quoted nothing, cached so it isn't
@@ -131,7 +129,7 @@ impl QuoteCache {
     /// request was built: if the pool moves while the call is in flight, the entry no
     /// longer matches and is never served.
     pub(crate) fn insert(&self, key: V3PoolKey, amount_in: U256, state_at_send: (U256, u128), amount_out: U256) {
-        if self.pools.len() > QUOTE_CACHE_MAX_POOLS {
+        if self.pools.len() > quote_cache_max_pools() {
             self.pools.clear();
         }
         self.pools.entry(key).or_default()
@@ -217,11 +215,6 @@ pub struct Strategy {
     pub quoter_v2_address: Option<Address>,
     /// Max concurrent Multicall3 chunks per scan (from config rpc_concurrency).
     pub rpc_concurrency: usize,
-    /// SyncSwap pool address cache.
-    /// Key: "router_id:token_in_lowercase:token_out_lowercase"
-    /// Value: Some(pool_address) if pool exists, None if no pool for this pair.
-    /// Populated at startup and after config hot-reload via populate_syncswap_pools().
-    pub syncswap_pool_cache: HashMap<String, Option<Address>>,
     /// V2/Solidly-volatile pool reserve cache — updated live from on-chain Sync events.
     /// When populated, forward and reverse quotes for V2/Solidly-volatile routers are
     /// computed locally (zero eth_call) instead of via multicall.
@@ -310,7 +303,7 @@ impl Strategy {
 
         let solidly_pool_keys: HashMap<String, (String, String)> = routers
             .iter()
-            .filter(|r| matches!(r.router_type, RouterType::Solidly | RouterType::Aerodrome))
+            .filter(|r| matches!(r.router_type, RouterType::Aerodrome))
             .map(|r| {
                 (
                     r.id.clone(),
@@ -320,7 +313,7 @@ impl Strategy {
             .collect();
 
         if optimistic_submission
-            && routers.iter().any(|r| r.chain_id == chain_id && r.router_type == RouterType::V3)
+            && routers.iter().any(|r| r.router_type == RouterType::V3)
         {
             warn!(
                 "[{}] optimistic_submission is on: triangular routes with a V3 leg are submitted on \
@@ -338,7 +331,6 @@ impl Strategy {
             min_profit_usd,
             min_triangular_profit_usd,
             quoter_v2_address,
-            syncswap_pool_cache: HashMap::new(),
             pool_cache,
             rpc_concurrency,
             pair_scan: Mutex::new(Vec::new()),
@@ -380,7 +372,7 @@ impl Strategy {
         }
         self.pairs
             .iter()
-            .filter(|p| p.chain_id == self.chain_id && disabled_triplets.contains(&p.id))
+            .filter(|p| disabled_triplets.contains(&p.id))
             .filter_map(|p| {
                 let ti: Address = p.token_in.parse().ok()?;
                 let to: Address = p.token_out.parse().ok()?;
@@ -470,14 +462,12 @@ impl Strategy {
             .pairs
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.chain_id == self.chain_id)
             .map(|(i, _)| i)
             .collect();
         self.chain_router_indices = self
             .routers
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.chain_id == self.chain_id)
             .map(|(i, _)| i)
             .collect();
         self.pair_id_to_index = self
@@ -528,7 +518,7 @@ impl Strategy {
         self.solidly_pool_keys = self
             .routers
             .iter()
-            .filter(|r| matches!(r.router_type, RouterType::Solidly | RouterType::Aerodrome))
+            .filter(|r| matches!(r.router_type, RouterType::Aerodrome))
             .map(|r| {
                 (
                     r.id.clone(),
@@ -536,159 +526,6 @@ impl Strategy {
                 )
             })
             .collect();
-    }
-
-    /// Populate the SyncSwap pool address cache by calling getPool() on each factory
-    /// for every configured pair. Must be awaited at startup and after config hot-reload.
-    ///
-    /// SyncSwap config entries use the `address` field as the Pool Factory address.
-    /// Both forward (A→B) and reverse (B→A) directions are stored (same pool address).
-    pub async fn populate_syncswap_pools<P: Provider + Clone>(&mut self, provider: &P) {
-        let syncswap_routers: Vec<RouterConfig> = self
-            .routers
-            .iter()
-            .filter(|r| r.chain_id == self.chain_id && r.router_type == RouterType::SyncSwap)
-            .cloned()
-            .collect();
-
-        if syncswap_routers.is_empty() {
-            return;
-        }
-
-        let chain_pairs: Vec<&PairConfig> = self
-            .pairs
-            .iter()
-            .filter(|p| p.chain_id == self.chain_id)
-            .collect();
-
-        let mut mc_calls: Vec<(Address, Vec<u8>)> = Vec::new();
-        // Metadata: (router_id, token_in_lower, token_out_lower)
-        let mut mc_meta: Vec<(String, String, String)> = Vec::new();
-
-        for pair in &chain_pairs {
-            let token_in: Address = match pair.token_in.parse() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let token_out: Address = match pair.token_out.parse() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            // Normalize addresses by parsing then formatting then lowercasing
-            let token_in_lower = format!("{token_in}").to_lowercase();
-            let token_out_lower = format!("{token_out}").to_lowercase();
-
-            for router in &syncswap_routers {
-                let factory_addr: Address = match router.address.parse() {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-
-                let calldata = ISyncSwapClassicPoolFactory::getPoolCall {
-                    tokenA: token_in,
-                    tokenB: token_out,
-                }
-                .abi_encode();
-
-                mc_calls.push((factory_addr, calldata));
-                mc_meta.push((router.id.clone(), token_in_lower.clone(), token_out_lower.clone()));
-            }
-        }
-
-        if mc_calls.is_empty() {
-            return;
-        }
-
-        let results = run_multicall(provider, mc_calls, self.rpc_concurrency).await;
-        let mut found = 0usize;
-
-        // Collect pool entries for the second round (seeding pool_cache with reserves).
-        struct SyncSwapPoolEntry { pool: Address, router_id: String, token_in: Address, token_out: Address, is_stable: bool }
-        let mut pool_entries: Vec<SyncSwapPoolEntry> = Vec::new();
-        let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
-        let mut seen_pools: std::collections::HashSet<Address> = std::collections::HashSet::new();
-
-        for ((router_id, token_in_lower, token_out_lower), raw_opt) in
-            mc_meta.into_iter().zip(results.into_iter())
-        {
-            let pool_opt: Option<Address> = raw_opt
-                .and_then(|raw| {
-                    ISyncSwapClassicPoolFactory::getPoolCall::abi_decode_returns(&raw).ok()
-                })
-                .filter(|a: &Address| !a.is_zero());
-
-            if pool_opt.is_some() {
-                found += 1;
-            }
-
-            // Store under forward AND reverse key (same pool serves both directions)
-            let key_fwd = format!("{}:{}:{}", router_id, token_in_lower, token_out_lower);
-            let key_rev = format!("{}:{}:{}", router_id, token_out_lower, token_in_lower);
-            self.syncswap_pool_cache.insert(key_fwd, pool_opt);
-            self.syncswap_pool_cache.insert(key_rev, pool_opt);
-
-            // Seed this pool into pool_cache for local computation (0 multicall detection).
-            if let Some(pool_addr) = pool_opt {
-                if seen_pools.insert(pool_addr) {
-                    // SyncSwap Stable pools use Curve StableSwap (An^n Σxi + D = const),
-                    // NOT Solidly x³y+xy³=k. The Solidly Newton-Raphson solver produces
-                    // wildly wrong outputs for Curve pools → phantom profitable quotes.
-                    // Exclude stable pools until a Curve StableSwap solver is implemented.
-                    if router_id.contains("stable") { continue; }
-                    let token_in: Address = match token_in_lower.parse() { Ok(a) => a, Err(_) => continue };
-                    let token_out: Address = match token_out_lower.parse() { Ok(a) => a, Err(_) => continue };
-                    let is_stable = false; // SyncSwap classic only (volatile xy=k)
-                    rv_calls.push((pool_addr, IUniswapV2Pair::token0Call {}.abi_encode()));
-                    rv_calls.push((pool_addr, IUniswapV2Pair::getReservesCall {}.abi_encode()));
-                    rv_calls.push((token_in, IERC20::decimalsCall {}.abi_encode()));
-                    rv_calls.push((token_out, IERC20::decimalsCall {}.abi_encode()));
-                    pool_entries.push(SyncSwapPoolEntry { pool: pool_addr, router_id: router_id.clone(), token_in, token_out, is_stable });
-                }
-            }
-        }
-
-        // Second multicall round: fetch token0 + reserves + decimals to seed pool_cache.
-        // After this, the Sync event listener will keep reserves fresh with zero RPC cost.
-        if !pool_entries.is_empty() {
-            let rv_raw = run_multicall(provider, rv_calls, self.rpc_concurrency).await;
-
-            for (i, pe) in pool_entries.iter().enumerate() {
-                let t0_raw  = match rv_raw.get(4 * i)     { Some(Some(r)) => r, _ => continue };
-                let res_raw = match rv_raw.get(4 * i + 1) { Some(Some(r)) => r, _ => continue };
-                let dec_ti: u8 = rv_raw.get(4 * i + 2).and_then(|r| r.as_ref())
-                    .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok()).unwrap_or(18);
-                let dec_to: u8 = rv_raw.get(4 * i + 3).and_then(|r| r.as_ref())
-                    .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok()).unwrap_or(18);
-
-                let token0   = match IUniswapV2Pair::token0Call::abi_decode_returns(t0_raw).ok()       { Some(t) => t, None => continue };
-                let reserves = match IUniswapV2Pair::getReservesCall::abi_decode_returns(res_raw).ok() { Some(r) => r, None => continue };
-
-                let token1 = if pe.token_in == token0 { pe.token_out } else { pe.token_in };
-                let (decimals0, decimals1) = if pe.token_in == token0 { (dec_ti, dec_to) } else { (dec_to, dec_ti) };
-
-                self.pool_cache.insert(pe.pool, PoolInfo {
-                    token0,
-                    token1,
-                    reserve0: U256::from(reserves.reserve0),
-                    reserve1: U256::from(reserves.reserve1),
-                    fee_bps: 10, // SyncSwap default ≈ 0.1% = 10 bps
-                    router_id: pe.router_id.clone(),
-                    is_stable: pe.is_stable,
-                    decimals0,
-                    decimals1,
-                    last_sync: std::time::Instant::now(), // startup reserves are accurate (just fetched)
-                    fee_num: alloy::primitives::U256::ZERO, // overwritten by PoolCache::insert()
-                });
-            }
-            debug!("[chain={}] SyncSwap: {} pools seeded into pool_cache", self.chain_id, pool_entries.len());
-        }
-
-        debug!(
-            "[chain={}] SyncSwap pool cache populated: {}/{} pairs have pools",
-            self.chain_id,
-            found,
-            self.syncswap_pool_cache.len() / 2
-        );
     }
 
     /// Returns indices into `self.pairs` for all pairs that trade `token_a` or `token_b`.
@@ -753,11 +590,11 @@ impl Strategy {
     }
 
     /// Update per-router QuoterV2 health after a batch and warn once on persistent failure:
-    /// - never returned a quote, failing for [`QUOTER_NEVER_OK_WARN_AFTER`] → likely wrong
+    /// - never returned a quote, failing for [`quoter_never_ok_warn_after()`] → likely wrong
     ///   quoter address/ABI (or every pool too thin to quote at trade size);
-    /// - worked before, failing for [`QUOTER_BROKEN_WARN_AFTER`] → persistent breakage.
+    /// - worked before, failing for [`quoter_broken_warn_after()`] → persistent breakage.
     ///
-    /// Both also need [`QUOTER_WARN_MIN_BATCHES`] failed batches in a row. Any success
+    /// Both also need [`quoter_warn_min_batches()`] failed batches in a row. Any success
     /// resets the streak, so a later breakage is warned again.
     pub(crate) fn note_quoter_health(&self, health: QuoterBatchHealth) {
         for (router_id, ok) in health.0 {
@@ -771,8 +608,8 @@ impl Strategy {
                 .or_insert((0, std::time::Instant::now(), false));
             let (batches, since, warned) = &mut *streak;
             *batches += 1;
-            let threshold = if ever_ok { QUOTER_BROKEN_WARN_AFTER } else { QUOTER_NEVER_OK_WARN_AFTER };
-            if !*warned && *batches >= QUOTER_WARN_MIN_BATCHES && since.elapsed() >= threshold {
+            let threshold = if ever_ok { quoter_broken_warn_after() } else { quoter_never_ok_warn_after() };
+            if !*warned && *batches >= quoter_warn_min_batches() && since.elapsed() >= threshold {
                 *warned = true;
                 if ever_ok {
                     warn!(
@@ -804,7 +641,7 @@ impl Strategy {
 /// Batch all calls into a single `eth_call` to Multicall3.
 /// Returns `Some(Vec<u8>)` for each call that succeeded, `None` for failures.
 /// Falls back to parallel individual `eth_call`s if Multicall3 is unavailable.
-/// Batch calls via Multicall3, chunking into groups of MULTICALL_CHUNK_SIZE.
+/// Batch calls via Multicall3, chunking into groups of multicall_chunk_size().
 /// All chunks are fired concurrently so total latency ≈ max(slowest chunk), not sum.
 /// Falls back to sequential individual eth_calls for any chunk that fails entirely.
 pub(crate) async fn run_multicall<P: Provider + Clone>(
@@ -823,7 +660,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
     // Materialise chunks into owned Vecs so the stream doesn't hold a borrow across awaits
     // (borrowed slice refs across await → future !Send → tokio::spawn compile error).
     let owned_chunks: Vec<Vec<(Address, Vec<u8>)>> = calls
-        .chunks(MULTICALL_CHUNK_SIZE)
+        .chunks(multicall_chunk_size())
         .map(|c| c.to_vec())
         .collect();
 
@@ -844,7 +681,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
         let tx = TransactionRequest::default().to(mc3).input(agg_calldata.into());
         let p = provider.clone();
         async move {
-            tokio::time::timeout(MULTICALL_CHUNK_TIMEOUT, p.call(tx)).await
+            tokio::time::timeout(multicall_chunk_timeout(), p.call(tx)).await
                 .map(|r| r.ok())
                 .map_err(|_| ())
         }
@@ -857,11 +694,11 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
     let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
     let mut call_offset = 0usize;
     for raw_res in chunk_raw {
-        let chunk_len = MULTICALL_CHUNK_SIZE.min(calls.len() - call_offset);
+        let chunk_len = multicall_chunk_size().min(calls.len() - call_offset);
         let Ok(raw_opt) = raw_res else {
             // Timed out: count the chunk's calls as failed. No sequential fallback — the
             // RPC is evidently stuck, and more calls would stall the scan loop further.
-            warn!("Multicall3 chunk timed out after {:?} — {} call(s) counted as failed", MULTICALL_CHUNK_TIMEOUT, chunk_len);
+            warn!("Multicall3 chunk timed out after {:?} — {} call(s) counted as failed", multicall_chunk_timeout(), chunk_len);
             out.extend(std::iter::repeat_n(None, chunk_len));
             call_offset += chunk_len;
             continue;
@@ -874,12 +711,12 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
             }
             None => {
                 // Chunk failed (Multicall3 unavailable or gas exceeded) — fall back sequentially.
-                warn!("Multicall3 chunk failed (gas limit exceeded?) — falling back to {} sequential eth_calls; reduce MULTICALL_CHUNK_SIZE if this persists", chunk_len);
+                warn!("Multicall3 chunk failed (gas limit exceeded?) — falling back to {} sequential eth_calls; reduce multicall_chunk_size() if this persists", chunk_len);
                 for (target, data) in calls[call_offset..call_offset + chunk_len].iter() {
                     let tx = TransactionRequest::default()
                         .to(*target)
                         .input(data.clone().into());
-                    let r = tokio::time::timeout(MULTICALL_CHUNK_TIMEOUT, provider.call(tx)).await;
+                    let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx)).await;
                     out.push(r.ok().and_then(|r| r.ok()).map(|b| b.to_vec()));
                 }
             }

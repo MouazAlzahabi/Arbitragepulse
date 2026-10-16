@@ -10,9 +10,11 @@
 *.db-shm
 *.db-wal
 
-# Environment files (secrets)
+# Environment files (secrets) — incl. per-instance engine/<instance>.env
 **/.env
+**/*.env
 !**/.env.example
+!**/*.env.example
 
 # Lab state
 .lab-state.json

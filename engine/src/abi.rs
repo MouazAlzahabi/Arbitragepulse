@@ -124,30 +124,6 @@ sol! {
     }
 }
 
-// ─── Solidly (ve(3,3)) Router ────────────────────────────────────────────────
-// Used by Lynex, Nile Exchange, and other Solidly forks on Linea.
-// fee field encoding (reuses uint24): 0 = volatile (vAMM: xy=k), 1 = stable (sAMM: x³y+y³x=k)
-
-sol! {
-    #[sol(rpc)]
-    interface ISolidlyRouter {
-        struct Route {
-            address from;
-            address to;
-            bool stable;
-        }
-        function getAmountsOut(uint256 amountIn, Route[] memory routes)
-            external view returns (uint256[] memory amounts);
-        function swapExactTokensForTokens(
-            uint256 amountIn,
-            uint256 amountOutMin,
-            Route[] calldata routes,
-            address to,
-            uint256 deadline
-        ) external returns (uint256[] memory amounts);
-    }
-}
-
 // ─── Aerodrome Router (Base) ──────────────────────────────────────────────────
 // Aerodrome V2 uses Route{from, to, stable, factory} (4-field).
 // factory=address(0) → router falls back to its internal default factory.
@@ -174,41 +150,7 @@ sol! {
     }
 }
 
-// ─── SyncSwap Pool (per-pool quoting) ────────────────────────────────────────
-// SyncSwap pools are queried directly (not via router).
-// Pool address obtained from factory.getPool(tokenA, tokenB).
-
-sol! {
-    #[sol(rpc)]
-    interface ISyncSwapPool {
-        function getAmountOut(
-            address tokenIn,
-            uint256 amountIn,
-            address sender
-        ) external view returns (uint256 amountOut);
-        // data = abi.encode(tokenIn, recipient, withdrawMode)
-        function swap(
-            bytes calldata data,
-            address sender,
-            address callback,
-            bytes calldata callbackData
-        ) external returns (uint256 amountOut);
-    }
-}
-
-// ─── SyncSwap Classic/Stable Pool Factory ────────────────────────────────────
-
-sol! {
-    #[sol(rpc)]
-    interface ISyncSwapClassicPoolFactory {
-        function getPool(
-            address tokenA,
-            address tokenB
-        ) external view returns (address pool);
-    }
-}
-
-// ─── V2 / Solidly Pair events ─────────────────────────────────────────────────
+// ─── V2 / Aerodrome Pair events ─────────────────────────────────────────────────
 
 sol! {
     event PairSwapV2(
@@ -239,12 +181,6 @@ sol! {
     #[sol(rpc)]
     interface IUniswapV2Factory {
         function getPair(address tokenA, address tokenB) external view returns (address pair);
-    }
-
-    #[sol(rpc)]
-    interface ISolidlyFactory {
-        /// stable=false → volatile (xy=k), stable=true → stable (x³y+y³x=k)
-        function getPair(address tokenA, address tokenB, bool stable) external view returns (address pair);
     }
 
     #[sol(rpc)]

@@ -201,7 +201,7 @@ impl Listener {
         let v3_count_log = v3_count.clone();
         let chain_name_c = chain_name.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(crate::config::tuning().price_refresh());
             let mut idle_ticks: u64 = 0;
             loop {
                 interval.tick().await;

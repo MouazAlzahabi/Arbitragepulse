@@ -31,15 +31,15 @@ pub fn addr_key(addr: Address) -> String {
 
 /// Background reads: native price, contract balances, RPC ping, nonce, gas price.
 /// On timeout the caller keeps its previous value.
-pub const RPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub fn rpc_read_timeout() -> std::time::Duration { crate::config::tuning().rpc_read_timeout() }
 
 /// Pre-flight simulation (eth_call of the signed tx) on the path to every trade.
 /// A simulation slower than this is stale anyway, so that candidate is skipped.
-pub const RPC_SIMULATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+pub fn rpc_simulate_timeout() -> std::time::Duration { crate::config::tuning().rpc_simulate_timeout() }
 
 /// eth_sendRawTransaction. On timeout the tx may still have been broadcast, so the
 /// nonce is treated as consumed and re-fetched.
-pub const RPC_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub fn rpc_send_timeout() -> std::time::Duration { crate::config::tuning().rpc_send_timeout() }
 
 /// Await an RPC future with a deadline. `Err` carries either the RPC error or a
 /// "timed out" message, so callers that only log or count failures can use it as-is.
@@ -78,28 +78,28 @@ pub async fn transport_timeout<T>(
 // No state depends on scans happening, so a quiet market can't leave it stuck.
 
 /// Hold after an outage before the monitor may clear it.
-pub const RPC_HOLD_BASE: std::time::Duration = std::time::Duration::from_secs(10);
+pub fn rpc_hold_base() -> std::time::Duration { crate::config::tuning().health_hold_base() }
 /// Longest hold (repeated relapses double it: 10, 20, 40, 80 s).
-pub const RPC_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(80);
+pub fn rpc_hold_max() -> std::time::Duration { crate::config::tuning().health_hold_max() }
 /// Degrading again within this long after recovering counts as a relapse (the probe
 /// passed but execution still failed), so the hold doubles instead of resetting.
-pub const RPC_RELAPSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+pub fn rpc_relapse_window() -> std::time::Duration { crate::config::tuning().health_relapse_window() }
 /// How often the monitor probes a degraded chain.
-pub const RPC_MONITOR_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+pub fn rpc_monitor_every() -> std::time::Duration { crate::config::tuning().health_monitor_every() }
 
 /// The node counts as healthy when a plain eth_call (the method simulations use)
 /// succeeds within this — the simulation timeout, since a node slower than that can't
 /// complete a simulation (seen on a fork at 1.5 s latency: execution flapped every
 /// ~15 s and nothing ran). Any error, including a gateway's JSON-RPC "upstream timeout",
 /// is unhealthy; a rate limit is healthy (the node is up — pairs cool down separately).
-pub const RPC_PROBE_HEALTHY: std::time::Duration = RPC_SIMULATE_TIMEOUT;
+pub fn rpc_probe_healthy() -> std::time::Duration { rpc_simulate_timeout() }
 
 /// Hold for an outage starting now, given the previous hold and how long ago the chain
 /// last recovered (`None` = never, or not since the last pause).
 pub fn next_hold(prev: std::time::Duration, since_recovery: Option<std::time::Duration>) -> std::time::Duration {
     match since_recovery {
-        Some(t) if t < RPC_RELAPSE_WINDOW => (prev * 2).clamp(RPC_HOLD_BASE, RPC_HOLD_MAX),
-        _ => RPC_HOLD_BASE,
+        Some(t) if t < rpc_relapse_window() => (prev * 2).clamp(rpc_hold_base(), rpc_hold_max()),
+        _ => rpc_hold_base(),
     }
 }
 
@@ -124,7 +124,7 @@ pub struct RpcHealth {
 pub type SharedRpcHealth = std::sync::Arc<RpcHealth>;
 
 /// Minimum interval between rate-limit reports per chain.
-pub const RATE_LIMIT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+pub fn rate_limit_log_every() -> std::time::Duration { crate::config::tuning().rate_limit_log_every() }
 
 impl RpcHealth {
     fn lock(&self) -> std::sync::MutexGuard<'_, HealthState> {
@@ -169,10 +169,10 @@ impl RpcHealth {
         *self.lock() = HealthState::default();
     }
 
-    /// True at most once per [`RATE_LIMIT_LOG_EVERY`].
+    /// True at most once per [`rate_limit_log_every()`].
     pub fn rate_limit_log_due(&self) -> bool {
         let mut last = self.rate_limit_logged.lock().unwrap_or_else(|e| e.into_inner());
-        let due = last.is_none_or(|t| t.elapsed() >= RATE_LIMIT_LOG_EVERY);
+        let due = last.is_none_or(|t| t.elapsed() >= rate_limit_log_every());
         if due {
             *last = Some(std::time::Instant::now());
         }
@@ -271,23 +271,23 @@ mod tests {
     #[test]
     fn hold_starts_at_base_and_doubles_only_on_relapse() {
         let s = Duration::from_secs;
-        assert_eq!(next_hold(Duration::ZERO, None), RPC_HOLD_BASE);
+        assert_eq!(next_hold(Duration::ZERO, None), rpc_hold_base());
         // Relapse within the window doubles…
         assert_eq!(next_hold(s(10), Some(s(5))), s(20));
         assert_eq!(next_hold(s(40), Some(s(59))), s(80));
         // …capped…
-        assert_eq!(next_hold(s(80), Some(s(1))), RPC_HOLD_MAX);
+        assert_eq!(next_hold(s(80), Some(s(1))), rpc_hold_max());
         // …and a healthy stretch resets it, however long the previous hold was.
-        assert_eq!(next_hold(s(80), Some(RPC_RELAPSE_WINDOW)), RPC_HOLD_BASE);
+        assert_eq!(next_hold(s(80), Some(rpc_relapse_window())), rpc_hold_base());
         // A first relapse after a zero/short hold never goes below base.
-        assert_eq!(next_hold(Duration::ZERO, Some(s(1))), RPC_HOLD_BASE);
+        assert_eq!(next_hold(Duration::ZERO, Some(s(1))), rpc_hold_base());
     }
 
     #[test]
     fn one_outage_marks_once_and_recover_clears() {
         let h = RpcHealth::default();
         assert!(!h.is_degraded());
-        assert_eq!(h.mark_outage(), Some(RPC_HOLD_BASE));
+        assert_eq!(h.mark_outage(), Some(rpc_hold_base()));
         assert!(h.is_degraded());
         assert_eq!(h.mark_outage(), None, "same outage must not be reported twice");
         assert!(!h.probe_due(), "hold has not passed yet");
@@ -295,10 +295,10 @@ mod tests {
         assert!(!h.is_degraded());
         assert!(h.recover().is_none());
         // Relapse right after recovering: hold doubles.
-        assert_eq!(h.mark_outage(), Some(RPC_HOLD_BASE * 2));
+        assert_eq!(h.mark_outage(), Some(rpc_hold_base() * 2));
         h.clear();
         assert!(!h.is_degraded());
-        assert_eq!(h.mark_outage(), Some(RPC_HOLD_BASE), "pause resets escalation");
+        assert_eq!(h.mark_outage(), Some(rpc_hold_base()), "pause resets escalation");
     }
 
     #[test]

@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
             println!();
             println!("Prerequisites:");
             println!("  1. Compile contracts: cd ../contract && forge build");
-            println!("  2. Start Anvil: anvil --fork-url <OPTIMISM_RPC> --chain-id 10 --block-time 2");
+            println!("  2. Start Anvil: anvil --fork-url <BASE_RPC> --chain-id 8453 --block-time 2");
         }
     }
 

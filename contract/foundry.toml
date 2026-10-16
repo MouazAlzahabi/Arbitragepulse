@@ -9,15 +9,14 @@ via_ir = true
 
 # Anvil fork for integration tests
 [rpc_endpoints]
-optimism = "${OPTIMISM_RPC}"
 base = "${BASE_RPC}"
-gnosis = "${GNOSIS_RPC}"
+base_sepolia = "${BASE_SEPOLIA_RPC}"
 local = "http://127.0.0.1:8545"
 
 # Etherscan verification
 [etherscan]
-optimism = { key = "${OPTIMISTIC_ETHERSCAN_API_KEY}", chain = 10, url = "https://api-optimistic.etherscan.io/api" }
 base = { key = "${BASESCAN_API_KEY}", chain = 8453, url = "https://api.basescan.org/api" }
+base_sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532, url = "https://api-sepolia.basescan.org/api" }
 
 # Formatting
 [fmt]

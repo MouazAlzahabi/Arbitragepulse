@@ -11,14 +11,14 @@ import "../src/ArbitrageExecutor.sol";
  *   # Deploy to Anvil (local fork)
  *   forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
  *
- *   # Deploy to Optimism mainnet
- *   forge script script/Deploy.s.sol --rpc-url $OPTIMISM_RPC --broadcast --verify
+ *   # Deploy to Base Sepolia (testing stage)
+ *   forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC --broadcast
  *
  *   # Deploy to Base
  *   forge script script/Deploy.s.sol --rpc-url $BASE_RPC --broadcast --verify
  *
  *   # Dry-run (simulate only, no broadcast)
- *   forge script script/Deploy.s.sol --rpc-url $OPTIMISM_RPC
+ *   forge script script/Deploy.s.sol --rpc-url $BASE_RPC
  */
 contract DeployExecutor is Script {
     function run() external {
@@ -41,7 +41,7 @@ contract DeployExecutor is Script {
         console.log("======================================");
         console.log("");
         console.log("Next steps:");
-        console.log("  1. Verify:  forge verify-contract", address(executor), "ArbitrageExecutor --chain optimism");
+        console.log("  1. Verify:  forge verify-contract", address(executor), "ArbitrageExecutor --chain base");
         console.log("  2. Fund:    Send WETH/USDC to", address(executor));
         console.log("  3. Update:  CONTRACT_ADDRESS=", address(executor));
     }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::util::{rpc_timeout, RPC_READ_TIMEOUT};
+use crate::util::{rpc_timeout, rpc_read_timeout};
 
 pub(crate) async fn update_native_price<P: Provider>(
     strategy: &Arc<RwLock<Strategy>>,
@@ -10,7 +10,7 @@ pub(crate) async fn update_native_price<P: Provider>(
     cfg: &ChainConfig,
 ) {
     use crate::abi::{IUniswapV2Router02, IQuoterV2};
-    use crate::pool_cache::VOLATILE_MAX_AGE;
+    use crate::pool_cache::volatile_max_age;
     use alloy::primitives::{U256, Uint};
     use crate::config::RouterType;
 
@@ -32,8 +32,7 @@ pub(crate) async fn update_native_price<P: Provider>(
 
     // Find a pair: WrappedNative → Stablecoin (USDC, USDT, DAI)
     let stable_pair = pairs.iter().find(|p| {
-        p.chain_id == cfg.id
-            && p.token_in == cfg.wrapped_native
+        p.token_in == cfg.wrapped_native
             && ["USDC", "USDT", "DAI"].contains(&p.token_out_symbol.as_str())
     });
     let stable_pair = match stable_pair { Some(p) => p, None => return };
@@ -48,13 +47,13 @@ pub(crate) async fn update_native_price<P: Provider>(
     // ── Try local V2 pool cache first (zero RPC on the 60s tick) ────────────
     {
         let strat = strategy.read().await;
-        for router in routers.iter().filter(|r| r.chain_id == cfg.id && r.router_type == RouterType::V2) {
+        for router in routers.iter().filter(|r| r.router_type == RouterType::V2) {
             if let Some(out) = strat.pool_cache.get_amount_out_by_key_str(
                 &router.id,
                 wrapped_native,
                 token_out,
                 probe_amount,
-                Some(VOLATILE_MAX_AGE),
+                Some(volatile_max_age()),
             ) {
                 if !out.is_zero() {
                     let price = out.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
@@ -74,7 +73,7 @@ pub(crate) async fn update_native_price<P: Provider>(
     // the deepest pool gives the most accurate market price.
     {
         let mut best_v3_price = 0.0;
-        for router in routers.iter().filter(|r| r.chain_id == cfg.id && r.router_type == RouterType::V3) {
+        for router in routers.iter().filter(|r| r.router_type == RouterType::V3) {
             // Effective quoter: per-router first, chain-level fallback
             let quoter_str = router.quoter_address.as_deref()
                 .map(str::to_owned)
@@ -94,7 +93,7 @@ pub(crate) async fn update_native_price<P: Provider>(
                     fee: Uint::from(*fee),
                     sqrtPriceLimitX96: Uint::ZERO,
                 });
-                if let Ok(r) = rpc_timeout(RPC_READ_TIMEOUT, quote.call()).await {
+                if let Ok(r) = rpc_timeout(rpc_read_timeout(), quote.call()).await {
                     if !r.amountOut.is_zero() {
                         let price = r.amountOut.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
                         debug!("[{}] {} price V3 router={} fee={} → ${:.2}", cfg.name, cfg.native_currency, router.id, fee, price);
@@ -112,12 +111,12 @@ pub(crate) async fn update_native_price<P: Provider>(
     }
 
     // ── Fall back to V2 getAmountsOut ──
-    for router in routers.iter().filter(|r| r.chain_id == cfg.id && r.router_type == RouterType::V2) {
+    for router in routers.iter().filter(|r| r.router_type == RouterType::V2) {
         let router_addr: Address = match router.address.parse() { Ok(a) => a, Err(_) => continue };
 
         let v2_router = IUniswapV2Router02::new(router_addr, provider.as_ref());
         let amounts_call = v2_router.getAmountsOut(probe_amount, vec![wrapped_native, token_out]);
-        if let Ok(amounts) = rpc_timeout(RPC_READ_TIMEOUT, amounts_call.call()).await {
+        if let Ok(amounts) = rpc_timeout(rpc_read_timeout(), amounts_call.call()).await {
             if let Some(&out) = amounts.last() {
                 if !out.is_zero() {
                     let price = out.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
@@ -157,7 +156,7 @@ pub(crate) async fn refresh_contract_balances<P: Provider + Clone>(
         async move {
             (
                 token,
-                rpc_timeout(RPC_READ_TIMEOUT, IERC20::new(token, &p).balanceOf(contract_addr).call()).await,
+                rpc_timeout(rpc_read_timeout(), IERC20::new(token, &p).balanceOf(contract_addr).call()).await,
             )
         }
     }))

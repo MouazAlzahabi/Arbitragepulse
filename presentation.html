@@ -306,7 +306,7 @@
   <div class="tag">Architecture</div>
   <h2 style="margin-bottom:14px;">Data Flow — End to End</h2>
   <div class="arch" style="max-width:1060px;">
-<span class="hl">┌─ Blockchain (Base / Linea) — 2s block cadence ──────────────────────────────────────────┐</span><br/>
+<span class="hl">┌─ Blockchain (Base) — 2s block cadence ─────────────────────────────────────────────────┐</span><br/>
 <span class="hl">│</span>  <span class="d">WebSocket stream:</span>  <span class="g">newBlock(num, baseFee)</span>  +  <span class="g">Log(address, topics[], data)</span>  <span class="d">per Swap/Sync event</span>  <span class="hl">│</span><br/>
 <span class="hl">└────────────────────────────────────────────────┬────────────────────────────────────────┘</span><br/>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="hl">│</span> <span class="d">&lt;1ms — decode + route</span><br/>
@@ -414,7 +414,7 @@ pool_info.last_sync = Instant::now()</span>
     <div>
       <div class="card green-border" style="margin-bottom:14px;">
         <h3>Curve 1 — Volatile pools: <code>xy = k</code></h3>
-        <p style="margin-bottom:8px;">Constant product. Used by: Uniswap V2, Aerodrome volatile, SyncSwap classic.</p>
+        <p style="margin-bottom:8px;">Constant product. Used by: Uniswap V2, Aerodrome volatile.</p>
         <pre><span class="c">// Closed form: O(1)</span>
 <span class="g">dy = y · dx / (x + dx)</span>
 
@@ -549,7 +549,6 @@ dy     = y · dx_adj / (x + dx_adj)</span></pre>
           <li><code>V3</code> — <code>exactInputSingle()</code> (7-field SwapRouter02)</li>
           <li><code>Solidly</code> — <code>swapExactTokensForTokens(routes[])</code></li>
           <li><code>Aerodrome</code> — Solidly + extra <code>factory</code> field in route</li>
-          <li><code>SyncSwap</code> — direct transfer to pool, then <code>pool.swap()</code></li>
         </ul>
       </div>
     </div>
@@ -832,7 +831,7 @@ run_multicall(provider, p1_mc).await  // ← empty</span>
     </div>
     <div style="display:flex;gap:20px;padding:4px 14px;background:#0a0f1a;border-bottom:1px solid #1e293b;font-size:10px;color:#475569;">
       <span>WS latency (Base): <span style="color:#34d399;">47ms</span></span>
-      <span>WS latency (Linea): <span style="color:#fbbf24;">183ms</span></span>
+      <span>WS latency (Base): <span style="color:#fbbf24;">183ms</span></span>
       <span>Dashboard ping: <span style="color:#34d399;">12ms</span></span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:8px;max-height:270px;overflow:hidden;">
@@ -846,7 +845,7 @@ run_multicall(provider, p1_mc).await  // ← empty</span>
             </div>
           </div>
           <div style="background:linear-gradient(135deg,#0f172a,#1e1b4b);border:1px solid #1e293b;border-radius:6px;padding:8px 10px;">
-            <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-weight:700;color:#e2e8f0;font-size:11px;">Linea</span><span style="font-size:8px;color:#34d399;background:#052e16;padding:1px 6px;border-radius:8px;">ACTIVE</span></div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-weight:700;color:#e2e8f0;font-size:11px;">Base</span><span style="font-size:8px;color:#34d399;background:#052e16;padding:1px 6px;border-radius:8px;">ACTIVE</span></div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px;font-size:9px;">
               <span style="color:#475569;">Scans <span style="color:#94a3b8;">1,403</span></span><span style="color:#475569;">Exec <span style="color:#94a3b8;">146</span></span>
               <span style="color:#475569;">✓ <span style="color:#34d399;">3</span></span><span style="color:#475569;">$ <span style="color:#a78bfa;">$0.61</span></span>

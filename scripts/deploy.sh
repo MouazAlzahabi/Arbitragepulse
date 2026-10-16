@@ -6,6 +6,10 @@
 #   ./scripts/deploy.sh botadmin@1.2.3.4      # override server
 #   ./scripts/deploy.sh --code-only           # skip rebuild (config/script changes only)
 #   ./scripts/deploy.sh --build-only          # rebuild + restart, no rsync
+#   ./scripts/deploy.sh --instance=base-sepolia  # restart another instance (default: base)
+#
+# One engine instance per chain: systemd unit arbitragepulse@<instance>, env file
+# engine/<instance>.env on the server.
 #
 # Requires: ssh key auth already set up (run ssh-copy-id first)
 
@@ -20,11 +24,13 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Flags ──────────────────────────────────────────────────────────────────────
 DO_SYNC=true
 DO_BUILD=true
+INSTANCE="base"
 
 for arg in "$@"; do
     case "$arg" in
         --code-only)  DO_BUILD=false ;;
         --build-only) DO_SYNC=false ;;
+        --instance=*) INSTANCE="${arg#--instance=}" ;;
         botadmin@*|root@*)  SERVER="$arg" ;;
     esac
 done
@@ -34,6 +40,7 @@ echo " ArbitragePulse Deploy → ${SERVER}"
 echo "================================================"
 echo "  Sync:  $DO_SYNC"
 echo "  Build: $DO_BUILD"
+echo "  Instance: arbitragepulse@${INSTANCE}"
 echo ""
 
 # ── Step 0: Dashboard static bundle (dist/) — gitignored, must build before rsync
@@ -56,6 +63,7 @@ if [ "$DO_SYNC" = true ]; then
         --exclude 'lab/' \
         --exclude '*.log' \
         --exclude '*.db' \
+        --exclude '*.env' \
         "$PROJECT_ROOT/" "$SERVER:$REMOTE_PATH/"
     echo "      Sync complete"
 else
@@ -78,23 +86,25 @@ if [ "$DO_BUILD" = true ]; then
 
     echo "[3/3] Restarting service + health check..."
     ssh "$SERVER" "
-        sudo systemctl restart arbitragepulse
+        sudo systemctl restart arbitragepulse@${INSTANCE}
         sleep 6
-        source $REMOTE_PATH/engine/.env
-        STATUS=\$(curl -sf --max-time 5 \
+        source $REMOTE_PATH/engine/${INSTANCE}.env
+        # -s, not -sf: /health answers 503 while degraded (RPC down or in backoff) —
+        # still print the body so the reason is visible.
+        STATUS=\$(curl -s --max-time 5 \
             -H \"Authorization: Bearer \$API_KEY\" \
             \"http://localhost:\${PORT:-3000}/health\" | python3 -c \"
 import sys, json
 d = json.load(sys.stdin)
 chains = ', '.join(c['chain_name'] + ':' + ('OK' if c['rpc_ok'] else 'FAIL') for c in d.get('chains',[]))
 print(f\\\"status={d['status']} chains=[{chains}] uptime={d['uptime_seconds']}s\\\")
-\" 2>/dev/null || echo 'health check failed — check journalctl -u arbitragepulse')
+\" 2>/dev/null || echo 'health check failed — check journalctl -u arbitragepulse@${INSTANCE}')
         echo \"\$STATUS\"
     "
 else
     echo "[2/3] Build skipped"
     echo "[3/3] Restarting service..."
-    ssh "$SERVER" "sudo systemctl restart arbitragepulse && echo 'Restarted'"
+    ssh "$SERVER" "sudo systemctl restart arbitragepulse@${INSTANCE} && echo 'Restarted arbitragepulse@${INSTANCE}'"
 fi
 
 echo ""
@@ -103,6 +113,6 @@ echo " Deploy complete!"
 echo "================================================"
 echo ""
 echo "Monitor:"
-echo "  ssh $SERVER 'journalctl -fu arbitragepulse'"
-echo "  ssh $SERVER 'tail -f /var/log/arbitragepulse/engine.log'"
+echo "  ssh $SERVER 'journalctl -fu arbitragepulse@${INSTANCE}'"
+echo "  ssh $SERVER 'tail -f /var/log/arbitragepulse/${INSTANCE}.log'"
 echo ""

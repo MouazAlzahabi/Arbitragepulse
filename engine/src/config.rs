@@ -8,7 +8,6 @@ use serde::Deserialize;
 pub struct ChainConfig {
     pub id: u64,
     pub name: String,
-    pub enabled: bool,
     pub ws_rpc: String,
     pub http_rpc: String,
     pub native_currency: String,
@@ -96,7 +95,7 @@ pub struct ChainConfig {
     #[serde(default)]
     pub pending_only_submission: bool,
     /// Poll `eth_getLogs` on an interval as a fallback when WS `eth_subscribe(logs)` is
-    /// unavailable or unreliable (e.g. some Linea providers). On Base with Alchemy WS,
+    /// unavailable or unreliable on the provider. On Base with Alchemy WS,
     /// leave **false** — WS updates are faster and avoid duplicate RPC + cache writes.
     #[serde(default)]
     pub poll_logs_fallback: bool,
@@ -139,17 +138,9 @@ fn default_large_v3_threshold_bps() -> u32 {
 pub enum RouterType {
     V2,
     V3,
-    /// Solidly / ve(3,3) fork (Lynex, Nile, Velodrome-style).
-    /// Uses Route[]{from, to, stable} interface.
-    /// fee field encodes pool type: 0=volatile, 1=stable.
-    Solidly,
-    /// SyncSwap: per-pool quoting via pool.getAmountOut(tokenIn, amountIn, sender).
-    /// The router `address` in config points to the Pool Factory.
-    /// Quoting only — execution requires major contract changes (not yet supported).
-    SyncSwap,
-    /// Aerodrome V2 (Base): uses Route{from, to, stable, factory} (4-field struct).
-    /// Same pool discovery and local quoting as Solidly, different execution interface.
-    /// fee=0 → volatile (xy=k), fee=1 → stable (x³y+y³x=k).
+    /// Aerodrome V2 (Base) — Solidly-family ve(3,3) DEX with Route{from, to, stable, factory}
+    /// (4-field struct). Volatile (xy=k) and stable (x³y+y³x=k) pools.
+    /// fee=0 → volatile, fee=1 → stable.
     /// factory=address(0) in Route → Aerodrome uses its own default factory.
     Aerodrome,
 }
@@ -164,7 +155,6 @@ impl Default for RouterType {
 pub struct RouterConfig {
     pub id: String,
     pub name: String,
-    pub chain_id: u64,
     pub address: String,
     #[serde(rename = "type", default)]
     pub router_type: RouterType,
@@ -175,8 +165,8 @@ pub struct RouterConfig {
     pub fee_tiers: Vec<u32>,
     /// Per-router QuoterV2 address for V3 quotes.
     /// If set, overrides the chain-level quoter_v2_address for this specific router.
-    /// Required when multiple V3 protocols on the same chain each have their own QuoterV2
-    /// (e.g., PancakeSwap V3 vs Uniswap V3 on Linea).
+    /// Required when multiple V3 protocols on the chain each have their own QuoterV2
+    /// (e.g., PancakeSwap V3 vs Uniswap V3).
     #[serde(default)]
     pub quoter_address: Option<String>,
     /// V3 pool factory address. Required for V3 pool discovery at startup.
@@ -192,7 +182,6 @@ pub struct RouterConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct PairConfig {
     pub id: String,
-    pub chain_id: u64,
     pub token_in: String,
     pub token_out: String,
     pub token_in_symbol: String,
@@ -213,21 +202,26 @@ pub struct PairConfig {
     pub watch_pools: Vec<String>,
 }
 
+/// One config file = one chain = one engine instance. To run another chain, deploy
+/// another instance with its own config file, `.env`, `PORT` and database.
 #[derive(Debug, Deserialize)]
 struct AppConfigRaw {
-    chains: Vec<ChainConfig>,
+    chain: Option<ChainConfig>,
     routers: Vec<RouterConfig>,
     #[serde(default)]
     pairs: Vec<PairConfig>,
+    #[serde(default)]
+    tuning: Tuning,
 }
 
 // ─── Parsed config (validated) ────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    pub chains: Vec<ChainConfig>,
+    pub chain: ChainConfig,
     pub routers: Vec<RouterConfig>,
     pub pairs: Vec<PairConfig>,
+    pub tuning: Tuning,
 }
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
@@ -242,6 +236,8 @@ pub struct Env {
     /// Whether to start in dry-run mode (detect-only, no tx submission).
     /// Set DRY_RUN=false in .env to start live. Default: true (safe default).
     pub dry_run: bool,
+    /// SQLite trade database. One per instance (DB_PATH, default `trades.db`).
+    pub db_path: String,
 }
 
 pub fn load_env() -> Result<Env> {
@@ -266,6 +262,7 @@ pub fn load_env() -> Result<Env> {
         dry_run: std::env::var("DRY_RUN")
             .map(|v| v.to_lowercase() != "false")
             .unwrap_or(true), // safe default: start dry unless explicitly set to false
+        db_path: std::env::var("DB_PATH").unwrap_or_else(|_| "trades.db".into()),
     })
 }
 
@@ -284,22 +281,387 @@ pub fn load_config(path: &str) -> Result<AppConfig> {
 
     let content = substitute_env_vars(raw_content);
 
-    let raw: AppConfigRaw = serde_yaml::from_str(&content)
-        .map_err(|e| anyhow!("Invalid config YAML: {}", e))?;
+    parse_config(&content)
+}
 
-    // Validate contract addresses
-    for chain in &raw.chains {
-        if chain.enabled && chain.contract_address.contains("YOUR_") {
-            return Err(anyhow!(
-                "Chain '{}' is enabled but contract_address is not set",
-                chain.name
-            ));
+/// Parse and validate config YAML (after env substitution).
+pub fn parse_config(content: &str) -> Result<AppConfig> {
+    // Old multi-chain files: say so before any field-level error (e.g. a removed
+    // router type) would hide the real reason.
+    let doc: serde_yaml::Value = serde_yaml::from_str(content)
+        .map_err(|e| anyhow!("Invalid config YAML: {}", e))?;
+    if doc.get("chains").is_some() {
+        return Err(anyhow!(
+            "`chains:` list is no longer supported — one chain per instance. \
+             Use a single `chain:` block, and run another instance for another chain."
+        ));
+    }
+    let raw: AppConfigRaw = serde_yaml::from_value(doc)
+        .map_err(|e| anyhow!("Invalid config YAML: {}", e))?;
+    let chain = raw.chain.ok_or_else(|| anyhow!("config is missing the `chain:` block"))?;
+    if chain.contract_address.contains("YOUR_") {
+        return Err(anyhow!("Chain '{}': contract_address is not set", chain.name));
+    }
+    raw.tuning.validate(chain.block_time_ms)?;
+
+    Ok(AppConfig {
+        chain,
+        routers: raw.routers,
+        pairs: raw.pairs,
+        tuning: raw.tuning,
+    })
+}
+
+/// Fail fast when the RPC serves a different chain than the config describes (e.g. a
+/// mainnet config pointed at a testnet RPC, or the reverse).
+pub fn check_chain_id(configured: u64, rpc_reported: u64, chain_name: &str) -> Result<()> {
+    if configured == rpc_reported {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "RPC for '{}' reports chain id {} but the config says {} — refusing to start \
+             (wrong RPC URL or wrong config file?)",
+            chain_name, rpc_reported, configured
+        ))
+    }
+}
+
+// ─── Tuning ───────────────────────────────────────────────────────────────────
+// Every timing and threshold the engine uses, in one place. All fields default to the
+// values tuned on Base (2 s blocks); override any of them in the config's `tuning:`
+// section. Fields marked "block-relative" default to a multiple of `block_time_ms`, so a
+// chain with a different block interval gets sensible values without overriding them.
+// Read once at startup (config hot-reload does not change tuning — restart instead).
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tuning {
+    // ── Execution ──
+    /// Gas limit for a 2-hop arb tx.
+    pub gas_limit_2hop: u64,
+    /// Gas limit for a triangular (3-hop) arb tx.
+    pub gas_limit_triangular: u64,
+    /// Bps shaved off the gas-derived minProfit before encoding (sell-leg min-out slack).
+    pub router_min_out_slack_bps: u64,
+    /// Final multiplier (bps of 10_000) on the gas-floor minProfit sent on-chain.
+    pub sell_leg_minprofit_mul_bps: u64,
+    /// Margin (bps) on the last known gas price when a fetch fails.
+    pub gas_fallback_margin_bps: u64,
+    /// Max age of the last known gas price to reuse it (ms).
+    pub gas_fallback_max_age_ms: u64,
+
+    // ── Detection ──
+    /// Haircut (bps) on quoted output before profit checks.
+    pub quoter_haircut_bps: u64,
+    /// Local spread above which Phase 1.5 QuoterV2 verification runs (fraction).
+    pub p15_gate_spread: f64,
+    /// Minimum active-tick liquidity for a V3 pool to be tradeable.
+    pub min_v3_liquidity: u128,
+    /// Cap on a V3 spot quote's input as a fraction of virtual reserves (bps).
+    pub v3_spot_max_vr_fraction_bps: u64,
+    /// Per-V3-leg spot overestimate deducted in optimistic mode (bps).
+    pub v3_spot_overestimate_bps: u64,
+    /// Profit above this share of input is treated as a phantom quote (bps; 500 = 5%).
+    pub phantom_cap_bps: u64,
+    /// Triangular V3 verification: max QuoterV2 rounds.
+    pub tri_verify_max_rounds: usize,
+    /// Triangular V3 verification: lower bracket point below the upper bound (bps).
+    pub tri_verify_bracket_bps: u64,
+    /// Triangular V3 verification: max gap to reuse a quoted point (bps).
+    pub tri_verify_max_gap_bps: u64,
+    /// Size optimizer: coarse and fine probe counts.
+    pub optimizer_coarse_steps: usize,
+    pub optimizer_fine_steps: usize,
+    /// Size optimizer: spread above which the coarse range widens (fraction).
+    pub optimizer_large_spread: f64,
+    /// How long a volatile (V2 / Aerodrome-volatile) and a stable pool's reserves count as
+    /// fresh without a Sync event (ms).
+    pub volatile_pool_max_age_ms: u64,
+    pub stable_pool_max_age_ms: u64,
+    /// V3 pools with no Swap event for this long count as stale in the heartbeat (ms).
+    pub v3_fresh_window_ms: u64,
+    /// Evict pools whose state hasn't been refreshed for this long (ms).
+    pub pool_prune_after_ms: u64,
+
+    // ── RPC ──
+    /// Timeout for background reads: price, balances, gas, nonce, ping (ms).
+    pub rpc_read_timeout_ms: u64,
+    /// Timeout for the pre-flight / dry-run simulation (ms). Block-relative: ½ block.
+    pub rpc_simulate_timeout_ms: Option<u64>,
+    /// Timeout for eth_sendRawTransaction (ms).
+    pub rpc_send_timeout_ms: u64,
+    /// Calls per Multicall3 batch, and the timeout for one batch (ms).
+    pub multicall_chunk_size: usize,
+    pub multicall_chunk_timeout_ms: u64,
+    /// Startup pool-discovery batch size and timeout (ms).
+    pub discover_chunk_size: usize,
+    pub discover_call_timeout_ms: u64,
+    /// Max age of a cached 2-hop QuoterV2 result (ms). Block-relative: 3 blocks.
+    pub quote_cache_max_age_ms: Option<u64>,
+    pub quote_cache_max_pools: usize,
+    /// RPC health: hold after an outage, cap for repeated relapses, relapse window (ms).
+    pub health_hold_base_ms: u64,
+    pub health_hold_max_ms: u64,
+    pub health_relapse_window_ms: u64,
+    /// RPC health: monitor probe interval (ms). Block-relative: 1 block.
+    pub health_monitor_every_ms: Option<u64>,
+    /// QuoterV2 health warnings: never-worked / broke-after-working thresholds (ms) and
+    /// minimum failed batches.
+    pub quoter_never_ok_warn_after_ms: u64,
+    pub quoter_broken_warn_after_ms: u64,
+    pub quoter_warn_min_batches: u32,
+    /// Minimum interval between rate-limit reports (ms).
+    pub rate_limit_log_every_ms: u64,
+
+    // ── Scan loop ──
+    /// Cooldowns after a failed attempt, after a send, and after a gas-unprofitable skip (s).
+    pub cooldown_secs: u64,
+    pub send_cooldown_secs: u64,
+    pub gas_reject_cooldown_secs: u64,
+    /// Consecutive non-RPC execution failures before the chain is paused.
+    pub max_consecutive_failures: u32,
+    /// Warn when one scan holds the loop this long (ms).
+    pub slow_scan_warn_ms: u64,
+    /// Heartbeat warns when no full scan ran this long (ms).
+    pub heartbeat_stall_warn_ms: u64,
+    /// Native-price refresh + heartbeat, contract-balance refresh, config hot-reload (ms).
+    pub price_refresh_ms: u64,
+    pub balance_refresh_ms: u64,
+    pub config_reload_ms: u64,
+    /// Max backoff between WS (re)connect attempts for subscriptions (ms).
+    pub ws_reconnect_max_backoff_ms: u64,
+
+    /// Set from the chain's block_time_ms at install (not configurable here).
+    #[serde(skip)]
+    block_time_ms: u64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            gas_limit_2hop: 700_000,
+            gas_limit_triangular: 900_000,
+            router_min_out_slack_bps: 200,
+            sell_leg_minprofit_mul_bps: 6200,
+            gas_fallback_margin_bps: 2_500,
+            gas_fallback_max_age_ms: 120_000,
+            quoter_haircut_bps: 15,
+            p15_gate_spread: 0.00005,
+            min_v3_liquidity: 1_000_000_000,
+            v3_spot_max_vr_fraction_bps: 200,
+            v3_spot_overestimate_bps: 30,
+            phantom_cap_bps: 500,
+            tri_verify_max_rounds: 3,
+            tri_verify_bracket_bps: 100,
+            tri_verify_max_gap_bps: 10,
+            optimizer_coarse_steps: 5,
+            optimizer_fine_steps: 5,
+            optimizer_large_spread: 0.05,
+            volatile_pool_max_age_ms: 120_000,
+            stable_pool_max_age_ms: 30_000,
+            v3_fresh_window_ms: 30_000,
+            pool_prune_after_ms: 45 * 60 * 1000,
+            rpc_read_timeout_ms: 5_000,
+            rpc_simulate_timeout_ms: None,
+            rpc_send_timeout_ms: 5_000,
+            multicall_chunk_size: 10,
+            multicall_chunk_timeout_ms: 3_000,
+            discover_chunk_size: 20,
+            discover_call_timeout_ms: 15_000,
+            quote_cache_max_age_ms: None,
+            quote_cache_max_pools: 1024,
+            health_hold_base_ms: 10_000,
+            health_hold_max_ms: 80_000,
+            health_relapse_window_ms: 60_000,
+            health_monitor_every_ms: None,
+            quoter_never_ok_warn_after_ms: 30_000,
+            quoter_broken_warn_after_ms: 300_000,
+            quoter_warn_min_batches: 5,
+            rate_limit_log_every_ms: 30_000,
+            cooldown_secs: 15,
+            send_cooldown_secs: 15,
+            gas_reject_cooldown_secs: 60,
+            max_consecutive_failures: 20,
+            slow_scan_warn_ms: 10_000,
+            heartbeat_stall_warn_ms: 30_000,
+            price_refresh_ms: 60_000,
+            balance_refresh_ms: 30_000,
+            config_reload_ms: 30_000,
+            ws_reconnect_max_backoff_ms: 30_000,
+            block_time_ms: 2_000,
+        }
+    }
+}
+
+fn ms(v: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(v)
+}
+
+impl Tuning {
+    fn validate(&self, block_time_ms: u64) -> Result<()> {
+        if block_time_ms == 0 {
+            return Err(anyhow!("chain.block_time_ms must be > 0"));
+        }
+        let positive: [(&str, u64); 17] = [
+            ("balance_refresh_ms", self.balance_refresh_ms),
+            ("volatile_pool_max_age_ms", self.volatile_pool_max_age_ms),
+            ("stable_pool_max_age_ms", self.stable_pool_max_age_ms),
+            ("price_refresh_ms", self.price_refresh_ms),
+            ("config_reload_ms", self.config_reload_ms),
+            ("gas_limit_2hop", self.gas_limit_2hop),
+            ("gas_limit_triangular", self.gas_limit_triangular),
+            ("rpc_read_timeout_ms", self.rpc_read_timeout_ms),
+            ("rpc_send_timeout_ms", self.rpc_send_timeout_ms),
+            ("multicall_chunk_size", self.multicall_chunk_size as u64),
+            ("multicall_chunk_timeout_ms", self.multicall_chunk_timeout_ms),
+            ("discover_chunk_size", self.discover_chunk_size as u64),
+            ("discover_call_timeout_ms", self.discover_call_timeout_ms),
+            ("health_hold_base_ms", self.health_hold_base_ms),
+            ("phantom_cap_bps", self.phantom_cap_bps),
+            ("tri_verify_max_rounds", self.tri_verify_max_rounds as u64),
+            ("max_consecutive_failures", self.max_consecutive_failures as u64),
+        ];
+        if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
+            return Err(anyhow!("tuning.{} must be > 0", name));
+        }
+        if self.health_hold_max_ms < self.health_hold_base_ms {
+            return Err(anyhow!("tuning.health_hold_max_ms must be >= health_hold_base_ms"));
+        }
+        if self.sell_leg_minprofit_mul_bps > 10_000 || self.router_min_out_slack_bps > 10_000 {
+            return Err(anyhow!("tuning: *_bps multipliers must be <= 10000"));
+        }
+        Ok(())
+    }
+
+    fn with_block_time(mut self, block_time_ms: u64) -> Self {
+        self.block_time_ms = block_time_ms;
+        self
+    }
+
+    pub fn rpc_simulate_timeout(&self) -> std::time::Duration {
+        ms(self.rpc_simulate_timeout_ms.unwrap_or(self.block_time_ms / 2))
+    }
+    pub fn quote_cache_max_age(&self) -> std::time::Duration {
+        ms(self.quote_cache_max_age_ms.unwrap_or(self.block_time_ms * 3))
+    }
+    pub fn health_monitor_every(&self) -> std::time::Duration {
+        ms(self.health_monitor_every_ms.unwrap_or(self.block_time_ms))
+    }
+    pub fn rpc_read_timeout(&self) -> std::time::Duration { ms(self.rpc_read_timeout_ms) }
+    pub fn rpc_send_timeout(&self) -> std::time::Duration { ms(self.rpc_send_timeout_ms) }
+    pub fn multicall_chunk_timeout(&self) -> std::time::Duration { ms(self.multicall_chunk_timeout_ms) }
+    pub fn discover_call_timeout(&self) -> std::time::Duration { ms(self.discover_call_timeout_ms) }
+    pub fn gas_fallback_max_age(&self) -> std::time::Duration { ms(self.gas_fallback_max_age_ms) }
+    pub fn health_hold_base(&self) -> std::time::Duration { ms(self.health_hold_base_ms) }
+    pub fn health_hold_max(&self) -> std::time::Duration { ms(self.health_hold_max_ms) }
+    pub fn health_relapse_window(&self) -> std::time::Duration { ms(self.health_relapse_window_ms) }
+    pub fn quoter_never_ok_warn_after(&self) -> std::time::Duration { ms(self.quoter_never_ok_warn_after_ms) }
+    pub fn quoter_broken_warn_after(&self) -> std::time::Duration { ms(self.quoter_broken_warn_after_ms) }
+    pub fn rate_limit_log_every(&self) -> std::time::Duration { ms(self.rate_limit_log_every_ms) }
+    pub fn slow_scan_warn(&self) -> std::time::Duration { ms(self.slow_scan_warn_ms) }
+    pub fn heartbeat_stall_warn(&self) -> std::time::Duration { ms(self.heartbeat_stall_warn_ms) }
+    pub fn volatile_pool_max_age(&self) -> std::time::Duration { ms(self.volatile_pool_max_age_ms) }
+    pub fn stable_pool_max_age(&self) -> std::time::Duration { ms(self.stable_pool_max_age_ms) }
+    pub fn v3_fresh_window(&self) -> std::time::Duration { ms(self.v3_fresh_window_ms) }
+    pub fn pool_prune_after(&self) -> std::time::Duration { ms(self.pool_prune_after_ms) }
+    pub fn price_refresh(&self) -> std::time::Duration { ms(self.price_refresh_ms) }
+    pub fn balance_refresh(&self) -> std::time::Duration { ms(self.balance_refresh_ms) }
+    pub fn config_reload(&self) -> std::time::Duration { ms(self.config_reload_ms) }
+    pub fn ws_reconnect_max_backoff(&self) -> std::time::Duration { ms(self.ws_reconnect_max_backoff_ms) }
+
+
+    /// True if `profit` exceeds [`Tuning::phantom_cap_bps`] of `input` (a phantom quote).
+    pub fn is_phantom(&self, profit: alloy::primitives::U256, input: alloy::primitives::U256) -> bool {
+        use alloy::primitives::U256;
+        profit.saturating_mul(U256::from(10_000u64)) > input.saturating_mul(U256::from(self.phantom_cap_bps))
+    }
+}
+
+static TUNING: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
+
+/// Install the instance's tuning once at startup (one process = one chain).
+pub fn install_tuning(tuning: Tuning, block_time_ms: u64) {
+    let _ = TUNING.set(tuning.with_block_time(block_time_ms));
+}
+
+/// The instance's tuning (defaults if not installed, e.g. in unit tests).
+pub fn tuning() -> &'static Tuning {
+    TUNING.get_or_init(Tuning::default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: &str = r#"
+chain:
+  id: 8453
+  name: "Base"
+  ws_rpc: "ws://x"
+  http_rpc: "http://x"
+  native_currency: "ETH"
+  wrapped_native: "0x4200000000000000000000000000000000000006"
+  block_time_ms: 2000
+  contract_address: "0x0000000000000000000000000000000000000001"
+  min_native_balance: 0.01
+  min_profit_usd: 0.1
+  deadline_seconds: 60
+routers: []
+"#;
+
+    #[test]
+    fn empty_tuning_matches_previous_constants() {
+        let cfg = parse_config(MIN).unwrap();
+        let t = cfg.tuning.with_block_time(cfg.chain.block_time_ms);
+        assert_eq!(t.gas_limit_2hop, 700_000);
+        assert_eq!(t.rpc_simulate_timeout(), std::time::Duration::from_secs(1));
+        assert_eq!(t.quote_cache_max_age(), std::time::Duration::from_secs(6));
+        assert_eq!(t.health_monitor_every(), std::time::Duration::from_secs(2));
+        assert_eq!(t.phantom_cap_bps, 500);
+    }
+
+    #[test]
+    fn block_relative_timings_follow_block_time() {
+        let t = Tuning::default().with_block_time(12_000);
+        assert_eq!(t.rpc_simulate_timeout(), std::time::Duration::from_secs(6));
+        assert_eq!(t.quote_cache_max_age(), std::time::Duration::from_secs(36));
+        let pinned = Tuning { rpc_simulate_timeout_ms: Some(800), ..Tuning::default() }.with_block_time(12_000);
+        assert_eq!(pinned.rpc_simulate_timeout(), std::time::Duration::from_millis(800));
+    }
+
+    #[test]
+    fn rejects_old_format_and_bad_values() {
+        let old = "chains:\n  - id: 8453\n    name: \"Base\"\nrouters: []\n";
+        assert!(parse_config(&old).unwrap_err().to_string().contains("one chain per instance"));
+        let typo = format!("{}tuning:\n  gas_limit_2hopp: 1\n", MIN);
+        assert!(parse_config(&typo).is_err(), "unknown tuning keys must be rejected");
+        let zero = format!("{}tuning:\n  multicall_chunk_size: 0\n", MIN);
+        assert!(parse_config(&zero).is_err());
+    }
+
+    #[test]
+    fn chain_id_guard() {
+        assert!(check_chain_id(8453, 8453, "Base").is_ok());
+        assert!(check_chain_id(8453, 84532, "Base").is_err());
+    }
+
+    #[test]
+    fn shipped_configs_parse() {
+        for path in ["config.yaml", "config-testnet.yaml"] {
+            let full = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path);
+            let content = std::fs::read_to_string(&full).unwrap();
+            // Placeholders (testnet contract not deployed yet) are allowed here.
+            let content = content.replace("YOUR_", "0000");
+            let cfg = parse_config(&content).unwrap_or_else(|e| panic!("{}: {}", path, e));
+            assert!(!cfg.routers.is_empty(), "{} has no routers", path);
         }
     }
 
-    Ok(AppConfig {
-        chains: raw.chains,
-        routers: raw.routers,
-        pairs: raw.pairs,
-    })
+    #[test]
+    fn phantom_cap() {
+        use alloy::primitives::U256;
+        let t = Tuning::default();
+        assert!(!t.is_phantom(U256::from(50u64), U256::from(1000u64)));
+        assert!(t.is_phantom(U256::from(51u64), U256::from(1000u64)));
+    }
 }

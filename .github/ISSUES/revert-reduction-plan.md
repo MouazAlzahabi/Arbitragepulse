@@ -16,7 +16,7 @@ round-trip (V3 spot, stale V2 reserves, buy-leg `amountOutMin = 0` in the contra
 |-------|-------------------------|--------------|
 | V3 sell floor | `Too little received` (router string) | Spot / stale cache vs inclusion-time pool |
 | Contract profit gate | `NotProfitable` custom error | Legs executed but net &lt; `minProfit` |
-| SyncSwap / router min | `InsufficientOutput` | Local quote &gt; actual out |
+| Router min-out | `InsufficientOutput` | Local quote &gt; actual out |
 | Time | `DeadlineExpired` | Rare on Base (executor uses 120s deadline) |
 | Allowlist | `RouterNotAllowed` | Config / deploy mismatch |
 

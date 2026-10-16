@@ -4,32 +4,32 @@ use std::collections::HashSet;
 use tracing::{debug, warn};
 
 use crate::config::RouterType;
-use crate::pool_cache::{PoolCache, V2PoolKey, V3PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
+use crate::pool_cache::{PoolCache, V2PoolKey, V3PoolKey, volatile_max_age, stable_max_age};
 use crate::types::{PairScanInfo, TriangularOpportunity};
 use crate::util::addr_key;
-use super::{Strategy, V3LegQuote, apply_exec_quote_haircut, token_amount_to_usd, parse_amount_capped, MIN_V3_LIQUIDITY};
+use super::{Strategy, V3LegQuote, apply_exec_quote_haircut, token_amount_to_usd, parse_amount_capped, min_v3_liquidity};
 
 /// Max QuoterV2 round trips when verifying V3-leg triangular routes. Round 1 brackets
-/// every V3 leg (see [`VERIFY_BRACKET_BPS`]), so later rounds are only needed when a real
+/// every V3 leg (see [`verify_bracket_bps()`]), so later rounds are only needed when a real
 /// input lands well outside its bracket.
-const VERIFY_MAX_ROUNDS: usize = 3;
+fn verify_max_rounds() -> usize { crate::config::tuning().tri_verify_max_rounds }
 
 /// A V3 leg whose input depends on earlier legs is quoted at two points in round 1: its
 /// upper-bound input `s` and `s × (1 − this)`. The real input normally falls between them
 /// (earlier legs' impact + tick crossings, ~30 bps on Base), where the chord between the
 /// two quotes is a tight lower bound — so one round trip usually suffices.
-const VERIFY_BRACKET_BPS: u64 = 100;
+fn verify_bracket_bps() -> u64 { crate::config::tuning().tri_verify_bracket_bps }
 
 /// Outside its quoted points, a V3 leg's real input is bounded by the nearest point
 /// (chord through the origin below it, flat output above it). Accepted when within this
 /// many bps of that point; otherwise the leg is re-quoted at its real input next round.
 /// In the last round the bound is used regardless — every bound is conservative.
-const VERIFY_MAX_GAP_BPS: u64 = 10;
+fn verify_max_gap_bps() -> u64 { crate::config::tuning().tri_verify_max_gap_bps }
 
 /// How much one V3 leg's cached spot quote overstates output (tick crossings aren't
 /// modelled) — historical Base data: ~0.30% on a 270 USDT trade. In optimistic mode, where
 /// V3-leg routes aren't QuoterV2-verified, this is deducted once per V3 leg.
-const V3_SPOT_OVERESTIMATE_BPS: u64 = 30;
+fn v3_spot_overestimate_bps() -> u64 { crate::config::tuning().v3_spot_overestimate_bps }
 
 /// Outcome of chaining a route through its legs during V3 verification.
 enum RouteWalk {
@@ -44,11 +44,11 @@ enum RouteWalk {
 /// Lower bound on a V3 leg's output at `amt` from QuoterV2 points `(input, output)` sorted
 /// by input, using that output is increasing and concave in input (zero at zero).
 /// Returns the bound and whether it is tight (exact, inside the points, or within
-/// [`VERIFY_MAX_GAP_BPS`] of the nearest point).
+/// [`verify_max_gap_bps()`] of the nearest point).
 fn v3_leg_lower_bound(points: &[(U256, U256)], amt: U256) -> Option<(U256, bool)> {
     let gap_ok = |near: U256, far: U256| {
         near.abs_diff(far).saturating_mul(U256::from(10_000u32))
-            <= near.saturating_mul(U256::from(VERIFY_MAX_GAP_BPS))
+            <= near.saturating_mul(U256::from(verify_max_gap_bps()))
     };
     let &(lo_in, lo_out) = points.first()?;
     let &(hi_in, hi_out) = points.last()?;
@@ -95,13 +95,13 @@ impl Strategy {
         use std::collections::HashMap;
 
         // ── Build token info from all pairs on this chain ─────────────────────────
-        let chain_pair_count = self.pairs.iter().filter(|p| p.chain_id == self.chain_id).count();
+        let chain_pair_count = self.pairs.len();
         // addr_lower → (symbol, decimals)
         let mut token_info: HashMap<String, (String, u8)> = HashMap::with_capacity(chain_pair_count * 2);
         // addr_lower → trade amount (from the first pair that starts with this token)
         let mut token_amounts: HashMap<String, U256> = HashMap::with_capacity(chain_pair_count);
 
-        for p in self.pairs.iter().filter(|p| p.chain_id == self.chain_id) {
+        for p in self.pairs.iter() {
             let Ok(addr_in) = p.token_in.parse::<Address>() else { continue };
             let Ok(addr_out) = p.token_out.parse::<Address>() else { continue };
             let key_in = addr_key(addr_in);
@@ -477,7 +477,7 @@ impl Strategy {
             // spread diagnostic, the 5% cap and the floor, so all see a realistic output.
             let amount_a_final = if self.optimistic_submission && v3_route {
                 let overestimate = p3e.effective_amount_in
-                    * U256::from(V3_SPOT_OVERESTIMATE_BPS * v3_legs) / U256::from(10_000u32);
+                    * U256::from(v3_spot_overestimate_bps() * v3_legs) / U256::from(10_000u32);
                 amount_a_final.saturating_sub(overestimate)
             } else {
                 amount_a_final
@@ -497,7 +497,7 @@ impl Strategy {
             // Sanity cap: profit > 5% of input is almost certainly a detection artifact.
             // Catches Solidly-echo phantoms and V3 spot mismatch phantoms (including
             // medium-range $37-$121 phantoms that passed the old 3× absolute cap).
-            if (amount_a_final - p3e.effective_amount_in).saturating_mul(U256::from(20)) > p3e.effective_amount_in {
+            if crate::config::tuning().is_phantom(amount_a_final - p3e.effective_amount_in, p3e.effective_amount_in) {
                 warn!(
                     "[{}] Triangular phantom skipped: {} | profit/input > 5%",
                     self.chain_id,
@@ -671,12 +671,12 @@ impl Strategy {
     /// QuoterV2-verify triangular routes that have at least one V3 leg (revert plan 1.4).
     ///
     /// Always quotes live through [`Strategy::quote_v3_legs`] (batched, deduplicated, no
-    /// cross-scan cache), normally in ONE round trip, at most [`VERIFY_MAX_ROUNDS`]:
+    /// cross-scan cache), normally in ONE round trip, at most [`verify_max_rounds()`]:
     ///
     /// 1. Each V3 leg's upper-bound input `s` is the route's input chained through earlier
     ///    legs at V3 *marginal* price (no impact, no tick cap — an upper bound on output)
     ///    and exact local quotes for non-V3 legs. A V3 leg whose input is exact (no earlier
-    ///    V3 leg) is quoted at `s`; otherwise at `s` and `s × (1 − VERIFY_BRACKET_BPS)`.
+    ///    V3 leg) is quoted at `s`; otherwise at `s` and `s × (1 − verify_bracket_bps())`.
     /// 2. Real amounts are chained leg by leg; each V3 leg uses
     ///    [`v3_leg_lower_bound`] over its quoted points. A loose bound (real input far
     ///    outside the points) is re-quoted at the real input next round; the last round
@@ -725,7 +725,7 @@ impl Strategy {
                     Some(key) => {
                         requests.push((i, leg, amt));
                         if input_uncertain {
-                            let lo = amt * U256::from(10_000 - VERIFY_BRACKET_BPS) / U256::from(10_000u32);
+                            let lo = amt * U256::from(10_000 - verify_bracket_bps()) / U256::from(10_000u32);
                             requests.push((i, leg, lo));
                         }
                         input_uncertain = true;
@@ -749,7 +749,7 @@ impl Strategy {
         // QuoterV2 points (input, output) per route and leg, kept sorted by input.
         let mut points: Vec<[Vec<(U256, U256)>; 3]> = vec![Default::default(); opportunities.len()];
         let mut final_amounts: Vec<Option<U256>> = vec![None; opportunities.len()];
-        for round in 0..VERIFY_MAX_ROUNDS {
+        for round in 0..verify_max_rounds() {
             let legs: Vec<V3LegQuote> = requests.iter().map(|&(i, leg, amount_in)| V3LegQuote {
                 key: keys[i][leg].as_ref().expect("requests are V3 legs"),
                 amount_in,
@@ -771,7 +771,7 @@ impl Strategy {
                 }
             }
 
-            let last_round = round + 1 == VERIFY_MAX_ROUNDS;
+            let last_round = round + 1 == verify_max_rounds();
             requests.clear();
             for (i, opp) in opportunities.iter().enumerate() {
                 if !alive[i] || final_amounts[i].is_some() { continue; }
@@ -794,7 +794,7 @@ impl Strategy {
 
             let profit = final_amt.checked_sub(opp.amount_in).filter(|p| !p.is_zero());
             // Same 5% sanity cap as detection: a verified edge that large means a bad quote.
-            if profit.is_some_and(|p| p.saturating_mul(U256::from(20)) > opp.amount_in) {
+            if profit.is_some_and(|p| crate::config::tuning().is_phantom(p, opp.amount_in)) {
                 warn!(
                     "[{}] Triangular V3 verify: {} | verified profit/input > 5% — bad quote, skipped",
                     self.chain_id, opp.triplet_id,
@@ -865,13 +865,7 @@ impl Strategy {
                 amount_in,
                 None,
             ),
-            RouterType::SyncSwap => self.pool_cache.get_amount_out_by_v2_key(
-                &V2PoolKey::new(router_id, token_in, token_out),
-                token_in,
-                amount_in,
-                Some(VOLATILE_MAX_AGE),
-            ),
-            RouterType::Solidly | RouterType::Aerodrome => solidly_out(
+            RouterType::Aerodrome => solidly_out(
                 &self.pool_cache,
                 &self.solidly_pool_keys,
                 router_id,
@@ -918,7 +912,7 @@ fn best_v3_spot(
             cache
                 .quote_v3_spot_key(&key, token_in, amount_in)
                 .and_then(|(out, liq, _)| {
-                    if liq < MIN_V3_LIQUIDITY {
+                    if liq < min_v3_liquidity() {
                         None
                     } else {
                         Some((out, f))
@@ -942,14 +936,14 @@ fn solidly_out(
             &V2PoolKey::new(vol, token_in, token_out),
             token_in,
             amount_in,
-            Some(VOLATILE_MAX_AGE),
+            Some(volatile_max_age()),
         )
         .or_else(|| {
             cache.get_amount_out_by_v2_key(
                 &V2PoolKey::new(sta, token_in, token_out),
                 token_in,
                 amount_in,
-                Some(STABLE_MAX_AGE),
+                Some(stable_max_age()),
             )
         })
 }

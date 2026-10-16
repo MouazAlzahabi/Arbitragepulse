@@ -384,7 +384,7 @@ pub fn spawn_pending_monitor(
                     warn!("[{}] Pending TX monitor: WS connect failed ({}): {} — next URL", chain_name, short_url, e);
                     url_idx += 1;
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
                     continue;
                 }
                 Ok(p) => p,
@@ -452,7 +452,7 @@ pub fn spawn_pending_monitor(
                         );
                     }
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
                     // Fall through to retry loop — next attempt tries hash-only on same URL
                     // because we don't advance url_idx when full-tx returns 0 events.
                     // Once hash-only is tried and also fails, url_idx advances.
@@ -478,7 +478,7 @@ pub fn spawn_pending_monitor(
                             );
                             url_idx += 1;
                             tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(Duration::from_secs(60));
+                            backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
                         }
 
                         Ok(hash_sub) => {
@@ -548,7 +548,7 @@ pub fn spawn_pending_monitor(
                                 );
                             }
                             tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                            backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
                         }
                     }
                 }

@@ -3,10 +3,10 @@ use alloy::providers::Provider;
 use tracing::{debug, info, warn};
 
 use crate::config::RouterType;
-use crate::pool_cache::{V2PoolKey, V3PoolKey, VOLATILE_MAX_AGE, STABLE_MAX_AGE};
+use crate::pool_cache::{V2PoolKey, V3PoolKey, volatile_max_age, stable_max_age};
 use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
-use super::{ForwardTask, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, encode_v3_quote, run_multicall, token_amount_to_usd, MIN_V3_LIQUIDITY};
+use super::{ForwardTask, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, encode_v3_quote, run_multicall, token_amount_to_usd, min_v3_liquidity};
 
 impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
@@ -40,14 +40,14 @@ impl Strategy {
         // ── Phase 1: Forward quotes ───────────────────────────────────────────────
         // V2 and Solidly-volatile pools use xy=k (constant-product AMM), so we compute
         // quotes locally from cached reserves — zero eth_calls.
-        // V3, SyncSwap, and Solidly-stable still need multicall (different curves / no cache).
+        // V3 legs are quoted from the local V3 spot cache, then QuoterV2-verified.
 
         // Build target index list first so we can use .len() for capacity hints below.
         let masked_indices: Vec<usize>;
         let target_indices: &[usize] = match pair_mask {
             Some(m) => {
                 masked_indices = m.iter().copied()
-                    .filter(|&i| self.pairs.get(i).map_or(false, |p| p.chain_id == self.chain_id))
+                    .filter(|&i| i < self.pairs.len())
                     .collect();
                 &masked_indices
             }
@@ -80,14 +80,14 @@ impl Strategy {
                 match router.router_type {
                     RouterType::V2 => {
                         // Try local xy=k reserve cache first (no eth_call needed).
-                        // VOLATILE_MAX_AGE (300s) freshness check: V2 reserves CAN go stale
+                        // volatile_max_age() (300s) freshness check: V2 reserves CAN go stale
                         // between Sync events. Without a freshness check, reserves from the
                         // last trade 10+ minutes ago produce phantom opportunities — the local
                         // xy=k formula is exact given correct reserves, but stale reserves
                         // overestimate output and cause on-chain "too little received" reverts.
                         let v2_key = V2PoolKey::new(&router.id, token_in, token_out);
                         if let Some(out) = self.pool_cache.get_amount_out_by_v2_key(
-                            &v2_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
+                            &v2_key, token_in, amount_in, Some(volatile_max_age()),
                         ) {
                             pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(self.chain_router_indices.len() * 2)).push(ForwardTask {
                                 pair_idx: pi,
@@ -131,7 +131,7 @@ impl Strategy {
                             if let Some((spot_out, liquidity, effective_in)) = self.pool_cache.quote_v3_spot_key(
                                 &v3_key, token_in, amount_in,
                             ) {
-                                if liquidity < MIN_V3_LIQUIDITY {
+                                if liquidity < min_v3_liquidity() {
                                     v3_cached += 1;
                                     continue;
                                 }
@@ -159,19 +159,19 @@ impl Strategy {
                             }
                         }
                     }
-                    RouterType::Solidly | RouterType::Aerodrome => {
+                    RouterType::Aerodrome => {
                         // Both volatile (fee=0) and stable (fee=1) pools use local reserve cache.
                         // Only adds to pair_quotes when the pool has had a recent Sync event
                         // (last_sync.elapsed() < max_age). Stale = no on-chain activity = skip.
-                        // Aerodrome pools use the same Sync(uint256,uint256) events and xy=k /
-                        // x³y+y³x=k curves as Solidly — pool discovery and quoting are identical.
+                        // Aerodrome pools emit Sync(uint256,uint256) and use xy=k (volatile)
+                        // or x³y+y³x=k (stable) curves.
                         let rtype = router.router_type.clone();
                         let Some((vol_id, sta_id)) = self.solidly_pool_keys.get(&router.id) else {
                             continue;
                         };
                         for (eff_id, fee, max_age) in [
-                            (vol_id.as_str(), 0u32, VOLATILE_MAX_AGE),
-                            (sta_id.as_str(), 1u32, STABLE_MAX_AGE),
+                            (vol_id.as_str(), 0u32, volatile_max_age()),
+                            (sta_id.as_str(), 1u32, stable_max_age()),
                         ] {
                             let v2_key = V2PoolKey::new(eff_id, token_in, token_out);
                             if let Some(out) = self.pool_cache.get_amount_out_by_v2_key(
@@ -194,32 +194,6 @@ impl Strategy {
                                     rev_v3_key: None,
                                 });
                             }
-                        }
-                    }
-                    RouterType::SyncSwap => {
-                        // SyncSwap pools are now seeded into pool_cache at startup
-                        // (populate_syncswap_pools also calls pool_cache.insert).
-                        // Use local reserve state with freshness check (0 eth_call).
-                        let v2_key = V2PoolKey::new(&router.id, token_in, token_out);
-                        if let Some(out) = self.pool_cache.get_amount_out_by_v2_key(
-                            &v2_key, token_in, amount_in, Some(VOLATILE_MAX_AGE),
-                        ) {
-                            pair_quotes.entry(pi).or_insert_with(|| Vec::with_capacity(self.chain_router_indices.len() * 2)).push(ForwardTask {
-                                pair_idx: pi,
-                                router_id: router.id.clone(),
-                                router_addr,
-                                router_type: RouterType::SyncSwap,
-                                fee: 0,
-                                amount_in: out, // repurposed: carries token_out amount
-                                capped_amount_in: amount_in,
-                                token_in,
-                                token_out,
-                                quoter_addr: None,
-                                v2_key: Some(v2_key),
-                                v3_key: None,
-                                rev_v2_key: Some(V2PoolKey::new(&router.id, token_out, token_in)),
-                                rev_v3_key: None,
-                            });
                         }
                     }
                 }
@@ -248,7 +222,7 @@ impl Strategy {
         // ── Phase 2: Reverse quotes ───────────────────────────────────────────────
         // V2 and Solidly-volatile reverse quotes use the same local xy=k cache.
         // V3 uses cached spot when fresh; falls back to QuoterV2 only when stale.
-        // SyncSwap and Solidly-stable still need multicall.
+        // V3 reverse legs are verified with QuoterV2 (Phase 1.5b/1.5c).
 
         // Pre-size rev_tasks to the exact number of A×B combinations across all pairs with ≥2 quotes.
         let rev_cap: usize = pair_quotes.values()
@@ -298,13 +272,13 @@ impl Strategy {
 
                     // Try local reverse quote — keys carried on ForwardTask from phase 1.
                     let local_back = match q_b.router_type {
-                        RouterType::V2 | RouterType::SyncSwap => q_b.rev_v2_key.as_ref().and_then(|k| {
+                        RouterType::V2 => q_b.rev_v2_key.as_ref().and_then(|k| {
                             self.pool_cache.get_amount_out_by_v2_key(
-                                k, token_out, token_out_amount, Some(VOLATILE_MAX_AGE),
+                                k, token_out, token_out_amount, Some(volatile_max_age()),
                             )
                         }),
-                        RouterType::Solidly | RouterType::Aerodrome => {
-                            let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
+                        RouterType::Aerodrome => {
+                            let max_age = if fee_b != 0 { stable_max_age() } else { volatile_max_age() };
                             q_b.rev_v2_key.as_ref().and_then(|k| {
                                 self.pool_cache.get_amount_out_by_v2_key(
                                     k, token_out, token_out_amount, Some(max_age),
@@ -360,10 +334,10 @@ impl Strategy {
 
         // Phase 1.5 gate: collect V3 tick-capped forward tasks that show real cross-DEX
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
-        const P15_GATE_SPREAD: f64 = 0.00005; // 0.005% — gate for Phase 1.5/1.5c QuoterV2 batches
+        let p15_gate_spread = crate::config::tuning().p15_gate_spread;
         // Integer spread gate: amount_back/amount_in > 1.00005  (avoids float in hot loop)
-        const P15_GATE_MUL: u64 = 1_000_050;
-        const P15_GATE_DEN: u64 = 1_000_000;
+        let p15_gate_mul: u64 = 1_000_000 + (p15_gate_spread * 1_000_000.0).round() as u64;
+        let p15_gate_den: u64 = 1_000_000;
         let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
         // Best QuoterV2-verified spread (signed). NEG_INFINITY when Phase 1.5 didn't run or
         // all reverse lookups failed. Exposed in heartbeat as "bestV=" to distinguish real
@@ -380,7 +354,7 @@ impl Strategy {
             // mismatch phantom (different routers' sqrtPriceX96 values compound
             // errors across the fwd/rev legs, producing billion-dollar phantoms).
             if amount_back > task.amount_in
-                && (amount_back - task.amount_in).saturating_mul(U256::from(20)) > task.amount_in
+                && crate::config::tuning().is_phantom(amount_back - task.amount_in, task.amount_in)
             {
                 warn!(
                     "[{}] 2-hop phantom skipped: {} | profit/input > 5% | {}/{}",
@@ -403,8 +377,8 @@ impl Strategy {
                 // QuoterV2 verifies the actual on-chain amount at full trade size. Without this,
                 // liquid pools (safe_cap >= trade_amount, task.amount_in == full) never trigger
                 // Phase 1.5 and V3×V3 spreads are permanently blocked from all_opportunities.
-                let p15_gate_hit = amount_back.saturating_mul(U256::from(P15_GATE_DEN))
-                    > task.amount_in.saturating_mul(U256::from(P15_GATE_MUL));
+                let p15_gate_hit = amount_back.saturating_mul(U256::from(p15_gate_den))
+                    > task.amount_in.saturating_mul(U256::from(p15_gate_mul));
                 if p15_gate_hit && matches!(task.router_a_type, RouterType::V3) {
                     p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
                 }
@@ -479,7 +453,7 @@ impl Strategy {
         }
 
         // ── Phase 1.5: Gated V3 QuoterV2 upgrade ─────────────────────────────────────
-        // Fires only when Phase 2 local data showed cross-DEX spread > P15_GATE_SPREAD
+        // Fires only when Phase 2 local data showed cross-DEX spread > p15_gate_spread
         // on a V3-tick-capped forward task. One batched multicall for all candidates.
         let mut t_after_p15: u128 = 0;
         // p15b state declared here so it can be consumed by the parallel fire section
@@ -537,7 +511,7 @@ impl Strategy {
                 if cache_misses > 0 {
                     debug!(
                         "[chain={}] Phase 1.5 (gated): {} QuoterV2 call(s) + {} from cache — local spread > {:.1}%",
-                        self.chain_id, cache_misses, cache_hits, P15_GATE_SPREAD * 100.0
+                        self.chain_id, cache_misses, cache_hits, p15_gate_spread * 100.0
                     );
                 } else {
                     debug!(
@@ -558,7 +532,7 @@ impl Strategy {
 
                 // Merge cache hits + MC results into final quoter_outs.
                 // MC results are also stored in quote_cache so the next scan with unchanged
-                // pool state gets a free cache hit (within QUOTE_CACHE_MAX_AGE).
+                // pool state gets a free cache hit (within quote_cache_max_age()).
                 // Cache a failed quote (ZERO) only if the batch otherwise worked — then the
                 // failure is a real revert, not a transport error that would suppress the pool.
                 let p15_batch_ok = p15_raw.iter().any(Option::is_some);
@@ -633,13 +607,13 @@ impl Strategy {
                             continue;
                         }
                         let local_back = match q_b.router_type {
-                            RouterType::V2 | RouterType::SyncSwap => q_b.rev_v2_key.as_ref().and_then(|k| {
+                            RouterType::V2 => q_b.rev_v2_key.as_ref().and_then(|k| {
                                 self.pool_cache.get_amount_out_by_v2_key(
-                                    k, token_out, quoter_out, Some(VOLATILE_MAX_AGE),
+                                    k, token_out, quoter_out, Some(volatile_max_age()),
                                 )
                             }),
-                            RouterType::Solidly | RouterType::Aerodrome => {
-                                let max_age = if fee_b != 0 { STABLE_MAX_AGE } else { VOLATILE_MAX_AGE };
+                            RouterType::Aerodrome => {
+                                let max_age = if fee_b != 0 { stable_max_age() } else { volatile_max_age() };
                                 q_b.rev_v2_key.as_ref().and_then(|k| {
                                     self.pool_cache.get_amount_out_by_v2_key(
                                         k, token_out, quoter_out, Some(max_age),
@@ -653,18 +627,18 @@ impl Strategy {
                         };
 
                         // Phantom check FIRST: >5% positive spread is physically impossible
-                        // for real arb — indicates stale Solidly/SyncSwap reserves or V3 spot
+                        // for real arb — indicates stale Aerodrome reserves or V3 spot
                         // mismatch. Reject before updating any metrics.
                         if amount_back > full_amount
-                            && (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount
+                            && crate::config::tuning().is_phantom(amount_back - full_amount, full_amount)
                         {
                             warn!("[{}] Phase 1.5 phantom: {} | {}/{}", self.chain_id, pair.id,
                                   router_a_id, q_b.router_id);
                             continue;
                         }
 
-                        // Apply P15_QUOTER_HAIRCUT_BPS buffer (Phase 1.5: V3 forward + Aerodrome/V2 reverse).
-                        // Aerodrome reverse uses local pool cache (VOLATILE_MAX_AGE=120s).
+                        // Apply quoter_haircut_bps() buffer (Phase 1.5: V3 forward + Aerodrome/V2 reverse).
+                        // Aerodrome reverse uses local pool cache (volatile_max_age()=120s).
                         // Active pools get Sync events every few blocks; haircut covers quote→inclusion drift.
                         let amount_back = apply_exec_quote_haircut(amount_back);
 
@@ -723,13 +697,13 @@ impl Strategy {
         let mut p15c_candidates: Vec<(usize, String, u32, Address, RouterType, Address, Address, U256, u32, Address, String)> = Vec::new();
         {
             for task in &rev_tasks {
-                let router_a_is_local = matches!(task.router_a_type, RouterType::V2 | RouterType::Solidly | RouterType::Aerodrome);
+                let router_a_is_local = matches!(task.router_a_type, RouterType::V2 | RouterType::Aerodrome);
                 if !router_a_is_local { continue; }
                 if !matches!(task.router_b_type, RouterType::V3) { continue; }
 
                 let local_back = match task.local_back { Some(v) => v, None => continue };
-                let p15_gate_hit = local_back.saturating_mul(U256::from(P15_GATE_DEN))
-                    > task.amount_in.saturating_mul(U256::from(P15_GATE_MUL));
+                let p15_gate_hit = local_back.saturating_mul(U256::from(p15_gate_den))
+                    > task.amount_in.saturating_mul(U256::from(p15_gate_mul));
                 if !p15_gate_hit { continue; }
 
                 let full_amount = match self
@@ -825,7 +799,7 @@ impl Strategy {
 
                 // Phantom check FIRST (same logic as Phase 1.5 non-b).
                 if amount_back > full_amount
-                    && (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount
+                    && crate::config::tuning().is_phantom(amount_back - full_amount, full_amount)
                 {
                     warn!("[{}] Phase 1.5b phantom: {} | {}/{}", self.chain_id,
                           self.pairs[pi].id, router_a_id, q_b.router_id);
@@ -891,13 +865,13 @@ impl Strategy {
 
             // Phantom check first (>5% positive spread = physically impossible)
             if amount_back > full_amount
-                && (amount_back - full_amount).saturating_mul(U256::from(20)) > full_amount
+                && crate::config::tuning().is_phantom(amount_back - full_amount, full_amount)
             {
                 warn!("[{}] Phase 1.5c phantom: {}/{}", self.chain_id, router_a_id, router_b_id);
                 continue;
             }
 
-            // Forward leg uses local pool cache (VOLATILE_MAX_AGE=120s); V3 reverse is QuoterV2-exact.
+            // Forward leg uses local pool cache (volatile_max_age()=120s); V3 reverse is QuoterV2-exact.
             let amount_back = apply_exec_quote_haircut(amount_back);
 
             let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
@@ -971,7 +945,7 @@ impl Strategy {
                     let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
                     scan.push(PairScanInfo {
                         pair_id: pair.id.clone(),
-                        chain_id: pair.chain_id,
+                        chain_id: self.chain_id,
                         display_name,
                         dex_count,
                         dex_ids,
@@ -989,7 +963,7 @@ impl Strategy {
                     let display_name = format!("{}→{}", pair.token_in_symbol, pair.token_out_symbol);
                     scan.push(PairScanInfo {
                         pair_id: pair.id.clone(),
-                        chain_id: pair.chain_id,
+                        chain_id: self.chain_id,
                         display_name,
                         dex_count: 0,
                         dex_ids: vec![],

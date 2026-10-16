@@ -24,21 +24,13 @@ function normalizeWsUrl(stored, sameOriginDefault) {
 
 // Known chain ID → display name mapping
 const CHAIN_NAMES = {
-  10:     "Optimism",
-  8453:   "Base",
-  42161:  "Arbitrum",
-  100:    "Gnosis",
-  137:    "Polygon",
-  534352: "Scroll",
-  59144:  "Linea",
-  1:      "Ethereum",
-  56:     "BNB Chain",
-  43114:  "Avalanche",
+  8453:  "Base",
+  84532: "Base Sepolia",
 };
 
 const chainName = (id) => CHAIN_NAMES[Number(id)] || `Chain ${id}`;
 
-// Extract [ChainName] prefix from log messages like "[Optimism] tx=..."
+// Extract [ChainName] prefix from log messages like "[Base] tx=..."
 const extractChain = (msg) => {
   const m = typeof msg === "string" && msg.match(/^\[([^\]]+)\]/);
   return m ? m[1] : null;

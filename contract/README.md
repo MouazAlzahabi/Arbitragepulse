@@ -40,14 +40,14 @@ forge test --match-test test_ExecuteProfitableArb -vvv
 # Gas report
 forge test --gas-report
 
-# Deploy to local Anvil fork
-anvil --fork-url $OPTIMISM_RPC --port 8545
+# Deploy to a local Anvil fork of Base
+anvil --fork-url $BASE_RPC --chain-id 8453 --port 8545
 forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
 
-# Deploy to Optimism mainnet
-forge script script/Deploy.s.sol --rpc-url $OPTIMISM_RPC --broadcast --verify
+# Deploy to Base Sepolia (testing stage) — then DeployMocks.s.sol, see TESTNET_DEPLOYMENT_GUIDE.md
+forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC --broadcast
 
-# Deploy to Base
+# Deploy to Base mainnet
 forge script script/Deploy.s.sol --rpc-url $BASE_RPC --broadcast --verify
 ```
 

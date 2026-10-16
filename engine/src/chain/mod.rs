@@ -14,11 +14,11 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use alloy::sol_types::SolEvent;
-use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, ISolidlyFactory, IAerodromeFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool, IPancakeV3Pool};
+use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, IAerodromeFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool, IPancakeV3Pool};
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
-use crate::util::{rpc_timeout, RPC_READ_TIMEOUT};
+use crate::util::{rpc_timeout, rpc_read_timeout};
 use crate::executor::{Executor, TxPrep};
 use crate::listener::{Listener, SwapEvent, SwapMagnitude};
 use crate::metrics::Metrics;
@@ -31,18 +31,18 @@ pub mod discover;
 pub mod pending;
 
 /// Cooldown after a dry-run failure or balance-guard skip (cheap check, no RPC spent).
-pub(crate) const COOLDOWN_SECS: u64 = 15;
+pub(crate) fn cooldown_secs() -> u64 { crate::config::tuning().cooldown_secs }
 /// Cooldown after a tx is sent to chain. Short window so the pool can emit Sync events
 /// and the local cache catches up before the next attempt.
-pub(crate) const SEND_COOLDOWN_SECS: u64 = 15;
+pub(crate) fn send_cooldown_secs() -> u64 { crate::config::tuning().send_cooldown_secs }
 /// Cooldown for routes rejected as unprofitable after gas. These routes have a real gross
 /// spread but the profit doesn't cover gas. Gas prices on L2s are stable minute-to-minute,
 /// so there is no value in retrying the same route every 15s — it wastes log space and
 /// prevents the engine from properly surfacing other opportunities.
-pub(crate) const GAS_REJECT_COOLDOWN_SECS: u64 = 60;
+pub(crate) fn gas_reject_cooldown_secs() -> u64 { crate::config::tuning().gas_reject_cooldown_secs }
 /// Only count real execution failures (simulation reverts, send errors).
 /// Gas-profitability rejects ("below threshold") do NOT count — they're pre-flight skips.
-pub(crate) const MAX_CONSECUTIVE_FAILURES: u32 = 20;
+pub(crate) fn max_consecutive_failures() -> u32 { crate::config::tuning().max_consecutive_failures }
 
 /// Non-blocking flush of WS logs queued before a scan. Uses `pool_cache` directly —
 /// avoids acquiring the strategy read lock on every block/swap scan.
@@ -90,6 +90,16 @@ pub async fn run_chain(
 
     let provider = Arc::new(provider);
 
+    // ── Chain-id guard: the RPC must serve the chain this config describes ──
+    let rpc_chain_id = crate::util::rpc_timeout(crate::util::rpc_read_timeout(), provider.get_chain_id())
+        .await
+        .map_err(|e| anyhow::anyhow!("[{}] eth_chainId failed: {}", cfg.name, e))?;
+    if let Err(e) = config::check_chain_id(cfg.id, rpc_chain_id, &cfg.name) {
+        // Not retryable: the caller's restart loop would just hit it again.
+        tracing::error!("{}", e);
+        std::process::exit(2);
+    }
+
     // ── Contract address ──
     let contract_addr: Address = cfg
         .contract_address
@@ -121,13 +131,11 @@ pub async fn run_chain(
     // ── Strategy ──
     let chain_pairs: Vec<PairConfig> = pairs
         .iter()
-        .filter(|p| p.chain_id == cfg.id)
         .cloned()
         .collect();
 
     let chain_routers: Vec<RouterConfig> = routers
         .iter()
-        .filter(|r| r.chain_id == cfg.id)
         .cloned()
         .collect();
 
@@ -146,12 +154,12 @@ pub async fn run_chain(
         None,
     );
 
-    // ── Pool discovery: populate V2/Solidly-volatile reserve cache ────────────
+    // ── Pool discovery: populate V2/Aerodrome reserve cache ───────────────────
     // Eliminates per-block eth_calls for xy=k routers — reserves stay fresh via
     // on-chain Sync events (listener.rs subscribes and updates the cache live).
     let pool_cache = Arc::new(PoolCache::new());
     discover::discover_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
-    info!("[{}] Pool cache: {} V2/Solidly pools discovered", cfg.name, pool_cache.by_address.len());
+    info!("[{}] Pool cache: {} V2/Aerodrome pools discovered", cfg.name, pool_cache.by_address.len());
 
     // ── V3 pool discovery: seed sqrtPriceX96 + liquidity from slot0() ─────────
     // Subscribes to V3 Swap events after startup to keep state fresh with zero RPC cost.
@@ -183,12 +191,6 @@ pub async fn run_chain(
         cfg.optimistic_submission,
         http_provider,
     )));
-
-    // Populate SyncSwap pool cache at startup (no-op if no SyncSwap routers configured)
-    {
-        let mut strat = strategy.write().await;
-        strat.populate_syncswap_pools(provider.as_ref()).await;
-    }
 
     // ── Contract balance cache ─────────────────────────────────────────────────
     // Caches the ArbitrageExecutor's token_in balances. Refreshed every 30s and
@@ -286,7 +288,7 @@ pub async fn run_chain(
                     }
                 }
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
             }
         });
     }
@@ -347,7 +349,7 @@ pub async fn run_chain(
                     Err(e) => {
                         debug!("[{}] log subscription failed: {} — retrying in {:?}", cname, e, backoff);
                         tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
                     }
                 }
             }
@@ -436,9 +438,9 @@ pub async fn run_chain(
     // Default 1000ms gives ~60 scans/min on a 2s-block chain (alternates block/poll).
     let poll_interval = Duration::from_millis(cfg.scan_interval_ms);
     let mut poll_tick     = tokio::time::interval(poll_interval);
-    let mut price_tick    = tokio::time::interval(Duration::from_secs(60));
-    let mut config_tick   = tokio::time::interval(Duration::from_secs(30));
-    let mut balance_tick  = tokio::time::interval(Duration::from_secs(30));
+    let mut price_tick    = tokio::time::interval(crate::config::tuning().price_refresh());
+    let mut config_tick   = tokio::time::interval(crate::config::tuning().config_reload());
+    let mut balance_tick  = tokio::time::interval(crate::config::tuning().balance_refresh());
     // Native-price and balance refreshes run as background tasks so their RPC calls never
     // delay a scan. Each flag stops a slow refresh from overlapping with the next tick.
     let price_refresh_busy   = Arc::new(AtomicBool::new(false));
@@ -472,8 +474,8 @@ pub async fn run_chain(
                 cooldowns.retain(|_, expire_at| *expire_at > now);
 
                 let (pruned_v2, pruned_v3) = pool_cache.prune_stale(
-                    Duration::from_secs(45 * 60),
-                    Duration::from_secs(45 * 60),
+                    crate::config::tuning().pool_prune_after(),
+                    crate::config::tuning().pool_prune_after(),
                 );
                 if pruned_v2 > 0 || pruned_v3 > 0 {
                     debug!(
@@ -484,7 +486,7 @@ pub async fn run_chain(
 
                 // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
                 let rpc_ping_start = Instant::now();
-                let rpc_latency_ms = match rpc_timeout(RPC_READ_TIMEOUT, provider.get_block_number()).await {
+                let rpc_latency_ms = match rpc_timeout(rpc_read_timeout(), provider.get_block_number()).await {
                     Ok(_) => rpc_ping_start.elapsed().as_millis() as f64,
                     Err(_) => 0.0,
                 };
@@ -564,7 +566,7 @@ pub async fn run_chain(
                 let total_pairs = chain_pairs.len() as u64;
                 let opp_count = last_opp_count.load(Ordering::Relaxed);
                 let (v3_fresh, v3_total) =
-                    pool_cache.count_fresh_v3_pools(Duration::from_secs(30));
+                    pool_cache.count_fresh_v3_pools(crate::config::tuning().v3_fresh_window());
                 let heartbeat_msg = format!(
                     "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}",
                     cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, v3_fresh, v3_total,
@@ -573,7 +575,7 @@ pub async fn run_chain(
                 // A full scan normally runs every block (~2 s); a long gap means scanning has
                 // stalled (e.g. RPC outage), which the counters alone don't show.
                 // Paused chains don't scan, so a long gap there is expected, not a stall.
-                if !paused && total_scans > 0 && last_scan_at.elapsed() > Duration::from_secs(30) {
+                if !paused && total_scans > 0 && last_scan_at.elapsed() > crate::config::tuning().heartbeat_stall_warn() {
                     warn!("{}", heartbeat_msg);
                 } else {
                     info!("{}", heartbeat_msg);
@@ -645,11 +647,10 @@ pub async fn run_chain(
             // ── Config hot-reload ─────────────────────────────────────────────
             _ = config_tick.tick() => {
                 if let Ok(new_cfg) = config::load_config(&config_path) {
-                    let new_pairs: Vec<_> = new_cfg.pairs.iter()
-                        .filter(|p| p.chain_id == cfg.id).cloned().collect();
-                    let new_routers: Vec<_> = new_cfg.routers.iter()
-                        .filter(|r| r.chain_id == cfg.id).cloned().collect();
-                    let new_chain_cfg = new_cfg.chains.iter().find(|c| c.id == cfg.id);
+                    let new_pairs: Vec<_> = new_cfg.pairs.clone();
+                    let new_routers: Vec<_> = new_cfg.routers.clone();
+                    // Same instance, same chain: a reload that switched chains is ignored.
+                    let new_chain_cfg = Some(&new_cfg.chain).filter(|c| c.id == cfg.id);
                     let new_min_profit = new_chain_cfg
                         .map(|c| c.min_profit_usd)
                         .unwrap_or(cfg.min_profit_usd);
@@ -659,10 +660,6 @@ pub async fn run_chain(
 
                     {
                         let mut strat = strategy.write().await;
-
-                        // Only trigger the network call if pairs/routers actually changed
-                        let structure_changed = strat.pairs.len() != new_pairs.len()
-                            || strat.routers.len() != new_routers.len();
 
                         let profit_changed = strat.min_profit_usd != new_min_profit
                             || strat.min_triangular_profit_usd != new_min_tri_profit;
@@ -674,11 +671,6 @@ pub async fn run_chain(
                         // Single rebuild with updated pairs, routers, and profit floors.
                         strat.rebuild_token_pair_index();
                         strat.rebuild_router_maps();
-
-                        if structure_changed {
-                            info!("[{}] Config structure changed — refreshing SyncSwap cache", cfg.name);
-                            strat.populate_syncswap_pools(provider.as_ref()).await;
-                        }
 
                         if profit_changed {
                             info!(
@@ -930,9 +922,9 @@ pub async fn run_chain(
 // ─── RPC connection with fallback ─────────────────────────────────────────────
 
 /// The chain's RPC monitor: while degraded and past the hold, probe every
-/// [`crate::util::RPC_MONITOR_EVERY`] with a plain eth_call (Multicall3.getBlockNumber,
+/// [`crate::util::rpc_monitor_every()`] with a plain eth_call (Multicall3.getBlockNumber,
 /// the method simulations use) and clear the degraded state once it succeeds within
-/// [`crate::util::RPC_PROBE_HEALTHY`]. The only writer of "recovered", and independent of
+/// [`crate::util::rpc_probe_healthy()`]. The only writer of "recovered", and independent of
 /// scans, so a quiet market can't leave a chain stuck. Holds weak references: it exits
 /// when this chain run's provider or health object is dropped (shutdown / reconnect).
 fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
@@ -940,12 +932,12 @@ fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
     rpc_health: &crate::util::SharedRpcHealth,
     chain: String,
 ) {
-    use crate::util::{rpc_timeout, classify_rpc_failure, RpcFailure, RPC_MONITOR_EVERY, RPC_PROBE_HEALTHY};
+    use crate::util::{rpc_timeout, classify_rpc_failure, RpcFailure, rpc_monitor_every, rpc_probe_healthy};
     const MULTICALL3: Address = alloy::primitives::address!("cA11bde05977b3631167028862bE2a173976CA11");
     const GET_BLOCK_NUMBER: [u8; 4] = [0x42, 0xcb, 0xb1, 0x5c]; // getBlockNumber()
     let (provider, health) = (Arc::downgrade(provider), Arc::downgrade(rpc_health));
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(RPC_MONITOR_EVERY);
+        let mut tick = tokio::time::interval(rpc_monitor_every());
         let mut slow_logged = false;
         loop {
             tick.tick().await;
@@ -958,7 +950,7 @@ fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
                 .to(MULTICALL3)
                 .input(alloy::primitives::Bytes::from_static(&GET_BLOCK_NUMBER).into());
             let t = Instant::now();
-            let result = rpc_timeout(RPC_PROBE_HEALTHY, provider.call(tx)).await;
+            let result = rpc_timeout(rpc_probe_healthy(), provider.call(tx)).await;
             let took = t.elapsed();
             let rate_limited = result.as_ref().err().is_some_and(|e| classify_rpc_failure(e) == RpcFailure::RateLimited);
             if result.is_ok() || rate_limited {
@@ -969,7 +961,7 @@ fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
             } else if !slow_logged {
                 // Once per degraded period: the probe itself keeps running every 2 s.
                 warn!("[{}] RPC not healthy yet ({}) — execution stays off, probing every {:?}",
-                      chain, result.err().unwrap_or_default(), RPC_MONITOR_EVERY);
+                      chain, result.err().unwrap_or_default(), rpc_monitor_every());
                 slow_logged = true;
             }
         }

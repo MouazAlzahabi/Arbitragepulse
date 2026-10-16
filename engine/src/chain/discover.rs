@@ -18,13 +18,13 @@ pub(crate) async fn discover_pools<P: Provider>(
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
 
-    // ── Collect V2, Solidly, and Aerodrome routers ────────────────────────────
+    // ── Collect V2 and Aerodrome routers ──────────────────────────────────────
     // configured_factory: pre-parsed from config.factory_address — avoids the on-chain
     // factory() call for routers that don't expose it (e.g. Aerodrome uses defaultFactory()).
     struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32, stable_fee_bps: u32, configured_factory: Option<Address> }
     let target_routers: Vec<RouterMeta> = routers
         .iter()
-        .filter(|r| r.router_type == RouterType::V2 || r.router_type == RouterType::Solidly || r.router_type == RouterType::Aerodrome)
+        .filter(|r| r.router_type == RouterType::V2 || r.router_type == RouterType::Aerodrome)
         .filter_map(|r| {
             let addr: Address = r.address.parse().ok()?;
             let stable_fee_bps = r.stable_fee_bps.unwrap_or(r.fee_bps);
@@ -59,7 +59,7 @@ pub(crate) async fn discover_pools<P: Provider>(
         .collect();
 
     // ── Round 2: getPair per (router × pair) ─────────────────────────────────
-    // Solidly routers produce TWO calls per pair: volatile (stable:false) and
+    // Aerodrome routers produce TWO calls per pair: volatile (stable:false) and
     // stable (stable:true). Both pools are discovered and cached independently.
     struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool }
     let mut pair_calls: Vec<(Address, Vec<u8>)> = Vec::new();
@@ -75,16 +75,6 @@ pub(crate) async fn discover_pools<P: Provider>(
                     let cd = IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode();
                     pair_calls.push((factory, cd));
                     pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
-                }
-                RouterType::Solidly => {
-                    // Volatile pool (xy=k)
-                    let cd_vol = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
-                    pair_calls.push((factory, cd_vol));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
-                    // Stable pool (x³y+xy³=k) — uses stable_fee_bps if configured
-                    let cd_sta = ISolidlyFactory::getPairCall { tokenA: ta, tokenB: tb, stable: true }.abi_encode();
-                    pair_calls.push((factory, cd_sta));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, ta, tb, is_stable: true });
                 }
                 RouterType::Aerodrome => {
                     // Aerodrome uses getPool() not getPair() — different 4-byte selector
@@ -173,9 +163,9 @@ pub(crate) async fn discover_pools<P: Provider>(
         // Map ta/tb decimals to token0/token1 order
         let (decimals0, decimals1) = if pm.ta == token0 { (dec_ta, dec_tb) } else { (dec_tb, dec_ta) };
 
-        // Key suffix: Solidly volatile → "::volatile", Solidly stable → "::stable", V2 → unchanged
+        // Key suffix: Aerodrome volatile → "::volatile", stable → "::stable", V2 → unchanged
         let effective_id = match pm.rtype {
-            RouterType::Solidly | RouterType::Aerodrome => if pm.is_stable {
+            RouterType::Aerodrome => if pm.is_stable {
                 format!("{}::stable", pm.router_id)
             } else {
                 format!("{}::volatile", pm.router_id)
@@ -285,7 +275,7 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
         .all(|(_, raw)| raw.is_none());
     let failed: Vec<&V3Router> = v3_routers.iter().filter(|vr| router_failed(&vr.id)).collect();
     let rpc_ok = failed.len() < v3_routers.len()
-        || crate::util::rpc_timeout(crate::util::RPC_READ_TIMEOUT, provider.get_block_number()).await.is_ok();
+        || crate::util::rpc_timeout(crate::util::rpc_read_timeout(), provider.get_block_number()).await.is_ok();
     if !failed.is_empty() && !rpc_ok {
         tracing::warn!(
             "V3 pool discovery: no factory answered any getPool call and the RPC is not \
@@ -383,15 +373,15 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
 
 /// Multicall3 helper used at startup by discover_pools / discover_v3_pools.
 ///
-/// Splits `calls` into chunks of `DISCOVER_CHUNK` items, issuing one Multicall3
+/// Splits `calls` into chunks of `discover_chunk()` items, issuing one Multicall3
 /// call per chunk sequentially. This smooths the startup CU burst:
 ///   • Old: 90 sub-calls in one Multicall3 (or worse, 90 sequential eth_calls on fallback)
 ///   • New: 5 × 20 = 5 Multicall3 calls, ~5 × 26 CU = 130 CU spread over ~150ms
-const DISCOVER_CHUNK: usize = 20;
+fn discover_chunk() -> usize { crate::config::tuning().discover_chunk_size }
 
 /// Timeout for one discovery Multicall3 chunk. Longer than the scan-path timeout: startup
 /// batches are bigger and a cold node may need to load state first.
-const DISCOVER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+fn discover_call_timeout() -> std::time::Duration { crate::config::tuning().discover_call_timeout() }
 
 pub(crate) async fn discover_mc<P: Provider>(
     calls: Vec<(Address, Vec<u8>)>,
@@ -410,7 +400,7 @@ pub(crate) async fn discover_mc<P: Provider>(
 
     let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
 
-    for chunk in calls.chunks(DISCOVER_CHUNK) {
+    for chunk in calls.chunks(discover_chunk()) {
         let mc_calls: Vec<crate::abi::IMulticall3::Call3> = chunk
             .iter()
             .map(|(t, d)| crate::abi::IMulticall3::Call3 {
@@ -423,11 +413,11 @@ pub(crate) async fn discover_mc<P: Provider>(
         let tx = TransactionRequest::default().to(mc3).input(calldata.into());
 
         // Bounded: a hung RPC otherwise blocks startup forever (seen on a cold fork).
-        let Ok(call_result) = tokio::time::timeout(DISCOVER_CALL_TIMEOUT, provider.call(tx)).await else {
+        let Ok(call_result) = tokio::time::timeout(discover_call_timeout(), provider.call(tx)).await else {
             // Timed out: the RPC is stuck, so skip the sequential fallback (more calls would
             // only stall longer) and count the chunk as failed — discovery warns per router.
             tracing::warn!("Pool discovery multicall timed out after {:?} — {} call(s) counted as failed",
-                           DISCOVER_CALL_TIMEOUT, chunk.len());
+                           discover_call_timeout(), chunk.len());
             results.extend(std::iter::repeat_n(None, chunk.len()));
             continue;
         };
@@ -445,7 +435,7 @@ pub(crate) async fn discover_mc<P: Provider>(
             let tx2 = TransactionRequest::default()
                 .to(*target)
                 .input(data.clone().into());
-            let r = tokio::time::timeout(crate::util::RPC_READ_TIMEOUT, provider.call(tx2)).await;
+            let r = tokio::time::timeout(crate::util::rpc_read_timeout(), provider.call(tx2)).await;
             results.push(r.ok().and_then(|r| r.ok()).map(|b| b.to_vec()));
         }
     }

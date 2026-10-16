@@ -275,8 +275,6 @@ pub fn router_type_label(t: &crate::config::RouterType) -> &'static str {
     match t {
         crate::config::RouterType::V2 => "V2",
         crate::config::RouterType::V3 => "V3",
-        crate::config::RouterType::Solidly => "Solidly",
-        crate::config::RouterType::SyncSwap => "SyncSwap",
         crate::config::RouterType::Aerodrome => "Aerodrome",
     }
 }

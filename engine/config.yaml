@@ -1,203 +1,69 @@
 # ============================================================
-# ArbitragePulse Engine — Configuration
+# ArbitragePulse Engine — Base mainnet (production)
 # ============================================================
-# Edit this file to add chains, routers, and trading pairs.
-# No code changes needed. Restart the engine to apply.
+# One config file = one chain = one engine instance. To trade another chain, deploy
+# another instance with its own config, .env, PORT and database (see
+# PRODUCTION_DEPLOYMENT_GUIDE.md). Testing stage: config-testnet.yaml (Base Sepolia).
+#
+# Routers, pairs and min-profit values hot-reload every `tuning.config_reload_ms`.
+# The `chain:` block and `tuning:` need a restart.
 # ============================================================
 
 
-# ─── CHAINS ────────────────────────────────────────────────
-chains:
-  # ── Local Anvil fork (for testing with MockRouters) — disabled for production ──
-  - id: 10
-    name: "Optimism"
-    enabled: false
-    ws_rpc: "ws://127.0.0.1:8545"
-    http_rpc: "http://127.0.0.1:8545"
-    native_currency: "ETH"
-    wrapped_native: "0x4200000000000000000000000000000000000006"
-    block_time_ms: 2000
-    contract_address: "0xa1d5a79a254f4622c34d9d3e813e51096e54fb12"  # Updated from lab setup
-    min_native_balance: 0.001
-    min_profit_usd: 0.01
-    deadline_seconds: 120
-    # QuoterV2 for Uniswap V3 price quoting
-    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
-
-  - id: 8453
-    name: "Base"
-    enabled: true
-    ws_rpc: "wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    http_rpc: "https://mainnet.base.org"
-    native_currency: "ETH"
-    wrapped_native: "0x4200000000000000000000000000000000000006"
-    block_time_ms: 2000
-    contract_address: "0xF8aa9d575CEccdFed211383Cd3979241d9C6E0c2"
-    min_native_balance: 0.005
-    # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
-    # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
-    # deliberately loosened (62% of gas floor, 2% router slack), so it does NOT filter thin edges.
-    min_profit_usd: 0.0001
-    deadline_seconds: 120
-    quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
-    scan_interval_ms: 2000
-    rpc_concurrency: 3
-    # Extra HTTP endpoints to broadcast signed txs concurrently (FCFS sequencer — race to arrive first)
-    ws_rpc_fallbacks:
-      - "wss://mainnet.base.org"                              # public fallback (no mempool, blocks only)
-    submission_rpcs:
-      - "https://mainnet-sequencer.base.org"                     # Direct OP Stack sequencer (bypasses CDN)
-      - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
-      - "https://base.llamarpc.com"                              # LlamaRPC parallel submit
-    # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).
-    # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
-    # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
-    # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
-    # Traced mined reverts on Base often show Phase-1 phantom edges vs actual V3 liquidity (sell leg <
-    # amountIn+minProfit). QuoterV2 preflight trades latency for fewer guaranteed reverts until the
-    # pipeline nets its first confirmations.
-    optimistic_submission: false  # Phase 1.5 QuoterV2 (~80–160ms) — restores bestV= in heartbeat
-    # preflight_eth_call: true     # eth_call before send — logs revert reason in engine (adds ~100–250ms latency)
-    # Applies to EVERY triangular route. V3-leg routes are QuoterV2-verified first (revert plan 1.4),
-    # so for them this is checked against verified profit and no longer absorbs the ~0.30% V3 spot
-    # overestimate the old $0.80 covered. V2/Solidly/Aerodrome-only routes are NOT re-verified: they
-    # rely on event-sourced reserves (exact xy=k / stable curve) + 15 bps haircut + 5% sanity cap.
-    # If those routes start reverting, raise this floor — it is the only extra guard they have.
-    # With optimistic_submission: true, V3-leg routes are submitted UNVERIFIED on spot quotes; the
-    # engine then deducts the ~0.30% V3 overestimate (V3_SPOT_OVERESTIMATE_BPS) before this floor.
-    min_triangular_profit_usd: 0.15
-    optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
-    priority_fee_wei: 10000000    # 10 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei (trigger_tip dominates for pending path)
-    pending_tx_monitoring: true   # monitor mempool for large swaps before they confirm → same-block arb
-    pending_only_submission: false # only submit TXs from pending monitor path; block/poll scans detect but don't submit (avoids pos 500+ failures)
-    poll_logs_fallback: false     # Alchemy WS logs are live — skip duplicate eth_getLogs polling
-
-  - id: 42161
-    name: "Arbitrum"
-    enabled: false
-    ws_rpc: "wss://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    http_rpc: "https://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    native_currency: "ETH"
-    wrapped_native: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
-    block_time_ms: 250
-    contract_address: "0xYOUR_CONTRACT_ON_ARBITRUM"
-    min_native_balance: 0.005
-    min_profit_usd: 0.30
-    deadline_seconds: 60
-    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
-
-  - id: 100
-    name: "Gnosis"
-    enabled: false
-    ws_rpc: "wss://rpc.gnosischain.com/wss"
-    http_rpc: "https://rpc.gnosischain.com"
-    native_currency: "xDAI"
-    wrapped_native: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"
-    block_time_ms: 5000
-    contract_address: "0xYOUR_CONTRACT_ON_GNOSIS"
-    min_native_balance: 1.0
-    min_profit_usd: 0.20
-    deadline_seconds: 180
-
-  - id: 137
-    name: "Polygon"
-    enabled: false
-    ws_rpc: "wss://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    http_rpc: "https://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    native_currency: "MATIC"
-    wrapped_native: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
-    block_time_ms: 2000
-    contract_address: "0xYOUR_CONTRACT_ON_POLYGON"
-    min_native_balance: 10.0
-    min_profit_usd: 0.30
-    deadline_seconds: 120
-    quoter_v2_address: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
-
-  - id: 534352
-    name: "Scroll"
-    enabled: false
-    ws_rpc: "wss://scroll-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    http_rpc: "https://scroll-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    native_currency: "ETH"
-    wrapped_native: "0x5300000000000000000000000000000000000004"
-    block_time_ms: 3000
-    contract_address: "0xYOUR_CONTRACT_ON_SCROLL"
-    min_native_balance: 0.005
-    min_profit_usd: 0.20
-    deadline_seconds: 120
-
-  - id: 59144
-    name: "Linea"
-    enabled: false  # Switched to Base — re-enable after bridging back if needed
-    ws_rpc: "wss://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    http_rpc: "https://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-    native_currency: "ETH"
-    wrapped_native: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"
-    block_time_ms: 2000  # 2 second blocks
-    contract_address: "0xb4DA83518bc53c54482ccFacAC7D9c828869829b"
-    min_native_balance: 0.01
-    min_profit_usd: 0.001   # Minimum NET profit after gas. Lowered for testing; raise once confirmed working.
-    deadline_seconds: 120
-    min_swap_amount_filter: 10000000  # 10 USDC minimum (reduced to catch more opportunities)
-    # Chain-level fallback quoter — used for routers that don't have their own quoter_address.
-    # Set to Uniswap's QuoterV2 (deepest liquidity → most accurate ETH price).
-    quoter_v2_address: "0x42bE4D6527829FeFA1493e1fb9F3676d2425C3C1"  # Uniswap V3 QuoterV2 (Linea)
-    ws_rpc_fallbacks:
-      - "wss://rpc.linea.build"  # Public fallback
-    # Max concurrent Multicall3 chunks per scan.
-    # Each chunk = 1 eth_call (26 CU). Free plan (330 CU/s): 3. Growth plan (3000 CU/s): 10.
-    rpc_concurrency: 3
-    # How often to scan between blocks (milliseconds). Aligned with Linea 2s block cadence
-    # to prevent poll_tick from firing between blocks (which doubled scan rate to ~45/min).
-    scan_interval_ms: 2000
+# ─── CHAIN ─────────────────────────────────────────────────
+chain:
+  id: 8453
+  name: "Base"
+  ws_rpc: "wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+  http_rpc: "https://mainnet.base.org"
+  native_currency: "ETH"
+  wrapped_native: "0x4200000000000000000000000000000000000006"
+  block_time_ms: 2000
+  contract_address: "0xF8aa9d575CEccdFed211383Cd3979241d9C6E0c2"
+  min_native_balance: 0.005
+  # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
+  # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
+  # deliberately loosened (62% of gas floor, 2% router slack), so it does NOT filter thin edges.
+  min_profit_usd: 0.0001
+  deadline_seconds: 120
+  quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
+  scan_interval_ms: 2000
+  rpc_concurrency: 3
+  # Extra HTTP endpoints to broadcast signed txs concurrently (FCFS sequencer — race to arrive first)
+  ws_rpc_fallbacks:
+    - "wss://mainnet.base.org"                              # public fallback (no mempool, blocks only)
+  submission_rpcs:
+    - "https://mainnet-sequencer.base.org"                     # Direct OP Stack sequencer (bypasses CDN)
+    - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
+    - "https://base.llamarpc.com"                              # LlamaRPC parallel submit
+  # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).
+  # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
+  # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
+  # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
+  # Traced mined reverts on Base often show Phase-1 phantom edges vs actual V3 liquidity (sell leg <
+  # amountIn+minProfit). QuoterV2 preflight trades latency for fewer guaranteed reverts until the
+  # pipeline nets its first confirmations.
+  optimistic_submission: false  # Phase 1.5 QuoterV2 (~80–160ms) — restores bestV= in heartbeat
+  # preflight_eth_call: true     # eth_call before send — logs revert reason in engine (adds ~100–250ms latency)
+  # Applies to EVERY triangular route. V3-leg routes are QuoterV2-verified first (revert plan 1.4),
+  # so for them this is checked against verified profit and no longer absorbs the ~0.30% V3 spot
+  # overestimate the old $0.80 covered. V2/Solidly/Aerodrome-only routes are NOT re-verified: they
+  # rely on event-sourced reserves (exact xy=k / stable curve) + 15 bps haircut + 5% sanity cap.
+  # If those routes start reverting, raise this floor — it is the only extra guard they have.
+  # With optimistic_submission: true, V3-leg routes are submitted UNVERIFIED on spot quotes; the
+  # engine then deducts the ~0.30% V3 overestimate (V3_SPOT_OVERESTIMATE_BPS) before this floor.
+  min_triangular_profit_usd: 0.15
+  optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
+  priority_fee_wei: 10000000    # 10 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei (trigger_tip dominates for pending path)
+  pending_tx_monitoring: true   # monitor mempool for large swaps before they confirm → same-block arb
+  pending_only_submission: false # only submit TXs from pending monitor path; block/poll scans detect but don't submit (avoids pos 500+ failures)
+  poll_logs_fallback: false     # Alchemy WS logs are live — skip duplicate eth_getLogs polling
 
 
-# ─── ROUTERS ──────────────────────────────────────────────
-# type: "v2" = Uniswap V2-compatible (getAmountsOut + swapExactTokensForTokens)
-#        "v3" = Uniswap V3-compatible (QuoterV2.quoteExactInputSingle + exactInputSingle)
-# fee_tiers: V3 only — fee tiers to try (in bps*100): 500=0.05%, 3000=0.3%, 10000=1%
-
+# ─── ROUTERS ───────────────────────────────────────────────
 routers:
-  # ── Optimism mainnet routers — DISABLED for local fork testing ──
-  # Uncomment when connecting to real Optimism mainnet (not local Anvil fork).
-  # When enabled alongside MockRouters on the fork, the real QuoterV2 returns
-  # real WETH amounts but MockRouter A gives nonsensical reverse quotes → phantom profits.
-  #
-  # - id: "uniswap-v3-op"
-  #   name: "Uniswap V3 (Optimism)"
-  #   chain_id: 10
-  #   address: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-  #   type: "v3"
-  #   fee_tiers: [500, 3000, 10000]
-  #   fee_bps: 0
-  #
-  # - id: "velodrome-v2-op"
-  #   name: "Velodrome V2 (Optimism)"
-  #   chain_id: 10
-  #   address: "0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858"
-  #   type: "v2"
-  #   fee_bps: 5
-
-  # ── Local Anvil fork — MockRouters (deployed by: cargo run -p lab -- setup) ──
-  # RouterB listed first so native price update gets market rate ($2500/WETH)
-  - id: "mock-router-b"
-    name: "MockRouter B (market WETH @ 2500)"
-    chain_id: 10
-    address: "0x6414c91aba1324db8ada3812bc11826bc5f3e4d2"  # Updated from lab setup
-    type: "v2"
-    fee_bps: 0
-
-  - id: "mock-router-a"
-    name: "MockRouter A (cheap WETH @ 2222)"
-    chain_id: 10
-    address: "0x60b7e35e6a2964b006a756f9bbea7d58e2c2ff98"  # Updated from lab setup
-    type: "v2"
-    fee_bps: 0
-
-  # ── Base ──
   - id: "uniswap-v3-base"
     name: "Uniswap V3 (Base)"
-    chain_id: 8453
     address: "0x2626664c2603336E57B271c5C0b26F421741e481"  # SwapRouter02
     type: "v3"
     fee_tiers: [100, 500, 3000, 10000]
@@ -206,9 +72,8 @@ routers:
 
   - id: "aerodrome-base"
     name: "Aerodrome V2 (Base)"
-    chain_id: 8453
     address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
-    type: "aerodrome"    # 4-field Route{from,to,stable,factory} — distinct from solidly (3-field)
+    type: "aerodrome"    # 4-field Route{from,to,stable,factory}
     fee_bps: 30        # volatile pools (0.3%)
     stable_fee_bps: 1  # stable pools (0.01%): USDC/USDbC, USDC/USDT, etc.
     # Aerodrome Router V2 exposes defaultFactory() not factory() — must be configured explicitly.
@@ -225,7 +90,6 @@ routers:
   # tickSpacing pool discovery, and tickSpacing quoting. Then restore this entry and the pair refs.
   # - id: "aerodrome-slipstream-base"
   #   name: "Aerodrome Slipstream CL (Base)"
-  #   chain_id: 8453
   #   address: "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
   #   type: "v3"
   #   fee_tiers: [100, 200, 500, 3000]   # 100 = 0.01% (USDC/EURC CL1 pool fee tier)
@@ -235,8 +99,7 @@ routers:
 
   - id: "pancake-v3-base"
     name: "PancakeSwap V3 (Base)"
-    chain_id: 8453
-    address: "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86"  # SmartRouter (7-field, same as Linea)
+    address: "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86"  # SmartRouter (7-field exactInputSingle, no deadline in struct)
     type: "v3"
     fee_tiers: [100, 500, 2500]
     fee_bps: 5
@@ -246,7 +109,6 @@ routers:
   # baseswap-v2 disabled: $29K USDC/WETH TVL → 0.8% price impact on $90 → confirmed reverts
   # - id: "baseswap-v2"
   #   name: "BaseSwap (Base)"
-  #   chain_id: 8453
   #   address: "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86"
   #   type: "v2"
   #   fee_bps: 30
@@ -254,7 +116,6 @@ routers:
   # alienbase-v2 disabled: thin liquidity, contributes phantom V2 routes
   # - id: "alienbase-v2"
   #   name: "Alien Base (Base)"
-  #   chain_id: 8453
   #   address: "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7"
   #   type: "v2"
   #   fee_bps: 12  # 0.12% protocol fee
@@ -262,210 +123,10 @@ routers:
   # SushiSwap V3: factory confirmed (0xc35DADB65012eC5796536bD9864eD8773aBc74C4) but
   # SwapRouter + QuoterV2 addresses not found in official docs — skipped until confirmed.
 
-  # ── Arbitrum ──
-  - id: "uniswap-v3-arb"
-    name: "Uniswap V3 (Arbitrum)"
-    chain_id: 42161
-    address: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-    type: "v3"
-    fee_tiers: [500, 3000, 10000]
-    fee_bps: 0
 
-  - id: "camelot-arb"
-    name: "Camelot (Arbitrum)"
-    chain_id: 42161
-    address: "0xc873fEcbd354f5A56E00E710B90EF4201db2448d"
-    type: "v2"
-    fee_bps: 30
-
-  # ── Gnosis ──
-  - id: "sushiswap-gnosis"
-    name: "SushiSwap (Gnosis)"
-    chain_id: 100
-    address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
-    type: "v2"
-    fee_bps: 30
-
-  - id: "honeyswap"
-    name: "Honeyswap (Gnosis)"
-    chain_id: 100
-    address: "0x1C232F01118CB8B424793ae03F870aa7D0ac7f77"
-    type: "v2"
-    fee_bps: 30
-
-  # ── Polygon ──
-  - id: "uniswap-v3-polygon"
-    name: "Uniswap V3 (Polygon)"
-    chain_id: 137
-    address: "0xE592427A0AEce92De3Edee1F18E0157C05861564"
-    type: "v3"
-    fee_tiers: [500, 3000, 10000]
-    fee_bps: 0
-
-  - id: "quickswap-polygon"
-    name: "QuickSwap (Polygon)"
-    chain_id: 137
-    address: "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff"
-    type: "v2"
-    fee_bps: 30
-
-  # ── Scroll ──
-  - id: "zebra-scroll"
-    name: "Zebra V1 (Scroll)"
-    chain_id: 534352
-    address: "0x0122960d6e391478bfe8fb2408ba412d5600f621"
-    type: "v2"
-    fee_bps: 30
-
-  - id: "syncswap-scroll"
-    name: "SyncSwap (Scroll)"
-    chain_id: 534352
-    address: "0x80e38291e06339d10aab483c65695d004dbd5c69"
-    type: "v2"
-    fee_bps: 30
-
-  # ── Linea ──
-  - id: "pancake-v2-linea"
-    name: "PancakeSwap V2 (Linea)"
-    chain_id: 59144
-    address: "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb"
-    type: "v2"
-    fee_bps: 25
-
-  - id: "pancake-v3-linea"
-    name: "PancakeSwap V3 (Linea)"
-    chain_id: 59144
-    address: "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86"
-    type: "v3"
-    fee_bps: 5
-    fee_tiers: [100, 500, 2500]  # 100bp is the only confirmed pool with liquidity on Linea
-    # PancakeSwap has its own QuoterV2 — different factory from Uniswap
-    quoter_address: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"
-    # V3 factory for pool discovery at startup (pools subscribe to Swap events for local state cache)
-    factory_address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
-
-  - id: "uniswap-v3-linea"
-    name: "Uniswap V3 (Linea)"
-    chain_id: 59144
-    address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # SwapRouter02 (Linea-specific address; 0x68b3465... is NOT SwapRouter02 on Linea)
-    type: "v3"
-    fee_bps: 0
-    fee_tiers: [500, 3000, 10000]
-    # Uses chain-level quoter_v2_address (Uniswap's own QuoterV2)
-    factory_address: "0x31FAfd4889FA1269F7a13A66eE0fB458f27D72A9"
-
-  # Nile Exchange — Solidly ve(3,3) fork on Linea
-  # Same Route[]{from, to, stable} interface as Lynex
-  - id: "nile-solidly-linea"
-    name: "Nile Exchange (Solidly, Linea)"
-    chain_id: 59144
-    address: "0xAAA45c8F5ef92a000a121d102F4e89278a711Faa"
-    type: "solidly"
-    fee_bps: 20  # ~0.2% volatile pool default
-
-  # Lynex — Solidly ve(3,3) fork (largest native Linea DEX by TVL)
-  # Uses Route[]{from, to, stable} interface.
-  # fee=0 → volatile pool (vAMM), fee=1 → stable pool (sAMM)
-  # IMPORTANT: Must be whitelisted on-chain after re-deploying updated contract:
-  #   executor.setAllowedRouter(0x610D..., true)
-  #   executor.setRouterType(0x610D..., 2)   # 2 = Solidly
-  - id: "lynex-solidly-linea"
-    name: "Lynex (Solidly, Linea)"
-    chain_id: 59144
-    address: "0x610D2f07b7EdC67565160F587F37636194C34E74"
-    type: "solidly"
-    fee_bps: 20  # ~0.2% Solidly volatile pool default
-
-  # SyncSwap — largest DEX on Linea by volume (custom per-pool quoting interface)
-  # The `address` field is the Pool Factory — used to look up pool addresses at startup.
-  # Opportunities are DETECT-ONLY (not executed) until contract-level support is added.
-  - id: "syncswap-classic-linea"
-    name: "SyncSwap Classic Pool Factory (Linea)"
-    chain_id: 59144
-    address: "0x37BAc764494c8db4e54BDE72f6965beA9fa0AC2d"
-    type: "syncswap"
-    fee_bps: 10  # 0.1% classic pools
-
-  - id: "syncswap-stable-linea"
-    name: "SyncSwap Stable Pool Factory (Linea)"
-    chain_id: 59144
-    address: "0xE4CF807E351b56720B17A59094179e7Ed9dD3727"
-    type: "syncswap"
-    fee_bps: 1   # 0.01% stable pools
-
-
-# ─── PAIRS ────────────────────────────────────────────────
-# trade_amount: human-readable amount in token_in units (e.g. "1000" = 1000 USDC)
-# max_trade:    optional cap — actual trade = min(trade_amount, max_trade)
-#               prevents excessive price impact on low-liquidity pools
-# watch_pools:  optional pool addresses for real-time Swap event triggers
-# NOTE: the per-pair "routers:" field is NOT parsed — all chain-level routers in the
-#       routers: section above always apply to every pair on that chain.
-
+# ─── PAIRS ─────────────────────────────────────────────────
 pairs:
-  # ── Optimism mainnet pairs — DISABLED for local fork testing ──
-  # These pairs use the same token addresses as MockRouters, causing the real QuoterV2
-  # on the fork to mix with MockRouter quotes → phantom profits → circuit breaker.
-  # Uncomment when running against real Optimism mainnet.
-  #
-  # - id: "op-usdc-weth"
-  #   chain_id: 10
-  #   token_in: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
-  #   token_out: "0x4200000000000000000000000000000000000006"
-  #   token_in_symbol: "USDC"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 6
-  #   token_out_decimals: 18
-  #   trade_amount: "5000"
-  #   max_trade: "5000"
-  #   min_swap_size: "10"
-  #   watch_pools:
-  #     - "0x85149247691df622eaF1a8Bd0CaFd40BC45154a"
-  #     - "0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7"
-  #
-  # - id: "op-usdt-weth"
-  #   chain_id: 10
-  #   token_in: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
-  #   token_out: "0x4200000000000000000000000000000000000006"
-  #   token_in_symbol: "USDT"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 6
-  #   token_out_decimals: 18
-  #   trade_amount: "5000"
-  #   max_trade: "5000"
-  #   min_swap_size: "10"
-  #   watch_pools: []
-  #
-  # - id: "op-usdc-usdt"
-  #   chain_id: 10
-  #   token_in: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
-  #   token_out: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"
-  #   token_in_symbol: "USDC"
-  #   token_out_symbol: "USDT"
-  #   token_in_decimals: 6
-  #   token_out_decimals: 6
-  #   trade_amount: "10000"
-  #   max_trade: "10000"
-  #   min_swap_size: "10"
-  #   watch_pools: []
-
-  # ── Local Anvil MockRouter pair ──
-  - id: "local-usdc-weth"
-    chain_id: 10
-    token_in: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"   # USDC
-    token_out: "0x4200000000000000000000000000000000000006"   # WETH
-    token_in_symbol: "USDC"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "1000"
-    max_trade: "1000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  # ── Base ──
   - id: "base-usdc-weth"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x4200000000000000000000000000000000000006"   # WETH
     token_in_symbol: "USDC"
@@ -480,7 +141,6 @@ pairs:
 
   # base-usdbc-weth disabled — contract has no USDbC; re-enable after funding with USDbC
   # - id: "base-usdbc-weth"
-  #   chain_id: 8453
   #   token_in: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC (bridged USDC)
   #   token_out: "0x4200000000000000000000000000000000000006"   # WETH
   #   token_in_symbol: "USDBC"
@@ -494,7 +154,6 @@ pairs:
   #   watch_pools: []
 
   - id: "base-usdc-usdbc"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC
     token_in_symbol: "USDC"
@@ -508,7 +167,6 @@ pairs:
     watch_pools: []
 
   - id: "base-usdc-usdt"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"   # USDT (bridged)
     token_in_symbol: "USDC"
@@ -523,7 +181,6 @@ pairs:
 
   # USDT → WETH: Aerodrome Slipstream 0.05% ($221K TVL, $775K/day) vs UniV3 0.05% ($41K TVL)
   - id: "base-usdt-weth"
-    chain_id: 8453
     token_in: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"   # USDT (bridged)
     token_out: "0x4200000000000000000000000000000000000006"   # WETH
     token_in_symbol: "USDT"
@@ -537,7 +194,6 @@ pairs:
     watch_pools: []
 
   - id: "base-usdc-cbbtc"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"   # cbBTC (Coinbase Wrapped BTC, 8 decimals)
     token_in_symbol: "USDC"
@@ -551,7 +207,6 @@ pairs:
     watch_pools: []
 
   - id: "base-usdc-aero"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x940181a94A35A4569E4529A3CDfB74e38FD98631"   # AERO (Aerodrome governance token)
     token_in_symbol: "USDC"
@@ -566,7 +221,6 @@ pairs:
 
   # cbETH disabled until contract funded with cbETH
   # - id: "base-cbeth-weth"
-  #   chain_id: 8453
   #   token_in: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH
   #   token_out: "0x4200000000000000000000000000000000000006"   # WETH
   #   token_in_symbol: "CBETH"
@@ -580,7 +234,6 @@ pairs:
 
   # USDC → DAI: stablecoin spread — enabled now that contract holds 1000+ USDC
   - id: "base-usdc-dai"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI
     token_in_symbol: "USDC"
@@ -595,7 +248,6 @@ pairs:
 
   # USDC → cbETH: Coinbase staked ETH — LST premium divergence across DEXes
   - id: "base-usdc-cbeth"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH (Coinbase staked ETH)
     token_in_symbol: "USDC"
@@ -610,7 +262,6 @@ pairs:
 
   # USDC → ZORA: Zora Network token — $2.7M/day UniV3 + $685K PancakeV3
   - id: "base-usdc-zora"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x1111111111166b7fe7bd91427724b487980afc69"   # ZORA (Zora Network)
     token_in_symbol: "USDC"
@@ -625,7 +276,6 @@ pairs:
 
   # USDC → VIRTUAL: Virtuals Protocol — $3M/day PancakeV3 + $217K UniV3
   - id: "base-usdc-virtual"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b"   # VIRTUAL (Virtuals Protocol)
     token_in_symbol: "USDC"
@@ -643,7 +293,6 @@ pairs:
   # UniV3 0.05% pool: ~$22K TVL — shallow, creates price divergence on large Slipstream flows
   # NOTE: aerodrome-base (V2 AMM) removed — EURC main liquidity is in Slipstream CL, not V2 AMM
   - id: "base-usdc-eurc"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1aDb42"   # EURC (Circle EUR stablecoin)
     token_in_symbol: "USDC"
@@ -658,7 +307,6 @@ pairs:
 
   # USDC → wstETH: Lido wrapped staked ETH — LST premium divergence across DEXes
   - id: "base-usdc-wsteth"
-    chain_id: 8453
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"   # wstETH (Lido)
     token_in_symbol: "USDC"
@@ -671,390 +319,62 @@ pairs:
     routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
     watch_pools: []
 
-  # ── Arbitrum ──
-  - id: "arb-usdc-weth"
-    chain_id: 42161
-    token_in: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"   # USDC (native)
-    token_out: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"   # WETH
-    token_in_symbol: "USDC"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
-    min_swap_size: "10"
-    watch_pools: []
 
-  - id: "arb-usdce-weth"
-    chain_id: 42161
-    token_in: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"   # USDC.e (bridged)
-    token_out: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"   # WETH
-    token_in_symbol: "USDC.E"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "arb-usdt-weth"
-    chain_id: 42161
-    token_in: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"   # USDT
-    token_out: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"   # WETH
-    token_in_symbol: "USDT"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "arb-usdc-usdce"
-    chain_id: 42161
-    token_in: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"   # USDC (native)
-    token_out: "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"   # USDC.e
-    token_in_symbol: "USDC"
-    token_out_symbol: "USDC.E"
-    token_in_decimals: 6
-    token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  # ── Gnosis ──
-  - id: "gnosis-usdc-weth"
-    chain_id: 100
-    token_in: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC
-    token_out: "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"   # WETH (bridged)
-    token_in_symbol: "USDC"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "2000"
-    max_trade: "2000"
-    min_swap_size: "5"
-    watch_pools: []
-
-  - id: "gnosis-usdc-wxdai"
-    chain_id: 100
-    token_in: "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"   # USDC
-    token_out: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"   # wxDAI
-    token_in_symbol: "USDC"
-    token_out_symbol: "WXDAI"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
-    min_swap_size: "5"
-    watch_pools: []
-
-  # ── Polygon ──
-  - id: "polygon-usdc-weth"
-    chain_id: 137
-    token_in: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # USDC (native)
-    token_out: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"   # WETH (bridged)
-    token_in_symbol: "USDC"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "polygon-usdce-weth"
-    chain_id: 137
-    token_in: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e (bridged)
-    token_out: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"   # WETH
-    token_in_symbol: "USDC.E"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "5000"
-    max_trade: "5000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "polygon-usdc-usdt"
-    chain_id: 137
-    token_in: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # USDC (native)
-    token_out: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"   # USDT
-    token_in_symbol: "USDC"
-    token_out_symbol: "USDT"
-    token_in_decimals: 6
-    token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "polygon-usdc-usdce"
-    chain_id: 137
-    token_in: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"   # USDC (native)
-    token_out: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"   # USDC.e
-    token_in_symbol: "USDC"
-    token_out_symbol: "USDC.E"
-    token_in_decimals: 6
-    token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
-    min_swap_size: "10"
-    watch_pools: []
-
-  # ── Scroll ──
-  - id: "scroll-usdc-weth"
-    chain_id: 534352
-    token_in: "0x06efdbff2a14a7c8e15944d1f4a48f9f95f663a4"   # USDC (verified)
-    token_out: "0x5300000000000000000000000000000000000004"  # WETH (verified)
-    token_in_symbol: "USDC"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "500"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "scroll-weth-usdc"
-    chain_id: 534352
-    token_in: "0x5300000000000000000000000000000000000004"  # WETH
-    token_out: "0x06efdbff2a14a7c8e15944d1f4a48f9f95f663a4"   # USDC
-    token_in_symbol: "WETH"
-    token_out_symbol: "USDC"
-    token_in_decimals: 18
-    token_out_decimals: 6
-    trade_amount: "0.05"
-    max_trade: "0.2"
-    min_swap_size: "0.01"
-    watch_pools: []
-
-  # ── Linea ──
-  - id: "linea-usdc-weth"
-    chain_id: 59144
-    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-    token_in_symbol: "USDC"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "100"
-    min_swap_size: "5"
-    watch_pools: []
-
-  # linea-weth-usdc DISABLED: contract holds no WETH — every execution attempt
-  # causes V3 router to call safeTransferFrom(WETH, contract, pool, amt) → STF revert.
-  # Re-enable only if the contract is funded with WETH.
-  # - id: "linea-weth-usdc"
-  #   chain_id: 59144
-  #   token_in: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-  #   token_out: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-  #   token_in_symbol: "WETH"
-  #   token_out_symbol: "USDC"
-  #   token_in_decimals: 18
-  #   token_out_decimals: 6
-  #   trade_amount: "0.048"   # ~$79 at current price
-  #   max_trade: "0.048"
-  #   min_swap_size: "0.003"
-  #   watch_pools: []
-
-  - id: "linea-usdc-usdt"
-    chain_id: 59144
-    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-    token_out: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
-    token_in_symbol: "USDC"
-    token_out_symbol: "USDT"
-    token_in_decimals: 6
-    token_out_decimals: 6
-    trade_amount: "100"
-    max_trade: "100"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "linea-usdt-weth"
-    chain_id: 59144
-    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
-    token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-    token_in_symbol: "USDT"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "100"
-    min_swap_size: "5"
-    watch_pools: []
-
-  # Reverse of linea-usdc-usdt: uses USDT as capital, routes USDT→USDC→USDT.
-  # Required because each pair only covers one base-capital direction.
-  - id: "linea-usdt-usdc"
-    chain_id: 59144
-    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
-    token_out: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"  # USDC
-    token_in_symbol: "USDT"
-    token_out_symbol: "USDC"
-    token_in_decimals: 6
-    token_out_decimals: 6
-    trade_amount: "100"
-    max_trade: "100"
-    min_swap_size: "10"
-    watch_pools: []
-
-  # USDC→WBTC→USDC: different asset class, different pool dynamics.
-  # PancakeV3 fee=500 and UniswapV3 fee=500/3000 both have WBTC/USDC pools on Linea.
-  # Trade size kept lower (~$50) due to shallower WBTC pool depth vs ETH.
-  - id: "linea-usdc-wbtc"
-    chain_id: 59144
-    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"  # USDC
-    token_out: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
-    token_in_symbol: "USDC"
-    token_out_symbol: "WBTC"
-    token_in_decimals: 6
-    token_out_decimals: 8
-    trade_amount: "50"
-    max_trade: "50"
-    min_swap_size: "5"
-    watch_pools: []
-
-  # USDT→WBTC→USDT: same as above but with USDT capital.
-  - id: "linea-usdt-wbtc"
-    chain_id: 59144
-    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"  # USDT
-    token_out: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
-    token_in_symbol: "USDT"
-    token_out_symbol: "WBTC"
-    token_in_decimals: 6
-    token_out_decimals: 8
-    trade_amount: "50"
-    max_trade: "50"
-    min_swap_size: "5"
-    watch_pools: []
-
-  # linea-wbtc-weth DISABLED: contract holds no WBTC — STF on every execution.
-  # Re-enable only if the contract is funded with WBTC.
-  # - id: "linea-wbtc-weth"
-  #   chain_id: 59144
-  #   token_in: "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4"  # WBTC
-  #   token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-  #   token_in_symbol: "WBTC"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 8
-  #   token_out_decimals: 18
-  #   trade_amount: "0.0005"   # ~$45 at current price
-  #   max_trade: "0.0005"
-  #   min_swap_size: "0.0001"
-  #   watch_pools: []
-
-  # linea-wsteth-weth DISABLED: contract holds no wstETH — STF on every execution.
-  # Re-enable only if the contract is funded with wstETH.
-  # - id: "linea-wsteth-weth"
-  #   chain_id: 59144
-  #   token_in: "0xB5beDd42000b71FddE22D3eE8a79Bd49A568fC8F"  # wstETH
-  #   token_out: "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f"  # WETH
-  #   token_in_symbol: "WSTETH"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 18
-  #   token_out_decimals: 18
-  #   trade_amount: "0.048"   # ~$79 at current price
-  #   max_trade: "0.048"
-  #   min_swap_size: "0.005"
-  #   watch_pools: []
-
-  # ── Linea new asset pairs (USDC/USDT capital only) ──────────────────────────
-
-  - id: "linea-usdc-wsteth"
-    chain_id: 59144
-    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-    token_out: "0xB5beDd42000b71FddE22D3eE8a79Bd49A568fC8F"  # wstETH
-    token_in_symbol: "USDC"
-    token_out_symbol: "WSTETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "200"
-    min_swap_size: "10"
-    watch_pools: []
-
-  - id: "linea-usdt-ezeth"
-    chain_id: 59144
-    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"   # USDT
-    token_out: "0x2416092f143378750bb29b79eD961ab195CcEea5"  # ezETH (Renzo)
-    token_in_symbol: "USDT"
-    token_out_symbol: "EZETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "200"
-    min_swap_size: "10"
-    watch_pools: []
-
-  # LYNX is the Lynex DEX governance token — low liquidity, small trade size.
-  - id: "linea-usdc-lynx"
-    chain_id: 59144
-    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-    token_out: "0x1a51b19ce03dbe0cb44c1528e34a7edd7771e9af"  # LYNX
-    token_in_symbol: "USDC"
-    token_out_symbol: "LYNX"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "50"
-    max_trade: "50"
-    min_swap_size: "2"
-    watch_pools: []
-
-  - id: "linea-usdt-weeth"
-    chain_id: 59144
-    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"   # USDT
-    token_out: "0x1Bf74C010E6320bAB11e2e5A532b5aC15e0b8aA6"  # weETH (EtherFi)
-    token_in_symbol: "USDT"
-    token_out_symbol: "WEETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "200"
-    min_swap_size: "10"
-    watch_pools: []
-
-  # USDe is Ethena's synthetic dollar — stablecoin pair, tighter spreads, larger max.
-  - id: "linea-usdc-usde"
-    chain_id: 59144
-    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-    token_out: "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"  # USDe (Ethena)
-    token_in_symbol: "USDC"
-    token_out_symbol: "USDE"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "100"
-    max_trade: "500"
-    min_swap_size: "10"
-    watch_pools: []
-
-  # LINEA token pairs — ~$50 trade sizes to stay within liquidity depth
-
-  - id: "linea-usdt-linea"
-    chain_id: 59144
-    token_in: "0xA219439258ca9da29E9Cc4cE5596924745e12B93"   # USDT
-    token_out: "0x1789e0043623282d5dcc7f213d703c6d8bafbb04"  # LINEA
-    token_in_symbol: "USDT"
-    token_out_symbol: "LINEA"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "50"
-    max_trade: "50"
-    min_swap_size: "5"
-    watch_pools: []
-
-  - id: "linea-usdc-linea"
-    chain_id: 59144
-    token_in: "0x176211869ca2b568f2a7d4ee941e073a821ee1ff"   # USDC
-    token_out: "0x1789e0043623282d5dcc7f213d703c6d8bafbb04"  # LINEA
-    token_in_symbol: "USDC"
-    token_out_symbol: "LINEA"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "50"
-    max_trade: "50"
-    min_swap_size: "5"
-    watch_pools: []
+# ─── TUNING ────────────────────────────────────────────────
+# Every timing and threshold, with the values tuned for Base. All keys are optional —
+# omit one to use the default shown. Unknown keys are rejected. Keys marked
+# "block-relative" default to a multiple of chain.block_time_ms when omitted.
+tuning:
+  # ── Execution ──
+  gas_limit_2hop: 700000
+  gas_limit_triangular: 900000
+  router_min_out_slack_bps: 200          # sell-leg min-out slack (2%)
+  sell_leg_minprofit_mul_bps: 6200       # on-chain minProfit = 62% of gas floor
+  gas_fallback_margin_bps: 2500          # last known gas price +25% if a fetch fails
+  gas_fallback_max_age_ms: 120000        # …only if it is at most this old
+  # ── Detection ──
+  quoter_haircut_bps: 15
+  p15_gate_spread: 0.00005               # local spread that triggers QuoterV2 verification
+  min_v3_liquidity: 1000000000
+  v3_spot_max_vr_fraction_bps: 200
+  v3_spot_overestimate_bps: 30           # per V3 leg, optimistic mode only
+  phantom_cap_bps: 500                   # profit > 5% of input = phantom quote
+  tri_verify_max_rounds: 3
+  tri_verify_bracket_bps: 100
+  tri_verify_max_gap_bps: 10
+  optimizer_coarse_steps: 5
+  optimizer_fine_steps: 5
+  optimizer_large_spread: 0.05
+  volatile_pool_max_age_ms: 120000
+  stable_pool_max_age_ms: 30000
+  v3_fresh_window_ms: 30000
+  pool_prune_after_ms: 2700000
+  # ── RPC ──
+  rpc_read_timeout_ms: 5000
+  # rpc_simulate_timeout_ms: 1000        # block-relative: ½ block
+  rpc_send_timeout_ms: 5000
+  multicall_chunk_size: 10
+  multicall_chunk_timeout_ms: 3000
+  discover_chunk_size: 20
+  discover_call_timeout_ms: 15000
+  # quote_cache_max_age_ms: 6000         # block-relative: 3 blocks
+  quote_cache_max_pools: 1024
+  health_hold_base_ms: 10000             # execution off after an RPC outage, at least
+  health_hold_max_ms: 80000              # repeated relapses double up to this
+  health_relapse_window_ms: 60000
+  # health_monitor_every_ms: 2000        # block-relative: 1 block
+  quoter_never_ok_warn_after_ms: 30000
+  quoter_broken_warn_after_ms: 300000
+  quoter_warn_min_batches: 5
+  rate_limit_log_every_ms: 30000
+  # ── Scan loop ──
+  cooldown_secs: 15
+  send_cooldown_secs: 15
+  gas_reject_cooldown_secs: 60
+  max_consecutive_failures: 20           # circuit breaker (RPC outages don't count)
+  slow_scan_warn_ms: 10000
+  heartbeat_stall_warn_ms: 30000
+  price_refresh_ms: 60000
+  balance_refresh_ms: 30000
+  config_reload_ms: 30000
+  ws_reconnect_max_backoff_ms: 30000

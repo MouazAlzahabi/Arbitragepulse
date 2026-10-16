@@ -15,35 +15,35 @@ use tracing::{info, warn, debug};
 
 use crate::abi::{ArbitrageExecutor, IERC20};
 use crate::db::Database;
-use crate::util::{transport_timeout, RPC_READ_TIMEOUT, RPC_SEND_TIMEOUT, RPC_SIMULATE_TIMEOUT};
+use crate::util::{transport_timeout, rpc_read_timeout, rpc_send_timeout, rpc_simulate_timeout};
 use crate::strategy::{ArbOpportunity, TriangularOpportunity};
 
 // Hardcoded gas limit — 700k covers any 2-hop arb including PancakeV3 SmartRouter
 // which is more gas-intensive than UniV3 SwapRouter02 (observed 496K/500K = 99.3% on Base).
-const GAS_LIMIT: u64 = 700_000;
+fn gas_limit_2hop() -> u64 { crate::config::tuning().gas_limit_2hop }
 
 /// When a gas-price fetch fails, the last real price is reused with this margin (bps)
 /// on top, covering fees that rose since it was observed (~a few blocks on Base).
-const GAS_FALLBACK_MARGIN_BPS: u128 = 2_500; // +25%
+fn gas_fallback_margin_bps() -> u128 { crate::config::tuning().gas_fallback_margin_bps as u128 }
 
 /// The last real gas price is only reused if it is at most this old; otherwise the
 /// candidate is skipped rather than priced on a guess.
-const GAS_FALLBACK_MAX_AGE: Duration = Duration::from_secs(120);
+fn gas_fallback_max_age() -> Duration { crate::config::tuning().gas_fallback_max_age() }
 
 // Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
-const GAS_LIMIT_TRIANGULAR: u64 = 900_000;
+fn gas_limit_triangular() -> u64 { crate::config::tuning().gas_limit_triangular }
 
 /// Shave this many basis points off the gas-derived `minProfit` before encoding the tx.
 /// The contract sets the **sell leg** V3 `amountOutMinimum = amountIn + minProfit`. If that sum
 /// sits exactly on the quoted edge, inclusion delay / tick crossing / competing flow causes
 /// Uniswap V3 to revert with **Too little received** even when simulation looked fine.
-const ROUTER_MIN_OUT_SLACK_BPS: u64 = 200; // 2.00% — raised after repeated mined reverts on Base
+fn router_min_out_slack_bps() -> u64 { crate::config::tuning().router_min_out_slack_bps }
 
 /// Final multiplier applied to the gas-floor `minProfit` (basis points): 6200 / 10000 = 62%.
-/// Combined with `ROUTER_MIN_OUT_SLACK_BPS`, lowers on-chain router min vs same-block pool drift.
+/// Combined with `router_min_out_slack_bps()`, lowers on-chain router min vs same-block pool drift.
 /// Tradeoff: `NotProfitable` also uses `minProfit`, so profitability on-chain becomes more lenient;
 /// off-chain `net profit` checks remain the economic guard.
-const SELL_LEG_MINPROFIT_MUL_BPS: u64 = 6200;
+fn sell_leg_minprofit_mul_bps() -> u64 { crate::config::tuning().sell_leg_minprofit_mul_bps }
 
 // ─── TxPrep ───────────────────────────────────────────────────────────────────
 
@@ -267,7 +267,7 @@ impl Executor {
         if self.rpc_health.is_degraded() {
             return Err(anyhow!("gas price not fetched: {}", crate::util::RPC_BACKOFF_MARKER));
         }
-        let fetched = transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await;
+        let fetched = transport_timeout(rpc_read_timeout(), provider.get_gas_price()).await;
         if let Err(e) = &fetched {
             let kind = crate::util::classify_rpc_failure(&e.to_string());
             let hard_down = kind == crate::util::RpcFailure::Unreachable
@@ -301,14 +301,14 @@ impl Executor {
                 // back, so the margin never compounds. Without a recent price, skip rather
                 // than guess — a hard-coded default was ~1000× Base fees and wrecked the
                 // net-profit estimate.
-                let Some((last, at)) = self.gas_price_cache.filter(|(_, at)| at.elapsed() <= GAS_FALLBACK_MAX_AGE)
+                let Some((last, at)) = self.gas_price_cache.filter(|(_, at)| at.elapsed() <= gas_fallback_max_age())
                 else {
-                    return Err(anyhow!("gas price unavailable ({}) and no price from the last {:?}", e, GAS_FALLBACK_MAX_AGE));
+                    return Err(anyhow!("gas price unavailable ({}) and no price from the last {:?}", e, gas_fallback_max_age()));
                 };
-                let gas_price = last.saturating_mul(10_000 + GAS_FALLBACK_MARGIN_BPS) / 10_000;
+                let gas_price = last.saturating_mul(10_000 + gas_fallback_margin_bps()) / 10_000;
                 warn!(
                     "[{}] Gas price fetch failed ({}) — using last known {} wei from {:.0?} ago + {}% = {} wei",
-                    self.chain_name, e, last, at.elapsed(), GAS_FALLBACK_MARGIN_BPS / 100, gas_price
+                    self.chain_name, e, last, at.elapsed(), gas_fallback_margin_bps() / 100, gas_price
                 );
                 Ok(gas_price)
             }
@@ -349,7 +349,7 @@ impl Executor {
         let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = effective_gas_price * GAS_LIMIT as u128;
+            let cost_wei = effective_gas_price * gas_limit_2hop() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -366,11 +366,11 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(GAS_LIMIT);
+        tx_base.gas = Some(gas_limit_2hop());
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
+            None => transport_timeout(rpc_read_timeout(), provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -424,7 +424,7 @@ impl Executor {
         let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = effective_gas_price * GAS_LIMIT_TRIANGULAR as u128;
+            let cost_wei = effective_gas_price * gas_limit_triangular() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -441,11 +441,11 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(GAS_LIMIT_TRIANGULAR);
+        tx_base.gas = Some(gas_limit_triangular());
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
+            None => transport_timeout(rpc_read_timeout(), provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -513,7 +513,7 @@ impl Executor {
     /// count, so a tx still in the mempool (e.g. a send that timed out but was broadcast)
     /// is counted and its nonce is never handed out again.
     pub async fn prefetch_nonce<P: Provider + Clone>(&mut self, provider: &P) {
-        match transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending()).await {
+        match transport_timeout(rpc_read_timeout(), provider.get_transaction_count(self.signer_address).pending()).await {
             Ok(n) => {
                 self.nonce = Some(n);
                 debug!("Executor: nonce pre-fetched = {}", n);
@@ -539,7 +539,7 @@ impl Executor {
 
         // ── Gas profitability check (300k hardcoded — no eth_estimateGas) ─────
         let gas_cost_usd = {
-            let cost_wei = (gas_price + self.priority_fee_wei) * GAS_LIMIT as u128;
+            let cost_wei = (gas_price + self.priority_fee_wei) * gas_limit_2hop() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -557,13 +557,13 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(GAS_LIMIT);
+        tx_base.gas = Some(gas_limit_2hop());
 
         self.stats.total_attempts += 1;
 
         // ── Dry-run: simulate only ─────────────────────────────────────────────
         if self.dry_run {
-            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(tx_base)).await {
+            match transport_timeout(rpc_simulate_timeout(), provider.call(tx_base)).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =
@@ -592,7 +592,7 @@ impl Executor {
         // mutex can be released immediately after send (not after receipt).
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
+            None => transport_timeout(rpc_read_timeout(), provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -635,7 +635,7 @@ impl Executor {
             });
         }
 
-        match transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(tx)).await {
+        match transport_timeout(rpc_send_timeout(), provider.send_transaction(tx)).await {
             Ok(pending) => {
                 // Nonce consumed — update counter immediately so next tx can use nonce+1
                 // even while this receipt is still pending.
@@ -749,7 +749,7 @@ impl Executor {
         let gas_price = self.get_gas_price(provider).await?;
 
         let gas_cost_usd = {
-            let cost_wei = gas_price * GAS_LIMIT_TRIANGULAR as u128;
+            let cost_wei = gas_price * gas_limit_triangular() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -767,12 +767,12 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(GAS_LIMIT_TRIANGULAR);
+        tx_base.gas = Some(gas_limit_triangular());
 
         self.stats.total_attempts += 1;
 
         if self.dry_run {
-            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(tx_base)).await {
+            match transport_timeout(rpc_simulate_timeout(), provider.call(tx_base)).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =
@@ -796,7 +796,7 @@ impl Executor {
 
         let nonce = match self.nonce {
             Some(n) => n,
-            None => transport_timeout(RPC_READ_TIMEOUT, provider.get_transaction_count(self.signer_address).pending())
+            None => transport_timeout(rpc_read_timeout(), provider.get_transaction_count(self.signer_address).pending())
                 .await
                 .map_err(|e| anyhow!("get_transaction_count failed: {}", e))?,
         };
@@ -832,7 +832,7 @@ impl Executor {
             });
         }
 
-        match transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(tx)).await {
+        match transport_timeout(rpc_send_timeout(), provider.send_transaction(tx)).await {
             Ok(pending) => {
                 self.nonce = Some(nonce + 1);
                 let tx_hash = format!("{:?}", pending.tx_hash());
@@ -977,9 +977,9 @@ impl Executor {
         let max_reasonable = expected_profit;
         let capped = gas_tokens.min(max_reasonable);
 
-        let slack_mul = 10_000u64.saturating_sub(ROUTER_MIN_OUT_SLACK_BPS);
+        let slack_mul = 10_000u64.saturating_sub(router_min_out_slack_bps());
         let out = (capped.saturating_mul(U256::from(slack_mul))) / U256::from(10_000u64);
-        let out = out.saturating_mul(U256::from(SELL_LEG_MINPROFIT_MUL_BPS)) / U256::from(10_000u64);
+        let out = out.saturating_mul(U256::from(sell_leg_minprofit_mul_bps())) / U256::from(10_000u64);
         out.max(U256::from(1u8))
     }
 

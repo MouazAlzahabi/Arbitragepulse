@@ -1,7 +1,7 @@
 use super::*;
 use alloy::network::ReceiptResponse;
 use alloy::primitives::B256;
-use crate::util::{transport_timeout, RpcFailure, RPC_SEND_TIMEOUT, RPC_SIMULATE_TIMEOUT};
+use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout, rpc_simulate_timeout};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -155,7 +155,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         .pairs
                         .iter()
                         .enumerate()
-                        .filter(|(_, p)| p.chain_id == cfg.id && !disabled_set.contains(&p.id))
+                        .filter(|(_, p)| !disabled_set.contains(&p.id))
                         .map(|(i, _)| i)
                         .collect(),
                 ),
@@ -323,31 +323,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         continue 'candidates;
     }
 
-    // ── SyncSwap detect-only check ────────────────────────────────────────────
-    // SyncSwap opportunities are broadcast to the live feed but never sent to
-    // the contract (no execution support yet). Continue to next candidate so an
-    // executable opportunity below it can still be attempted this scan.
-
-    if !best_opp.is_executable() {
-        broadcast_log(
-            log_tx,
-            "opportunity",
-            &format!(
-                "[{}] [DETECT-ONLY/SyncSwap] {} | profit=${:.4}",
-                cfg.name,
-                display_id,
-                best_opp.profit_usd(),
-            ),
-            Some(serde_json::json!({
-                "chain":      cfg.name,
-                "pair_id":    display_id,
-                "profit_usd": best_opp.profit_usd(),
-                "detect_only": true,
-            })),
-        );
-        continue 'candidates;
-    }
-
     // ── Pending-only submission gate ──────────────────────────────────────────
     // When pending_only_submission is enabled, block-scan / poll-tick / swap-event
     // triggered calls have tip_override=None. Skip TX for those — log the opportunity
@@ -415,11 +390,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 if bal < optimized.amount_in {
                     let msg = format!(
                         "[{}] Skipping {} — insufficient token_in balance (have {}, need {}) → cd={}s",
-                        cfg.name, optimized.pair_id, bal, optimized.amount_in, COOLDOWN_SECS
+                        cfg.name, optimized.pair_id, bal, optimized.amount_in, cooldown_secs()
                     );
                     warn!("{}", msg);
                     broadcast_log(log_tx, "warn", &msg, None);
-                    cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                    cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
                     continue 'candidates;
                 }
             }
@@ -438,20 +413,20 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(tx_hash) => {
                         let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
-                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
-                        cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
+                        cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         handle_execution_success(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, scan_to_submit_ms,
-                            COOLDOWN_SECS,
+                            cooldown_secs(),
                         ).await;
                         break 'candidates;
                     }
                     Err(e) => {
                         drop(exec);
                         failure |= handle_execution_failure(&mut scan_rpc, 
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, cooldown_secs(),
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, optimized.profit_usd,
                         ).await;
@@ -461,7 +436,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             } else {
                 // Live: prepare (nonce + tx build) with brief lock, release, then send
                 // without holding the mutex. Prevents blocking the select! loop for
-                // the 500ms–2s it takes send_transaction to complete on Linea.
+                // the 500ms–2s a slow send_transaction can take.
                 let prep_result: Result<TxPrep> = {
                     let mut exec = executor.lock().await;
                     exec.dry_run = false;
@@ -476,14 +451,14 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 match prep_result {
                     Err(e) => {
                         failure |= handle_execution_failure(&mut scan_rpc, 
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, cooldown_secs(),
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, optimized.profit_usd,
                         ).await;
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
+                            match transport_timeout(rpc_simulate_timeout(), provider.call(prep.tx.clone())).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
@@ -508,7 +483,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     }
                                     failure |= handle_execution_failure(&mut scan_rpc, 
                                         anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
-                                        &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
+                                        &fingerprint, &router_ids, pending_pairs, cooldowns, send_cooldown_secs(),
                                         consecutive_failures, cfg, shared_state, metrics, log_tx,
                                         &ghost_profit_bits, prep.profit_usd,
                                     ).await;
@@ -560,9 +535,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         let send_start = std::time::Instant::now();
                         // Use pre-signed raw bytes when available (skips re-signing in WalletFiller).
                         let send_result = if let Some(ref raw) = prep.raw_tx {
-                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_raw_transaction(raw)).await
+                            transport_timeout(rpc_send_timeout(), provider.send_raw_transaction(raw)).await
                         } else {
-                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(prep.tx.clone())).await
+                            transport_timeout(rpc_send_timeout(), provider.send_transaction(prep.tx.clone())).await
                         };
                         match send_result {
                             Ok(pending) => {
@@ -579,8 +554,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
-                                cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
-                                cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
+                                cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
+                                cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
 
                                 // Fire-and-forget receipt task using cloned prep fields
                                 let tx_hash_bg = tx_hash.clone();
@@ -757,7 +732,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, scan_to_submit_ms,
-                                    SEND_COOLDOWN_SECS,
+                                    send_cooldown_secs(),
                                 ).await;
                                 break 'candidates;
                             }
@@ -805,7 +780,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 }
                                 failure |= handle_execution_failure(&mut scan_rpc, 
                                     anyhow::anyhow!("Send failed: {}", e),
-                                    &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
+                                    &fingerprint, &router_ids, pending_pairs, cooldowns, send_cooldown_secs(),
                                     consecutive_failures, cfg, shared_state, metrics, log_tx,
                                     &ghost_profit_bits, prep.profit_usd,
                                 ).await;
@@ -848,11 +823,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     if b < opp.amount_in {
                         let msg = format!(
                             "[{}] Skipping triangular {} — insufficient token_a balance (have {}, need {}) → cd={}s",
-                            cfg.name, opp.triplet_id, b, opp.amount_in, COOLDOWN_SECS
+                            cfg.name, opp.triplet_id, b, opp.amount_in, cooldown_secs()
                         );
                         warn!("{}", msg);
                         broadcast_log(log_tx, "warn", &msg, None);
-                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         continue 'candidates;
                     }
                 }
@@ -876,20 +851,20 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(tx_hash) => {
                         let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
-                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
-                        cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                        cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
+                        cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         handle_execution_success(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                             shared_state, log_tx, metrics, scan_to_submit_ms,
-                            COOLDOWN_SECS,
+                            cooldown_secs(),
                         ).await;
                         break 'candidates;
                     }
                     Err(e) => {
                         drop(exec);
                         failure |= handle_execution_failure(&mut scan_rpc, 
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, cooldown_secs(),
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, opp.profit_usd,
                         ).await;
@@ -911,14 +886,14 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 match prep_result {
                     Err(e) => {
                         failure |= handle_execution_failure(&mut scan_rpc, 
-                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, COOLDOWN_SECS,
+                            e, &fingerprint, &router_ids, pending_pairs, cooldowns, cooldown_secs(),
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
                             &ghost_profit_bits, opp.profit_usd,
                         ).await;
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
+                            match transport_timeout(rpc_simulate_timeout(), provider.call(prep.tx.clone())).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
@@ -944,7 +919,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     }
                                     failure |= handle_execution_failure(&mut scan_rpc, 
                                         anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
-                                        &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
+                                        &fingerprint, &router_ids, pending_pairs, cooldowns, send_cooldown_secs(),
                                         consecutive_failures, cfg, shared_state, metrics, log_tx,
                                         &ghost_profit_bits, prep.profit_usd,
                                     ).await;
@@ -983,9 +958,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         }
                         let send_start = std::time::Instant::now();
                         let send_result = if let Some(ref raw) = prep.raw_tx {
-                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_raw_transaction(raw)).await
+                            transport_timeout(rpc_send_timeout(), provider.send_raw_transaction(raw)).await
                         } else {
-                            transport_timeout(RPC_SEND_TIMEOUT, provider.send_transaction(prep.tx.clone())).await
+                            transport_timeout(rpc_send_timeout(), provider.send_transaction(prep.tx.clone())).await
                         };
                         match send_result {
                             Ok(pending) => {
@@ -1002,8 +977,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
-                                cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
-                                cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(SEND_COOLDOWN_SECS));
+                                cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
+                                cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
 
                                 // Fire-and-forget receipt task
                                 let tx_hash_bg = tx_hash.clone();
@@ -1180,7 +1155,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
                                     shared_state, log_tx, metrics, scan_to_submit_ms,
-                                    SEND_COOLDOWN_SECS,
+                                    send_cooldown_secs(),
                                 ).await;
                                 break 'candidates;
                             }
@@ -1226,7 +1201,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 }
                                 failure |= handle_execution_failure(&mut scan_rpc, 
                                     anyhow::anyhow!("Triangular send failed: {}", e),
-                                    &fingerprint, &router_ids, pending_pairs, cooldowns, SEND_COOLDOWN_SECS,
+                                    &fingerprint, &router_ids, pending_pairs, cooldowns, send_cooldown_secs(),
                                     consecutive_failures, cfg, shared_state, metrics, log_tx,
                                     &ghost_profit_bits, prep.profit_usd,
                                 ).await;
@@ -1273,9 +1248,9 @@ impl std::ops::BitOrAssign for FailureAction {
 }
 
 /// Scan duration above which [`SlowScanGuard`] warns (normal scans take < 100 ms).
-const SLOW_SCAN_WARN: Duration = Duration::from_secs(10);
+fn slow_scan_warn() -> Duration { crate::config::tuning().slow_scan_warn() }
 
-/// Logs a warning when dropped if the scan ran longer than [`SLOW_SCAN_WARN`].
+/// Logs a warning when dropped if the scan ran longer than [`slow_scan_warn()`].
 struct SlowScanGuard<'a> {
     chain: &'a str,
     trigger: &'a str,
@@ -1285,7 +1260,7 @@ struct SlowScanGuard<'a> {
 impl Drop for SlowScanGuard<'_> {
     fn drop(&mut self) {
         let took = self.start.elapsed();
-        if took > SLOW_SCAN_WARN {
+        if took > slow_scan_warn() {
             warn!("[{}] Slow scan: {} scan held the chain loop for {:.1}s — RPC slow or down?",
                   self.chain, self.trigger, took.as_secs_f64());
         }
@@ -1382,7 +1357,7 @@ pub(crate) async fn handle_execution_failure(
     pending_pairs.remove(pair_id);
 
     // Gas-profitability rejects: route has a real spread but profit < gas cost.
-    // Apply a much longer cooldown (GAS_REJECT_COOLDOWN_SECS=120s) so the same
+    // Apply a much longer cooldown (gas_reject_cooldown_secs()=120s) so the same
     // route doesn't spam the log every 15s. Gas prices are stable on L2s, and the
     // spread is unlikely to change in 15s — there's no value in retrying sooner.
     let err_str = error.to_string();
@@ -1404,7 +1379,7 @@ pub(crate) async fn handle_execution_failure(
     // more calls now just prolong the limit. It doesn't start the chain backoff.
     let action = FailureAction { outage, stop_scan: outage || rpc == RpcFailure::RateLimited };
     let is_gas_reject = err_str.contains("below threshold") || err_str.contains("negative after gas");
-    let effective_cooldown = if is_gas_reject { GAS_REJECT_COOLDOWN_SECS } else { cooldown_secs };
+    let effective_cooldown = if is_gas_reject { gas_reject_cooldown_secs() } else { cooldown_secs };
     cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(effective_cooldown));
 
     if is_gas_reject {
@@ -1414,7 +1389,7 @@ pub(crate) async fn handle_execution_failure(
         }).ok();
         debug!("[{}] Skipped (unprofitable after gas): {}", cfg.name, err_str);
         broadcast_log(log_tx, "info",
-            &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4}, cooldown={}s)", cfg.name, pair_id, opportunity_profit_usd, GAS_REJECT_COOLDOWN_SECS),
+            &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4}, cooldown={}s)", cfg.name, pair_id, opportunity_profit_usd, gas_reject_cooldown_secs()),
             None);
         return action;
     }
@@ -1424,11 +1399,11 @@ pub(crate) async fn handle_execution_failure(
     // Counting them would pause the chain (manual resume) after a few minutes' outage.
     if rpc == RpcFailure::RateLimited {
         // Can hit every candidate on every scan while it lasts: report at most once per
-        // RATE_LIMIT_LOG_EVERY per chain, the rest at debug.
+        // rate_limit_log_every() per chain, the rest at debug.
         debug!("[{}] Execute failed (rate limited): {} | pair={}", cfg.name, error, pair_id);
         if scan_rpc.health.rate_limit_log_due() {
             warn!("[{}] RPC rate limiting — affected pairs cool down {}s (further reports muted {:?})",
-                  cfg.name, effective_cooldown, crate::util::RATE_LIMIT_LOG_EVERY);
+                  cfg.name, effective_cooldown, crate::util::rate_limit_log_every());
             broadcast_log(log_tx, "warn",
                 &format!("[{}] RPC rate limited: {} → cd={}s", cfg.name, error, effective_cooldown), None);
         }
@@ -1470,7 +1445,7 @@ pub(crate) async fn handle_execution_failure(
     }
 
     // Circuit breaker
-    if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+    if *consecutive_failures >= max_consecutive_failures() {
         warn!(
             "[{}] Circuit breaker: {} consecutive failures — pausing chain",
             cfg.name, consecutive_failures

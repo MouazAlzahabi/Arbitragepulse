@@ -75,11 +75,6 @@ impl Opportunity {
         }
     }
 
-    /// Returns true if this opportunity can be sent to the contract for execution.
-    pub fn is_executable(&self) -> bool {
-        true
-    }
-
     /// Full opportunity fingerprint for deduplication.
     pub fn fingerprint(&self) -> String {
         match self {
