@@ -7,24 +7,25 @@ import "../src/ArbitrageExecutor.sol";
 /**
  * @title Deploy ArbitrageExecutor
  *
- * Usage:
+ * Usage (rpc/etherscan aliases from foundry.toml; verification needs ETHERSCAN_API_KEY):
  *   # Deploy to Anvil (local fork)
- *   forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
+ *   forge script script/Deploy.s.sol --rpc-url local --broadcast
  *
  *   # Deploy to Base Sepolia (testing stage)
- *   forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC --broadcast
+ *   forge script script/Deploy.s.sol --rpc-url base_sepolia --broadcast --verify
  *
  *   # Deploy to Base
- *   forge script script/Deploy.s.sol --rpc-url $BASE_RPC --broadcast --verify
+ *   forge script script/Deploy.s.sol --rpc-url base --broadcast --verify
  *
  *   # Dry-run (simulate only, no broadcast)
- *   forge script script/Deploy.s.sol --rpc-url $BASE_RPC
+ *   forge script script/Deploy.s.sol --rpc-url base
  */
 contract DeployExecutor is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address deployer = vm.addr(deployerKey);
 
+        console.log("Chain id:", block.chainid);
         console.log("Deployer:", deployer);
         console.log("Balance:", deployer.balance);
 
@@ -34,6 +35,8 @@ contract DeployExecutor is Script {
 
         vm.stopBroadcast();
 
+        string memory chain = block.chainid == 8453 ? "base" : block.chainid == 84532 ? "base-sepolia" : "<chain>";
+
         console.log("");
         console.log("======================================");
         console.log("ArbitrageExecutor deployed to:", address(executor));
@@ -41,8 +44,16 @@ contract DeployExecutor is Script {
         console.log("======================================");
         console.log("");
         console.log("Next steps:");
-        console.log("  1. Verify:  forge verify-contract", address(executor), "ArbitrageExecutor --chain base");
-        console.log("  2. Fund:    Send WETH/USDC to", address(executor));
-        console.log("  3. Update:  CONTRACT_ADDRESS=", address(executor));
+        console.log("  1. Verify (if --verify was not passed):");
+        console.log(string.concat(
+            "       forge verify-contract ", vm.toString(address(executor)),
+            " src/ArbitrageExecutor.sol:ArbitrageExecutor --chain ", chain, " --watch"
+        ));
+        console.log("  2. Whitelist each router with its type (0 = V2, 1 = V3 SwapRouter02, 4 = Aerodrome):");
+        console.log(string.concat(
+            "       cast send ", vm.toString(address(executor)), " 'setRouter(address,uint8)' <router> <type>"
+        ));
+        console.log("  3. Fund:    send the pair's start token (e.g. USDC) to", address(executor));
+        console.log("  4. Engine:  chain.contract_address =", address(executor));
     }
 }

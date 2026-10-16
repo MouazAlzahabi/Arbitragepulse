@@ -94,8 +94,9 @@ sol! {
             uint256 deadline
         ) external;
 
-        function setAllowedRouter(address router, bool approved) external;
-        function setRouterType(address router, uint8 rtype) external;
+        /// Allow a router with its type (0 = V2, 1 = V3, 4 = Aerodrome); the only way to allow one.
+        function setRouter(address router, uint8 rtype) external;
+        function revokeRouter(address router) external;
         function allowedRouters(address router) external view returns (bool);
         function routerType(address router) external view returns (uint8);
         function totalProfit(address token) external view returns (uint256);
@@ -162,7 +163,7 @@ sol! {
         address indexed to
     );
 
-    /// Emitted by every V2 and Solidly-volatile pair on every swap.
+    /// Emitted by every V2 and Aerodrome-volatile pair on every swap.
     /// reserve0/reserve1 are the NEW balances after the swap.
     /// NOTE: Name MUST be "Sync" (not "PairSyncV2") — alloy computes SIGNATURE_HASH
     /// from the event name, and on-chain pairs emit Sync(uint112,uint112).

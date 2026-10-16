@@ -541,13 +541,15 @@ async fn token_remove(
 
 // ─── Pair scan endpoints ───────────────────────────────────────────────────────
 
-/// GET /pair-scan — returns all pair scan info grouped by chain_id.
+/// GET /pair-scan — returns all pair scan info grouped by chain (id + name).
 async fn pair_scan_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Clone data inside the read lock (fast), then serialize outside the lock
     // so JSON serialization does not hold up other readers (e.g., /stats polls).
-    let (pair_scan_snapshot, disabled_snapshot) = {
+    let (pair_scan_snapshot, disabled_snapshot, names) = {
         let engine = state.engine.read().await;
-        (engine.pair_scan.clone(), engine.disabled_pairs.clone())
+        let names: std::collections::HashMap<u64, String> =
+            engine.chains.iter().map(|c| (c.chain_id, c.chain_name.clone())).collect();
+        (engine.pair_scan.clone(), engine.disabled_pairs.clone(), names)
     };
     let mut result: Vec<serde_json::Value> = Vec::new();
     for (chain_id, pairs) in &pair_scan_snapshot {
@@ -558,7 +560,9 @@ async fn pair_scan_list(State(state): State<Arc<AppState>>) -> impl IntoResponse
             }
             v
         }).collect();
-        result.push(serde_json::json!({ "chain_id": chain_id, "pairs": enriched }));
+        // chain_name lets the dashboard label the tab without its own id → name table.
+        let name = names.get(chain_id).cloned().unwrap_or_else(|| format!("Chain {chain_id}"));
+        result.push(serde_json::json!({ "chain_id": chain_id, "chain_name": name, "pairs": enriched }));
     }
     Json(serde_json::json!({ "chains": result }))
 }

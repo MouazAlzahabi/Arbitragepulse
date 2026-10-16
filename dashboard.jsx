@@ -22,13 +22,10 @@ function normalizeWsUrl(stored, sameOriginDefault) {
   return d;
 }
 
-// Known chain ID → display name mapping
-const CHAIN_NAMES = {
-  8453:  "Base",
-  84532: "Base Sepolia",
-};
-
-const chainName = (id) => CHAIN_NAMES[Number(id)] || `Chain ${id}`;
+/** ws(s)://host/ws → http(s)://host — swaps the scheme and strips only the trailing /ws path. */
+const wsToHttpBase = (u) => u.replace(/^ws(s?):\/\//i, "http$1://").replace(/\/ws\/?(\?.*)?$/, "");
+/** ws(s)://host/ws → host, for display. */
+const wsHostLabel = (u) => u.replace(/^wss?:\/\//i, "").replace(/\/ws\/?(\?.*)?$/, "");
 
 // Extract [ChainName] prefix from log messages like "[Base] tx=..."
 const extractChain = (msg) => {
@@ -39,7 +36,7 @@ const extractChain = (msg) => {
 // ═══════════════════════════════════════════════════════════
 // HOOKS
 // ═══════════════════════════════════════════════════════════
-function useWebSocket(url, apiKey, httpBaseUrl) {
+function useWebSocket(url, apiKey, httpBaseUrl, enabled) {
   const [status, setStatus] = useState("disconnected");
   const [logs, setLogs] = useState(() => {
     try { return JSON.parse(localStorage.getItem("ap_logs") || "[]"); } catch { return []; }
@@ -53,6 +50,9 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
   const mountedRef = useRef(true);
   const logPersistRef = useRef(null);
   const attempts = useRef(0);
+  // Logged out → no connect, no reconnect, no visibility-triggered reconnect.
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
 
   const persistLogs = useCallback((next) => {
     clearTimeout(logPersistRef.current);
@@ -90,7 +90,7 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
   }, [httpBaseUrl, apiKey]);
 
   const scheduleReconnect = useCallback(() => {
-    if (!mountedRef.current) return;
+    if (!mountedRef.current || !enabledRef.current) return;
     attempts.current++;
     const delay = Math.min(1000 * Math.pow(2, attempts.current), 15000);
     reconnRef.current = setTimeout(() => connectRef.current?.(), delay);
@@ -99,7 +99,7 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
   const connectRef = useRef(null);
 
   const connect = useCallback(() => {
-    if (!url) return;
+    if (!url || !enabledRef.current) return;
     // Null out old socket's handlers before closing so onclose doesn't
     // schedule a reconnect that races with the new connection (React StrictMode
     // double-mounts trigger this and result in two live WS connections).
@@ -178,8 +178,10 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
 
   useEffect(() => {
     mountedRef.current = true;
+    if (!enabled) { setStatus("disconnected"); return; }
     connect();
     const onVisible = () => {
+      if (!enabledRef.current) return;
       if (document.visibilityState === "visible" && wsRef.current?.readyState !== WebSocket.OPEN) {
         attempts.current = 0;
         connect();
@@ -201,12 +203,11 @@ function useWebSocket(url, apiKey, httpBaseUrl) {
         wsRef.current = null;
       }
     };
-  }, [connect]);
+  }, [connect, enabled]);
 
   return {
     status, logs, stats, engineState, authError, send,
     clearLogs: () => { clearTimeout(logPersistRef.current); setLogs([]); try { localStorage.removeItem("ap_logs"); } catch {} },
-    disconnect: () => { clearTimeout(reconnRef.current); attempts.current = 999; wsRef.current?.close(); setStatus("disconnected"); },
     reconnect: () => { attempts.current = 0; connect(); },
     refreshState: () => void hydrateFromHttp(),
   };
@@ -216,6 +217,7 @@ function useApi(baseUrl, apiKey) {
   const [tokens, setTokens] = useState([]);
   const [pairs, setPairs] = useState([]);
   const [pairScan, setPairScan] = useState({});  // chain_id → [{pair_id, display_name, ...}]
+  const [chainNames, setChainNames] = useState({}); // chain_id → name (from the engine config)
   const [loading, setLoading] = useState(false);
   const headers = useMemo(() => {
     const h = { "Content-Type": "application/json" };
@@ -231,13 +233,14 @@ function useApi(baseUrl, apiKey) {
   const fetchPairScan = useCallback(async () => {
     const d = await f("/pair-scan");
     if (!d?.chains) return;
-    const m = {};
-    for (const c of d.chains) m[c.chain_id] = c.pairs;
+    const m = {}, names = {};
+    for (const c of d.chains) { m[c.chain_id] = c.pairs; names[c.chain_id] = c.chain_name || `Chain ${c.chain_id}`; }
     setPairScan(m);
+    setChainNames(names);
   }, [f]);
 
   return {
-    tokens, pairs, pairScan, loading,
+    tokens, pairs, pairScan, chainNames, loading,
     fetchTokens: async (cid) => { setLoading(true); const d = await f(`/tokens${cid ? `?chain_id=${cid}` : ""}`); setTokens(d?.tokens || []); setLoading(false); },
     fetchPairs: async (cid) => { const d = await f(`/tokens/pairs${cid ? `?chain_id=${cid}` : ""}`); setPairs(d?.pairs || []); },
     fetchPairScan,
@@ -245,8 +248,8 @@ function useApi(baseUrl, apiKey) {
     toggleTrust: async (cid, addr, trusted) => { await f(`/tokens/${cid}/${addr}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ trusted }) }); },
     addToken: async (t) => { const r = await fetch(`${baseUrl}/tokens`, { method: "POST", headers, body: JSON.stringify(t) }); return r?.ok; },
     removeToken: async (cid, addr) => { await f(`/tokens/${cid}/${addr}`, { method: "DELETE" }); },
-    pauseEngine: (cid) => f("/engine/pause", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cid ? { chain_id: cid } : {}) }),
-    resumeEngine: (cid) => f("/engine/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cid ? { chain_id: cid } : {}) }),
+    pauseEngine: () => f("/engine/pause", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
+    resumeEngine: () => f("/engine/resume", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
     setDryRun: (enabled) => f("/engine/dry-run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }) }),
     restartEngine: () => f("/engine/restart", { method: "POST", headers: { "Content-Type": "application/json" } }),
     resetDb: () => f("/stats/reset", { method: "POST", headers: { "Content-Type": "application/json" } }),
@@ -276,14 +279,15 @@ function LoginScreen({ engineUrl, setEngineUrl, apiKey, setApiKey, onConnect, er
         </div>
         <div style={{ marginBottom: 24 }}>
           <label style={{ display: "block", fontSize: 10, color: "#475569", letterSpacing: 1.2, marginBottom: 6, textTransform: "uppercase", fontWeight: 700 }}>API Key <span style={{ color: "#334155", fontWeight: 400 }}>(leave empty if auth disabled)</span></label>
-          <input value={localKey} onChange={(e) => setLocalKey(e.target.value)} type="password" placeholder="Same value as API_KEY in engine/.env on the server" style={{ width: "100%", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, color: "#e2e8f0", fontFamily: "inherit", padding: "10px 14px", fontSize: 13 }} autoComplete="off" />
+          <input value={localKey} onChange={(e) => setLocalKey(e.target.value)} type="password" placeholder="Same value as API_KEY in engine/<instance>.env on the server" style={{ width: "100%", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, color: "#e2e8f0", fontFamily: "inherit", padding: "10px 14px", fontSize: 13 }} autoComplete="off" />
         </div>
         {error && <div style={{ background: "#450a0a", border: "1px solid #7f1d1d", borderRadius: 6, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 12 }}>Authentication failed. Use the exact <code style={{ color: "#fecaca" }}>API_KEY</code> from the engine&apos;s <code style={{ color: "#fecaca" }}>.env</code> on the server (REST and WebSocket require it).</div>}
         <button onClick={handleSubmit} style={{ ...btn, width: "100%", padding: "12px 20px", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg, #4c1d95, #1e1b4b)", color: "#a78bfa", borderRadius: 6 }}>Connect</button>
         <div style={{ marginTop: 24, fontSize: 10, color: "#1e293b", textAlign: "center", lineHeight: 1.8 }}>
           Remote engine? Use <span style={{ color: "#475569" }}>ws://HOST:PORT/ws</span> (not localhost from an old session — run <span style={{ color: "#475569" }}>localStorage.clear()</span> in DevTools if stuck).
           <br />Local Vite: run the engine on port 3000 (or set <span style={{ color: "#475569" }}>ENGINE_PROXY_TARGET</span>) so the dev proxy can reach it.
-          <br />Engine not running? <span style={{ color: "#334155" }}>cargo run -p engine</span> in your workspace directory
+          <br />Engine not running? On the server: <span style={{ color: "#334155" }}>sudo systemctl start arbitragepulse@base</span>
+          <br />Never <span style={{ color: "#334155" }}>cargo run -p engine</span> from the repo root to test — the root .env is the live key.
         </div>
       </div>
     </div>
@@ -348,7 +352,7 @@ function Header({ tab, setTab, status, engineUrl, apiKey, onLogout }) {
         <span style={{ flex: 1 }} />
         <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
           <Dot status={status} />
-          <span style={{ color: "#334155", fontSize: 10 }}>{engineUrl.replace("ws://", "").replace("/ws", "")}</span>
+          <span style={{ color: "#334155", fontSize: 10 }}>{wsHostLabel(engineUrl)}</span>
           {apiKey && <span style={{ color: "#166534", fontSize: 9, background: "#052e16", padding: "2px 6px", borderRadius: 3 }}>{"\ud83d\udd12"}</span>}
           <button onClick={onLogout} style={{ ...btn, fontSize: 10, padding: "4px 10px", color: "#64748b" }} title="Disconnect & change settings">Logout</button>
         </div>
@@ -362,8 +366,9 @@ function StatsRow({ stats, logs, engineState, apiStats }) {
   // is unreliable: the Rust engine emits level="info" (not type="trade"), and the
   // log buffer is capped at 500 entries so counts freeze after ~250 arbs.
   const allChains = apiStats?.chains || [];
-  const trades  = allChains.reduce((s, c) => s + (c.total_success  || 0), 0)
-                  || logs.filter((l) => l.type === "trade").length;
+  const trades  = allChains.length > 0
+                  ? allChains.reduce((s, c) => s + (c.total_success || 0), 0)
+                  : logs.filter((l) => l.type === "trade").length;
   const attempts = allChains.reduce((s, c) => s + (c.total_attempts || 0), 0);
   // opportunities = every execution attempt that passed the gas-profit check
   const opps   = allChains.length > 0 ? attempts
@@ -378,7 +383,7 @@ function StatsRow({ stats, logs, engineState, apiStats }) {
 
   const items = [
     { l: "UPTIME", v: uptime, c: "#94a3b8" },
-    { l: "CHAINS", v: apiStats?.chains?.length ?? stats?.chains?.length ?? "—", c: "#a78bfa" },
+    { l: "CHAIN", v: allChains[0]?.chain_name ?? "—", c: "#a78bfa" },
     { l: "OPPORTUNITIES", v: opps, c: "#818cf8" },
     { l: "TRADES", v: trades, c: "#34d399" },
     { l: "ERRORS", v: errors, c: errors > 0 ? "#f87171" : "#334155" },
@@ -462,7 +467,12 @@ function ProfitChart({ fetchTrades, wsLogs }) {
   const [series, setSeries] = useState([{ time: "start", profit: 0 }]);
   const [total, setTotal] = useState(0);
   const loadedRef = useRef(false);
-  const appendedRef = useRef(0);
+  // Ids of trade entries already counted. Seeded with the buffer at mount: those trades
+  // (persisted from an earlier session) are already in the DB history loaded below.
+  // Tracking ids, not an index, keeps working once the 500-entry buffer starts rolling
+  // or is cleared.
+  const seenRef = useRef(null);
+  if (seenRef.current === null) seenRef.current = new Set(wsLogs.map((l) => l._id));
 
   // Load historical trades from DB on mount (survives restarts)
   useEffect(() => {
@@ -487,10 +497,13 @@ function ProfitChart({ fetchTrades, wsLogs }) {
 
   // Append new live WS trades
   useEffect(() => {
-    const liveTrades = wsLogs.filter((l) => l.type === "trade" && l.data?.profit_usd != null && !l._historical);
-    const newTrades = liveTrades.slice(appendedRef.current);
+    // Same filter as the DB history: real (not dry-run) successful trades.
+    const liveTrades = wsLogs.filter((l) => l.type === "trade" && l.data?.profit_usd != null && !l.data?.dry_run && !l._historical);
+    const seen = seenRef.current;
+    const newTrades = liveTrades.filter((l) => !seen.has(l._id));
+    // Keep only ids still in the buffer so the set stays bounded.
+    seenRef.current = new Set(wsLogs.map((l) => l._id));
     if (newTrades.length === 0) return;
-    appendedRef.current = liveTrades.length;
     setSeries((prev) => {
       const last = prev[prev.length - 1] || { profit: 0 };
       let cum = last.profit;
@@ -735,12 +748,15 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset }) {
   const [confirmDbReset, setConfirmDbReset] = useState(false);
   const [dbResetting, setDbResetting] = useState(false);
 
-  // Sound on trade
+  // Sound on trade — keyed on the newest entry's id: the buffer length stops changing
+  // once it reaches its 500-entry cap.
+  const lastBeepIdRef = useRef(ws.logs[ws.logs.length - 1]?._id);
+  const newestLog = ws.logs[ws.logs.length - 1];
   useEffect(() => {
-    if (!soundOn) return;
-    const last = ws.logs[ws.logs.length - 1];
-    if (last?.type === "trade") playBeep();
-  }, [ws.logs.length, soundOn]);
+    if (!newestLog || newestLog._id === lastBeepIdRef.current) return;
+    lastBeepIdRef.current = newestLog._id;
+    if (soundOn && newestLog.type === "trade") playBeep();
+  }, [newestLog?._id, soundOn]);
 
   const handleGoLive = async () => {
     if (!confirmLive) { setConfirmLive(true); return; }
@@ -778,9 +794,9 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset }) {
           </div>
           <span style={{ flex: 1 }} />
           {paused ? (
-            <button onClick={handleResume} style={{ ...btn, background: "#052e16", color: "#34d399", padding: "10px 24px", fontSize: 14, fontWeight: 700, borderRadius: 6 }}>▶ Resume All Chains</button>
+            <button onClick={handleResume} style={{ ...btn, background: "#052e16", color: "#34d399", padding: "10px 24px", fontSize: 14, fontWeight: 700, borderRadius: 6 }}>▶ Resume</button>
           ) : (
-            <button onClick={handlePause} style={{ ...btn, background: "#450a0a", color: "#f87171", padding: "10px 24px", fontSize: 14, fontWeight: 700, borderRadius: 6 }}>⏸ Pause All Chains</button>
+            <button onClick={handlePause} style={{ ...btn, background: "#450a0a", color: "#f87171", padding: "10px 24px", fontSize: 14, fontWeight: 700, borderRadius: 6 }}>⏸ Pause</button>
           )}
         </div>
       </div>
@@ -888,14 +904,16 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset }) {
 
 // ─── Pair Manager (replaces TokenManager) ─────────────────
 function PairManager({ api }) {
-  const chainIds = Object.keys(api.pairScan).map(Number).sort();
+  const chainIds = Object.keys(api.pairScan).map(Number).sort((a, b) => a - b);
   const [selectedChain, setSelectedChain] = useState(null);
   const [toggling, setToggling] = useState({});
 
-  // Auto-select first chain when data arrives
+  // Select the first chain when data arrives, and again if the selected chain is gone
+  // (e.g. the engine behind this URL was restarted with another chain's config).
+  const chainKey = chainIds.join(",");
   useEffect(() => {
-    if (chainIds.length > 0 && selectedChain === null) setSelectedChain(chainIds[0]);
-  }, [chainIds.length]);
+    if (chainIds.length > 0 && !chainIds.includes(selectedChain)) setSelectedChain(chainIds[0]);
+  }, [chainKey]);
 
   // Poll pair scan (10s) — restarts when API base URL or key changes
   useEffect(() => {
@@ -999,7 +1017,7 @@ function PairManager({ api }) {
               color: activeChain === cid ? "#a78bfa" : "#475569",
               border: `1px solid ${activeChain === cid ? "#4c1d95" : "#1e293b"}` }}
           >
-            {chainName(cid)}
+            {api.chainNames[cid] ?? `Chain ${cid}`}
           </button>
         ))}
         <span style={{ flex: 1 }} />
@@ -1070,8 +1088,11 @@ export default function Dashboard() {
   );
   useEffect(() => { localStorage.setItem("ap_url", url); }, [url]);
   useEffect(() => { localStorage.setItem("ap_key", apiKey); }, [apiKey]);
-  const apiUrl = url.replace("ws://", "http://").replace("wss://", "https://").replace("/ws", "");
-  const ws = useWebSocket(url, apiKey, apiUrl);
+  // Logout sticks (also across reloads) until the next Connect.
+  const [loggedOut, setLoggedOut] = useState(() => localStorage.getItem("ap_logged_out") === "1");
+  useEffect(() => { localStorage.setItem("ap_logged_out", loggedOut ? "1" : "0"); }, [loggedOut]);
+  const apiUrl = wsToHttpBase(url);
+  const ws = useWebSocket(url, apiKey, apiUrl, !loggedOut);
   const api = useApi(apiUrl, apiKey);
   const [tab, setTab] = useState("monitor");
   const [enabledTypes, setEnabledTypes] = useState(() => new Set(["trade", "opportunity", "errors", "info", "heartbeat"]));
@@ -1136,10 +1157,10 @@ export default function Dashboard() {
 
   useEffect(() => { if (ws.status === "connected") setAuthenticated(true); }, [ws.status]);
 
-  const handleConnect = () => { setStatsAuthFailed(false); setAuthenticated(true); };
-  const handleLogout = () => { ws.disconnect(); setStatsAuthFailed(false); setAuthenticated(false); };
+  const handleConnect = () => { setStatsAuthFailed(false); setLoggedOut(false); setAuthenticated(true); };
+  const handleLogout = () => { setLoggedOut(true); setStatsAuthFailed(false); setAuthenticated(false); };
 
-  if (!authenticated || ws.authError || statsAuthFailed) {
+  if (!authenticated || loggedOut || ws.authError || statsAuthFailed) {
     return (
       <>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');*{box-sizing:border-box;margin:0;padding:0}button:hover{filter:brightness(1.15)}input:focus{outline:none;border-color:#a78bfa}`}</style>

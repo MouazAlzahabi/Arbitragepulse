@@ -27,10 +27,11 @@ cargo run -p lab -- test-reverts
 cd contract
 forge script script/Deploy.s.sol      --rpc-url $RPC --broadcast   # executor
 forge script script/DeployMocks.s.sol --rpc-url $RPC --broadcast   # testnet mock tokens + pools
+MUSDC=… MWETH=… forge script script/RewidenMocks.s.sol --rpc-url $RPC --broadcast   # restore mock spread
 
-# Router types: 0 = V2, 1 = V3, 4 = Aerodrome
-cast send $EXECUTOR "setAllowedRouter(address,bool)" $ROUTER true  --private-key $PRIVATE_KEY --rpc-url $RPC
-cast send $EXECUTOR "setRouterType(address,uint8)"   $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url $RPC
+# Router types: 0 = V2, 1 = V3 (SwapRouter02), 4 = Aerodrome (2, 3 retired)
+cast send $EXECUTOR "setRouter(address,uint8)"        $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url $RPC
+cast send $EXECUTOR "revokeRouter(address)"           $ROUTER       --private-key $PRIVATE_KEY --rpc-url $RPC   # revoke
 cast call $EXECUTOR "allowedRouters(address)(bool)" $ROUTER --rpc-url $RPC
 
 cast send $EXECUTOR "withdrawToken(address)" $TOKEN --private-key $PRIVATE_KEY --rpc-url $RPC

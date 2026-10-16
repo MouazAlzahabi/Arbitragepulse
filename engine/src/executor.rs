@@ -34,14 +34,15 @@ fn gas_fallback_max_age() -> Duration { crate::config::tuning().gas_fallback_max
 fn gas_limit_triangular() -> u64 { crate::config::tuning().gas_limit_triangular }
 
 /// Shave this many basis points off the gas-derived `minProfit` before encoding the tx.
-/// The contract sets the **sell leg** V3 `amountOutMinimum = amountIn + minProfit`. If that sum
-/// sits exactly on the quoted edge, inclusion delay / tick crossing / competing flow causes
-/// Uniswap V3 to revert with **Too little received** even when simulation looked fine.
+/// The contract requires a final balance of `amountIn + minProfit` (`NotProfitable` otherwise;
+/// pre-v3 executors also passed it as the sell leg's router min-out → "Too little received").
+/// If that sum sits exactly on the quoted edge, inclusion delay / tick crossing / competing
+/// flow reverts the trade even when simulation looked fine.
 fn router_min_out_slack_bps() -> u64 { crate::config::tuning().router_min_out_slack_bps }
 
 /// Final multiplier applied to the gas-floor `minProfit` (basis points): 6200 / 10000 = 62%.
-/// Combined with `router_min_out_slack_bps()`, lowers on-chain router min vs same-block pool drift.
-/// Tradeoff: `NotProfitable` also uses `minProfit`, so profitability on-chain becomes more lenient;
+/// Combined with `router_min_out_slack_bps()`, lowers the on-chain floor vs same-block pool drift.
+/// Tradeoff: profitability on-chain becomes more lenient;
 /// off-chain `net profit` checks remain the economic guard.
 fn sell_leg_minprofit_mul_bps() -> u64 { crate::config::tuning().sell_leg_minprofit_mul_bps }
 
@@ -956,7 +957,7 @@ impl Executor {
     /// for on-chain minProfit that covers gas regardless of token type or decimals.
     ///
     /// Uses U256 + ppm math — converting `expected_profit` through `f64` loses precision
-    /// on Base-mainnet-sized wei and can inflate `minProfit`, tightening the V3 minOut.
+    /// on Base-mainnet-sized wei and can inflate `minProfit`, tightening the on-chain floor.
     fn gas_cost_to_token_floor(expected_profit: U256, profit_usd: f64, gas_cost_usd: f64) -> U256 {
         if profit_usd <= 0.0 || expected_profit.is_zero() {
             return U256::from(1u8);

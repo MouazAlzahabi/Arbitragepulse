@@ -13,10 +13,11 @@ base = "${BASE_RPC}"
 base_sepolia = "${BASE_SEPOLIA_RPC}"
 local = "http://127.0.0.1:8545"
 
-# Etherscan verification
+# Verification — Foundry uses the Etherscan API V2 by default (one etherscan.io key covers
+# Base and Base Sepolia; it adds the chainid itself, so no url here).
 [etherscan]
-base = { key = "${BASESCAN_API_KEY}", chain = 8453, url = "https://api.basescan.org/api" }
-base_sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532, url = "https://api-sepolia.basescan.org/api" }
+base = { key = "${ETHERSCAN_API_KEY}", chain = 8453 }
+base_sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 84532 }
 
 # Formatting
 [fmt]

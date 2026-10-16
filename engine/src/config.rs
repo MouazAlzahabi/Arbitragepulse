@@ -56,7 +56,7 @@ pub struct ChainConfig {
     /// Skip QuoterV2 verification (phases 1.5/1.5b/1.5c) and submit immediately
     /// after Phase 1 local spot quotes. Saves ~80-160ms per scan — enough to land
     /// in the same block as the detected opportunity on FCFS chains (Base).
-    /// Tradeoff: some txs revert ("Too little received") when local quotes are
+    /// Tradeoff: some txs revert (NotProfitable) when local quotes are
     /// optimistic. The contract's min_profit floor is the only safety net.
     /// Set to false to restore full QuoterV2 verification. Default: false.
     #[serde(default)]
@@ -341,7 +341,7 @@ pub struct Tuning {
     pub gas_limit_2hop: u64,
     /// Gas limit for a triangular (3-hop) arb tx.
     pub gas_limit_triangular: u64,
-    /// Bps shaved off the gas-derived minProfit before encoding (sell-leg min-out slack).
+    /// Bps shaved off the gas-derived minProfit before encoding (slack on the on-chain floor).
     pub router_min_out_slack_bps: u64,
     /// Final multiplier (bps of 10_000) on the gas-floor minProfit sent on-chain.
     pub sell_leg_minprofit_mul_bps: u64,

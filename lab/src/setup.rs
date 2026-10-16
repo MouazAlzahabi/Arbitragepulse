@@ -15,8 +15,7 @@ sol! {
     #[sol(rpc)]
     contract ArbitrageExecutor {
         constructor();
-        function setAllowedRouter(address router, bool approved) external;
-        function setRouterType(address router, uint8 rtype) external;
+        function setRouter(address router, uint8 rtype) external;
         function allowedRouters(address router) external view returns (bool);
         function totalTrades() external view returns (uint256);
     }
@@ -118,8 +117,9 @@ pub async fn run_setup<P: Provider>(
     let router_a: Address = routers.router_a.parse()?;
     let router_b: Address = routers.router_b.parse()?;
 
-    executor.setAllowedRouter(router_a, true).send().await?.get_receipt().await?;
-    executor.setAllowedRouter(router_b, true).send().await?.get_receipt().await?;
+    // 0 = V2 (the lab's MockRouters are V2-style)
+    executor.setRouter(router_a, 0).send().await?.get_receipt().await?;
+    executor.setRouter(router_b, 0).send().await?.get_receipt().await?;
     info!("Routers whitelisted on executor");
 
     // ── Fund executor with USDC for trading ──

@@ -38,7 +38,7 @@ The current Base executor is configured in `engine/config.yaml`
 
 ```bash
 cd contract
-forge script script/Deploy.s.sol --rpc-url https://mainnet.base.org --broadcast --verify
+forge script script/Deploy.s.sol --rpc-url base --broadcast --verify   # BASE_RPC + ETHERSCAN_API_KEY in contract/.env
 ```
 
 Whitelist every active router (types: `0` = V2, `1` = V3, `4` = Aerodrome):
@@ -50,13 +50,15 @@ Whitelist every active router (types: `0` = V2, `1` = V3, `4` = Aerodrome):
 | Aerodrome V2 Router | `0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43` | 4 |
 
 ```bash
-cast send $EXECUTOR "setAllowedRouter(address,bool)" $ROUTER true  --private-key $PRIVATE_KEY --rpc-url https://mainnet.base.org
-cast send $EXECUTOR "setRouterType(address,uint8)"   $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url https://mainnet.base.org
+cast send $EXECUTOR "setRouter(address,uint8)" $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url https://mainnet.base.org
 ```
 
 Fund the executor with the pairs' `token_in` (mostly USDC) and the wallet with a little
 ETH for gas (`chain.min_native_balance`). Withdraw with `withdrawToken(token)` /
 `withdrawETH()`; `pause()` freezes the contract.
+
+Failed trades are logged with the decoded contract error — which leg, which router and the
+router's own reason (see [contract/README.md](contract/README.md#readable-failures)).
 
 ## 4. Instance environment
 

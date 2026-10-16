@@ -1,108 +1,115 @@
-# ArbitrageExecutor v2 — Foundry
+# ArbitrageExecutor v3 — Foundry
 
-Atomic cross-DEX arbitrage executor contract. Migrated from Hardhat to **Foundry** for faster compilation, Solidity-native tests, and native Anvil integration with the ArbitragePulse Lab.
+Atomic cross-DEX arbitrage executor for Base. The engine calls one of two entry points:
 
-## Prerequisites
+| Function | Route |
+|----------|-------|
+| `executeArbitrage(tokenIn, tokenOut, amountIn, routerA, routerB, feeA, feeB, minProfit, deadline)` | `tokenIn → tokenOut` on A, back on B |
+| `executeTriangularArbitrage(tokenA, tokenB, tokenC, amountIn, routerAB, routerBC, routerCA, feeAB, feeBC, feeCA, minProfit, deadline)` | `A → B → C → A` |
 
-Install Foundry:
+Both revert unless the contract ends with at least `amountIn + minProfit` of the start token.
+The trade uses the contract's own balance; profit stays in the contract until `withdrawToken`.
+
+## Router types
+
+Each router must be whitelisted with a type. Ordinals are part of the engine interface:
+
+| Type | Value | Swap call | `fee` argument |
+|------|-------|-----------|----------------|
+| V2 | 0 | `swapExactTokensForTokens` | ignored |
+| V3 | 1 | SwapRouter02 7-field `exactInputSingle` (Uniswap V3, PancakeSwap V3) | pool fee tier, must be non-zero |
+| — | 2, 3 | retired (Solidly 3-field, SyncSwap) — rejected | |
+| Aerodrome | 4 | 4-field `Route{from,to,stable,factory}` | `0` volatile pool, non-zero stable pool |
+
 ```bash
-curl -L https://foundry.paradigm.xyz | bash
-foundryup
+cast send $EXECUTOR "setRouter(address,uint8)" $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url $RPC
+cast send $EXECUTOR "revokeRouter(address)" $ROUTER ...                    # stop using it
 ```
 
-## Setup
+## Readable failures
 
-```bash
-# Install dependencies (OpenZeppelin + forge-std)
-forge install OpenZeppelin/openzeppelin-contracts --no-commit
-forge install foundry-rs/forge-std --no-commit
+Every failure path reverts with a custom error the engine decodes (`engine/src/revert.rs`)
+into a log line such as `not profitable: balance 1000 → 998, needed +1` or
+`leg 1 (V3 router 0x2626…) reverted with no reason (no pool for this pair/fee tier, or wrong
+router type — check setRouter)`.
 
-# Copy env
-cp .env.example .env
-# Edit .env with your keys
-```
+`minProfit` is enforced once, on the final balance: routers get a zero min-out, so a price
+move reads as `NotProfitable` with the exact shortfall on every DEX (PancakeSwap's router
+reverts on slippage with no reason at all). The transaction is atomic, so this protects
+the capital exactly like a router-level minimum.
+
+| Error | Meaning |
+|-------|---------|
+| `LegFailed(leg, router, rtype, reason)` | a router reverted; `reason` is its raw revert data (string, custom error such as Aerodrome's, or empty). Empty: no pool for that fee tier / stable flag, or the wrong router type |
+| `NotProfitable(balanceBefore, balanceAfter, minProfit)` | the route completed but returned less than `amountIn + minProfit` — price moved or spread closed |
+| `InsufficientBalance(token, balance, needed)` | the contract does not hold `amountIn` of the start token |
+| `NoOutput(leg, router)` | a router returned without paying anything out |
+| `InvalidV3Fee(leg, router)` | V3 leg with fee 0 |
+| `RouterNotAllowed(router)` / `UnsupportedRouterType(router, rtype)` | not whitelisted / retired type |
+| `InvalidPath()` | repeated token in the route |
+| `DeadlineExpired(deadline, now)`, `ZeroAmount()`, `ZeroAddress()` | input checks |
+| `EnforcedPause()`, `OwnableUnauthorizedAccount(caller)` | OpenZeppelin: paused / not owner |
+
+`setRouter` is the only way to allow a router (it also rejects addresses with no code), so
+no router is ever allowed with a forgotten type; call it again to change the type.
+
+Routers are called with a low-level call and their return value is never decoded: each
+leg is measured by balance delta, so a router that misreports (or returns nothing) cannot
+make the next leg over-spend, and still fails as `NoOutput`/`LegFailed` naming the leg.
+Each leg approves exactly its input; a leftover allowance is cleared best-effort (a token
+that rejects `approve(0)` is left at 1 wei instead of aborting a finished trade;
+`revokeApproval` does the same).
+
+Events: `ArbitrageExecuted(tokenIn, tokenOut, routerA, routerB, amountIn, profit)` for 2-hop,
+`TriangularArbitrageExecuted(tokenA, tokenB, tokenC, routerAB, routerBC, routerCA, amountIn, profit)`
+for triangular.
+
+Fee-on-transfer tokens are **not** supported as a leg input: real V2/Aerodrome pools revert
+(`K`) and V3 pools revert (`IIA`) when the input arrives short.
+
+v3 removed `batchExecute`, `executeArbitrageMultiHop` and `estimateArbitrage` (unused by the
+engine) and the Solidly/SyncSwap paths. Gas per trade (mocks): ~185k for two legs, ~320k
+triangular; real pools add their own swap cost on top.
 
 ## Commands
 
 ```bash
-# Compile
 forge build
-
-# Run all tests (fast — no fork needed, uses mocks)
-forge test
-
-# Run tests with verbosity (see traces on failure)
-forge test -vvv
-
-# Run a specific test
-forge test --match-test test_ExecuteProfitableArb -vvv
-
-# Gas report
+forge test                 # no fork needed, all mocks
+forge test -vvv            # traces on failure
 forge test --gas-report
 
-# Deploy to a local Anvil fork of Base
+# Local Anvil fork of Base
 anvil --fork-url $BASE_RPC --chain-id 8453 --port 8545
-forge script script/Deploy.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
+forge script script/Deploy.s.sol --rpc-url local --broadcast
 
-# Deploy to Base Sepolia (testing stage) — then DeployMocks.s.sol, see TESTNET_DEPLOYMENT_GUIDE.md
-forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC --broadcast
+# Base Sepolia (testing stage) — then DeployMocks.s.sol, see ../TESTNET_DEPLOYMENT_GUIDE.md
+forge script script/Deploy.s.sol --rpc-url base_sepolia --broadcast --verify
 
-# Deploy to Base mainnet
-forge script script/Deploy.s.sol --rpc-url $BASE_RPC --broadcast --verify
+# Base mainnet
+forge script script/Deploy.s.sol --rpc-url base --broadcast --verify
 ```
 
-## Integration with ArbitragePulse Lab
+`.env` (see `.env.example`): `PRIVATE_KEY`, `BASE_RPC`, `BASE_SEPOLIA_RPC`, and
+`ETHERSCAN_API_KEY` (Etherscan API V2 — one etherscan.io key verifies on both chains; needs
+Foundry ≥ 1.3, where V2 is the default — run `foundryup` if verification hits the old BaseScan API).
 
-The Lab's `setup-fork.ts` deploys this contract to Anvil using the compiled artifact. After running `forge build`, the artifact is at:
+The Rust lab (`cargo run -p lab -- setup`) deploys from the compiled artifact
+`out/ArbitrageExecutor.sol/ArbitrageExecutor.json`, so run `forge build` first.
 
-```
-out/ArbitrageExecutor.sol/ArbitrageExecutor.json
-```
-
-Update the lab's `.env`:
-```
-CONTRACT_ARTIFACT_PATH=../arb-contract-foundry/out/ArbitrageExecutor.sol/ArbitrageExecutor.json
-```
-
-## Project Structure
+## Layout
 
 ```
 src/
-  ArbitrageExecutor.sol    — Main contract
-  mocks/
-    MockERC20.sol           — Test token
-    MockRouter.sol          — Test DEX router
-test/
-  ArbitrageExecutor.t.sol  — Full test suite (38 tests)
+  ArbitrageExecutor.sol      main contract
+  mocks/                     MockERC20, MockRouter (V2), MockV3Router, MockAerodromeRouter,
+                             MockOddTokens (fee-on-transfer, approve-0-rejecting, lying/no-op/silent/partial routers)
 script/
-  Deploy.s.sol              — Deployment script
+  Deploy.s.sol               executor
+  DeployMocks.s.sol          Base Sepolia mock tokens seeded on real Uniswap V2/V3 at a spread
+  RewidenMocks.s.sol         restore that spread after arbs narrow it
+  MockMarket.sol             shared addresses, prices and sqrtPriceX96 math
+test/
+  ArbitrageExecutor.t.sol    executor (49 tests)
+  MockMarket.t.sol           mock-market price math
 ```
-
-## Test Coverage
-
-All original Hardhat tests ported 1:1 to Forge Solidity tests:
-
-| Category | Tests |
-|----------|-------|
-| ETH deposit/withdraw | 4 |
-| Token withdrawal | 5 |
-| Arbitrage execution | 5 |
-| Access control | 7 |
-| #1 Deadline | 3 |
-| #2 minProfit | 2 |
-| #4 Allowance hygiene | 2 |
-| #5 Ownable2Step | 3 |
-| #6 Batch execution | 5 |
-| #7 Profit accumulator | 4 |
-| #8 Pausable | 4 |
-| estimateArbitrage | 2 |
-| **Total** | **46** |
-
-## Why Foundry over Hardhat?
-
-- **10-50x faster tests** — Solidity tests run in the EVM directly, no JS overhead
-- **Native Anvil** — same tool for fork, test, and deploy
-- **forge script** — deploy scripts are Solidity too, type-safe
-- **Better traces** — `forge test -vvvv` shows full call traces on revert
-- **Gas snapshots** — `forge snapshot` for tracking gas regressions
-- **No node_modules** — dependencies are git submodules in `lib/`

@@ -15,15 +15,9 @@ interface IUniswapV2Router02 {
         address to,
         uint256 deadline
     ) external returns (uint256[] memory amounts);
-
-    function getAmountsOut(
-        uint256 amountIn,
-        address[] calldata path
-    ) external view returns (uint256[] memory amounts);
-
-    function WETH() external pure returns (address);
 }
 
+/// @dev Uniswap SwapRouter02 / PancakeSwap V3 SmartRouter (7-field, no deadline in struct).
 interface ISwapRouterV3 {
     struct ExactInputSingleParams {
         address tokenIn;
@@ -35,28 +29,10 @@ interface ISwapRouterV3 {
         uint160 sqrtPriceLimitX96;
     }
     function exactInputSingle(ExactInputSingleParams calldata params)
-        external returns (uint256 amountOut);
+        external payable returns (uint256 amountOut);
 }
 
-interface ISolidlyRouter {
-    struct Route {
-        address from;
-        address to;
-        bool stable;
-    }
-    function getAmountsOut(uint256 amountIn, Route[] calldata routes)
-        external view returns (uint256[] memory amounts);
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        Route[] calldata routes,
-        address to,
-        uint256 deadline
-    ) external returns (uint256[] memory amounts);
-}
-
-// Aerodrome V2 (Base) — uses 4-field Route including factory address.
-// factory=address(0) → router uses its internal default factory.
+/// @dev Aerodrome V2 (Base) — 4-field Route; factory=address(0) → router's default factory.
 interface IAerodromeRouter {
     struct Route {
         address from;
@@ -73,47 +49,37 @@ interface IAerodromeRouter {
     ) external returns (uint256[] memory amounts);
 }
 
-// SyncSwap — pools are called directly (transfer-then-swap, no approve pattern)
-interface ISyncSwapPool {
-    // data = abi.encode(tokenIn, recipient, withdrawMode)
-    // withdrawMode: 1 = ERC20 transfer, 2 = native unwrap
-    function swap(
-        bytes calldata data,
-        address sender,
-        address callback,
-        bytes calldata callbackData
-    ) external returns (uint256 amountOut);
-}
-
-interface ISyncSwapFactory {
-    function getPool(address tokenA, address tokenB) external view returns (address pool);
-}
-
 /**
- * @title ArbitrageExecutor v2
- * @notice Atomic cross-DEX arbitrage executor with V2 and V3 support.
+ * @title ArbitrageExecutor v3
+ * @notice Atomic cross-DEX arbitrage: 2-hop (buy on A, sell on B) and triangular
+ *         (A → B → C → A). Each trade either ends with at least `minProfit` more of the
+ *         start token or reverts — the contract never keeps a loss.
  *
- * Improvements over v1:
- *   1. Caller-supplied deadline — stale txns expire instead of being held
- *   2. minProfit parameter — ensures profit covers gas, not just 1 wei
- *   3. ReentrancyGuard — protects against malicious token callbacks
- *   4. Exact allowance hygiene — approve exact, reset to 0 after each swap
- *   5. Ownable2Step — typo-proof ownership transfer
- *   6. batchExecute — multiple arbs in one transaction
- *   7. On-chain profit accumulator — track total profits without parsing logs
- *   8. Pausable — freeze execution without withdrawing
- *   9. V3 support — dispatch to Uniswap V3 exactInputSingle when routerType is V3
+ * Failure reporting — every revert says what went wrong and where:
+ *   • a router call that reverts is re-raised as LegFailed(leg, router, type, reason),
+ *     with the router's own revert data in `reason` (e.g. "Too little received");
+ *   • missing funds → InsufficientBalance; a leg that delivers nothing → NoOutput;
+ *   • misconfiguration (unknown / retired router type, V3 fee 0, repeated tokens) has
+ *     its own error, checked before any swap.
+ *
+ * Amounts between legs are measured as balance deltas, not taken from router return
+ * values, so a router that misreports its output cannot make the next leg over-spend.
+ * Fee-on-transfer tokens are NOT supported as a leg input: real V2/Aerodrome pools
+ * revert ("K") and V3 pools revert ("IIA") when the input arrives short.
+ * Allowances are exact and cleared after each leg if anything is left.
  */
 contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     // ─── Router Types ─────────────────────────────────────────
-
-    enum RouterType { V2, V3, Solidly, SyncSwap, Aerodrome }
+    /// @dev Ordinals are part of the off-chain interface (setRouter takes a uint8):
+    ///      0 = V2, 1 = V3, 4 = Aerodrome. 2 and 3 (Solidly v1, SyncSwap) are retired —
+    ///      no Base deployment — and rejected; they keep their slots so 4 stays Aerodrome.
+    enum RouterType { V2, V3, RetiredSolidly, RetiredSyncSwap, Aerodrome }
 
     // ─── State ────────────────────────────────────────────────
 
-    /// @notice Total accumulated profit per token (improvement #7)
+    /// @notice Total accumulated profit per token
     mapping(address => uint256) public totalProfit;
 
     /// @notice Total number of successful trades
@@ -122,7 +88,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Routers approved to be used in arbitrage calls
     mapping(address => bool) public allowedRouters;
 
-    /// @notice Router protocol type (V2 or V3) — defaults to V2 if not set
+    /// @notice Router protocol type (set together with the allowlist by setRouter)
     mapping(address => RouterType) public routerType;
 
     // ─── Events ───────────────────────────────────────────────
@@ -135,8 +101,16 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 amountIn,
         uint256 profit
     );
-
-    event BatchExecuted(uint256 attempted, uint256 succeeded, uint256 totalBatchProfit);
+    event TriangularArbitrageExecuted(
+        address indexed tokenA,
+        address indexed tokenB,
+        address indexed tokenC,
+        address routerAB,
+        address routerBC,
+        address routerCA,
+        uint256 amountIn,
+        uint256 profit
+    );
     event WithdrawETH(address indexed to, uint256 amount);
     event WithdrawToken(address indexed token, address indexed to, uint256 amount);
     event RouterApproved(address indexed router, bool approved);
@@ -145,82 +119,80 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     // ─── Errors ───────────────────────────────────────────────
 
+    /// @notice The trade completed but ended below `balanceBefore + minProfit`.
     error NotProfitable(uint256 balanceBefore, uint256 balanceAfter, uint256 minProfit);
     error DeadlineExpired(uint256 deadline, uint256 currentTimestamp);
     error ZeroAmount();
     error ZeroAddress();
     error TransferFailed();
-    error EmptyBatch();
     error RouterNotAllowed(address router);
-    error InsufficientOutput(uint256 got, uint256 min);
-    error PoolNotFound(address factory);
+    /// @notice The router's configured type has no swap path (retired type).
+    error UnsupportedRouterType(address router, RouterType rtype);
+    /// @notice The contract holds less of `token` than the trade needs.
+    error InsufficientBalance(address token, uint256 balance, uint256 needed);
+    /// @notice The same token appears twice in the route.
+    error InvalidPath();
+    /// @notice A V3 leg was given fee 0 — no such pool; the fee tier is required.
+    error InvalidV3Fee(uint8 leg, address router);
+    /// @notice A router call reverted. `reason` is the router's own revert data.
+    error LegFailed(uint8 leg, address router, RouterType rtype, bytes reason);
+    /// @notice A leg succeeded but the contract received none of its output token.
+    error NoOutput(uint8 leg, address router);
+    /// @notice setRouter was given an address with no code (EOA or typo).
+    error NotAContract(address router);
 
     // ─── Constructor ──────────────────────────────────────────
 
-    /// @dev Ownable2Step (improvement #5): deployer is initial owner,
-    ///      transfer requires new owner to call acceptOwnership()
+    /// @dev Ownable2Step: deployer is initial owner; transfer needs acceptOwnership().
     constructor() Ownable(msg.sender) {}
 
-    // ─── Router Allowlist ─────────────────────────────────────
+    // ─── Router configuration ─────────────────────────────────
 
-    /**
-     * @notice Approve or revoke a router for use in arbitrage.
-     *         Defaults to V2 router type.
-     */
-    function setAllowedRouter(address router, bool approved) external onlyOwner {
+    /// @notice Allow a router with its type: 0 = V2, 1 = V3 (SwapRouter02), 4 = Aerodrome
+    ///         (2 and 3 are retired). The only way to allow a router, so none is ever
+    ///         allowed with a forgotten type. Call again to change the type.
+    function setRouter(address router, RouterType rtype) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
-        allowedRouters[router] = approved;
-        emit RouterApproved(router, approved);
+        if (router.code.length == 0) revert NotAContract(router);
+        if (!_isSupported(rtype)) revert UnsupportedRouterType(router, rtype);
+        routerType[router] = rtype;
+        allowedRouters[router] = true;
+        emit RouterTypeSet(router, rtype);
+        emit RouterApproved(router, true);
     }
 
-    /**
-     * @notice Set the protocol type for an already-approved router.
-     *         Call setAllowedRouter first, then setRouterType if not V2.
-     *         RouterType: 0=V2, 1=V3, 2=Solidly
-     */
-    function setRouterType(address router, RouterType rtype) external onlyOwner {
-        if (router == address(0)) revert ZeroAddress();
-        routerType[router] = rtype;
-        emit RouterTypeSet(router, rtype);
+    /// @notice Stop using a router.
+    function revokeRouter(address router) external onlyOwner {
+        allowedRouters[router] = false;
+        emit RouterApproved(router, false);
+    }
+
+    function _isSupported(RouterType rtype) internal pure returns (bool) {
+        return rtype == RouterType.V2 || rtype == RouterType.V3 || rtype == RouterType.Aerodrome;
     }
 
     // ─── Receive ETH ──────────────────────────────────────────
 
     receive() external payable {}
 
-    // ─── Modifiers ────────────────────────────────────────────
-
-    /// @dev Improvement #1: reject transactions past their deadline
     modifier checkDeadline(uint256 deadline) {
-        if (block.timestamp > deadline) {
-            revert DeadlineExpired(deadline, block.timestamp);
-        }
+        if (block.timestamp > deadline) revert DeadlineExpired(deadline, block.timestamp);
         _;
     }
 
     // ═══════════════════════════════════════════════════════════
-    // CORE: Single Arbitrage Execution
+    // 2-hop arbitrage
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * @notice Execute an atomic arbitrage: buy tokenOut on routerA,
-     *         sell tokenOut on routerB, profit in tokenIn.
-     *
-     * Works with V2, V3, and Solidly routers — dispatch is automatic based on
-     * the routerType mapping set via setRouterType().
-     *
-     * @param tokenIn    Base token we start and end with
-     * @param tokenOut   Intermediate token to flip
-     * @param amountIn   How much tokenIn to spend
-     * @param routerA    DEX to buy on (cheaper)
-     * @param routerB    DEX to sell on (more expensive)
-     * @param feeA       Fee encoding for routerA:
-     *                     V2: ignored (pass 0)
-     *                     V3: fee tier (500/3000/10000)
-     *                     Solidly: pool type (0=volatile, 1=stable)
-     * @param feeB       Fee encoding for routerB (same convention as feeA)
-     * @param minProfit  Minimum profit required in tokenIn units (#2)
-     * @param deadline   Unix timestamp — revert if tx lands after this (#1)
+     * @notice Buy `tokenOut` with `tokenIn` on routerA, sell it back on routerB.
+     * @param feeA/feeB  V2: ignored. V3: fee tier (100/500/2500/3000/10000).
+     *                   Aerodrome: 0 = volatile pool, non-zero = stable pool.
+     * @param minProfit  Minimum gain in tokenIn. Enforced by the contract on the final
+     *                   balance (NotProfitable), not by the routers: they get a zero
+     *                   min-out, so slippage reads the same on every DEX (PancakeSwap's
+     *                   router reverts without a reason). The tx is atomic, so this is
+     *                   as safe as router-level protection.
      */
     function executeArbitrage(
         address tokenIn,
@@ -232,116 +204,28 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint24 feeB,
         uint256 minProfit,
         uint256 deadline
-    )
-        external
-        onlyOwner
-        whenNotPaused        // #8
-        nonReentrant         // #3
-        checkDeadline(deadline) // #1
-    {
+    ) external onlyOwner whenNotPaused nonReentrant checkDeadline(deadline) {
         if (amountIn == 0) revert ZeroAmount();
         if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
-        if (routerA == address(0) || routerB == address(0)) revert ZeroAddress();
-        if (!allowedRouters[routerA]) revert RouterNotAllowed(routerA);
-        if (!allowedRouters[routerB]) revert RouterNotAllowed(routerB);
+        if (tokenIn == tokenOut) revert InvalidPath();
+        RouterType typeA = _checkRouter(routerA);
+        RouterType typeB = _checkRouter(routerB);
+        uint256 balanceBefore = _checkBalance(tokenIn, amountIn);
 
-        uint256 profit = _executeSwapPair(
-            tokenIn, tokenOut, amountIn, routerA, routerB, feeA, feeB, minProfit, deadline
-        );
+        uint256 mid = _swap(1, routerA, typeA, tokenIn, tokenOut, amountIn, feeA, deadline);
+        _swap(2, routerB, typeB, tokenOut, tokenIn, mid, feeB, deadline);
 
-        // Accumulate profit (#7)
-        totalProfit[tokenIn] += profit;
-        totalTrades++;
-
+        uint256 profit = _settle(tokenIn, balanceBefore, minProfit);
         emit ArbitrageExecuted(tokenIn, tokenOut, routerA, routerB, amountIn, profit);
     }
 
     // ═══════════════════════════════════════════════════════════
-    // CORE: Multi-Hop Arbitrage (V2 only)
+    // Triangular arbitrage (A → B → C → A)
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * @notice Execute arbitrage with custom multi-hop paths (V2 only).
-     *         e.g., USDC → WETH → TOKEN on routerA, TOKEN → USDC on routerB
-     */
-    function executeArbitrageMultiHop(
-        address tokenIn,
-        uint256 amountIn,
-        address routerA,
-        address routerB,
-        address[] calldata pathA,
-        address[] calldata pathB,
-        uint256 minProfit,
-        uint256 deadline
-    )
-        external
-        onlyOwner
-        whenNotPaused
-        nonReentrant
-        checkDeadline(deadline)
-    {
-        if (amountIn == 0) revert ZeroAmount();
-        if (routerA == address(0) || routerB == address(0)) revert ZeroAddress();
-        if (!allowedRouters[routerA]) revert RouterNotAllowed(routerA);
-        if (!allowedRouters[routerB]) revert RouterNotAllowed(routerB);
-        require(pathA.length >= 2 && pathB.length >= 2, "Invalid path length");
-        require(pathA[0] == tokenIn, "pathA must start with tokenIn");
-        require(pathB[pathB.length - 1] == tokenIn, "pathB must end with tokenIn");
-
-        uint256 balanceBefore = IERC20(tokenIn).balanceOf(address(this));
-
-        // Buy leg
-        _approveExact(tokenIn, routerA, amountIn);
-        uint256[] memory amountsA = IUniswapV2Router02(routerA)
-            .swapExactTokensForTokens(amountIn, 0, pathA, address(this), deadline);
-
-        // Sell leg — require at least amountIn + minProfit back for MEV protection
-        address tokenMid = pathA[pathA.length - 1];
-        uint256 midAmount = amountsA[amountsA.length - 1];
-        _approveExact(tokenMid, routerB, midAmount);
-        IUniswapV2Router02(routerB)
-            .swapExactTokensForTokens(midAmount, amountIn + minProfit, pathB, address(this), deadline);
-
-        // Cleanup allowances (#4)
-        _resetAllowance(tokenIn, routerA);
-        _resetAllowance(tokenMid, routerB);
-
-        // Profitability check with minProfit (#2)
-        uint256 balanceAfter = IERC20(tokenIn).balanceOf(address(this));
-        if (balanceAfter < balanceBefore + minProfit) {
-            revert NotProfitable(balanceBefore, balanceAfter, minProfit);
-        }
-
-        uint256 profit;
-        unchecked { profit = balanceAfter - balanceBefore; } // balanceAfter >= balanceBefore + minProfit checked above
-        totalProfit[tokenIn] += profit;
-        totalTrades++;
-
-        emit ArbitrageExecuted(tokenIn, tokenMid, routerA, routerB, amountIn, profit);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // CORE: Triangular Arbitrage (3-token loop)
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * @notice Execute triangular arbitrage: A → B → C → A loop.
-     *         Example: USDC → WETH → OP → USDC
-     *
-     * All three legs can use V2 or V3 routers (dispatch is automatic).
-     *
-     * @param tokenA     Base token we start and end with
-     * @param tokenB     First intermediate token
-     * @param tokenC     Second intermediate token
-     * @param amountIn   How much tokenA to start with
-     * @param routerAB   Router for A→B leg
-     * @param routerBC   Router for B→C leg
-     * @param routerCA   Router for C→A leg
-     * @param feeAB      V3 fee tier for A→B (0 for V2)
-     * @param feeBC      V3 fee tier for B→C (0 for V2)
-     * @param feeCA      V3 fee tier for C→A (0 for V2)
-     * @param minProfit  Minimum profit required in tokenA units
-     * @param deadline   Unix timestamp — revert if tx lands after this
+     * @notice A → B on routerAB, B → C on routerBC, C → A on routerCA.
+     *         Fees follow the same convention as executeArbitrage.
      */
     function executeTriangularArbitrage(
         address tokenA,
@@ -356,413 +240,129 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint24 feeCA,
         uint256 minProfit,
         uint256 deadline
-    )
-        external
-        onlyOwner
-        whenNotPaused
-        nonReentrant
-        checkDeadline(deadline)
-    {
+    ) external onlyOwner whenNotPaused nonReentrant checkDeadline(deadline) {
         if (amountIn == 0) revert ZeroAmount();
-        if (tokenA == address(0) || tokenB == address(0) || tokenC == address(0)) {
-            revert ZeroAddress();
-        }
-        if (!allowedRouters[routerAB]) revert RouterNotAllowed(routerAB);
-        if (!allowedRouters[routerBC]) revert RouterNotAllowed(routerBC);
-        if (!allowedRouters[routerCA]) revert RouterNotAllowed(routerCA);
+        if (tokenA == address(0) || tokenB == address(0) || tokenC == address(0)) revert ZeroAddress();
+        if (tokenA == tokenB || tokenB == tokenC || tokenA == tokenC) revert InvalidPath();
+        RouterType typeAB = _checkRouter(routerAB);
+        RouterType typeBC = _checkRouter(routerBC);
+        RouterType typeCA = _checkRouter(routerCA);
+        uint256 balanceBefore = _checkBalance(tokenA, amountIn);
 
-        uint256 balanceBefore = IERC20(tokenA).balanceOf(address(this));
+        uint256 amountB = _swap(1, routerAB, typeAB, tokenA, tokenB, amountIn, feeAB, deadline);
+        uint256 amountC = _swap(2, routerBC, typeBC, tokenB, tokenC, amountB, feeBC, deadline);
+        _swap(3, routerCA, typeCA, tokenC, tokenA, amountC, feeCA, deadline);
 
-        // ── Leg 1: A → B ──
-        uint256 amountB;
-        if (routerType[routerAB] == RouterType.V3) {
-            amountB = _executeSwapV3(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
-        } else if (routerType[routerAB] == RouterType.Solidly) {
-            amountB = _executeSwapSolidly(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
-        } else if (routerType[routerAB] == RouterType.SyncSwap) {
-            amountB = _executeSwapSyncSwap(tokenA, tokenB, amountIn, routerAB, 0, deadline);
-        } else if (routerType[routerAB] == RouterType.Aerodrome) {
-            amountB = _executeSwapAerodrome(tokenA, tokenB, amountIn, routerAB, feeAB, 0, deadline);
-        } else {
-            amountB = _executeSwapV2(tokenA, tokenB, amountIn, routerAB, 0, deadline);
-        }
+        uint256 profit = _settle(tokenA, balanceBefore, minProfit);
+        emit TriangularArbitrageExecuted(tokenA, tokenB, tokenC, routerAB, routerBC, routerCA, amountIn, profit);
+    }
 
-        // ── Leg 2: B → C ──
-        uint256 amountC;
-        if (routerType[routerBC] == RouterType.V3) {
-            amountC = _executeSwapV3(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
-        } else if (routerType[routerBC] == RouterType.Solidly) {
-            amountC = _executeSwapSolidly(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
-        } else if (routerType[routerBC] == RouterType.SyncSwap) {
-            amountC = _executeSwapSyncSwap(tokenB, tokenC, amountB, routerBC, 0, deadline);
-        } else if (routerType[routerBC] == RouterType.Aerodrome) {
-            amountC = _executeSwapAerodrome(tokenB, tokenC, amountB, routerBC, feeBC, 0, deadline);
-        } else {
-            amountC = _executeSwapV2(tokenB, tokenC, amountB, routerBC, 0, deadline);
-        }
+    // ═══════════════════════════════════════════════════════════
+    // Internal
+    // ═══════════════════════════════════════════════════════════
 
-        // ── Leg 3: C → A ──
-        // Require at least amountIn + minProfit on the final leg for router-level MEV protection
-        if (routerType[routerCA] == RouterType.V3) {
-            _executeSwapV3(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
-        } else if (routerType[routerCA] == RouterType.Solidly) {
-            _executeSwapSolidly(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
-        } else if (routerType[routerCA] == RouterType.SyncSwap) {
-            _executeSwapSyncSwap(tokenC, tokenA, amountC, routerCA, amountIn + minProfit, deadline);
-        } else if (routerType[routerCA] == RouterType.Aerodrome) {
-            _executeSwapAerodrome(tokenC, tokenA, amountC, routerCA, feeCA, amountIn + minProfit, deadline);
-        } else {
-            _executeSwapV2(tokenC, tokenA, amountC, routerCA, amountIn + minProfit, deadline);
-        }
+    /// @dev setRouter is the only way in and rejects retired types, so an allowed
+    ///      router's type is always supported.
+    function _checkRouter(address router) internal view returns (RouterType) {
+        if (!allowedRouters[router]) revert RouterNotAllowed(router);
+        return routerType[router];
+    }
 
-        // ── Profitability gate ──
-        uint256 balanceAfter = IERC20(tokenA).balanceOf(address(this));
+    /// @dev Returns the current balance (the "before" for the profit check).
+    function _checkBalance(address token, uint256 needed) internal view returns (uint256 balance) {
+        balance = IERC20(token).balanceOf(address(this));
+        if (balance < needed) revert InsufficientBalance(token, balance, needed);
+    }
+
+    function _settle(address token, uint256 balanceBefore, uint256 minProfit) internal returns (uint256 profit) {
+        uint256 balanceAfter = IERC20(token).balanceOf(address(this));
         if (balanceAfter < balanceBefore + minProfit) {
             revert NotProfitable(balanceBefore, balanceAfter, minProfit);
         }
-
-        uint256 profit;
-        unchecked { profit = balanceAfter - balanceBefore; } // balanceAfter >= balanceBefore + minProfit checked above
-        totalProfit[tokenA] += profit;
+        unchecked { profit = balanceAfter - balanceBefore; }
+        totalProfit[token] += profit;
         totalTrades++;
-
-        // Emit event with tokenB as "tokenOut" for dashboard compatibility
-        emit ArbitrageExecuted(tokenA, tokenB, routerAB, routerCA, amountIn, profit);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // CORE: Batch Execution (improvement #6)
-    // ═══════════════════════════════════════════════════════════
-
-    struct ArbParams {
-        address tokenIn;
-        address tokenOut;
-        uint256 amountIn;
-        address routerA;
-        address routerB;
-        uint24 feeA;     // V3 fee tier for routerA (0 for V2)
-        uint24 feeB;     // V3 fee tier for routerB (0 for V2)
-        uint256 minProfit;
     }
 
     /**
-     * @notice Execute multiple arbs in one transaction.
-     *         Individual arbs that fail are skipped (not reverted),
-     *         so one bad trade doesn't kill the profitable ones.
-     *
-     * @param arbs      Array of arbitrage parameters
-     * @param deadline  Shared deadline for all arbs in this batch
-     * @return results  Profit for each arb (0 = skipped/failed)
+     * @dev One swap leg on any supported router type. Returns the amount of `tokenOut`
+     *      actually received (balance delta). Router reverts become LegFailed.
+     *      Min-out is 0: profit is enforced once, in _settle.
      */
-    function batchExecute(
-        ArbParams[] calldata arbs,
-        uint256 deadline
-    )
-        external
-        onlyOwner
-        whenNotPaused
-        nonReentrant
-        checkDeadline(deadline)
-        returns (uint256[] memory results)
-    {
-        if (arbs.length == 0) revert EmptyBatch();
-
-        results = new uint256[](arbs.length);
-        uint256 succeeded = 0;
-        uint256 batchProfit = 0;
-
-        for (uint256 i = 0; i < arbs.length; i++) {
-            ArbParams calldata a = arbs[i];
-
-            // Skip invalid params
-            if (a.amountIn == 0 || a.tokenIn == address(0) || a.tokenOut == address(0)) {
-                continue;
-            }
-
-            // Skip unapproved routers
-            if (!allowedRouters[a.routerA] || !allowedRouters[a.routerB]) {
-                continue;
-            }
-
-            // Skip if insufficient balance
-            if (IERC20(a.tokenIn).balanceOf(address(this)) < a.amountIn) {
-                continue;
-            }
-
-            // Try-catch: failures are skipped, not fatal
-            try this._executeSingle(a, deadline) returns (uint256 profit) {
-                results[i] = profit;
-                totalProfit[a.tokenIn] += profit;
-                batchProfit += profit;
-                succeeded++;
-
-                emit ArbitrageExecuted(
-                    a.tokenIn, a.tokenOut, a.routerA, a.routerB, a.amountIn, profit
-                );
-            } catch {
-                results[i] = 0;
-            }
-        }
-
-        totalTrades += succeeded;
-        emit BatchExecuted(arbs.length, succeeded, batchProfit);
-    }
-
-    /**
-     * @dev External wrapper for try-catch in batchExecute.
-     *      MUST only be callable by the contract itself.
-     */
-    function _executeSingle(
-        ArbParams calldata a,
-        uint256 deadline
-    ) external returns (uint256 profit) {
-        if (msg.sender != address(this)) revert RouterNotAllowed(msg.sender);
-        if (!allowedRouters[a.routerA]) revert RouterNotAllowed(a.routerA);
-        if (!allowedRouters[a.routerB]) revert RouterNotAllowed(a.routerB);
-
-        profit = _executeSwapPair(
-            a.tokenIn, a.tokenOut, a.amountIn,
-            a.routerA, a.routerB, a.feeA, a.feeB, a.minProfit, deadline
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // INTERNAL: Swap Logic (V2 + V3 dispatch)
-    // ═══════════════════════════════════════════════════════════
-
-    function _executeSwapPair(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        address routerA,
-        address routerB,
-        uint24 feeA,
-        uint24 feeB,
-        uint256 minProfit,
-        uint256 deadline
-    ) internal returns (uint256 profit) {
-        uint256 balanceBefore = IERC20(tokenIn).balanceOf(address(this));
-
-        // ── Leg 1: Buy tokenOut on routerA ──
-        uint256 tokenOutReceived;
-        if (routerType[routerA] == RouterType.V3) {
-            tokenOutReceived = _executeSwapV3(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
-        } else if (routerType[routerA] == RouterType.Solidly) {
-            tokenOutReceived = _executeSwapSolidly(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
-        } else if (routerType[routerA] == RouterType.SyncSwap) {
-            tokenOutReceived = _executeSwapSyncSwap(tokenIn, tokenOut, amountIn, routerA, 0, deadline);
-        } else if (routerType[routerA] == RouterType.Aerodrome) {
-            tokenOutReceived = _executeSwapAerodrome(tokenIn, tokenOut, amountIn, routerA, feeA, 0, deadline);
-        } else {
-            tokenOutReceived = _executeSwapV2(tokenIn, tokenOut, amountIn, routerA, 0, deadline);
-        }
-
-        // ── Leg 2: Sell tokenOut on routerB ──
-        // amountOutMin = amountIn + minProfit: router-level MEV protection.
-        if (routerType[routerB] == RouterType.V3) {
-            _executeSwapV3(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
-        } else if (routerType[routerB] == RouterType.Solidly) {
-            _executeSwapSolidly(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
-        } else if (routerType[routerB] == RouterType.SyncSwap) {
-            _executeSwapSyncSwap(tokenOut, tokenIn, tokenOutReceived, routerB, amountIn + minProfit, deadline);
-        } else if (routerType[routerB] == RouterType.Aerodrome) {
-            _executeSwapAerodrome(tokenOut, tokenIn, tokenOutReceived, routerB, feeB, amountIn + minProfit, deadline);
-        } else {
-            _executeSwapV2(tokenOut, tokenIn, tokenOutReceived, routerB, amountIn + minProfit, deadline);
-        }
-
-        // ── Profitability gate ── (#2)
-        uint256 balanceAfter = IERC20(tokenIn).balanceOf(address(this));
-
-        if (balanceAfter < balanceBefore + minProfit) {
-            revert NotProfitable(balanceBefore, balanceAfter, minProfit);
-        }
-
-        unchecked { profit = balanceAfter - balanceBefore; } // balanceAfter >= balanceBefore + minProfit checked above
-    }
-
-    function _executeSwapV2(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
+    function _swap(
+        uint8 leg,
         address router,
-        uint256 amountOutMin,
-        uint256 deadline
-    ) internal returns (uint256 amountOut) {
-        _approveExact(tokenIn, router, amountIn);  // #4
-
-        address[] memory path = new address[](2);
-        path[0] = tokenIn;
-        path[1] = tokenOut;
-
-        uint256[] memory amounts = IUniswapV2Router02(router)
-            .swapExactTokensForTokens(amountIn, amountOutMin, path, address(this), deadline);
-
-        amountOut = amounts[amounts.length - 1];
-        _resetAllowance(tokenIn, router);  // #4
-    }
-
-    function _executeSwapV3(
+        RouterType rtype,
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
-        address router,
         uint24 fee,
-        uint256 amountOutMin,
         uint256 deadline
-    ) internal returns (uint256 amountOut) {
-        _approveExact(tokenIn, router, amountIn);  // #4
+    ) internal returns (uint256 received) {
+        if (rtype == RouterType.V3 && fee == 0) revert InvalidV3Fee(leg, router);
 
-        amountOut = ISwapRouterV3(router).exactInputSingle(
-            ISwapRouterV3.ExactInputSingleParams({
+        uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
+        IERC20(tokenIn).forceApprove(router, amountIn);
+
+        // Low-level call: the router's return value is never decoded (we measure the
+        // balance delta), so a router returning nothing or garbage can't revert here
+        // without a LegFailed/NoOutput that names the leg.
+        bytes memory data;
+        if (rtype == RouterType.V3) {
+            data = abi.encodeCall(ISwapRouterV3.exactInputSingle, (ISwapRouterV3.ExactInputSingleParams({
                 tokenIn: tokenIn,
                 tokenOut: tokenOut,
                 fee: fee,
                 recipient: address(this),
                 amountIn: amountIn,
-                amountOutMinimum: amountOutMin,
+                amountOutMinimum: 0,
                 sqrtPriceLimitX96: 0
-            })
-        );
+            })));
+        } else if (rtype == RouterType.Aerodrome) {
+            IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
+            routes[0] = IAerodromeRouter.Route({ from: tokenIn, to: tokenOut, stable: fee != 0, factory: address(0) });
+            data = abi.encodeCall(IAerodromeRouter.swapExactTokensForTokens,
+                (amountIn, 0, routes, address(this), deadline));
+        } else {
+            // V2 (allowed routers only ever have a supported type)
+            address[] memory path = new address[](2);
+            path[0] = tokenIn;
+            path[1] = tokenOut;
+            data = abi.encodeCall(IUniswapV2Router02.swapExactTokensForTokens,
+                (amountIn, 0, path, address(this), deadline));
+        }
+        (bool ok, bytes memory reason) = router.call(data);
+        if (!ok) revert LegFailed(leg, router, rtype, reason);
 
-        _resetAllowance(tokenIn, router);  // #4
+        _clearAllowance(tokenIn, router);
+        uint256 outAfter = IERC20(tokenOut).balanceOf(address(this));
+        // `<=` rather than a checked subtraction: a balance that shrank (rebasing token,
+        // router pulling tokenOut) must still name the leg, not panic.
+        if (outAfter <= outBefore) revert NoOutput(leg, router);
+        unchecked { received = outAfter - outBefore; }
     }
 
-    function _executeSwapSolidly(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        address router,
-        uint24 fee,
-        uint256 amountOutMin,
-        uint256 deadline
-    ) internal returns (uint256 amountOut) {
-        _approveExact(tokenIn, router, amountIn);  // #4
-
-        // fee=0 → volatile pool (xy=k), fee≠0 → stable pool (x³y+y³x=k)
-        bool stable = (fee != 0);
-
-        ISolidlyRouter.Route[] memory routes = new ISolidlyRouter.Route[](1);
-        routes[0] = ISolidlyRouter.Route({ from: tokenIn, to: tokenOut, stable: stable });
-
-        uint256[] memory amounts = ISolidlyRouter(router)
-            .swapExactTokensForTokens(amountIn, amountOutMin, routes, address(this), deadline);
-
-        amountOut = amounts[amounts.length - 1];
-        _resetAllowance(tokenIn, router);  // #4
-    }
-
-    function _executeSwapAerodrome(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        address router,
-        uint24 fee,
-        uint256 amountOutMin,
-        uint256 deadline
-    ) internal returns (uint256 amountOut) {
-        _approveExact(tokenIn, router, amountIn);
-
-        // fee=0 → volatile pool (xy=k), fee≠0 → stable pool (x³y+y³x=k)
-        // factory=address(0) → Aerodrome router uses its internal default factory
-        bool stable = (fee != 0);
-        IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](1);
-        routes[0] = IAerodromeRouter.Route({ from: tokenIn, to: tokenOut, stable: stable, factory: address(0) });
-
-        uint256[] memory amounts = IAerodromeRouter(router)
-            .swapExactTokensForTokens(amountIn, amountOutMin, routes, address(this), deadline);
-
-        amountOut = amounts[amounts.length - 1];
-        _resetAllowance(tokenIn, router);
-    }
-
-    function _executeSwapSyncSwap(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        address factory,      // routerA/routerB = SyncSwap pool factory address
-        uint256 amountOutMin,
-        uint256 /*deadline*/  // deadline enforced by outer checkDeadline modifier
-    ) internal returns (uint256 amountOut) {
-        address pool = ISyncSwapFactory(factory).getPool(tokenIn, tokenOut);
-        if (pool == address(0)) revert PoolNotFound(factory);
-
-        // SyncSwap pools: transfer tokens in, then call swap (no approve needed)
-        IERC20(tokenIn).safeTransfer(pool, amountIn);
-
-        // withdrawMode = 1 → ERC20 transfer to recipient
-        bytes memory swapData = abi.encode(tokenIn, address(this), uint8(1));
-        amountOut = ISyncSwapPool(pool).swap(swapData, address(this), address(0), "");
-
-        if (amountOut < amountOutMin) revert InsufficientOutput(amountOut, amountOutMin);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // INTERNAL: Allowance Helpers (improvement #4)
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * @dev Approve exact amount. Uses forceApprove which handles tokens
-     *      that require allowance = 0 before setting new value (e.g., USDT).
-     */
-    function _approveExact(address token, address spender, uint256 amount) internal {
-        IERC20(token).forceApprove(spender, amount);
-    }
-
-    /**
-     * @dev Reset allowance to 0 after swap. Prevents dangling allowances.
-     */
-    function _resetAllowance(address token, address spender) internal {
-        IERC20(token).forceApprove(spender, 0);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // VIEW: Estimation & Stats
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * @notice Simulate a V2 arb off-chain (no gas cost).
-     */
-    function estimateArbitrage(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        address routerA,
-        address routerB
-    ) external view returns (uint256 profit, uint256 amountOut) {
-        address[] memory pathBuy = new address[](2);
-        pathBuy[0] = tokenIn;
-        pathBuy[1] = tokenOut;
-
-        address[] memory pathSell = new address[](2);
-        pathSell[0] = tokenOut;
-        pathSell[1] = tokenIn;
-
-        try IUniswapV2Router02(routerA).getAmountsOut(amountIn, pathBuy) returns (
-            uint256[] memory amountsBuy
-        ) {
-            uint256 tokenOutAmount = amountsBuy[amountsBuy.length - 1];
-
-            try IUniswapV2Router02(routerB).getAmountsOut(tokenOutAmount, pathSell) returns (
-                uint256[] memory amountsSell
-            ) {
-                amountOut = amountsSell[amountsSell.length - 1];
-                if (amountOut > amountIn) {
-                    profit = amountOut - amountIn;
-                }
-            } catch {
-                profit = 0;
-                amountOut = 0;
-            }
-        } catch {
-            profit = 0;
-            amountOut = 0;
+    /// @dev Routers normally pull exactly the approved amount; only write when they didn't.
+    ///      Best effort: a token that rejects approve(0) must not abort a finished trade,
+    ///      so it falls back to a 1-wei allowance (to a whitelisted router).
+    function _clearAllowance(address token, address spender) internal {
+        if (IERC20(token).allowance(address(this), spender) != 0 && !_tryApprove(token, spender, 0)) {
+            _tryApprove(token, spender, 1);
         }
     }
 
-    /**
-     * @notice Get accumulated stats for a token (#7).
-     */
+    /// @dev approve() that reports failure instead of reverting (handles tokens that
+    ///      return nothing, false, or revert).
+    function _tryApprove(address token, address spender, uint256 value) internal returns (bool) {
+        (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20.approve, (spender, value)));
+        return ok && (ret.length == 0 || abi.decode(ret, (bool)));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Views
+    // ═══════════════════════════════════════════════════════════
+
+    /// @notice Accumulated stats for a token.
     function getStats(address token) external view returns (
         uint256 _totalProfit,
         uint256 _totalTrades,
@@ -774,31 +374,21 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // PAUSE (improvement #8)
+    // Pause / funds / emergency
     // ═══════════════════════════════════════════════════════════
 
     /// @notice Freeze all trade execution. Withdrawals still work.
-    function pause() external onlyOwner {
-        _pause();
-    }
+    function pause() external onlyOwner { _pause(); }
 
     /// @notice Resume trade execution.
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // FUND MANAGEMENT
-    // ═══════════════════════════════════════════════════════════
+    function unpause() external onlyOwner { _unpause(); }
 
     /// @notice Withdraw all native ETH. Always works (even when paused).
     function withdrawETH() external onlyOwner nonReentrant {
         uint256 balance = address(this).balance;
         if (balance == 0) revert ZeroAmount();
-
         (bool success, ) = payable(owner()).call{value: balance}("");
         if (!success) revert TransferFailed();
-
         emit WithdrawETH(owner(), balance);
     }
 
@@ -807,27 +397,24 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         if (_token == address(0)) revert ZeroAddress();
         uint256 balance = IERC20(_token).balanceOf(address(this));
         if (balance == 0) revert ZeroAmount();
-
         IERC20(_token).safeTransfer(owner(), balance);
         emit WithdrawToken(_token, owner(), balance);
     }
 
-    /// @notice Withdraw specific amount of an ERC20. Always works (even when paused).
+    /// @notice Withdraw a specific amount of an ERC20. Always works (even when paused).
     function withdrawTokenAmount(address _token, uint256 _amount) external onlyOwner {
         if (_token == address(0)) revert ZeroAddress();
         if (_amount == 0) revert ZeroAmount();
-
         IERC20(_token).safeTransfer(owner(), _amount);
         emit WithdrawToken(_token, owner(), _amount);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // EMERGENCY
-    // ═══════════════════════════════════════════════════════════
-
-    /// @notice Zero out allowance for a token on a spender.
+    /// @notice Zero out an allowance this contract granted (1 wei for tokens that reject
+    ///         approve(0)).
     function revokeApproval(address _token, address _spender) external onlyOwner {
-        IERC20(_token).forceApprove(_spender, 0);
+        if (!_tryApprove(_token, _spender, 0) && !_tryApprove(_token, _spender, 1)) {
+            revert SafeERC20.SafeERC20FailedOperation(_token);
+        }
         emit ApprovalRevoked(_token, _spender);
     }
 }

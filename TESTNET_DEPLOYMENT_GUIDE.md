@@ -36,7 +36,7 @@ export RPC=https://sepolia.base.org
 
 ```bash
 cd contract
-forge script script/Deploy.s.sol --rpc-url $RPC --broadcast
+forge script script/Deploy.s.sol --rpc-url $RPC --broadcast --verify   # --verify needs ETHERSCAN_API_KEY
 # → "ArbitrageExecutor deployed to: 0x…"   (call it $EXECUTOR)
 ```
 
@@ -48,17 +48,23 @@ forge script script/DeployMocks.s.sol --rpc-url $RPC --broadcast
 # and the V3 pool (1 mWETH = 2575 mUSDC, 0.3% fee)
 ```
 
+Prices and fee live in `contract/script/MockMarket.sol`. Executed arbs narrow the
+spread; restore it with the same tokens (no config change):
+
+```bash
+MUSDC=0x… MWETH=0x… forge script script/RewidenMocks.s.sol --rpc-url $RPC --broadcast
+```
+
 ## 4. Whitelist the routers and fund the executor
 
-Router types: `0` = V2, `1` = V3, `4` = Aerodrome.
+Router types: `0` = V2, `1` = V3 (SwapRouter02), `4` = Aerodrome. `setRouter` whitelists
+and types a router in one call.
 
 ```bash
 V2=0x1689E7B1F10000AE47eBfE339a4f69dECd19F602
 V3=0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4
-cast send $EXECUTOR "setAllowedRouter(address,bool)" $V2 true --private-key $PRIVATE_KEY --rpc-url $RPC
-cast send $EXECUTOR "setAllowedRouter(address,bool)" $V3 true --private-key $PRIVATE_KEY --rpc-url $RPC
-cast send $EXECUTOR "setRouterType(address,uint8)"   $V2 0    --private-key $PRIVATE_KEY --rpc-url $RPC
-cast send $EXECUTOR "setRouterType(address,uint8)"   $V3 1    --private-key $PRIVATE_KEY --rpc-url $RPC
+cast send $EXECUTOR "setRouter(address,uint8)" $V2 0 --private-key $PRIVATE_KEY --rpc-url $RPC
+cast send $EXECUTOR "setRouter(address,uint8)" $V3 1 --private-key $PRIVATE_KEY --rpc-url $RPC
 
 # Trading capital: 50,000 mUSDC (mock tokens have 18 decimals)
 cast send $MUSDC "transfer(address,uint256)" $EXECUTOR 50000000000000000000000 \
@@ -112,6 +118,9 @@ breaker trips, and `/health` stays `ok`. Then follow
 | `refusing to start (wrong RPC URL or wrong config file?)` | RPC chain id ≠ `chain.id` — e.g. the mainnet config pointed at a Sepolia RPC |
 | `contract_address is not set` | `YOUR_…` placeholder still in the config |
 | Simulation reverts `0x118cdaa7` | the engine's key is not the executor owner |
-| Simulation reverts on router | router not whitelisted, or wrong `setRouterType` |
-| `insufficient token_a balance` | executor holds no mUSDC |
+| `RouterNotAllowed(0x…)` | router not whitelisted — `setRouter(router, type)` |
+| `leg N (… router 0x…) reverted with no reason` | wrong router type for that router — re-run `setRouter` with the right type |
+| `leg N (… router 0x…) reverted: …` | the router's own reason (e.g. a token transfer failing) |
+| `not profitable: balance X → Y, needed +Z` | route completed but the price moved / spread closed before inclusion |
+| `InsufficientBalance(token, balance, needed)` / `insufficient token_a balance` | executor holds too little mUSDC |
 | `/health` 503, `rpc_backoff: true` | RPC hanging, down or slower than the simulation timeout — execution resumes automatically when it recovers |

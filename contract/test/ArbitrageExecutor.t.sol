@@ -6,1419 +6,560 @@ import "../src/ArbitrageExecutor.sol";
 import "../src/mocks/MockERC20.sol";
 import "../src/mocks/MockRouter.sol";
 import "../src/mocks/MockV3Router.sol";
-import "../src/mocks/MockSolidlyRouter.sol";
-import "../src/mocks/MockSyncSwapPool.sol";
-import "../src/mocks/MockSyncSwapFactory.sol";
+import "../src/mocks/MockAerodromeRouter.sol";
+import "../src/mocks/MockOddTokens.sol";
 
 /**
- * @title ArbitrageExecutor v2 — Full Test Suite (Forge)
+ * @title ArbitrageExecutor v3 — test suite
  *
- * Port of original Hardhat/Chai tests to pure Solidity + forge-std.
- *
- * Original DoD (ARB-001):
- *   ✅ Test Case 1: Owner can deposit and withdraw ETH
- *   ✅ Test Case 2: executeArbitrage reverts if trade is unprofitable
- *   ✅ Test Case 3: Non-owner cannot call withdraw or execute
- *
- * Improvement Coverage:
- *   ✅ #1 Deadline: stale txns revert
- *   ✅ #2 minProfit: dust profits rejected
- *   ✅ #3 ReentrancyGuard: verified via modifier presence
- *   ✅ #4 Allowance hygiene: allowances reset to 0 after swaps
- *   ✅ #5 Ownable2Step: 2-step ownership transfer
- *   ✅ #6 batchExecute: multiple arbs, partial failures handled
- *   ✅ #7 Profit accumulator: totalProfit and totalTrades tracked
- *   ✅ #8 Pausable: execution blocked when paused, withdrawals still work
- *   ✅ #9 V3 support: V3, mixed V2+V3, and V3+V2 arbs
+ * Rates used throughout (amountIn 100 TKA unless noted):
+ *   buy  routers *A:  1 TKA → 2 TKB              (100 TKA → 200 TKB)
+ *   sell routers *B:  1 TKB → 0.6 TKA  → profit  (200 TKB → 120 TKA, +20)
+ *   sell routers *C:  1 TKB → 0.4 TKA  → loss    (200 TKB →  80 TKA, −20)
+ *   Aerodrome: volatile 1 TKB → 0.6 TKA (profit), stable 1 TKB → 0.4 TKA (loss)
  */
 contract ArbitrageExecutorTest is Test {
     ArbitrageExecutor public executor;
     MockERC20 public tokenA;
     MockERC20 public tokenB;
-    MockRouter public routerA;   // V2: 1 TKA → 2 TKB (buy side)
-    MockRouter public routerB;   // V2: 1 TKB → 0.6 TKA → profit
-    MockRouter public routerC;   // V2: 1 TKB → 0.4 TKA → loss
-    MockV3Router public routerV3A; // V3: 1 TKA → 2 TKB (buy side)
-    MockV3Router public routerV3B; // V3: 1 TKB → 0.6 TKA → profit
-    MockV3Router public routerV3C; // V3: 1 TKB → 0.4 TKA → loss
-    MockSolidlyRouter public routerSolidlyA; // Solidly: 1 TKA → 2 TKB (buy side)
-    MockSolidlyRouter public routerSolidlyB; // Solidly: 1 TKB → 0.6 TKA → profit
-    MockSolidlyRouter public routerSolidlyC; // Solidly: 1 TKB → 0.4 TKA → loss
-    MockSyncSwapFactory public factorySyncSwap;
-    MockSyncSwapPool public poolSyncSwapA;   // SyncSwap: 1 TKA → 2 TKB (buy side)
-    MockSyncSwapPool public poolSyncSwapB;   // SyncSwap: 1 TKB → 0.6 TKA → profit
-    MockSyncSwapPool public poolSyncSwapC;   // SyncSwap: 1 TKB → 0.4 TKA → loss
+    MockERC20 public tokenC;
+
+    MockRouter public v2A;   // TKA→TKB 2/1
+    MockRouter public v2B;   // TKB→TKA 6/10
+    MockRouter public v2C;   // TKB→TKA 4/10
+    MockV3Router public v3A;
+    MockV3Router public v3B;
+    MockV3Router public v3C;
+    MockAerodromeRouter public aero; // TKB→TKA: volatile 6/10, stable 4/10
 
     address public owner;
     address public attacker;
-    address public newOwner;
     uint256 public deadline;
 
-    // Event declarations for testing
-    event WithdrawETH(address indexed to, uint256 amount);
-    event WithdrawToken(address indexed token, address indexed to, uint256 amount);
+    uint256 constant AMT = 100 ether;
+    uint24 constant FEE = 500;
+
     event ArbitrageExecuted(
-        address indexed tokenIn,
-        address indexed tokenOut,
-        address routerA,
-        address routerB,
-        uint256 amountIn,
-        uint256 profit
+        address indexed tokenIn, address indexed tokenOut, address routerA, address routerB,
+        uint256 amountIn, uint256 profit
     );
-    event BatchExecuted(uint256 attempted, uint256 succeeded, uint256 totalBatchProfit);
 
     function setUp() public {
         owner = address(this);
         attacker = makeAddr("attacker");
-        newOwner = makeAddr("newOwner");
+        deadline = block.timestamp + 300;
 
-        // Deploy executor
         executor = new ArbitrageExecutor();
+        tokenA = new MockERC20("Token A", "TKA", 10_000_000 ether);
+        tokenB = new MockERC20("Token B", "TKB", 10_000_000 ether);
+        tokenC = new MockERC20("Token C", "TKC", 10_000_000 ether);
 
-        // Deploy mock tokens
-        tokenA = new MockERC20("Token A", "TKA", 1_000_000 ether);
-        tokenB = new MockERC20("Token B", "TKB", 1_000_000 ether);
+        v2A = new MockRouter(2, 1);
+        v2B = new MockRouter(6, 10);
+        v2C = new MockRouter(4, 10);
+        v3A = new MockV3Router(2, 1);
+        v3B = new MockV3Router(6, 10);
+        v3C = new MockV3Router(4, 10);
+        aero = new MockAerodromeRouter(6, 10, 4, 10);
 
-        // Deploy V2 mock routers with different rates
-        routerA = new MockRouter(2, 1);   // 1 TKA → 2 TKB
-        routerB = new MockRouter(6, 10);  // 1 TKB → 0.6 TKA → 2 * 0.6 = 1.2 TKA = PROFIT
-        routerC = new MockRouter(4, 10);  // 1 TKB → 0.4 TKA → 2 * 0.4 = 0.8 TKA = LOSS
+        _fund(address(v2A)); _fund(address(v3A));
+        _fund(address(v2B)); _fund(address(v2C));
+        _fund(address(v3B)); _fund(address(v3C));
+        _fund(address(aero));
 
-        // Deploy V3 mock routers with same rates
-        routerV3A = new MockV3Router(2, 1);   // 1 TKA → 2 TKB
-        routerV3B = new MockV3Router(6, 10);  // 1 TKB → 0.6 TKA = PROFIT
-        routerV3C = new MockV3Router(4, 10);  // 1 TKB → 0.4 TKA = LOSS
-
-        // Fund V2 routers
-        tokenB.transfer(address(routerA), 100_000 ether);
-        tokenA.transfer(address(routerB), 100_000 ether);
-        tokenA.transfer(address(routerC), 100_000 ether);
-
-        // Fund V3 routers
-        tokenB.transfer(address(routerV3A), 100_000 ether);
-        tokenA.transfer(address(routerV3B), 100_000 ether);
-        tokenA.transfer(address(routerV3C), 100_000 ether);
-
-        // Fund executor with trading capital
         tokenA.transfer(address(executor), 1_000 ether);
 
-        // Whitelist V2 routers (V2 is default, no setRouterType needed)
-        executor.setAllowedRouter(address(routerA), true);
-        executor.setAllowedRouter(address(routerB), true);
-        executor.setAllowedRouter(address(routerC), true);
+        executor.setRouter(address(v2A), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(v2B), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(v2C), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(v3A), ArbitrageExecutor.RouterType.V3);
+        executor.setRouter(address(v3B), ArbitrageExecutor.RouterType.V3);
+        executor.setRouter(address(v3C), ArbitrageExecutor.RouterType.V3);
+        executor.setRouter(address(aero), ArbitrageExecutor.RouterType.Aerodrome);
+    }
 
-        // Whitelist V3 routers and set their type
-        executor.setAllowedRouter(address(routerV3A), true);
-        executor.setRouterType(address(routerV3A), ArbitrageExecutor.RouterType.V3);
-        executor.setAllowedRouter(address(routerV3B), true);
-        executor.setRouterType(address(routerV3B), ArbitrageExecutor.RouterType.V3);
-        executor.setAllowedRouter(address(routerV3C), true);
-        executor.setRouterType(address(routerV3C), ArbitrageExecutor.RouterType.V3);
+    function _fund(address router) internal {
+        tokenA.transfer(router, 100_000 ether);
+        tokenB.transfer(router, 100_000 ether);
+        tokenC.transfer(router, 100_000 ether);
+    }
 
-        // Deploy Solidly mock routers with same rates as V2/V3
-        routerSolidlyA = new MockSolidlyRouter(2, 1);   // 1 TKA → 2 TKB
-        routerSolidlyB = new MockSolidlyRouter(6, 10);  // 1 TKB → 0.6 TKA = PROFIT
-        routerSolidlyC = new MockSolidlyRouter(4, 10);  // 1 TKB → 0.4 TKA = LOSS
+    function _arb(address rA, address rB, uint24 fA, uint24 fB, uint256 minProfit) internal {
+        executor.executeArbitrage(address(tokenA), address(tokenB), AMT, rA, rB, fA, fB, minProfit, deadline);
+    }
 
-        // Fund Solidly routers
-        tokenB.transfer(address(routerSolidlyA), 100_000 ether);
-        tokenA.transfer(address(routerSolidlyB), 100_000 ether);
-        tokenA.transfer(address(routerSolidlyC), 100_000 ether);
+    function _legFailed(uint8 leg, address router, ArbitrageExecutor.RouterType t, bytes memory reason)
+        internal pure returns (bytes memory)
+    {
+        return abi.encodeWithSelector(ArbitrageExecutor.LegFailed.selector, leg, router, t, reason);
+    }
 
-        // Whitelist Solidly routers and set their type
-        executor.setAllowedRouter(address(routerSolidlyA), true);
-        executor.setRouterType(address(routerSolidlyA), ArbitrageExecutor.RouterType.Solidly);
-        executor.setAllowedRouter(address(routerSolidlyB), true);
-        executor.setRouterType(address(routerSolidlyB), ArbitrageExecutor.RouterType.Solidly);
-        executor.setAllowedRouter(address(routerSolidlyC), true);
-        executor.setRouterType(address(routerSolidlyC), ArbitrageExecutor.RouterType.Solidly);
+    function _notProfitable(uint256 afterBal, uint256 minProfit) internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(ArbitrageExecutor.NotProfitable.selector, 1_000 ether, afterBal, minProfit);
+    }
 
-        // Deploy SyncSwap mock factory and pools
-        factorySyncSwap = new MockSyncSwapFactory();
-        poolSyncSwapA = new MockSyncSwapPool(address(tokenA), address(tokenB), 2, 1);   // 1 TKA → 2 TKB
-        poolSyncSwapB = new MockSyncSwapPool(address(tokenB), address(tokenA), 6, 10);  // 1 TKB → 0.6 TKA
-        poolSyncSwapC = new MockSyncSwapPool(address(tokenB), address(tokenA), 4, 10);  // 1 TKB → 0.4 TKA
-
-        // Fund SyncSwap pools
-        tokenB.transfer(address(poolSyncSwapA), 100_000 ether);
-        tokenA.transfer(address(poolSyncSwapB), 100_000 ether);
-        tokenA.transfer(address(poolSyncSwapC), 100_000 ether);
-
-        // Register pools in factory
-        factorySyncSwap.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
-        factorySyncSwap.setPool(address(tokenB), address(tokenA), address(poolSyncSwapB));
-
-        // Whitelist SyncSwap factory and set its type
-        executor.setAllowedRouter(address(factorySyncSwap), true);
-        executor.setRouterType(address(factorySyncSwap), ArbitrageExecutor.RouterType.SyncSwap);
-
-        // Default deadline: 1 hour from now
-        deadline = block.timestamp + 3600;
+    function _err(string memory m) internal pure returns (bytes memory) {
+        return abi.encodeWithSignature("Error(string)", m);
     }
 
     // ════════════════════════════════════════════════════════════
-    // DoD Test Case 1: Owner can deposit and withdraw ETH
+    // 2-hop: happy paths per router type
     // ════════════════════════════════════════════════════════════
 
-    function test_AcceptETH() public {
-        (bool ok,) = address(executor).call{value: 1 ether}("");
-        assertTrue(ok);
-        assertEq(address(executor).balance, 1 ether);
-    }
-
-    function test_WithdrawETH() public {
-        (bool ok,) = address(executor).call{value: 1 ether}("");
-        assertTrue(ok);
-
-        uint256 before = address(this).balance;
-        executor.withdrawETH();
-        uint256 after_ = address(this).balance;
-
-        assertEq(after_ - before, 1 ether);
-    }
-
-    function test_WithdrawETH_EmitsEvent() public {
-        (bool ok,) = address(executor).call{value: 0.5 ether}("");
-        assertTrue(ok);
-
-        vm.expectEmit(true, false, false, true);
-        emit WithdrawETH(address(this), 0.5 ether);
-        executor.withdrawETH();
-    }
-
-    function test_WithdrawETH_RevertsOnZero() public {
-        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
-        executor.withdrawETH();
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // DoD Test Case 1 (cont): Token withdrawal
-    // ════════════════════════════════════════════════════════════
-
-    function test_WithdrawToken_FullBalance() public {
-        uint256 before = tokenA.balanceOf(address(this));
-        executor.withdrawToken(address(tokenA));
-        uint256 after_ = tokenA.balanceOf(address(this));
-
-        assertEq(after_ - before, 1_000 ether);
-    }
-
-    function test_WithdrawTokenAmount_Partial() public {
-        executor.withdrawTokenAmount(address(tokenA), 300 ether);
-        assertEq(tokenA.balanceOf(address(executor)), 700 ether);
-    }
-
-    function test_WithdrawToken_EmitsEvent() public {
-        vm.expectEmit(true, true, false, true);
-        emit WithdrawToken(address(tokenA), address(this), 1_000 ether);
-        executor.withdrawToken(address(tokenA));
-    }
-
-    function test_WithdrawToken_RevertsOnZero() public {
-        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
-        executor.withdrawToken(address(tokenB)); // executor has no tokenB
-    }
-
-    function test_WithdrawToken_WorksWhenPaused() public {
-        executor.pause();
-        // Should NOT revert — withdrawals bypass pause
-        executor.withdrawToken(address(tokenA));
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // DoD Test Case 2: executeArbitrage reverts if unprofitable
-    // ════════════════════════════════════════════════════════════
-
-    function test_ExecuteProfitableArb() public {
+    function test_V2V2_Profitable() public {
         uint256 before = tokenA.balanceOf(address(executor));
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,  // feeA, feeB (V2 = 0)
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertGt(after_, before);
-    }
-
-    function test_ExecuteArb_EmitsEvent() public {
-        vm.expectEmit(true, true, false, true);
-        emit ArbitrageExecuted(
-            address(tokenA), address(tokenB),
-            address(routerA), address(routerB),
-            100 ether, 20 ether
-        );
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_ExecuteArb_RevertsIfUnprofitable() public {
-        vm.expectRevert(); // NotProfitable
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerC), // Loss router
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_ExecuteArb_RevertsOnZeroAmount() public {
-        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            0,
-            address(routerA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_ExecuteArb_RevertsOnZeroAddress() public {
-        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
-        executor.executeArbitrage(
-            address(tokenA), address(0),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // DoD Test Case 3: Non-owner access control
-    // ════════════════════════════════════════════════════════════
-
-    function test_NonOwnerCannotExecute() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_NonOwnerCannotWithdrawETH() public {
-        (bool ok,) = address(executor).call{value: 1 ether}("");
-        assertTrue(ok);
-
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.withdrawETH();
-    }
-
-    function test_NonOwnerCannotWithdrawTokens() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.withdrawToken(address(tokenA));
-    }
-
-    function test_NonOwnerCannotPause() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.pause();
-    }
-
-    function test_NonOwnerCannotBatchExecute() public {
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](0);
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.batchExecute(arbs, deadline);
-    }
-
-    function test_NonOwnerCannotRevokeApproval() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.revokeApproval(address(tokenA), address(routerA));
-    }
-
-    function test_CorrectOwner() public view {
-        assertEq(executor.owner(), address(this));
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Improvement #1: Deadline
-    // ════════════════════════════════════════════════════════════
-
-    function test_Deadline_RevertsIfExpired() public {
-        vm.warp(1000); // Set block.timestamp to a non-zero value
-        uint256 pastDeadline = block.timestamp - 100;
-
-        vm.expectRevert();
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, pastDeadline
-        );
-    }
-
-    function test_Deadline_AcceptsWithinDeadline() public {
-        uint256 futureDeadline = block.timestamp + 60;
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, futureDeadline
-        );
-        // No revert = pass
-    }
-
-    function test_Deadline_BatchRevertsIfExpired() public {
-        uint256 pastDeadline = block.timestamp - 1;
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](0);
-
-        vm.expectRevert();
-        executor.batchExecute(arbs, pastDeadline);
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Improvement #2: minProfit
-    // ════════════════════════════════════════════════════════════
-
-    function test_MinProfit_SucceedsWhenAbove() public {
-        // Trade: 100 → 120 = 20 profit. minProfit = 10. Should pass.
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            10 ether, deadline
-        );
-    }
-
-    function test_MinProfit_RevertsWhenBelow() public {
-        // Trade profit is 20 TKA, but we require 50 → revert
-        vm.expectRevert();
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            50 ether, deadline
-        );
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Improvement #4: Allowance hygiene
-    // ════════════════════════════════════════════════════════════
-
-    function test_AllowanceResetAfterArb() public {
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-
-        assertEq(tokenA.allowance(address(executor), address(routerA)), 0);
-        assertEq(tokenB.allowance(address(executor), address(routerB)), 0);
-    }
-
-    function test_RevokeApproval() public {
-        executor.revokeApproval(address(tokenA), address(routerA));
-        assertEq(tokenA.allowance(address(executor), address(routerA)), 0);
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Improvement #5: Ownable2Step
-    // ════════════════════════════════════════════════════════════
-
-    function test_Ownable2Step_RequiresAcceptance() public {
-        executor.transferOwnership(newOwner);
-
-        // Owner unchanged until accepted
-        assertEq(executor.owner(), address(this));
-        assertEq(executor.pendingOwner(), newOwner);
-    }
-
-    function test_Ownable2Step_CompleteTransfer() public {
-        executor.transferOwnership(newOwner);
-
-        vm.prank(newOwner);
-        executor.acceptOwnership();
-
-        assertEq(executor.owner(), newOwner);
-    }
-
-    function test_Ownable2Step_RandomCannotAccept() public {
-        executor.transferOwnership(newOwner);
-
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.acceptOwnership();
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Improvement #6: Batch execution
-    // ════════════════════════════════════════════════════════════
-
-    function test_BatchExecute_MultipleProfitable() public {
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](2);
-        arbs[0] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 50 ether,
-            routerA: address(routerA), routerB: address(routerB),
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-        arbs[1] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 50 ether,
-            routerA: address(routerA), routerB: address(routerB),
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-
-        executor.batchExecute(arbs, deadline);
-
-        uint256 balAfter = tokenA.balanceOf(address(executor));
-        // Each 50 trade = 10 profit → 20 total
-        assertEq(balAfter - balBefore, 20 ether);
-    }
-
-    function test_BatchExecute_SkipsFailingArbs() public {
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](2);
-        arbs[0] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 50 ether,
-            routerA: address(routerA), routerB: address(routerB),
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-        arbs[1] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 50 ether,
-            routerA: address(routerA), routerB: address(routerC), // Loss
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-
-        // Should NOT revert
-        executor.batchExecute(arbs, deadline);
-    }
-
-    function test_BatchExecute_EmitsBatchExecuted() public {
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](2);
-        arbs[0] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 50 ether,
-            routerA: address(routerA), routerB: address(routerB),
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-        arbs[1] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 50 ether,
-            routerA: address(routerA), routerB: address(routerC),
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-
-        vm.expectEmit(false, false, false, true);
-        emit BatchExecuted(2, 1, 10 ether);
-        executor.batchExecute(arbs, deadline);
-    }
-
-    function test_BatchExecute_RevertsOnEmpty() public {
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](0);
-
-        vm.expectRevert(ArbitrageExecutor.EmptyBatch.selector);
-        executor.batchExecute(arbs, deadline);
-    }
-
-    function test_BatchExecute_SkipsInsufficientBalance() public {
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](1);
-        arbs[0] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 999_999 ether, // Way more than balance
-            routerA: address(routerA), routerB: address(routerB),
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-
-        // Should not revert, just skip
-        executor.batchExecute(arbs, deadline);
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Improvement #7: Profit accumulator
-    // ════════════════════════════════════════════════════════════
-
-    function test_TotalProfit_TrackedPerToken() public {
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-
+        _arb(address(v2A), address(v2B), 0, 0, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
         assertEq(executor.totalProfit(address(tokenA)), 20 ether);
+        assertEq(executor.totalTrades(), 1);
     }
 
-    function test_TotalProfit_Accumulates() public {
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerB), 0, 0, 0, deadline
-        );
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerB), 0, 0, 0, deadline
-        );
+    function test_V3V3_Profitable() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+        _arb(address(v3A), address(v3B), FEE, FEE, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
+    }
 
+    function test_MixedV2V3_BothDirections() public {
+        _arb(address(v2A), address(v3B), 0, FEE, 1 ether);
+        _arb(address(v3A), address(v2B), FEE, 0, 1 ether);
         assertEq(executor.totalProfit(address(tokenA)), 40 ether);
     }
 
-    function test_TotalTrades_Increments() public {
-        assertEq(executor.totalTrades(), 0);
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerB), 0, 0, 0, deadline
-        );
-
-        assertEq(executor.totalTrades(), 1);
+    function test_Aerodrome_VolatileSell_Profitable() public {
+        uint256 before = tokenA.balanceOf(address(executor));
+        _arb(address(v2A), address(aero), 0, 0, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
+        assertFalse(aero.lastStable(), "fee 0 must select the volatile pool");
+        assertEq(aero.lastFactory(), address(0), "default factory");
     }
 
-    function test_GetStats_ReturnsCorrectValues() public {
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerB), 0, 0, 0, deadline
-        );
+    function test_Aerodrome_StableFlagFollowsFee() public {
+        // fee != 0 → stable pool (4/10 here: 100 → 200 → 80, a 20 loss)
+        vm.expectRevert(_notProfitable(980 ether, 1 ether));
+        _arb(address(v2A), address(aero), 0, 1, 1 ether);
+    }
 
-        (uint256 profit, uint256 trades, uint256 balance) = executor.getStats(address(tokenA));
-
-        assertEq(profit, 20 ether);
-        assertEq(trades, 1);
-        // 1000 initial + 20 profit = 1020
-        assertEq(balance, 1_020 ether);
+    function test_Arb_EmitsEvent() public {
+        vm.expectEmit(true, true, false, true);
+        emit ArbitrageExecuted(address(tokenA), address(tokenB), address(v2A), address(v2B), AMT, 20 ether);
+        _arb(address(v2A), address(v2B), 0, 0, 1 ether);
     }
 
     // ════════════════════════════════════════════════════════════
-    // Improvement #8: Pausable
+    // Readable failures
     // ════════════════════════════════════════════════════════════
 
-    function test_Pause_BlocksExecution() public {
-        executor.pause();
-
-        vm.expectRevert();
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerB), 0, 0, 0, deadline
-        );
+    // Slippage reads the same on every router type: routers get min-out 0 and the
+    // contract reports the exact shortfall (PancakeSwap's router reverts with no reason).
+    function test_Loss_V2_ReportsNotProfitableWithBalances() public {
+        vm.expectRevert(_notProfitable(980 ether, 1 ether)); // 100 → 200 → 80
+        _arb(address(v2A), address(v2C), 0, 0, 1 ether);
     }
 
-    function test_Pause_BlocksBatchExecute() public {
-        executor.pause();
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](0);
-
-        vm.expectRevert();
-        executor.batchExecute(arbs, deadline);
+    function test_Loss_V3_ReportsNotProfitableWithBalances() public {
+        vm.expectRevert(_notProfitable(980 ether, 1 ether));
+        _arb(address(v3A), address(v3C), FEE, FEE, 1 ether);
     }
 
-    function test_Unpause_AllowsExecution() public {
+    function test_MinProfitAboveSpread_ReportsNotProfitable() public {
+        // spread is +20; asking for 30 → after 1020, required +30
+        vm.expectRevert(_notProfitable(1_020 ether, 30 ether));
+        _arb(address(v2A), address(v2B), 0, 0, 30 ether);
+    }
+
+    function test_RouterRevert_ReportsLegAndRouterReason() public {
+        // Router without liquidity: its token transfer fails → the router's own error surfaces.
+        MockRouter dry = new MockRouter(6, 10);
+        executor.setRouter(address(dry), ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(_legFailed(2, address(dry), ArbitrageExecutor.RouterType.V2,
+            abi.encodeWithSignature("ERC20InsufficientBalance(address,uint256,uint256)", address(dry), 0, 120 ether)));
+        _arb(address(v2A), address(dry), 0, 0, 1 ether);
+    }
+
+    function test_InsufficientBalance() public {
+        vm.expectRevert(abi.encodeWithSelector(
+            ArbitrageExecutor.InsufficientBalance.selector, address(tokenA), 1_000 ether, 5_000 ether));
+        executor.executeArbitrage(address(tokenA), address(tokenB), 5_000 ether,
+            address(v2A), address(v2B), 0, 0, 0, deadline);
+    }
+
+    function test_V3FeeZero_IsRejectedBeforeSwapping() public {
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.InvalidV3Fee.selector, uint8(1), address(v3A)));
+        _arb(address(v3A), address(v3B), 0, FEE, 1 ether);
+    }
+
+    function test_V3RouterTypedAsV2_FailsWithEmptyReason() public {
+        // V3 router registered with the wrong type → it has no V2 function.
+        MockV3Router misconfigured = new MockV3Router(2, 1);
+        _fund(address(misconfigured));
+        executor.setRouter(address(misconfigured), ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(_legFailed(1, address(misconfigured), ArbitrageExecutor.RouterType.V2, ""));
+        _arb(address(misconfigured), address(v2B), 0, 0, 1 ether);
+    }
+
+    function test_NoOutput() public {
+        MockNoOpRouter noop = new MockNoOpRouter();
+        executor.setRouter(address(noop), ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.NoOutput.selector, uint8(1), address(noop)));
+        _arb(address(noop), address(v2B), 0, 0, 1 ether);
+    }
+
+    function test_SameTokenTwice_InvalidPath() public {
+        vm.expectRevert(ArbitrageExecutor.InvalidPath.selector);
+        executor.executeArbitrage(address(tokenA), address(tokenA), AMT, address(v2A), address(v2B), 0, 0, 0, deadline);
+    }
+
+    function test_Deadline() public {
+        vm.warp(deadline + 1);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.DeadlineExpired.selector, deadline, deadline + 1));
+        _arb(address(v2A), address(v2B), 0, 0, 0);
+    }
+
+    function test_ZeroAmount() public {
+        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
+        executor.executeArbitrage(address(tokenA), address(tokenB), 0, address(v2A), address(v2B), 0, 0, 0, deadline);
+    }
+
+    function test_ZeroAddressToken() public {
+        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
+        executor.executeArbitrage(address(0), address(tokenB), AMT, address(v2A), address(v2B), 0, 0, 0, deadline);
+    }
+
+    function test_UnknownRouter() public {
+        address unknown = makeAddr("unknown");
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, unknown));
+        _arb(unknown, address(v2B), 0, 0, 0);
+    }
+
+    function test_RevokedRouter() public {
+        executor.revokeRouter(address(v2B));
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(v2B)));
+        _arb(address(v2A), address(v2B), 0, 0, 0);
+    }
+
+    function test_RetiredRouterTypesRejected() public {
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.UnsupportedRouterType.selector,
+            address(v2A), ArbitrageExecutor.RouterType.RetiredSolidly));
+        executor.setRouter(address(v2A), ArbitrageExecutor.RouterType.RetiredSolidly);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.UnsupportedRouterType.selector,
+            address(v2A), ArbitrageExecutor.RouterType.RetiredSyncSwap));
+        executor.setRouter(address(v2A), ArbitrageExecutor.RouterType.RetiredSyncSwap);
+    }
+
+    function test_Paused() public {
         executor.pause();
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        _arb(address(v2A), address(v2B), 0, 0, 0);
         executor.unpause();
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerB), 0, 0, 0, deadline
-        );
+        _arb(address(v2A), address(v2B), 0, 0, 0);
     }
 
-    function test_Pause_StillAllowsWithdrawals() public {
+    // ════════════════════════════════════════════════════════════
+    // Robustness: amounts measured, odd tokens
+    // ════════════════════════════════════════════════════════════
+
+    function test_RouterMisreportingOutput_UsesRealBalance() public {
+        // Lying router sends 200 TKB but reports 400. The sell leg must sell 200.
+        MockLyingRouter liar = new MockLyingRouter();
+        _fund(address(liar));
+        executor.setRouter(address(liar), ArbitrageExecutor.RouterType.V2);
+        uint256 before = tokenA.balanceOf(address(executor));
+        _arb(address(liar), address(v2B), 0, 0, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
+        assertEq(tokenB.balanceOf(address(executor)), 0, "nothing stranded");
+    }
+
+    function test_FeeOnTransferIntermediate_ForwardsActualAmount() public {
+        // TKA → FEE → TKA. 1% transfer fee on FEE: the sell leg is given what actually
+        // arrived, not the buy router's quote. (Real pools still reject a short input —
+        // FoT tokens are unsupported; this pins the contract's own accounting.)
+        MockFeeOnTransferERC20 fee = new MockFeeOnTransferERC20(10_000_000 ether);
+        MockRouter buy = new MockRouter(2, 1);
+        MockRouter sell = new MockRouter(6, 10);
+        fee.transfer(address(buy), 100_000 ether);
+        tokenA.transfer(address(sell), 100_000 ether);
+        executor.setRouter(address(buy), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(sell), ArbitrageExecutor.RouterType.V2);
+        uint256 before = tokenA.balanceOf(address(executor));
+        executor.executeArbitrage(address(tokenA), address(fee), AMT, address(buy), address(sell), 0, 0, 1 ether, deadline);
+        // 200 FEE sent → 198 received → 118.8 TKA back
+        assertEq(tokenA.balanceOf(address(executor)), before - AMT + 118.8 ether);
+        assertEq(fee.balanceOf(address(executor)), 0, "nothing stranded");
+    }
+
+    function test_NotProfitable_WhenFeeEatsTheMargin() public {
+        // tokenIn is fee-on-transfer: the sell router sends 120, but the executor
+        // receives 118.8 < 100 + 19 → NotProfitable (the contract counts what arrived).
+        MockFeeOnTransferERC20 fee = new MockFeeOnTransferERC20(10_000_000 ether);
+        MockRouter buy = new MockRouter(2, 1);
+        MockRouter sell = new MockRouter(6, 10);
+        tokenB.transfer(address(buy), 100_000 ether);
+        fee.transfer(address(sell), 100_000 ether);
+        fee.transfer(address(executor), 1_000 ether);   // executor receives 990
+        executor.setRouter(address(buy), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(sell), ArbitrageExecutor.RouterType.V2);
+        uint256 before = fee.balanceOf(address(executor));
+        // buy router pulls 100 FEE but only 99 reach it — it still quotes on 100
+        vm.expectRevert(abi.encodeWithSelector(
+            ArbitrageExecutor.NotProfitable.selector, before, before - AMT + 118.8 ether, 19 ether));
+        executor.executeArbitrage(address(fee), address(tokenB), AMT, address(buy), address(sell), 0, 0, 19 ether, deadline);
+    }
+
+    function test_TokenRejectingZeroApprove_StillTrades() public {
+        // Routers pull the exact approved amount, so no approve(0) is ever sent.
+        MockNoZeroApproveERC20 nza = new MockNoZeroApproveERC20(10_000_000 ether);
+        MockRouter buy = new MockRouter(2, 1);
+        MockRouter sell = new MockRouter(6, 10);
+        tokenB.transfer(address(buy), 100_000 ether);
+        nza.transfer(address(sell), 100_000 ether);
+        nza.transfer(address(executor), 1_000 ether);
+        executor.setRouter(address(buy), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(sell), ArbitrageExecutor.RouterType.V2);
+        executor.executeArbitrage(address(nza), address(tokenB), AMT, address(buy), address(sell), 0, 0, 1 ether, deadline);
+        assertEq(nza.balanceOf(address(executor)), 1_020 ether);
+    }
+
+    function test_LeftoverAllowance_TokenRejectingZeroApprove_DoesNotAbort() public {
+        MockNoZeroApproveERC20 nza = new MockNoZeroApproveERC20(10_000_000 ether);
+        MockPartialRouter partialBuy = new MockPartialRouter();
+        MockRouter sell = new MockRouter(6, 10);
+        tokenB.transfer(address(partialBuy), 100_000 ether);
+        nza.transfer(address(sell), 100_000 ether);
+        nza.transfer(address(executor), 1_000 ether);
+        executor.setRouter(address(partialBuy), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(sell), ArbitrageExecutor.RouterType.V2);
+        // pulls 50, sends 200 TKB → 120 NZA back
+        executor.executeArbitrage(address(nza), address(tokenB), AMT, address(partialBuy), address(sell), 0, 0, 1 ether, deadline);
+        assertEq(nza.balanceOf(address(executor)), 1_070 ether);
+        assertEq(nza.allowance(address(executor), address(partialBuy)), 1, "approve(0) rejected -> 1 wei left");
+    }
+
+    function test_RevokeApproval_TokenRejectingZeroApprove() public {
+        MockNoZeroApproveERC20 nza = new MockNoZeroApproveERC20(1 ether);
+        vm.prank(address(executor));
+        nza.approve(address(v2A), 500);
+        executor.revokeApproval(address(nza), address(v2A));
+        assertEq(nza.allowance(address(executor), address(v2A)), 1);
+    }
+
+    function test_ShrinkingOutputBalance_ReportsNoOutputNotPanic() public {
+        MockSlashableERC20 sls = new MockSlashableERC20(1_000 ether);
+        sls.transfer(address(executor), 10 ether);   // executor already holds some tokenOut
+        MockSlashingRouter slasher = new MockSlashingRouter();
+        executor.setRouter(address(slasher), ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.NoOutput.selector, uint8(1), address(slasher)));
+        executor.executeArbitrage(address(tokenA), address(sls), AMT, address(slasher), address(v2B), 0, 0, 0, deadline);
+    }
+
+    function test_LeftoverAllowance_IsCleared() public {
+        MockPartialRouter partialBuy = new MockPartialRouter();
+        _fund(address(partialBuy));
+        executor.setRouter(address(partialBuy), ArbitrageExecutor.RouterType.V2);
+        _arb(address(partialBuy), address(v2B), 0, 0, 1 ether);
+        assertEq(tokenA.allowance(address(executor), address(partialBuy)), 0);
+    }
+
+    function test_AllowancesClearedAfterTrade() public {
+        _arb(address(v2A), address(v3B), 0, FEE, 1 ether);
+        _arb(address(v3A), address(aero), FEE, 0, 1 ether);
+        assertEq(tokenA.allowance(address(executor), address(v2A)), 0);
+        assertEq(tokenB.allowance(address(executor), address(v3B)), 0);
+        assertEq(tokenA.allowance(address(executor), address(v3A)), 0);
+        assertEq(tokenB.allowance(address(executor), address(aero)), 0);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Triangular
+    // ════════════════════════════════════════════════════════════
+
+    // A→B 2/1 (v2A), B→C via new 1/1 routers, C→A 6/10 (v2B rates) → 100 → 200 → 200 → 120
+    function _triRouters(ArbitrageExecutor.RouterType tBC) internal returns (address bc) {
+        if (tBC == ArbitrageExecutor.RouterType.V3) {
+            MockV3Router r = new MockV3Router(1, 1); _fund(address(r)); bc = address(r);
+        } else if (tBC == ArbitrageExecutor.RouterType.Aerodrome) {
+            MockAerodromeRouter r = new MockAerodromeRouter(1, 1, 1, 1); _fund(address(r)); bc = address(r);
+        } else {
+            MockRouter r = new MockRouter(1, 1); _fund(address(r)); bc = address(r);
+        }
+        executor.setRouter(bc, tBC);
+    }
+
+    function _tri(address ab, address bc, address ca, uint24 fab, uint24 fbc, uint24 fca, uint256 minProfit) internal {
+        executor.executeTriangularArbitrage(address(tokenA), address(tokenB), address(tokenC), AMT,
+            ab, bc, ca, fab, fbc, fca, minProfit, deadline);
+    }
+
+    function test_Triangular_V2_Profitable() public {
+        address bc = _triRouters(ArbitrageExecutor.RouterType.V2);
+        uint256 before = tokenA.balanceOf(address(executor));
+        _tri(address(v2A), bc, address(v2B), 0, 0, 0, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
+        assertEq(tokenB.balanceOf(address(executor)) + tokenC.balanceOf(address(executor)), 0, "nothing stranded");
+    }
+
+    event TriangularArbitrageExecuted(
+        address indexed tokenA, address indexed tokenB, address indexed tokenC,
+        address routerAB, address routerBC, address routerCA, uint256 amountIn, uint256 profit
+    );
+
+    function test_Triangular_EventNamesAllThreeRouters() public {
+        address bc = _triRouters(ArbitrageExecutor.RouterType.V2);
+        vm.expectEmit(true, true, true, true);
+        emit TriangularArbitrageExecuted(address(tokenA), address(tokenB), address(tokenC),
+            address(v2A), bc, address(v2B), AMT, 20 ether);
+        _tri(address(v2A), bc, address(v2B), 0, 0, 0, 1 ether);
+    }
+
+    function test_Triangular_AllTypes() public {
+        address bc = _triRouters(ArbitrageExecutor.RouterType.Aerodrome);
+        uint256 before = tokenA.balanceOf(address(executor));
+        _tri(address(v3A), bc, address(v3B), FEE, 0, FEE, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
+    }
+
+    function test_Triangular_LossReportsNotProfitable() public {
+        address bc = _triRouters(ArbitrageExecutor.RouterType.V3);
+        vm.expectRevert(_notProfitable(980 ether, 1 ether)); // 100 → 200 → 200 → 80
+        _tri(address(v2A), bc, address(v3C), 0, FEE, FEE, 1 ether);
+    }
+
+    function test_Triangular_RepeatedToken() public {
+        vm.expectRevert(ArbitrageExecutor.InvalidPath.selector);
+        executor.executeTriangularArbitrage(address(tokenA), address(tokenB), address(tokenA), AMT,
+            address(v2A), address(v2A), address(v2B), 0, 0, 0, 0, deadline);
+    }
+
+    function test_Triangular_RouterNotAllowed() public {
+        address unknown = makeAddr("unknown");
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, unknown));
+        _tri(address(v2A), unknown, address(v2B), 0, 0, 0, 0);
+    }
+
+    function test_Triangular_ZeroAmountAndAddress() public {
+        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
+        executor.executeTriangularArbitrage(address(tokenA), address(tokenB), address(tokenC), 0,
+            address(v2A), address(v2A), address(v2B), 0, 0, 0, 0, deadline);
+        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
+        executor.executeTriangularArbitrage(address(tokenA), address(0), address(tokenC), AMT,
+            address(v2A), address(v2A), address(v2B), 0, 0, 0, 0, deadline);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Router configuration
+    // ════════════════════════════════════════════════════════════
+
+    function test_RouterReturningNoData_ReportsNoOutput() public {
+        // Success with empty return data must not fail in the executor's own decoder.
+        MockSilentRouter silent = new MockSilentRouter();
+        executor.setRouter(address(silent), ArbitrageExecutor.RouterType.V3);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.NoOutput.selector, uint8(1), address(silent)));
+        _arb(address(silent), address(v2B), FEE, 0, 1 ether);
+    }
+
+    function test_SetRouter_RejectsNonContract() public {
+        address eoa = makeAddr("eoa");
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.NotAContract.selector, eoa));
+        executor.setRouter(eoa, ArbitrageExecutor.RouterType.V2);
+    }
+
+    function test_SetRouter_RetypesAndRevokeRouter() public {
+        executor.setRouter(address(v2A), ArbitrageExecutor.RouterType.V3);
+        assertEq(uint8(executor.routerType(address(v2A))), 1);
+        executor.revokeRouter(address(v2A));
+        assertFalse(executor.allowedRouters(address(v2A)));
+    }
+
+    function test_SetRouter_AllowsAndTypes() public {
+        address r = address(new MockAerodromeRouter(1, 1, 1, 1));
+        executor.setRouter(r, ArbitrageExecutor.RouterType.Aerodrome);
+        assertTrue(executor.allowedRouters(r));
+        assertEq(uint8(executor.routerType(r)), 4, "Aerodrome must stay ordinal 4");
+        assertEq(uint8(ArbitrageExecutor.RouterType.V2), 0);
+        assertEq(uint8(ArbitrageExecutor.RouterType.V3), 1);
+    }
+
+    function test_SetRouter_ZeroAddress() public {
+        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
+        executor.setRouter(address(0), ArbitrageExecutor.RouterType.V2);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Access control
+    // ════════════════════════════════════════════════════════════
+
+    function test_NonOwnerCannotTradeOrConfigure() public {
+        bytes memory unauthorized = abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker);
+        vm.startPrank(attacker);
+        vm.expectRevert(unauthorized);
+        _arb(address(v2A), address(v2B), 0, 0, 0);
+        vm.expectRevert(unauthorized);
+        executor.executeTriangularArbitrage(address(tokenA), address(tokenB), address(tokenC), AMT,
+            address(v2A), address(v2A), address(v2B), 0, 0, 0, 0, deadline);
+        vm.expectRevert(unauthorized);
+        executor.setRouter(attacker, ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(unauthorized);
+        executor.revokeRouter(address(v2A));
+        vm.expectRevert(unauthorized);
         executor.pause();
-
-        // ETH withdrawal
-        (bool ok,) = address(executor).call{value: 1 ether}("");
-        assertTrue(ok);
+        vm.expectRevert(unauthorized);
+        executor.withdrawToken(address(tokenA));
+        vm.expectRevert(unauthorized);
         executor.withdrawETH();
+        vm.expectRevert(unauthorized);
+        executor.revokeApproval(address(tokenA), address(v2A));
+        vm.stopPrank();
+    }
 
-        // Token withdrawal
+    function test_Ownable2Step() public {
+        address next = makeAddr("next");
+        executor.transferOwnership(next);
+        assertEq(executor.owner(), owner, "pending until accepted");
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        executor.acceptOwnership();
+        vm.prank(next);
+        executor.acceptOwnership();
+        assertEq(executor.owner(), next);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Funds
+    // ════════════════════════════════════════════════════════════
+
+    function test_WithdrawETH() public {
+        vm.deal(address(executor), 1 ether);
+        uint256 before = owner.balance;
+        executor.withdrawETH();
+        assertEq(owner.balance, before + 1 ether);
+        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
+        executor.withdrawETH();
+    }
+
+    function test_WithdrawTokens_WorkWhenPaused() public {
+        executor.pause();
+        executor.withdrawTokenAmount(address(tokenA), 100 ether);
+        assertEq(tokenA.balanceOf(address(executor)), 900 ether);
+        executor.withdrawToken(address(tokenA));
+        assertEq(tokenA.balanceOf(address(executor)), 0);
+        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
         executor.withdrawToken(address(tokenA));
     }
 
-    // ════════════════════════════════════════════════════════════
-    // estimateArbitrage
-    // ════════════════════════════════════════════════════════════
-
-    function test_Estimate_ProfitableRoute() public view {
-        (uint256 profit, uint256 amountOut) = executor.estimateArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerB)
-        );
-
-        assertEq(profit, 20 ether);
-        assertEq(amountOut, 120 ether);
+    function test_RevokeApproval() public {
+        vm.prank(address(executor));
+        tokenA.approve(address(v2A), 123);
+        executor.revokeApproval(address(tokenA), address(v2A));
+        assertEq(tokenA.allowance(address(executor), address(v2A)), 0);
     }
 
-    function test_Estimate_UnprofitableRoute() public view {
-        (uint256 profit,) = executor.estimateArbitrage(
-            address(tokenA), address(tokenB), 100 ether,
-            address(routerA), address(routerC)
-        );
-
-        assertEq(profit, 0);
+    function test_GetStats() public {
+        _arb(address(v2A), address(v2B), 0, 0, 1 ether);
+        (uint256 p, uint256 n, uint256 bal) = executor.getStats(address(tokenA));
+        assertEq(p, 20 ether);
+        assertEq(n, 1);
+        assertEq(bal, 1_020 ether);
     }
 
-    // ════════════════════════════════════════════════════════════
-    // Router Allowlist
-    // ════════════════════════════════════════════════════════════
-
-    function test_RouterNotAllowed_RevertsOnUnknownRouter() public {
-        address fakeRouter = makeAddr("fakeRouter");
-
-        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, fakeRouter));
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            fakeRouter, address(routerB),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_RouterNotAllowed_RevertsOnRevokedRouter() public {
-        executor.setAllowedRouter(address(routerA), false);
-
-        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(routerA)));
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_SetAllowedRouter_UpdatesAllowlist() public {
-        address newRouter = makeAddr("newRouter");
-
-        assertFalse(executor.allowedRouters(newRouter));
-
-        executor.setAllowedRouter(newRouter, true);
-        assertTrue(executor.allowedRouters(newRouter));
-
-        executor.setAllowedRouter(newRouter, false);
-        assertFalse(executor.allowedRouters(newRouter));
-    }
-
-    function test_SetAllowedRouter_ZeroAddressReverts() public {
-        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
-        executor.setAllowedRouter(address(0), true);
-    }
-
-    function test_NonOwnerCannotSetAllowedRouter() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.setAllowedRouter(address(routerA), false);
-    }
-
-    function test_BatchExecute_SkipsUnapprovedRouter() public {
-        executor.setAllowedRouter(address(routerA), false);
-
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](1);
-        arbs[0] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 100 ether,
-            routerA: address(routerA), routerB: address(routerB),
-            feeA: 0, feeB: 0,
-            minProfit: 0
-        });
-
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-        executor.batchExecute(arbs, deadline);
-        // Trade was skipped — balance unchanged
-        assertEq(tokenA.balanceOf(address(executor)), balBefore);
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Improvement #9: V3 support
-    // ════════════════════════════════════════════════════════════
-
-    function test_V3_RouterType_SetAndGet() public view {
-        // V3 routers should report V3 type
-        assertEq(uint8(executor.routerType(address(routerV3A))), uint8(ArbitrageExecutor.RouterType.V3));
-        assertEq(uint8(executor.routerType(address(routerV3B))), uint8(ArbitrageExecutor.RouterType.V3));
-        // V2 routers default to V2 (0)
-        assertEq(uint8(executor.routerType(address(routerA))), uint8(ArbitrageExecutor.RouterType.V2));
-    }
-
-    function test_V3_ExecuteProfitableArb() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // V3→V3: buy on routerV3A (1 TKA → 2 TKB), sell on routerV3B (1 TKB → 0.6 TKA)
-        // 100 TKA → 200 TKB → 120 TKA: profit = 20 TKA
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerV3A), address(routerV3B),
-            3000, 3000,  // V3 fee tier (not enforced by MockV3Router, but validates flow)
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_V3_RevertsIfUnprofitable() public {
-        vm.expectRevert();
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerV3A), address(routerV3C), // Loss router
-            3000, 3000,
-            0, deadline
-        );
-    }
-
-    function test_MixedV2V3_ArbBuyV2SellV3() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // Buy on V2 routerA (1 TKA → 2 TKB), sell on V3 routerV3B (1 TKB → 0.6 TKA)
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerV3B),
-            0, 3000,  // feeA=0 for V2, feeB=3000 for V3
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_MixedV3V2_ArbBuyV3SellV2() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // Buy on V3 routerV3A (1 TKA → 2 TKB), sell on V2 routerB (1 TKB → 0.6 TKA)
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerV3A), address(routerB),
-            3000, 0,  // feeA=3000 for V3, feeB=0 for V2
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_V3_AllowanceResetAfterArb() public {
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerV3A), address(routerV3B),
-            3000, 3000,
-            0, deadline
-        );
-
-        // Allowances must be reset to 0
-        assertEq(tokenA.allowance(address(executor), address(routerV3A)), 0);
-        assertEq(tokenB.allowance(address(executor), address(routerV3B)), 0);
-    }
-
-    function test_V3_BatchExecute() public {
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-
-        ArbitrageExecutor.ArbParams[] memory arbs = new ArbitrageExecutor.ArbParams[](3);
-        // V3→V3 profitable
-        arbs[0] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 100 ether,
-            routerA: address(routerV3A), routerB: address(routerV3B),
-            feeA: 3000, feeB: 3000,
-            minProfit: 0
-        });
-        // V2→V3 profitable
-        arbs[1] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 100 ether,
-            routerA: address(routerA), routerB: address(routerV3B),
-            feeA: 0, feeB: 3000,
-            minProfit: 0
-        });
-        // V3→V3 loss (skipped)
-        arbs[2] = ArbitrageExecutor.ArbParams({
-            tokenIn: address(tokenA), tokenOut: address(tokenB),
-            amountIn: 100 ether,
-            routerA: address(routerV3A), routerB: address(routerV3C),
-            feeA: 3000, feeB: 3000,
-            minProfit: 0
-        });
-
-        uint256[] memory results = executor.batchExecute(arbs, deadline);
-
-        assertEq(results[0], 20 ether); // V3→V3 profit
-        assertEq(results[1], 20 ether); // V2→V3 profit
-        assertEq(results[2], 0);        // loss → skipped
-
-        uint256 balAfter = tokenA.balanceOf(address(executor));
-        assertEq(balAfter - balBefore, 40 ether);
-    }
-
-    function test_V3_NonOwnerCannotSetRouterType() public {
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.setRouterType(address(routerA), ArbitrageExecutor.RouterType.V3);
-    }
-
-    function test_V3_SetRouterType_ZeroAddressReverts() public {
-        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
-        executor.setRouterType(address(0), ArbitrageExecutor.RouterType.V3);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // TRIANGULAR ARBITRAGE TESTS
-    // ═══════════════════════════════════════════════════════════
-
-    function test_Triangular_V2V2V2_Profitable() public {
-        // Setup: TKA → TKB → TKC → TKA loop with profit
-        // Create tokenC (third token) with 1M supply
-        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
-
-        // Deploy routerBC (TKB/TKC pool) and routerCA (TKC/TKA pool)
-        // Configure pricing loop for profit:
-        // A→B: existing routerA (1 TKA → 2 TKB)
-        // B→C: new routerBC (need rate that gives profit)
-        // C→A: new routerCA (need rate that gives profit)
-        MockRouter routerBC = new MockRouter(3, 1);  // 1 TKB → 3 TKC
-        MockRouter routerCA = new MockRouter(51, 100); // 1 TKC → 0.51 TKA
-
-        // Fund routers
-        tokenC.transfer(address(routerBC), 300_000 ether);
-        tokenB.transfer(address(routerBC), 100_000 ether);
-        tokenA.transfer(address(routerCA), 100_000 ether);
-        tokenC.transfer(address(routerCA), 100_000 ether);
-
-        // Whitelist new routers
-        executor.setAllowedRouter(address(routerBC), true);
-        executor.setAllowedRouter(address(routerCA), true);
-
-        // Calculate expected profit:
-        // 100 TKA → 200 TKB (via routerA: 1→2)
-        // 200 TKB → 600 TKC (via routerBC: 1→3)
-        // 600 TKC → 306 TKA (via routerCA: 1→0.51)
-        // Net: 100 TKA → 306 TKA = +206 TKA profit
-
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-
-        executor.executeTriangularArbitrage(
-            address(tokenA), // TKA
-            address(tokenB), // TKB
-            address(tokenC), // TKC
-            100 ether,
-            address(routerA),  // A→B (1→2)
-            address(routerBC), // B→C (1→3)
-            address(routerCA), // C→A (1→0.51)
-            0, 0, 0, // V2 fees
-            100 ether, // minProfit (expect ~206)
-            deadline
-        );
-
-        uint256 balAfter = tokenA.balanceOf(address(executor));
-        uint256 profit = balAfter - balBefore;
-
-        assertGt(profit, 100 ether); // At least 100 TKA profit
-        assertEq(executor.totalTrades(), 1);
-    }
-
-    function test_Triangular_V3V3V3_Profitable() public {
-        // V3 triangular: TKA → TKB → TKC → TKA with V3 routers
-        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
-
-        // Deploy V3 routers for B→C and C→A legs
-        MockV3Router routerV3_BC = new MockV3Router(3, 1);  // 1 TKB → 3 TKC
-        MockV3Router routerV3_CA = new MockV3Router(51, 100); // 1 TKC → 0.51 TKA
-
-        // Fund routers
-        tokenC.transfer(address(routerV3_BC), 300_000 ether);
-        tokenB.transfer(address(routerV3_BC), 100_000 ether);
-        tokenA.transfer(address(routerV3_CA), 100_000 ether);
-        tokenC.transfer(address(routerV3_CA), 100_000 ether);
-
-        // Whitelist and set types
-        executor.setAllowedRouter(address(routerV3_BC), true);
-        executor.setAllowedRouter(address(routerV3_CA), true);
-        executor.setRouterType(address(routerV3_BC), ArbitrageExecutor.RouterType.V3);
-        executor.setRouterType(address(routerV3_CA), ArbitrageExecutor.RouterType.V3);
-
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-
-        executor.executeTriangularArbitrage(
-            address(tokenA),
-            address(tokenB),
-            address(tokenC),
-            100 ether,
-            address(routerV3A),   // A→B (V3, 1→2)
-            address(routerV3_BC), // B→C (V3, 1→3)
-            address(routerV3_CA), // C→A (V3, 1→0.51)
-            3000, 3000, 3000, // V3 fee tiers
-            100 ether,
-            deadline
-        );
-
-        uint256 balAfter = tokenA.balanceOf(address(executor));
-        assertGt(balAfter - balBefore, 100 ether);
-    }
-
-    function test_Triangular_MixedV2V3_Profitable() public {
-        // Mixed: V2 → V3 → V2
-        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
-
-        MockRouter routerCA_v2 = new MockRouter(51, 100); // 1 TKC → 0.51 TKA (V2)
-        MockV3Router routerBC_v3 = new MockV3Router(3, 1); // 1 TKB → 3 TKC (V3)
-
-        tokenA.transfer(address(routerCA_v2), 100_000 ether);
-        tokenC.transfer(address(routerCA_v2), 100_000 ether);
-        tokenB.transfer(address(routerBC_v3), 100_000 ether);
-        tokenC.transfer(address(routerBC_v3), 300_000 ether);
-
-        executor.setAllowedRouter(address(routerCA_v2), true);
-        executor.setAllowedRouter(address(routerBC_v3), true);
-        executor.setRouterType(address(routerBC_v3), ArbitrageExecutor.RouterType.V3);
-
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-
-        executor.executeTriangularArbitrage(
-            address(tokenA),
-            address(tokenB),
-            address(tokenC),
-            100 ether,
-            address(routerA),      // V2 (1→2)
-            address(routerBC_v3),  // V3 (1→3)
-            address(routerCA_v2),  // V2 (1→0.51)
-            0, 3000, 0,
-            100 ether,
-            deadline
-        );
-
-        uint256 balAfter = tokenA.balanceOf(address(executor));
-        assertGt(balAfter - balBefore, 100 ether);
-    }
-
-    function test_Triangular_RevertsIfUnprofitable() public {
-        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
-
-        // Bad pricing: loss loop - use routerC (existing V2 loss router: 1→0.4)
-        // A→B: 100 → 200 (routerA)
-        // B→C: 200 → 80 (routerC gives 0.4 rate, treating B as input)
-        // C→A: need to get back >100 from 80 TKC → impossible
-        MockRouter routerCA_bad = new MockRouter(2, 10); // 1 TKC → 0.2 TKA (bad rate)
-        tokenA.transfer(address(routerCA_bad), 100_000 ether);
-        tokenC.transfer(address(routerCA_bad), 100_000 ether);
-        executor.setAllowedRouter(address(routerCA_bad), true);
-
-        vm.expectRevert();
-        executor.executeTriangularArbitrage(
-            address(tokenA),
-            address(tokenB),
-            address(tokenC),
-            100 ether,
-            address(routerA),    // 1→2
-            address(routerC),    // Treats input as B, gives 0.4 output
-            address(routerCA_bad), // 1→0.2
-            0, 0, 0,
-            1 ether, // require 1 TKA profit
-            deadline
-        );
-    }
-
-    function test_Triangular_RevertsIfRouterNotAllowed() public {
-        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
-        MockRouter routerCA_unwhitelisted = new MockRouter(51, 100);
-        // Don't whitelist
-
-        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(routerCA_unwhitelisted)));
-        executor.executeTriangularArbitrage(
-            address(tokenA),
-            address(tokenB),
-            address(tokenC),
-            100 ether,
-            address(routerA),
-            address(routerA),
-            address(routerCA_unwhitelisted), // not whitelisted
-            0, 0, 0,
-            1 ether,
-            deadline
-        );
-    }
-
-    function test_Triangular_RevertsIfZeroAddress() public {
-        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
-        executor.executeTriangularArbitrage(
-            address(0), // tokenA = 0
-            address(tokenB),
-            address(tokenA),
-            1000 ether,
-            address(routerA),
-            address(routerA),
-            address(routerA),
-            0, 0, 0,
-            1 ether,
-            deadline
-        );
-    }
-
-    function test_Triangular_RevertsIfZeroAmount() public {
-        MockERC20 tokenC = new MockERC20("OP", "OP", 18);
-
-        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
-        executor.executeTriangularArbitrage(
-            address(tokenA),
-            address(tokenB),
-            address(tokenC),
-            0, // amountIn = 0
-            address(routerA),
-            address(routerA),
-            address(routerA),
-            0, 0, 0,
-            1 ether,
-            deadline
-        );
-    }
-
-    function test_Triangular_NonOwnerCannotExecute() public {
-        MockERC20 tokenC = new MockERC20("OP", "OP", 18);
-
-        vm.prank(attacker);
-        vm.expectRevert();
-        executor.executeTriangularArbitrage(
-            address(tokenA),
-            address(tokenB),
-            address(tokenC),
-            1000 ether,
-            address(routerA),
-            address(routerA),
-            address(routerA),
-            0, 0, 0,
-            1 ether,
-            deadline
-        );
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // Solidly (ve(3,3)) support tests
-    // ════════════════════════════════════════════════════════════
-
-    function test_Solidly_RouterType_SetAndGet() public view {
-        assertEq(uint8(executor.routerType(address(routerSolidlyA))), uint8(ArbitrageExecutor.RouterType.Solidly));
-        assertEq(uint8(executor.routerType(address(routerSolidlyB))), uint8(ArbitrageExecutor.RouterType.Solidly));
-        // V2 routers still report V2 (0)
-        assertEq(uint8(executor.routerType(address(routerA))), uint8(ArbitrageExecutor.RouterType.V2));
-    }
-
-    function test_Solidly_ExecuteProfitableArb_Volatile() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // Solidly→Solidly volatile: buy on routerSolidlyA (1 TKA → 2 TKB), sell on routerSolidlyB (1 TKB → 0.6 TKA)
-        // 100 TKA → 200 TKB → 120 TKA: profit = 20 TKA
-        // fee=0 means volatile (stable=false)
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerSolidlyA), address(routerSolidlyB),
-            0, 0,  // fee=0 = volatile
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_Solidly_ExecuteProfitableArb_Stable() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // fee=1 means stable pool — MockSolidlyRouter uses same rate regardless of stable flag
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerSolidlyA), address(routerSolidlyB),
-            1, 1,  // fee=1 = stable
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_Solidly_RevertsIfUnprofitable() public {
-        vm.expectRevert();
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerSolidlyA), address(routerSolidlyC), // loss router
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_MixedV2Solidly_ArbBuyV2SellSolidly() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // Buy on V2 routerA (1 TKA → 2 TKB), sell on Solidly routerSolidlyB (1 TKB → 0.6 TKA)
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA), address(routerSolidlyB),
-            0, 0,
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_MixedSolidlyV2_ArbBuySolidlySellV2() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // Buy on Solidly routerSolidlyA (1 TKA → 2 TKB), sell on V2 routerB (1 TKB → 0.6 TKA)
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerSolidlyA), address(routerB),
-            0, 0,
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_MixedSolidlyV3_ArbBuySolidlySellV3() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        // Buy on Solidly routerSolidlyA (1 TKA → 2 TKB), sell on V3 routerV3B (1 TKB → 0.6 TKA)
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerSolidlyA), address(routerV3B),
-            0, 3000,
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_Solidly_AllowanceResetAfterArb() public {
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerSolidlyA), address(routerSolidlyB),
-            0, 0,
-            0, deadline
-        );
-
-        // Allowances must be reset to 0
-        assertEq(tokenA.allowance(address(executor), address(routerSolidlyA)), 0);
-        assertEq(tokenB.allowance(address(executor), address(routerSolidlyB)), 0);
-    }
-
-    function test_Solidly_RevertsIfRouterNotWhitelisted() public {
-        MockSolidlyRouter unwhitelisted = new MockSolidlyRouter(2, 1);
-        tokenB.transfer(address(unwhitelisted), 100_000 ether);
-
-        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(unwhitelisted)));
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(unwhitelisted), address(routerSolidlyB),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_Solidly_Triangular_Profitable() public {
-        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
-
-        // A→B: Solidly (1 TKA → 2 TKB), B→C: Solidly (1 TKB → 3 TKC), C→A: Solidly (1 TKC → 0.51 TKA)
-        MockSolidlyRouter routerSolidlyBC = new MockSolidlyRouter(3, 1);   // 1 TKB → 3 TKC
-        MockSolidlyRouter routerSolidlyCA = new MockSolidlyRouter(51, 100); // 1 TKC → 0.51 TKA
-
-        tokenC.transfer(address(routerSolidlyBC), 300_000 ether);
-        tokenB.transfer(address(routerSolidlyBC), 100_000 ether);
-        tokenA.transfer(address(routerSolidlyCA), 100_000 ether);
-        tokenC.transfer(address(routerSolidlyCA), 100_000 ether);
-
-        executor.setAllowedRouter(address(routerSolidlyBC), true);
-        executor.setRouterType(address(routerSolidlyBC), ArbitrageExecutor.RouterType.Solidly);
-        executor.setAllowedRouter(address(routerSolidlyCA), true);
-        executor.setRouterType(address(routerSolidlyCA), ArbitrageExecutor.RouterType.Solidly);
-
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-
-        executor.executeTriangularArbitrage(
-            address(tokenA), address(tokenB), address(tokenC),
-            100 ether,
-            address(routerSolidlyA),  // A→B: Solidly volatile
-            address(routerSolidlyBC), // B→C: Solidly volatile
-            address(routerSolidlyCA), // C→A: Solidly volatile
-            0, 0, 0,
-            100 ether,
-            deadline
-        );
-
-        uint256 balAfter = tokenA.balanceOf(address(executor));
-        assertGt(balAfter - balBefore, 100 ether);
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // SyncSwap Tests
-    // ════════════════════════════════════════════════════════════
-
-    function test_SyncSwap_RouterType_SetAndGet() public {
-        assertEq(
-            uint8(executor.routerType(address(factorySyncSwap))),
-            uint8(ArbitrageExecutor.RouterType.SyncSwap)
-        );
-        assertTrue(executor.allowedRouters(address(factorySyncSwap)));
-    }
-
-    function test_SyncSwap_ExecuteProfitableArb() public {
-        // SyncSwap→SyncSwap: buy on poolA (1 TKA → 2 TKB), sell on poolB (1 TKB → 0.6 TKA)
-        // 100 TKA → 200 TKB → 120 TKA: profit = 20 TKA
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(factorySyncSwap), address(factorySyncSwap),
-            0, 0,
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_SyncSwap_RevertsIfUnprofitable() public {
-        // Pool C gives 0.4 TKA per TKB → 100 TKA → 200 TKB → 80 TKA → loss
-        MockSyncSwapFactory factoryLoss = new MockSyncSwapFactory();
-        factoryLoss.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
-        factoryLoss.setPool(address(tokenB), address(tokenA), address(poolSyncSwapC));
-        executor.setAllowedRouter(address(factoryLoss), true);
-        executor.setRouterType(address(factoryLoss), ArbitrageExecutor.RouterType.SyncSwap);
-
-        // Fund loss pool
-        tokenA.transfer(address(poolSyncSwapC), 100_000 ether);
-
-        vm.expectRevert();
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(factoryLoss), address(factoryLoss),
-            0, 0,
-            1 ether, deadline
-        );
-    }
-
-    function test_MixedV2SyncSwap_ArbBuyV2SellSyncSwap() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(routerA),          // V2: buy 200 TKB for 100 TKA
-            address(factorySyncSwap),  // SyncSwap: sell 200 TKB → 120 TKA
-            0, 0,
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_MixedSyncSwapV2_ArbBuySyncSwapSellV2() public {
-        uint256 before = tokenA.balanceOf(address(executor));
-
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(factorySyncSwap),  // SyncSwap: buy 200 TKB for 100 TKA
-            address(routerB),          // V2: sell 200 TKB → 120 TKA
-            0, 0,
-            0, deadline
-        );
-
-        uint256 after_ = tokenA.balanceOf(address(executor));
-        assertEq(after_ - before, 20 ether);
-    }
-
-    function test_SyncSwap_RevertsIfFactoryNotWhitelisted() public {
-        MockSyncSwapFactory unwhitelisted = new MockSyncSwapFactory();
-        unwhitelisted.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
-        unwhitelisted.setPool(address(tokenB), address(tokenA), address(poolSyncSwapB));
-
-        vm.expectRevert(
-            abi.encodeWithSelector(ArbitrageExecutor.RouterNotAllowed.selector, address(unwhitelisted))
-        );
-        executor.executeArbitrage(
-            address(tokenA), address(tokenB),
-            100 ether,
-            address(unwhitelisted), address(unwhitelisted),
-            0, 0,
-            0, deadline
-        );
-    }
-
-    function test_SyncSwap_Triangular_Profitable() public {
-        // Deploy tokenC for triangular test
-        MockERC20 tokenC = new MockERC20("Token C", "TKC", 1_000_000 ether);
-
-        // SyncSwap pools for triangular: A→B→C→A
-        // A→B: 1 TKA → 2 TKB (pool AB already exists in factorySyncSwap)
-        // B→C: 1 TKB → 3 TKC
-        // C→A: 1 TKC → 0.51 TKA  → 100 TKA → 200 TKB → 600 TKC → 306 TKA: profit = 206 TKA
-        MockSyncSwapPool poolBC = new MockSyncSwapPool(address(tokenB), address(tokenC), 3, 1);
-        MockSyncSwapPool poolCA = new MockSyncSwapPool(address(tokenC), address(tokenA), 51, 100);
-
-        tokenC.transfer(address(poolBC), 300_000 ether);
-        tokenA.transfer(address(poolCA), 100_000 ether);
-        tokenC.transfer(address(poolCA), 100_000 ether);
-
-        MockSyncSwapFactory factoryTri = new MockSyncSwapFactory();
-        factoryTri.setPool(address(tokenA), address(tokenB), address(poolSyncSwapA));
-        factoryTri.setPool(address(tokenB), address(tokenC), address(poolBC));
-        factoryTri.setPool(address(tokenC), address(tokenA), address(poolCA));
-
-        executor.setAllowedRouter(address(factoryTri), true);
-        executor.setRouterType(address(factoryTri), ArbitrageExecutor.RouterType.SyncSwap);
-
-        uint256 balBefore = tokenA.balanceOf(address(executor));
-
-        executor.executeTriangularArbitrage(
-            address(tokenA), address(tokenB), address(tokenC),
-            100 ether,
-            address(factoryTri), address(factoryTri), address(factoryTri),
-            0, 0, 0,
-            100 ether,
-            deadline
-        );
-
-        uint256 balAfter = tokenA.balanceOf(address(executor));
-        assertGt(balAfter - balBefore, 100 ether);
-    }
-
-    // Allow receiving ETH for withdraw tests
     receive() external payable {}
 }
