@@ -437,12 +437,18 @@ function ChainCards({ apiStats }) {
 function GasLatencyBar({ apiStats, apiLatency, statsPollError }) {
   // Show RPC latency per chain (only chains that have a measurement)
   const rpcChains = (apiStats?.chains || []).filter((c) => c.rpc_latency_ms > 0);
-  if (statsPollError == null && apiLatency == null && rpcChains.length === 0) return null;
+  const backoffChains = (apiStats?.chains || []).filter((c) => c.rpc_backoff);
+  if (statsPollError == null && apiLatency == null && rpcChains.length === 0 && backoffChains.length === 0) return null;
   return (
     <div style={{ display: "flex", gap: 24, padding: "4px 16px", background: "#0a0f1a", borderBottom: "1px solid #1e293b", fontSize: 11, alignItems: "center", flexWrap: "wrap" }}>
       {statsPollError != null && (
         <span style={{ color: "#f87171" }}>⚠ /stats: {statsPollError}</span>
       )}
+      {backoffChains.map((c) => (
+        <span key={`backoff-${c.chain_id}`} style={{ color: "#f87171" }}>
+          ⚠ {c.chain_name}: RPC backoff — detecting, not executing
+        </span>
+      ))}
       {rpcChains.map((c) => {
         const ms = Math.round(c.rpc_latency_ms);
         const col = ms < 100 ? "#34d399" : ms < 300 ? "#fbbf24" : "#f87171";

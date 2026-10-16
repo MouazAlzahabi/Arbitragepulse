@@ -67,6 +67,9 @@ pub struct ChainStats {
     pub last_block: u64,
     /// Latest eth_blockNumber round-trip latency in ms (measured once per heartbeat interval). 0 = not yet measured.
     pub rpc_latency_ms: f64,
+    /// True while the chain's RPC backoff is active: opportunities are still detected,
+    /// but none are executed (node hanging, down, or too slow to simulate on).
+    pub rpc_backoff: bool,
 }
 
 #[derive(Debug, Default)]
@@ -262,13 +265,15 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = state.engine.read().await;
     let uptime = now_secs() - engine.uptime_start;
     let all_rpc_ok = !engine.chains.is_empty() && engine.chains.iter().all(|c| c.rpc_ok);
-    let status = if engine.chains.is_empty() || all_rpc_ok { "ok" } else { "degraded" };
+    let any_backoff = engine.chains.iter().any(|c| c.rpc_backoff);
+    let status = if engine.chains.is_empty() || (all_rpc_ok && !any_backoff) { "ok" } else { "degraded" };
     let chain_health: Vec<_> = engine.chains.iter().map(|c| serde_json::json!({
         "chain_id":   c.chain_id,
         "chain_name": c.chain_name,
         "rpc_ok":     c.rpc_ok,
         "last_block": c.last_block,
         "paused":     c.paused,
+        "rpc_backoff": c.rpc_backoff,
     })).collect();
     let code = if all_rpc_ok || engine.chains.is_empty() {
         StatusCode::OK

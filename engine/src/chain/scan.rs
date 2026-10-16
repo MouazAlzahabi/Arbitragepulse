@@ -283,7 +283,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     // What failures so far this scan call for — see handle_execution_failure.
     let mut failure = FailureAction::default();
-    let mut scan_rpc = ScanRpc { sim_timeouts: 0, health: rpc_health.clone() };
+    let mut scan_rpc = ScanRpc { sim_timeouts: 0, health: &rpc_health };
     'candidates: for best_opp in &all_opportunities {
         // Stop executing (but keep walking candidates so they're still logged) after an
         // outage (failure, or the executor's gas fetch timing out) or a rate limit.
@@ -492,7 +492,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
                             match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
-                                Ok(_) => {}
+                                // The node answered a simulation: it isn't hanging.
+                                Ok(_) => scan_rpc.sim_timeouts = 0,
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
                                     warn!(
@@ -927,7 +928,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
                             match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
-                                Ok(_) => {}
+                                // The node answered a simulation: it isn't hanging.
+                                Ok(_) => scan_rpc.sim_timeouts = 0,
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
                                     warn!(
@@ -1289,11 +1291,11 @@ fn spawn_backoff_probe<P: Provider + Clone + 'static>(
 }
 
 /// Per-scan RPC failure state passed to [`handle_execution_failure`].
-pub(crate) struct ScanRpc {
+pub(crate) struct ScanRpc<'a> {
     /// Consecutive simulation timeouts (two in a row = the node is hanging).
     sim_timeouts: u32,
-    /// The chain's RPC health (rate-limit log throttle).
-    health: crate::util::SharedRpcHealth,
+    /// The chain's RPC health (rate-limit log throttle), borrowed from the scan.
+    health: &'a crate::util::RpcHealth,
 }
 
 /// What a failed candidate calls for. Merged across a scan's candidates with `|=`.
@@ -1404,7 +1406,7 @@ pub(crate) async fn handle_execution_success(
 
 /// Handle execution failure (both 2-hop and triangular).
 pub(crate) async fn handle_execution_failure(
-    scan_rpc: &mut ScanRpc,
+    scan_rpc: &mut ScanRpc<'_>,
     error: anyhow::Error,
     pair_id: &str,
     router_ids: &[String],
@@ -1430,12 +1432,17 @@ pub(crate) async fn handle_execution_failure(
     let is_sim_failure = crate::util::is_sim_failure(&err_str);
     let rpc = crate::util::classify_rpc_failure(&err_str);
     // One simulation timeout = that candidate is stale. Two in a row = the node is
-    // hanging (in dry-run / pre-flight mode the simulation is the only RPC call). Only a
-    // simulation the node actually answered resets the streak — local rejects (gas,
-    // net profit, paused) never reach the node and say nothing about its health.
+    // hanging (in dry-run / pre-flight mode the simulation is the only RPC call). Any
+    // answer from the node resets the streak: a simulation it rejected, or a send it
+    // rejected (e.g. "nonce too low"); a passed pre-flight resets it at the call site.
+    // Local rejects (gas, net profit, paused) never reach the node and don't count.
+    let send_failure = {
+        let e = err_str.to_lowercase();
+        e.starts_with("send failed") || e.starts_with("triangular send failed")
+    };
     if is_sim_failure && rpc == RpcFailure::Timeout {
         scan_rpc.sim_timeouts += 1;
-    } else if is_sim_failure && rpc == RpcFailure::None {
+    } else if rpc == RpcFailure::None && (is_sim_failure || send_failure) {
         scan_rpc.sim_timeouts = 0;
     }
     // Node hanging or down: the caller stops executing further candidates and backs off,

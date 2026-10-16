@@ -270,13 +270,15 @@ impl Executor {
         let fetched = transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await;
         if let Err(e) = &fetched {
             let kind = crate::util::classify_rpc_failure(&e.to_string());
-            if kind == crate::util::RpcFailure::Timeout {
-                // Node hanging (a full 5 s with no answer): start the chain backoff and
-                // stop this candidate instead of falling back — its simulation/send would
-                // wait out the same timeouts. The error keeps the RPC marker, so the scan
-                // treats it as an outage (no circuit-breaker count). A fast failure
-                // (connection reset, rate limit) may be one-off, so it uses the fallback
-                // below; if the node really is down, the send fails fast and backs off.
+            let hard_down = kind == crate::util::RpcFailure::Unreachable
+                && crate::util::is_hard_down(&e.to_string());
+            if kind == crate::util::RpcFailure::Timeout || hard_down {
+                // Node hanging (a full 5 s with no answer) or definitely down (connection
+                // refused, WS backend stopped): start the chain backoff and stop this
+                // candidate instead of falling back — its simulation/send would fail the
+                // same way. The error keeps the RPC marker, so the scan treats it as an
+                // outage (no circuit-breaker count). A failure that may be one-off
+                // (connection reset, rate limit) uses the fallback below.
                 self.rpc_health.backoff_start();
                 return Err(anyhow!("gas price fetch failed: {}", e));
             }
