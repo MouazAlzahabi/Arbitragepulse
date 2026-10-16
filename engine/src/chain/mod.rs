@@ -239,6 +239,8 @@ pub async fn run_chain(
         } else if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
             chain.rpc_ok = true;
         }
+        // Register this run's RPC health (replacing a previous run's after a reconnect).
+        state.rpc_health.insert(cfg.id, rpc_health.clone());
     }
     metrics.rpc_connected.with_label_values(&[&cfg.name]).set(1.0);
 
@@ -739,7 +741,6 @@ pub async fn run_chain(
                     "block",
                 ).await;
                 last_scan_at = Instant::now();
-                sync_backoff_status(&shared_state, cfg.id, &rpc_health).await;
             }
 
             // ── Periodic fallback scan (safety net if block subscription is down) ──
@@ -779,7 +780,6 @@ pub async fn run_chain(
                     "poll",
                 ).await;
                 last_scan_at = Instant::now();
-                sync_backoff_status(&shared_state, cfg.id, &rpc_health).await;
             }
 
             // ── Swap event → instant targeted scan ───────────────────────────────
@@ -928,19 +928,6 @@ pub async fn run_chain(
 }
 
 // ─── RPC connection with fallback ─────────────────────────────────────────────
-
-/// Mirror the RPC backoff into the chain's stats (/stats, /health, dashboard) after each
-/// full scan. Only takes the write lock when the value changed.
-async fn sync_backoff_status(shared_state: &SharedState, chain_id: u64, rpc_health: &crate::util::RpcHealth) {
-    let active = rpc_health.backoff_state().is_some();
-    let changed = shared_state.read().await.chains.iter()
-        .any(|c| c.chain_id == chain_id && c.rpc_backoff != active);
-    if changed {
-        if let Some(c) = shared_state.write().await.chains.iter_mut().find(|c| c.chain_id == chain_id) {
-            c.rpc_backoff = active;
-        }
-    }
-}
 
 /// A scan trigger fired while the chain is paused: no scan is expected (keeps the
 /// heartbeat's stall check quiet, also right after resume), and any RPC backoff from

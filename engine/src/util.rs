@@ -74,12 +74,16 @@ pub const RPC_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Per-chain RPC health, shared lock-free by the scan loop and the executor (one per
 /// chain; held by the Executor).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct RpcHealth {
     /// Backoff deadline: milliseconds since process start (+1), 0 = no backoff.
     backoff_until: std::sync::atomic::AtomicU64,
     /// When a rate limit was last reported (same clock), for log throttling.
     rate_limit_logged: std::sync::atomic::AtomicU64,
+    /// Backoffs started since execution last succeeded; each doubles the next backoff
+    /// (see [`backoff_len`]), so a node that passes the probe but still can't execute
+    /// doesn't flap every 10 s.
+    strikes: std::sync::atomic::AtomicU32,
 }
 
 pub type SharedRpcHealth = std::sync::Arc<RpcHealth>;
@@ -92,23 +96,63 @@ fn monotonic_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-/// Deadline for a backoff starting now — the one place its length is decided.
-fn backoff_deadline() -> u64 {
-    monotonic_ms() + RPC_BACKOFF.as_millis() as u64
+/// Longest backoff after repeated outages (10 s doubling: 10, 20, 40, 80).
+pub const RPC_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(80);
+
+/// Backoff length after `strikes` outages without an execution succeeding in between.
+pub fn backoff_len(strikes: u32) -> std::time::Duration {
+    let base = RPC_BACKOFF.as_millis() as u64;
+    let ms = base.saturating_mul(1u64 << strikes.saturating_sub(1).min(8));
+    std::time::Duration::from_millis(ms.min(RPC_BACKOFF_MAX.as_millis() as u64))
 }
 
 impl RpcHealth {
-    /// Start (or extend) the backoff for [`RPC_BACKOFF`]. Returns the new deadline,
-    /// which [`RpcHealth::backoff_resolve`] uses to act only on its own backoff.
+    /// Deadline for a backoff starting now — the one place its length is decided.
+    fn deadline(&self) -> u64 {
+        let strikes = self.strikes.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        monotonic_ms() + backoff_len(strikes).as_millis() as u64
+    }
+
+    /// Start a backoff after an outage (counts a strike, so repeats back off longer).
+    /// If one is already running (e.g. the executor's gas fetch started it earlier in the
+    /// same scan), it's the same outage: no extra strike, deadline left as is.
     pub fn backoff_start(&self) -> u64 {
-        let until = backoff_deadline();
+        if self.backoff_state() == Some(true) {
+            return self.backoff_until.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        self.strikes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.backoff_hold()
+    }
+
+    /// (Re)start the backoff without counting a strike — while a probe runs, or when a
+    /// probe finds the node still down. Returns the new deadline, which
+    /// [`RpcHealth::backoff_resolve`] uses to act only on its own backoff.
+    pub fn backoff_hold(&self) -> u64 {
+        let until = self.deadline();
         self.backoff_until.store(until, std::sync::atomic::Ordering::Relaxed);
         until
     }
 
-    /// Clear the backoff (the chain was paused/resumed).
+    /// An execution reached the node and succeeded (a pre-flight passed, a dry run or a
+    /// send went through): the node is usable, so the next outage starts short again.
+    pub fn note_success(&self) {
+        self.strikes.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Length of the backoff currently in force (for logs).
+    pub fn current_backoff_len(&self) -> std::time::Duration {
+        backoff_len(self.strikes.load(std::sync::atomic::Ordering::Relaxed).max(1))
+    }
+
+    /// Backoff running or expired-but-not-yet-probed: execution is off either way.
+    pub fn execution_off(&self) -> bool {
+        self.backoff_state().is_some()
+    }
+
+    /// Clear the backoff and its strikes (the chain was paused/resumed: start fresh).
     pub fn backoff_clear(&self) {
         self.backoff_until.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.strikes.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `None` = no backoff; `Some(true)` = running; `Some(false)` = expired (probe due).
@@ -124,7 +168,7 @@ impl RpcHealth {
     /// it, or an execution failure restarted it) — the probe's result is stale then.
     /// Returns whether it applied.
     pub fn backoff_resolve(&self, started: u64, healthy: bool) -> bool {
-        let next = if healthy { 0 } else { backoff_deadline() };
+        let next = if healthy { 0 } else { self.deadline() };
         self.backoff_until
             .compare_exchange(started, next, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
             .is_ok()
@@ -141,24 +185,41 @@ impl RpcHealth {
     }
 }
 
-/// A backoff probe counts the node as healthy only if it answers within this — fast
-/// enough to trade on. It is the simulation timeout on purpose: a node slower than that
-/// can't complete a simulation, so resuming would just restart the backoff two failed
-/// simulations later (seen on a fork at 1.5 s latency: backoff flapping every ~15 s,
-/// nothing executed). Such a node stays in backoff, visibly (/stats rpc_backoff).
+/// A backoff probe counts the node as healthy only if its eth_call answers within this —
+/// the simulation timeout, since a node slower than that can't complete a simulation (seen
+/// on a fork at 1.5 s latency: backoff flapping every ~15 s, nothing executed). The probe
+/// is an eth_call (same method as simulations) with one retry for jitter. If simulations
+/// still time out after a pass, repeated backoffs double ([`backoff_len`]), so flapping
+/// dies down instead of repeating every 10 s.
 pub const RPC_PROBE_HEALTHY: std::time::Duration = RPC_SIMULATE_TIMEOUT;
 
 /// Text of the error returned when a call is skipped because the backoff is running.
 /// Classified as [`RpcFailure::Unreachable`], so it never counts toward the breaker.
 pub const RPC_BACKOFF_MARKER: &str = "rpc backoff active";
 
-/// Unreachable errors that mean the node is definitely down (as opposed to a connection
-/// reset, which can be one-off): nothing will get through until it comes back.
+/// Unreachable markers meaning the node is definitely down (refusing connections, the WS
+/// backend gone): nothing will get through until it comes back.
+const HARD_DOWN_MARKERS: [&str; 3] =
+    ["connection refused", "backend connection task has stopped", "pubsub service dropped"];
+
+/// Unreachable markers that can be one-off (a reset socket, a resolver blip): the node may
+/// well answer the next request.
+const TRANSIENT_UNREACHABLE_MARKERS: [&str; 6] = [
+    "error sending request", "connection reset", "connection closed", "broken pipe",
+    "dns error", "failed to lookup address",
+];
+
+/// An Unreachable error that means the node is definitely down — see [`HARD_DOWN_MARKERS`].
 pub fn is_hard_down(err: &str) -> bool {
     let e = err.to_lowercase();
-    ["connection refused", "backend connection task has stopped", "pubsub service dropped",
-     "dns error", "failed to lookup address", RPC_BACKOFF_MARKER]
-        .iter().any(|m| e.contains(m))
+    HARD_DOWN_MARKERS.iter().any(|m| e.contains(m))
+}
+
+/// Whether the node itself answered (with a JSON-RPC error), as opposed to the request
+/// failing locally or at a gateway (502/503, signer, filler). alloy writes this prefix for
+/// every JSON-RPC error response.
+pub fn node_answered(err: &str) -> bool {
+    err.to_lowercase().contains("server returned an error response")
 }
 
 /// Text every timeout error from [`rpc_timeout`] / [`transport_timeout`] contains.
@@ -188,18 +249,10 @@ pub fn classify_rpc_failure(err: &str) -> RpcFailure {
     let e = err.to_lowercase();
     if e.contains(RPC_TIMEOUT_MARKER) {
         RpcFailure::Timeout
-    } else if [
-        "error sending request",
-        "connection refused",
-        "connection reset",
-        "connection closed",
-        "broken pipe",
-        "dns error",
-        "failed to lookup address",
-        "backend connection task has stopped",
-        "pubsub service dropped",
-        RPC_BACKOFF_MARKER,
-    ].iter().any(|m| e.contains(m)) {
+    } else if HARD_DOWN_MARKERS.iter().chain(TRANSIENT_UNREACHABLE_MARKERS.iter()).any(|m| e.contains(m))
+        // Written by the engine itself when a call is skipped during a backoff.
+        || e.contains(RPC_BACKOFF_MARKER)
+    {
         RpcFailure::Unreachable
     } else if contains_status_429(&e) || e.contains("too many requests")
         || e.contains("compute units") || e.contains("rate limit")

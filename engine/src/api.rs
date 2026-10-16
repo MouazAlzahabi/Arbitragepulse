@@ -68,7 +68,8 @@ pub struct ChainStats {
     /// Latest eth_blockNumber round-trip latency in ms (measured once per heartbeat interval). 0 = not yet measured.
     pub rpc_latency_ms: f64,
     /// True while the chain's RPC backoff is active: opportunities are still detected,
-    /// but none are executed (node hanging, down, or too slow to simulate on).
+    /// but none are executed (node hanging, down, or too slow to simulate on). Filled in
+    /// live from [`EngineState::rpc_health`] when served, not stored.
     pub rpc_backoff: bool,
 }
 
@@ -84,6 +85,9 @@ pub struct EngineState {
     /// Per-pair scan info published by each chain heartbeat.
     /// Key = chain_id, Value = list of pairs and their last-scan stats.
     pub pair_scan: std::collections::HashMap<u64, Vec<PairScanInfo>>,
+    /// Per-chain RPC health, registered by each chain at startup. /stats and /health read
+    /// the backoff from it live, so pause, probe and reconnect show up at once.
+    pub rpc_health: std::collections::HashMap<u64, crate::util::SharedRpcHealth>,
     /// Pair IDs disabled via POST /pair-scan/{id}/toggle.
     /// Evaluated pairs in this set are skipped during each scan cycle.
     pub disabled_pairs: std::sync::Arc<std::collections::HashSet<String>>,
@@ -95,6 +99,13 @@ pub struct EngineState {
 }
 
 pub type SharedState = Arc<RwLock<EngineState>>;
+
+impl EngineState {
+    /// Whether the chain's RPC backoff is in force right now (execution off).
+    pub fn backoff_active(&self, chain_id: u64) -> bool {
+        self.rpc_health.get(&chain_id).is_some_and(|h| h.execution_off())
+    }
+}
 pub type LogBroadcaster = broadcast::Sender<LogEntry>;
 
 // ─── API server ───────────────────────────────────────────────────────────────
@@ -265,17 +276,20 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = state.engine.read().await;
     let uptime = now_secs() - engine.uptime_start;
     let all_rpc_ok = !engine.chains.is_empty() && engine.chains.iter().all(|c| c.rpc_ok);
-    let any_backoff = engine.chains.iter().any(|c| c.rpc_backoff);
-    let status = if engine.chains.is_empty() || (all_rpc_ok && !any_backoff) { "ok" } else { "degraded" };
+    let any_backoff = engine.chains.iter().any(|c| engine.backoff_active(c.chain_id));
+    // A chain in backoff isn't executing — report it the same way as a lost RPC (503), so
+    // uptime checks that only read the status code alert on it.
+    let healthy = engine.chains.is_empty() || (all_rpc_ok && !any_backoff);
+    let status = if healthy { "ok" } else { "degraded" };
     let chain_health: Vec<_> = engine.chains.iter().map(|c| serde_json::json!({
         "chain_id":   c.chain_id,
         "chain_name": c.chain_name,
         "rpc_ok":     c.rpc_ok,
         "last_block": c.last_block,
         "paused":     c.paused,
-        "rpc_backoff": c.rpc_backoff,
+        "rpc_backoff": engine.backoff_active(c.chain_id),
     })).collect();
-    let code = if all_rpc_ok || engine.chains.is_empty() {
+    let code = if healthy {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -299,8 +313,11 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = state.engine.read().await;
+    let chains: Vec<ChainStats> = engine.chains.iter().cloned()
+        .map(|mut c| { c.rpc_backoff = engine.backoff_active(c.chain_id); c })
+        .collect();
     Json(serde_json::json!({
-        "chains": engine.chains,
+        "chains": chains,
         "dry_run": engine.dry_run,
         "paused": engine.paused,
         "uptime_seconds": now_secs() - engine.uptime_start,

@@ -291,7 +291,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             if failure.stop_scan && !failure.outage {
                 debug!("[{}] RPC rate limited — not executing further candidates this scan", cfg.name);
             } else {
-                warn!("[{}] RPC outage — skipping execution of remaining candidates, backing off {:?}", cfg.name, crate::util::RPC_BACKOFF);
+                warn!("[{}] RPC outage — skipping execution of remaining candidates", cfg.name);
             }
             skip_execution = true;
         }
@@ -448,6 +448,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                        rpc_health.note_success();
                         handle_execution_success(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -493,7 +494,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if cfg.preflight_eth_call {
                             match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
                                 // The node answered a simulation: it isn't hanging.
-                                Ok(_) => scan_rpc.sim_timeouts = 0,
+                                Ok(_) => { scan_rpc.sim_timeouts = 0; scan_rpc.health.note_success(); }
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
                                     warn!(
@@ -762,6 +763,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     drop(provider_bg);
                                 });
 
+                                rpc_health.note_success();
                                 handle_execution_success(
                                     &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -887,6 +889,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(COOLDOWN_SECS));
+                        rpc_health.note_success();
                         handle_execution_success(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -929,7 +932,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         if cfg.preflight_eth_call {
                             match transport_timeout(RPC_SIMULATE_TIMEOUT, provider.call(prep.tx.clone())).await {
                                 // The node answered a simulation: it isn't hanging.
-                                Ok(_) => scan_rpc.sim_timeouts = 0,
+                                Ok(_) => { scan_rpc.sim_timeouts = 0; scan_rpc.health.note_success(); }
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
                                     warn!(
@@ -1186,6 +1189,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     drop(provider_bg);
                                 });
 
+                                rpc_health.note_success();
                                 handle_execution_success(
                                     &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
@@ -1252,40 +1256,55 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     if failure.outage {
         rpc_health.backoff_start();
+        warn!("[{}] Backing off execution for {:?} (repeated outages back off longer)", cfg.name, rpc_health.current_backoff_len());
     }
 
 }
 
-/// Probe an RPC whose backoff has expired, off the scan loop. The backoff is restarted
-/// first, so later scans keep skipping execution (and don't spawn more probes) while it
-/// runs; the probe's 5 s timeout is shorter than the backoff.
+/// Probe an RPC whose backoff has expired, off the scan loop. The backoff is held first,
+/// so later scans keep skipping execution (and don't spawn more probes) while it runs.
 ///
-/// Healthy = answered within [`crate::util::RPC_PROBE_HEALTHY`] (fast enough to trade), or
-/// answered with a rate limit (the node is up; per-pair cooldowns handle 429s). The probe
-/// only resolves the backoff it started: if a pause cleared it or a failure restarted it
-/// meanwhile, the result is dropped.
+/// The probe is an eth_call (Multicall3.getBlockNumber) — the same RPC method simulations
+/// use, so it sees the same node-side queueing — tried up to twice so one jittery answer
+/// doesn't hold the backoff. Healthy = answered within [`crate::util::RPC_PROBE_HEALTHY`]
+/// (a revert counts as an answer), or rate-limited (the node is up; per-pair cooldowns
+/// handle 429s). The probe only resolves the backoff it started: if a pause cleared it or
+/// a failure restarted it meanwhile, the result is dropped.
 fn spawn_backoff_probe<P: Provider + Clone + 'static>(
     provider: Arc<P>,
     rpc_health: crate::util::SharedRpcHealth,
     chain: String,
 ) {
-    let started = rpc_health.backoff_start();
+    let started = rpc_health.backoff_hold();
     tokio::spawn(async move {
-        let t = Instant::now();
-        let result = crate::util::rpc_timeout(crate::util::RPC_READ_TIMEOUT, provider.get_block_number()).await;
-        let took = t.elapsed();
-        let healthy = match &result {
-            Ok(_) => took <= crate::util::RPC_PROBE_HEALTHY,
-            Err(e) => crate::util::classify_rpc_failure(e) == RpcFailure::RateLimited,
-        };
+        const MULTICALL3: Address = alloy::primitives::address!("cA11bde05977b3631167028862bE2a173976CA11");
+        const GET_BLOCK_NUMBER: [u8; 4] = [0x42, 0xcb, 0xb1, 0x5c]; // getBlockNumber()
+        let mut last = (false, Duration::ZERO, None::<String>);
+        for _ in 0..2 {
+            let tx = alloy::rpc::types::TransactionRequest::default()
+                .to(MULTICALL3)
+                .input(alloy::primitives::Bytes::from_static(&GET_BLOCK_NUMBER).into());
+            let t = Instant::now();
+            let result = crate::util::rpc_timeout(crate::util::RPC_READ_TIMEOUT, provider.call(tx)).await;
+            let took = t.elapsed();
+            let answered = match &result {
+                Ok(_) => true,
+                Err(e) => crate::util::node_answered(e) || crate::util::classify_rpc_failure(e) == RpcFailure::RateLimited,
+            };
+            last = (answered && took <= crate::util::RPC_PROBE_HEALTHY, took, result.err());
+            if last.0 { break; }
+        }
+        let (healthy, took, err) = last;
         if !rpc_health.backoff_resolve(started, healthy) {
             return; // paused/resumed or restarted meanwhile — stale result
         }
-        match (healthy, &result) {
-            (true, _) => info!("[{}] RPC answering again ({:.1}s) — resuming execution", chain, took.as_secs_f64()),
-            (false, Ok(_)) => warn!("[{}] RPC answering but slow ({:.1}s) — skipping execution for {:?}",
-                                    chain, took.as_secs_f64(), crate::util::RPC_BACKOFF),
-            (false, Err(_)) => warn!("[{}] RPC still not answering — skipping execution for {:?}", chain, crate::util::RPC_BACKOFF),
+        if healthy {
+            info!("[{}] RPC answering again ({:.1}s) — resuming execution", chain, took.as_secs_f64());
+        } else if err.is_none() || err.as_deref().is_some_and(crate::util::node_answered) {
+            warn!("[{}] RPC answering but slow ({:.1}s) — skipping execution for {:?}",
+                  chain, took.as_secs_f64(), rpc_health.current_backoff_len());
+        } else {
+            warn!("[{}] RPC still not answering — skipping execution for {:?}", chain, rpc_health.current_backoff_len());
         }
     });
 }
@@ -1433,16 +1452,14 @@ pub(crate) async fn handle_execution_failure(
     let rpc = crate::util::classify_rpc_failure(&err_str);
     // One simulation timeout = that candidate is stale. Two in a row = the node is
     // hanging (in dry-run / pre-flight mode the simulation is the only RPC call). Any
-    // answer from the node resets the streak: a simulation it rejected, or a send it
-    // rejected (e.g. "nonce too low"); a passed pre-flight resets it at the call site.
+    // answer from the node resets the streak: a simulation or send it rejected (e.g.
+    // "nonce too low"); a passed pre-flight resets it at the call site.
     // Local rejects (gas, net profit, paused) never reach the node and don't count.
-    let send_failure = {
-        let e = err_str.to_lowercase();
-        e.starts_with("send failed") || e.starts_with("triangular send failed")
-    };
+    // "Answered" means a JSON-RPC error from the node itself — not a gateway 502/503 or a
+    // local signer/filler failure, which say nothing about whether the node is hanging.
     if is_sim_failure && rpc == RpcFailure::Timeout {
         scan_rpc.sim_timeouts += 1;
-    } else if rpc == RpcFailure::None && (is_sim_failure || send_failure) {
+    } else if rpc == RpcFailure::None && crate::util::node_answered(&err_str) {
         scan_rpc.sim_timeouts = 0;
     }
     // Node hanging or down: the caller stops executing further candidates and backs off,
