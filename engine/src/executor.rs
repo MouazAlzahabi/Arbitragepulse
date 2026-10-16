@@ -135,10 +135,9 @@ pub struct Executor {
     pub signer_address: Address,
     pub dry_run: bool,
     pub paused: bool,
-    /// Chain-level RPC backoff (see util::RpcBackoff), shared with the scan loop. Set
-    /// here too: a timed-out gas fetch is an outage signal even though the last-known
-    /// fallback lets the candidate continue.
-    pub rpc_backoff: crate::util::RpcBackoff,
+    /// Per-chain RPC health (backoff, rate-limit log throttle), shared with the scan
+    /// loop. The executor starts the backoff itself when a gas fetch times out.
+    pub rpc_health: crate::util::SharedRpcHealth,
     pub stats: ExecutorStats,
     /// ETH/USD price — updated from the price-tick handler each minute.
     pub native_price_usd: f64,
@@ -210,7 +209,7 @@ impl Executor {
             nonce: None,
             db,
             gas_price_cache: None,
-            rpc_backoff: Default::default(),
+            rpc_health: Default::default(),
             gas_price_cache_ttl,
             confirmed_success: Arc::new(AtomicU64::new(0)),
             confirmed_failed: Arc::new(AtomicU64::new(0)),
@@ -265,18 +264,20 @@ impl Executor {
 
         // Cache miss or expired. If the RPC is known to be down (backoff running), stop:
         // this candidate's simulation and send would hit the same dead node.
-        if crate::util::backoff_state(&self.rpc_backoff) == Some(true) {
+        if self.rpc_health.backoff_state() == Some(true) {
             return Err(anyhow!("gas price not fetched: {}", crate::util::RPC_BACKOFF_MARKER));
         }
         let fetched = transport_timeout(RPC_READ_TIMEOUT, provider.get_gas_price()).await;
         if let Err(e) = &fetched {
             let kind = crate::util::classify_rpc_failure(&e.to_string());
-            if matches!(kind, crate::util::RpcFailure::Timeout | crate::util::RpcFailure::Unreachable) {
-                // Node hanging or down: start the chain backoff and stop this candidate
-                // instead of falling back — its simulation/send would wait out the same
-                // timeouts. The error keeps the RPC marker, so the scan treats it as an
-                // outage (no circuit-breaker count).
-                crate::util::backoff_start(&self.rpc_backoff);
+            if kind == crate::util::RpcFailure::Timeout {
+                // Node hanging (a full 5 s with no answer): start the chain backoff and
+                // stop this candidate instead of falling back — its simulation/send would
+                // wait out the same timeouts. The error keeps the RPC marker, so the scan
+                // treats it as an outage (no circuit-breaker count). A fast failure
+                // (connection reset, rate limit) may be one-off, so it uses the fallback
+                // below; if the node really is down, the send fails fast and backs off.
+                self.rpc_health.backoff_start();
                 return Err(anyhow!("gas price fetch failed: {}", e));
             }
         }
@@ -290,8 +291,8 @@ impl Executor {
                 Ok(gas_price)
             }
             Err(e) => {
-                // Fetch failed with a non-outage error (node answered with an error, rate
-                // limit): fall back to the last real price plus
+                // Fetch failed fast (node error, rate limit, connection reset): fall back to
+                // the last real price plus
                 // a margin for fees having risen since. The inflated value is NOT written
                 // back, so the margin never compounds. Without a recent price, skip rather
                 // than guess — a hard-coded default was ~1000× Base fees and wrecked the

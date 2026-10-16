@@ -72,32 +72,74 @@ pub async fn transport_timeout<T>(
 /// After an RPC outage-class failure, scans skip execution this long before probing.
 pub const RPC_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Chain-level RPC backoff deadline, shared lock-free between the scan loop and the
-/// executor: milliseconds since process start (+1), 0 = no backoff.
-pub type RpcBackoff = std::sync::Arc<std::sync::atomic::AtomicU64>;
+/// Per-chain RPC health, shared lock-free by the scan loop and the executor (one per
+/// chain; held by the Executor).
+#[derive(Default)]
+pub struct RpcHealth {
+    /// Backoff deadline: milliseconds since process start (+1), 0 = no backoff.
+    backoff_until: std::sync::atomic::AtomicU64,
+    /// When a rate limit was last reported (same clock), for log throttling.
+    rate_limit_logged: std::sync::atomic::AtomicU64,
+}
+
+pub type SharedRpcHealth = std::sync::Arc<RpcHealth>;
+
+/// Minimum interval between rate-limit reports per chain.
+pub const RATE_LIMIT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-/// Start (or extend) the backoff for [`RPC_BACKOFF`].
-pub fn backoff_start(b: &RpcBackoff) {
-    b.store(monotonic_ms() + RPC_BACKOFF.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-}
+impl RpcHealth {
+    /// Start (or extend) the backoff for [`RPC_BACKOFF`]. Returns the new deadline,
+    /// which [`RpcHealth::backoff_resolve`] uses to act only on its own backoff.
+    pub fn backoff_start(&self) -> u64 {
+        let until = monotonic_ms() + RPC_BACKOFF.as_millis() as u64;
+        self.backoff_until.store(until, std::sync::atomic::Ordering::Relaxed);
+        until
+    }
 
-/// Clear the backoff (RPC answered again, or the chain was paused/resumed).
-pub fn backoff_clear(b: &RpcBackoff) {
-    b.store(0, std::sync::atomic::Ordering::Relaxed);
-}
+    /// Clear the backoff (the chain was paused/resumed).
+    pub fn backoff_clear(&self) {
+        self.backoff_until.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 
-/// `None` = no backoff; `Some(true)` = backoff running; `Some(false)` = expired (probe due).
-pub fn backoff_state(b: &RpcBackoff) -> Option<bool> {
-    match b.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        until => Some(monotonic_ms() < until),
+    /// `None` = no backoff; `Some(true)` = running; `Some(false)` = expired (probe due).
+    pub fn backoff_state(&self) -> Option<bool> {
+        match self.backoff_until.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            until => Some(monotonic_ms() < until),
+        }
+    }
+
+    /// Resolve the backoff a probe started (deadline `started`): clear it if the node is
+    /// healthy, restart it if not. A no-op if anything changed it since (a pause cleared
+    /// it, or an execution failure restarted it) — the probe's result is stale then.
+    /// Returns whether it applied.
+    pub fn backoff_resolve(&self, started: u64, healthy: bool) -> bool {
+        let next = if healthy { 0 } else { monotonic_ms() + RPC_BACKOFF.as_millis() as u64 };
+        self.backoff_until
+            .compare_exchange(started, next, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// True at most once per [`RATE_LIMIT_LOG_EVERY`].
+    pub fn rate_limit_log_due(&self) -> bool {
+        let now = monotonic_ms();
+        let last = self.rate_limit_logged.load(std::sync::atomic::Ordering::Relaxed);
+        (last == 0 || now - last >= RATE_LIMIT_LOG_EVERY.as_millis() as u64)
+            && self.rate_limit_logged
+                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
     }
 }
+
+/// A backoff probe counts the node as healthy only if it answers within this — fast
+/// enough to trade on. A node answering in ~4 s is up but too degraded: resuming would
+/// hold every scan for seconds per candidate. ~1.2 s per call still passes.
+pub const RPC_PROBE_HEALTHY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Text of the error returned when a call is skipped because the backoff is running.
 /// Classified as [`RpcFailure::Unreachable`], so it never counts toward the breaker.
