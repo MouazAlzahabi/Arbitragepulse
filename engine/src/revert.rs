@@ -2,7 +2,7 @@
 
 use alloy::consensus::Transaction as TxFields;
 use alloy::network::TransactionResponse;
-use alloy::primitives::{hex, Bytes, B256};
+use alloy::primitives::{hex, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::transports::TransportError;
@@ -31,11 +31,11 @@ pub enum RevertClass {
     InvalidRoute,
     /// Contract paused, or caller is not the owner.
     Blocked,
+    /// A router call burned all its gas (`LegOutOfGas`): the tx gas limit is too low.
+    OutOfGas,
     Unknown,
     /// Replay RPC failed or node returned no revert data.
     Unavailable,
-    /// No revert bytes; sell leg is V3 (historical ~99% of Base failures).
-    V3TooLittleLikely,
 }
 
 impl RevertClass {
@@ -52,9 +52,9 @@ impl RevertClass {
             Self::NoOutput => "no_output",
             Self::InvalidRoute => "invalid_route",
             Self::Blocked => "blocked",
+            Self::OutOfGas => "out_of_gas",
             Self::Unknown => "unknown",
             Self::Unavailable => "unavailable",
-            Self::V3TooLittleLikely => "v3_too_little_likely",
         }
     }
 }
@@ -65,32 +65,37 @@ pub struct RevertDiagnosis {
     pub detail: Option<String>,
 }
 
-// ArbitrageExecutor v3 errors (+ the OpenZeppelin ones it can raise), for decoding.
+// Every error the executor can raise (v3 + OpenZeppelin + pre-v3), decoded once into
+// `Executor::ExecutorErrors`. `explain_executor` matches it exhaustively, so a new contract
+// error that is added here but not handled is a compile error — class and text can't drift.
 alloy::sol! {
-    error NotProfitable(uint256 balanceBefore, uint256 balanceAfter, uint256 minProfit);
-    error DeadlineExpired(uint256 deadline, uint256 currentTimestamp);
-    error ZeroAmount();
-    error ZeroAddress();
-    error TransferFailed();
-    error RouterNotAllowed(address router);
-    error UnsupportedRouterType(address router, uint8 rtype);
-    error InsufficientBalance(address token, uint256 balance, uint256 needed);
-    error InvalidPath();
-    error InvalidV3Fee(uint8 leg, address router);
-    error LegFailed(uint8 leg, address router, uint8 rtype, bytes reason);
-    error NoOutput(uint8 leg, address router);
-    error OwnableUnauthorizedAccount(address account);
-    error EnforcedPause();
-    error SafeERC20FailedOperation(address token);
-    // Pre-v3 executor errors (still deployed until the redeploy).
-    error InsufficientOutput(uint256 got, uint256 min);
-    error PoolNotFound(address factory);
-}
+    interface Executor {
+        error NotProfitable(uint256 balanceBefore, uint256 balanceAfter, uint256 minProfit);
+        error DeadlineExpired(uint256 deadline, uint256 currentTimestamp);
+        error ZeroAmount();
+        error ZeroAddress();
+        error TransferFailed();
+        error RouterNotAllowed(address router);
+        error UnsupportedRouterType(address router, uint8 rtype);
+        error InsufficientBalance(address token, uint256 balance, uint256 needed);
+        error InvalidPath();
+        error InvalidV3Fee(uint8 leg, address router, uint24 fee);
+        error LegFailed(uint8 leg, address router, uint8 rtype, bytes reason);
+        error NoOutput(uint8 leg, address router);
+        error NotAContract(address router);
+        error LegOutOfGas(uint8 leg, address router);
+        error RenounceDisabled();
+        error OwnableUnauthorizedAccount(address account);
+        error EnforcedPause();
+        error SafeERC20FailedOperation(address token);
+        // Pre-v3 executor errors (still deployed until the redeploy).
+        error InsufficientOutput(uint256 got, uint256 min);
+        error PoolNotFound(address factory);
+    }
 
-/// Custom errors the routers themselves raise (inside `LegFailed.reason`). Aerodrome's
-/// router and pools use argument-less errors; Uniswap/Pancake use `Error(string)`.
-mod router_errors {
-    alloy::sol! {
+    /// Custom errors the routers themselves raise (inside `LegFailed.reason`). Aerodrome's
+    /// router and pools use argument-less errors; Uniswap/Pancake use `Error(string)`.
+    interface Router {
         error InsufficientOutputAmount();
         error Expired();
         error InsufficientLiquidity();
@@ -103,29 +108,6 @@ mod router_errors {
     }
 }
 
-/// `(error name, what it means, class)` for a known router custom error.
-fn router_error(reason: &[u8]) -> Option<(&'static str, &'static str, RevertClass)> {
-    use alloy::sol_types::SolError;
-    use router_errors::*;
-    let sel: [u8; 4] = reason.get(..4)?.try_into().ok()?;
-    let found = [
-        (InsufficientOutputAmount::SELECTOR, InsufficientOutputAmount::SIGNATURE,
-            "output below the leg minimum — price moved", RevertClass::InsufficientOutput),
-        (Expired::SELECTOR, Expired::SIGNATURE, "router deadline passed", RevertClass::DeadlineExpired),
-        (PoolDoesNotExist::SELECTOR, PoolDoesNotExist::SIGNATURE,
-            "no pool for this pair/stable flag", RevertClass::PoolNotFound),
-        (InsufficientLiquidity::SELECTOR, InsufficientLiquidity::SIGNATURE, "pool has too little liquidity", RevertClass::Unknown),
-        (K::SELECTOR, K::SIGNATURE, "pool invariant check failed", RevertClass::Unknown),
-        (InsufficientInputAmount::SELECTOR, InsufficientInputAmount::SIGNATURE, "pool received no input", RevertClass::TransferFailed),
-        (InvalidPath::SELECTOR, InvalidPath::SIGNATURE, "router rejected the route", RevertClass::Unknown),
-        (SameAddresses::SELECTOR, SameAddresses::SIGNATURE, "router rejected the route", RevertClass::Unknown),
-        (ZeroAddress::SELECTOR, ZeroAddress::SIGNATURE, "router rejected the route", RevertClass::Unknown),
-    ]
-    .into_iter()
-    .find(|(s, ..)| *s == sel)?;
-    Some((found.1, found.2, found.3))
-}
-
 fn router_type_name(t: u8) -> &'static str {
     match t { 0 => "V2", 1 => "V3", 4 => "Aerodrome", _ => "retired type" }
 }
@@ -133,126 +115,116 @@ fn router_type_name(t: u8) -> &'static str {
 /// Classify revert bytes from `eth_call` replay or RPC error payload. `detail` is a
 /// human-readable sentence (see [`describe_revert`]).
 pub fn classify_revert_bytes(data: &[u8]) -> RevertDiagnosis {
-    RevertDiagnosis { class: classify_inner(data), detail: describe_revert(data) }
+    let (class, detail) = explain(data);
+    RevertDiagnosis { class, detail }
 }
 
-fn classify_inner(data: &[u8]) -> RevertClass {
-    use alloy::sol_types::SolError;
-    if data.len() < 4 {
-        return RevertClass::Unknown;
-    }
-    let sel: [u8; 4] = data[..4].try_into().unwrap_or_default();
-    match sel {
-        s if s == LegFailed::SELECTOR => match LegFailed::abi_decode(data) {
-            // The router's own reason decides the class (e.g. V3 "Too little received").
-            Ok(e) if !e.reason.is_empty() => match router_error(&e.reason) {
-                Some((_, _, class)) => class,
-                None => classify_inner(&e.reason),
-            },
-            _ => RevertClass::Unknown,
-        },
-        s if s == NotProfitable::SELECTOR => RevertClass::NotProfitable,
-        s if s == InsufficientOutput::SELECTOR => RevertClass::InsufficientOutput,
-        s if s == DeadlineExpired::SELECTOR => RevertClass::DeadlineExpired,
-        s if s == RouterNotAllowed::SELECTOR => RevertClass::RouterNotAllowed,
-        s if s == PoolNotFound::SELECTOR => RevertClass::PoolNotFound,
-        s if s == InsufficientBalance::SELECTOR => RevertClass::InsufficientBalance,
-        s if s == NoOutput::SELECTOR => RevertClass::NoOutput,
-        s if s == UnsupportedRouterType::SELECTOR || s == InvalidPath::SELECTOR
-            || s == InvalidV3Fee::SELECTOR || s == ZeroAmount::SELECTOR
-            || s == ZeroAddress::SELECTOR => RevertClass::InvalidRoute,
-        s if s == EnforcedPause::SELECTOR || s == OwnableUnauthorizedAccount::SELECTOR => RevertClass::Blocked,
-        s if s == SafeERC20FailedOperation::SELECTOR || s == TransferFailed::SELECTOR => RevertClass::TransferFailed,
-        _ => match decode_abi_revert(data) {
-            Some(msg) => {
-                let lower = msg.to_ascii_lowercase();
-                if lower.contains("too little received") {
-                    RevertClass::V3TooLittle
-                } else if lower.contains("stf") || lower.contains("transfer") {
-                    RevertClass::TransferFailed
-                } else if lower.contains("insufficient") {
-                    RevertClass::InsufficientOutput
-                } else {
-                    RevertClass::Unknown
-                }
-            }
-            None => RevertClass::Unknown,
-        },
-    }
-}
-
-/// Human-readable explanation of executor revert data, e.g.
+/// Human-readable explanation of revert data, e.g.
 /// `leg 2 (V3 router 0x2626…) reverted: "Too little received"`.
 pub fn describe_revert(data: &[u8]) -> Option<String> {
-    use alloy::sol_types::SolError;
+    explain(data).1
+}
+
+/// `(class, sentence)` for any revert payload. Never loses the bytes: anything that
+/// doesn't decode (including a known selector with malformed arguments) falls back to hex.
+fn explain(data: &[u8]) -> (RevertClass, Option<String>) {
+    use alloy::sol_types::SolInterface;
     if data.is_empty() {
-        return None;
+        return (RevertClass::Unknown, None);
     }
-    if data.len() < 4 {
-        return Some(format!("0x{}", hex::encode(data)));
+    if let Ok(e) = Executor::ExecutorErrors::abi_decode(data) {
+        let (class, text) = explain_executor(e);
+        return (class, Some(text));
     }
-    let sel: [u8; 4] = data[..4].try_into().unwrap_or_default();
-    let d = match sel {
-        s if s == LegFailed::SELECTOR => {
-            let e = LegFailed::abi_decode(data).ok()?;
-            let why = if e.reason.is_empty() {
-                "reverted with no reason (no pool for this pair/fee tier, or wrong router type — check setRouter)"
-                    .to_string()
-            } else if let Some((name, meaning, _)) = router_error(&e.reason) {
-                format!("reverted: {name} ({meaning})")
+    let hex_text = format!("0x{}", hex::encode(data));
+    if data.len() >= 4 && Executor::ExecutorErrors::valid_selector(data[..4].try_into().unwrap_or_default()) {
+        return (RevertClass::Unknown, Some(format!("malformed executor error data {hex_text}")));
+    }
+    if let Some((name, meaning, class)) = explain_router(data) {
+        return (class, Some(format!("{name} ({meaning})")));
+    }
+    match decode_abi_revert(data) {
+        Some(msg) => (class_from_message(&msg), Some(format!("\"{msg}\""))),
+        None => (RevertClass::Unknown, Some(hex_text)),
+    }
+}
+
+fn explain_executor(e: Executor::ExecutorErrors) -> (RevertClass, String) {
+    use Executor::ExecutorErrors as X;
+    use RevertClass as C;
+    match e {
+        X::LegFailed(e) => {
+            let (class, why) = if e.reason.is_empty() {
+                (C::InvalidRoute,
+                 "reverted with no reason (no pool for this pair/fee tier, wrong router type — check setRouter — or out of gas)".to_string())
             } else {
-                format!("reverted: {}", describe_revert(&e.reason).unwrap_or_default())
+                let (inner, text) = explain(&e.reason);
+                (inner, format!("reverted: {}", text.unwrap_or_default()))
             };
-            format!("leg {} ({} router {}) {}", e.leg, router_type_name(e.rtype), e.router, why)
+            (class, format!("leg {} ({} router {}) {}", e.leg, router_type_name(e.rtype), e.router, why))
         }
-        s if s == NotProfitable::SELECTOR => {
-            let e = NotProfitable::abi_decode(data).ok()?;
-            format!("not profitable: balance {} → {}, needed +{}", e.balanceBefore, e.balanceAfter, e.minProfit)
-        }
-        s if s == DeadlineExpired::SELECTOR => {
-            let e = DeadlineExpired::abi_decode(data).ok()?;
-            format!("deadline {} passed (block time {})", e.deadline, e.currentTimestamp)
-        }
-        s if s == RouterNotAllowed::SELECTOR => {
-            format!("router {} is not whitelisted on the executor", RouterNotAllowed::abi_decode(data).ok()?.router)
-        }
-        s if s == UnsupportedRouterType::SELECTOR => {
-            let e = UnsupportedRouterType::abi_decode(data).ok()?;
-            format!("router {} has unsupported type {}", e.router, e.rtype)
-        }
-        s if s == InsufficientBalance::SELECTOR => {
-            let e = InsufficientBalance::abi_decode(data).ok()?;
-            format!("executor holds {} of token {} but the trade needs {}", e.balance, e.token, e.needed)
-        }
-        s if s == InvalidV3Fee::SELECTOR => {
-            let e = InvalidV3Fee::abi_decode(data).ok()?;
-            format!("leg {}: V3 router {} given fee 0", e.leg, e.router)
-        }
-        s if s == NoOutput::SELECTOR => {
-            let e = NoOutput::abi_decode(data).ok()?;
-            format!("leg {}: router {} delivered no output", e.leg, e.router)
-        }
-        s if s == InvalidPath::SELECTOR => "route repeats a token".to_string(),
-        s if s == ZeroAmount::SELECTOR => "amount is zero".to_string(),
-        s if s == ZeroAddress::SELECTOR => "zero address in route".to_string(),
-        s if s == EnforcedPause::SELECTOR => "executor is paused".to_string(),
-        s if s == OwnableUnauthorizedAccount::SELECTOR => {
-            format!("caller {} is not the executor owner", OwnableUnauthorizedAccount::abi_decode(data).ok()?.account)
-        }
-        s if s == SafeERC20FailedOperation::SELECTOR => {
-            format!("token {} rejected an approve/transfer", SafeERC20FailedOperation::abi_decode(data).ok()?.token)
-        }
-        s if s == InsufficientOutput::SELECTOR => {
-            let e = InsufficientOutput::abi_decode(data).ok()?;
-            format!("output {} below minimum {}", e.got, e.min)
-        }
-        s if s == PoolNotFound::SELECTOR => format!("pool not found ({})", PoolNotFound::abi_decode(data).ok()?.factory),
-        _ => match decode_abi_revert(data) {
-            Some(msg) => format!("\"{}\"", msg),
-            None => format!("0x{}", hex::encode(data)),
-        },
-    };
-    Some(d)
+        X::NotProfitable(e) => (C::NotProfitable,
+            format!("not profitable: balance {} → {}, needed +{}", e.balanceBefore, e.balanceAfter, e.minProfit)),
+        X::DeadlineExpired(e) => (C::DeadlineExpired,
+            format!("deadline {} passed (block time {})", e.deadline, e.currentTimestamp)),
+        X::RouterNotAllowed(e) => (C::RouterNotAllowed,
+            format!("router {} is not whitelisted on the executor", e.router)),
+        X::UnsupportedRouterType(e) => (C::InvalidRoute,
+            format!("router {} has unsupported type {}", e.router, e.rtype)),
+        X::InsufficientBalance(e) => (C::InsufficientBalance,
+            format!("executor holds {} of token {} but the trade needs {}", e.balance, e.token, e.needed)),
+        X::InvalidV3Fee(e) => (C::InvalidRoute,
+            format!("leg {}: fee {} is not a V3 fee tier (router {})", e.leg, e.fee, e.router)),
+        X::NoOutput(e) => (C::NoOutput, format!("leg {}: router {} delivered no output", e.leg, e.router)),
+        X::NotAContract(e) => (C::InvalidRoute, format!("{} has no code — not a router", e.router)),
+        X::LegOutOfGas(e) => (C::OutOfGas,
+            format!("leg {}: router {} ran out of gas — raise the tx gas limit", e.leg, e.router)),
+        X::InvalidPath(_) => (C::InvalidRoute, "route repeats a token".to_string()),
+        X::ZeroAmount(_) => (C::InvalidRoute, "amount is zero".to_string()),
+        X::ZeroAddress(_) => (C::InvalidRoute, "zero address in route".to_string()),
+        X::RenounceDisabled(_) => (C::Blocked, "renounceOwnership is disabled".to_string()),
+        X::EnforcedPause(_) => (C::Blocked, "executor is paused".to_string()),
+        X::OwnableUnauthorizedAccount(e) => (C::Blocked,
+            format!("caller {} is not the executor owner", e.account)),
+        X::SafeERC20FailedOperation(e) => (C::TransferFailed,
+            format!("token {} rejected an approve/transfer", e.token)),
+        X::TransferFailed(_) => (C::TransferFailed, "ETH transfer failed".to_string()),
+        X::InsufficientOutput(e) => (C::InsufficientOutput, format!("output {} below minimum {}", e.got, e.min)),
+        X::PoolNotFound(e) => (C::PoolNotFound, format!("pool not found ({})", e.factory)),
+    }
+}
+
+/// `(error name, what it means, class)` for a router's own custom error.
+fn explain_router(data: &[u8]) -> Option<(&'static str, &'static str, RevertClass)> {
+    use alloy::sol_types::SolInterface;
+    use Router::RouterErrors as R;
+    use RevertClass as C;
+    Some(match R::abi_decode(data).ok()? {
+        R::InsufficientOutputAmount(_) =>
+            ("InsufficientOutputAmount()", "output below the leg minimum — price moved", C::InsufficientOutput),
+        R::Expired(_) => ("Expired()", "router deadline passed", C::DeadlineExpired),
+        R::PoolDoesNotExist(_) => ("PoolDoesNotExist()", "no pool for this pair/stable flag", C::PoolNotFound),
+        R::InsufficientLiquidity(_) => ("InsufficientLiquidity()", "pool has too little liquidity", C::PoolNotFound),
+        R::K(_) => ("K()", "pool invariant check failed (fee-on-transfer token?)", C::Unknown),
+        R::InsufficientInputAmount(_) => ("InsufficientInputAmount()", "pool received no input", C::TransferFailed),
+        R::InvalidPath(_) => ("InvalidPath()", "router rejected the route", C::InvalidRoute),
+        R::SameAddresses(_) => ("SameAddresses()", "router rejected the route", C::InvalidRoute),
+        R::ZeroAddress(_) => ("ZeroAddress()", "router rejected the route", C::InvalidRoute),
+    })
+}
+
+/// Class for a plain `Error(string)` revert (pre-v3 executors bubbled router strings).
+fn class_from_message(msg: &str) -> RevertClass {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("too little received") {
+        RevertClass::V3TooLittle
+    } else if lower.contains("stf") || lower.contains("transfer") {
+        RevertClass::TransferFailed
+    } else if lower.contains("insufficient") {
+        RevertClass::InsufficientOutput
+    } else {
+        RevertClass::Unknown
+    }
 }
 
 /// Best-effort decode of standard `Error(string)` and Solidity panic selectors.
@@ -305,89 +277,104 @@ fn spelunk_revert_hex_in_json(raw: &str) -> Option<Vec<u8>> {
     walk(&v)
 }
 
+/// Revert data carried by a JSON-RPC error — only when the error *is* an execution revert
+/// (code 3 or "revert" in the message). Other errors (rate limits, timeouts) may carry
+/// unrelated hex such as request ids, which must not be decoded as a revert.
 fn revert_bytes_from_transport(e: &TransportError) -> Option<Vec<u8>> {
     let payload = e.as_error_resp()?;
-    let mut rd_opt = payload.as_revert_data();
-    if rd_opt.is_none() {
-        if let Some(raw) = payload.data.as_ref() {
-            if let Some(b) = spelunk_revert_hex_in_json(raw.get()) {
-                rd_opt = Some(Bytes::from(b));
-            }
-        }
+    if payload.code != 3 && !payload.message.to_ascii_lowercase().contains("revert") {
+        return None;
     }
-    rd_opt.map(|b| b.to_vec())
+    if let Some(b) = payload.as_revert_data() {
+        return Some(b.to_vec());
+    }
+    let raw = payload.data.as_ref()?.get();
+    spelunk_revert_hex_in_json(raw).or_else(|| {
+        let s = raw.trim().trim_matches('"');
+        let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+        hex::decode(h).ok().filter(|b| !b.is_empty())
+    })
 }
 
-/// Replay a mined transaction at its inclusion block to recover revert data.
+/// A revert that used this share of its gas limit ran out of gas: the contract had too
+/// little left to say so itself (see `LegOutOfGas` in ArbitrageExecutor.sol).
+const OUT_OF_GAS_USED_PCT: u64 = 97;
+
+/// Replay a mined transaction to recover revert data. Without revert bytes the class is
+/// `Unavailable` — no guessing from the route's shape (executor v3 can no longer fail with
+/// "Too little received") — unless the receipt shows the gas limit was exhausted.
 pub async fn diagnose_mined_revert<P: Provider>(
     provider: &P,
     tx_hash: &B256,
     block_number: Option<u64>,
-    sell_leg_is_v3: bool,
+    gas_used: u64,
 ) -> RevertDiagnosis {
     let _ = block_number;
-    if let Ok(Some(tx)) = provider.get_transaction_by_hash(*tx_hash).await {
-        let inner = &tx.inner;
-        let mut req = TransactionRequest::default()
-            .from(tx.from())
-            .input(inner.input().clone().into())
-            .value(inner.value());
-        if let Some(to) = inner.to() {
-            req.to = Some(to.into());
-        }
-        req.gas = Some(inner.gas_limit());
+    let Ok(Some(tx)) = provider.get_transaction_by_hash(*tx_hash).await else {
+        return RevertDiagnosis { class: RevertClass::Unavailable, detail: None };
+    };
+    let diagnosis = replay_revert(provider, &tx).await;
+    out_of_gas_override(diagnosis, gas_used, tx.inner.gas_limit())
+}
 
-        match provider.call(req).await {
-            Ok(_) => {
-                debug!("replay eth_call succeeded for reverted tx — unexpected");
-            }
-            Err(e) => {
-                if let Some(bytes) = revert_bytes_from_transport(&e) {
-                    return classify_revert_bytes(&bytes);
-                }
-                return RevertDiagnosis {
-                    class: if sell_leg_is_v3 {
-                        RevertClass::V3TooLittleLikely
-                    } else {
-                        RevertClass::Unavailable
-                    },
-                    detail: Some(e.to_string()),
-                };
-            }
-        }
+/// Reclassify as `OutOfGas` when the receipt used ≥97% of the limit and the replay found
+/// nothing more specific (no data, or an empty-reason leg failure).
+fn out_of_gas_override(d: RevertDiagnosis, gas_used: u64, gas_limit: u64) -> RevertDiagnosis {
+    let exhausted = gas_limit > 0 && gas_used.saturating_mul(100) >= gas_limit.saturating_mul(OUT_OF_GAS_USED_PCT);
+    let vague = matches!(d.class, RevertClass::Unavailable | RevertClass::Unknown | RevertClass::InvalidRoute | RevertClass::OutOfGas);
+    if !exhausted || !vague {
+        return d;
     }
-
-    if sell_leg_is_v3 {
-        RevertDiagnosis {
-            class: RevertClass::V3TooLittleLikely,
-            detail: None,
-        }
-    } else {
-        RevertDiagnosis {
-            class: RevertClass::Unavailable,
-            detail: None,
-        }
+    RevertDiagnosis {
+        class: RevertClass::OutOfGas,
+        detail: Some(format!(
+            "ran out of gas: used {gas_used} of {gas_limit} — raise tuning.gas_limit_2hop / gas_limit_triangular{}",
+            d.detail.map(|x| format!(" (replay: {x})")).unwrap_or_default()
+        )),
     }
 }
 
-/// Format JSON-RPC failures from `eth_call`, including revert hex when the node returns it.
-pub fn format_eth_call_transport_error(e: &TransportError) -> String {
-    let Some(payload) = e.as_error_resp() else { return e.to_string() };
-    let revert = payload.as_revert_data().map(|b| b.to_vec()).or_else(|| {
-        let raw = payload.data.as_ref()?;
-        spelunk_revert_hex_in_json(raw.get()).or_else(|| {
-            let s = raw.get().trim().trim_matches('"');
-            let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
-            hex::decode(h).ok().filter(|b| !b.is_empty())
-        })
-    });
-    match revert {
-        // Decoded reason first: it is the part a human needs, and the transport text
-        // only repeats the raw bytes (which follow for grep/replay).
-        Some(rd) => match describe_revert(&rd) {
-            Some(desc) => format!("{desc} | revert_data=0x{}", hex::encode(&rd)),
-            None => format!("{e} | revert_data=0x{}", hex::encode(&rd)),
+/// Re-run the mined tx as an `eth_call` (same sender, calldata, value and gas limit).
+async fn replay_revert<P: Provider>(
+    provider: &P,
+    tx: &<alloy::network::Ethereum as alloy::network::Network>::TransactionResponse,
+) -> RevertDiagnosis {
+    let inner = &tx.inner;
+    let mut req = TransactionRequest::default()
+        .from(tx.from())
+        .input(inner.input().clone().into())
+        .value(inner.value());
+    if let Some(to) = inner.to() {
+        req.to = Some(to.into());
+    }
+    req.gas = Some(inner.gas_limit());
+    match provider.call(req).await {
+        Ok(_) => {
+            debug!("replay eth_call succeeded for reverted tx — unexpected");
+            RevertDiagnosis { class: RevertClass::Unavailable, detail: None }
+        }
+        Err(e) => match revert_bytes_from_transport(&e) {
+            Some(bytes) => classify_revert_bytes(&bytes),
+            None => RevertDiagnosis { class: RevertClass::Unavailable, detail: Some(e.to_string()) },
         },
+    }
+}
+
+/// Marker every decoded revert carries in [`format_eth_call_transport_error`]'s output;
+/// `util::classify_rpc_failure` uses it to never read a revert as an RPC-health problem
+/// (e.g. "needed +429" as HTTP 429).
+pub const REVERT_MARKER: &str = "execution reverted";
+
+/// Format `eth_call` failures. A revert reads `execution reverted: <decoded reason> |
+/// revert_data=0x…` (reason first — the part a human needs; the node text only repeats the
+/// bytes). Anything else keeps the node's own text (rate limit, timeout, …).
+pub fn format_eth_call_transport_error(e: &TransportError) -> String {
+    match revert_bytes_from_transport(e) {
+        Some(rd) => format!(
+            "{REVERT_MARKER}: {} | revert_data=0x{}",
+            describe_revert(&rd).unwrap_or_else(|| "no data".into()),
+            hex::encode(&rd)
+        ),
         None => e.to_string(),
     }
 }
@@ -400,14 +387,10 @@ pub fn router_type_label(t: &crate::config::RouterType) -> &'static str {
     }
 }
 
-/// Final leg router type for triangular (C→A sell-back).
-pub fn triangular_sell_leg_is_v3(opp: &crate::strategy::TriangularOpportunity) -> bool {
-    matches!(opp.router_ca_type, crate::config::RouterType::V3)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::Executor::*;
     use alloy::primitives::{address, Bytes, U256};
     use alloy::sol_types::SolError;
 
@@ -431,7 +414,43 @@ mod tests {
     fn leg_failed_without_reason_hints_at_router_type() {
         let data = LegFailed { leg: 1, router: Default::default(), rtype: 0, reason: Bytes::new() }.abi_encode();
         let d = classify_revert_bytes(&data);
+        assert_eq!(d.class, RevertClass::InvalidRoute, "a config problem, not 'unknown'");
         assert!(d.detail.unwrap().contains("check setRouter"));
+    }
+
+    #[test]
+    fn out_of_gas_and_bad_fee_are_named() {
+        let router = address!("2626664c2603336E57B271c5C0b26F421741e481");
+        let d = classify_revert_bytes(&LegOutOfGas { leg: 2, router }.abi_encode());
+        assert_eq!(d.class, RevertClass::OutOfGas);
+        assert!(d.detail.unwrap().contains("raise the tx gas limit"));
+        let fee = alloy::primitives::Uint::<24, 1>::from(30u32);
+        let d = classify_revert_bytes(&InvalidV3Fee { leg: 1, router, fee }.abi_encode());
+        assert_eq!(d.class, RevertClass::InvalidRoute);
+        assert!(d.detail.unwrap().contains("fee 30 is not a V3 fee tier"));
+    }
+
+    #[test]
+    fn exhausted_gas_limit_reads_as_out_of_gas() {
+        let vague = RevertDiagnosis { class: RevertClass::Unavailable, detail: None };
+        let d = out_of_gas_override(vague.clone(), 699_000, 700_000);
+        assert_eq!(d.class, RevertClass::OutOfGas);
+        assert!(d.detail.unwrap().contains("used 699000 of 700000"));
+        // Plenty of gas left → keep the replay's answer.
+        assert_eq!(out_of_gas_override(vague, 300_000, 700_000).class, RevertClass::Unavailable);
+        // A specific contract error wins even near the limit.
+        let specific = RevertDiagnosis { class: RevertClass::NotProfitable, detail: None };
+        assert_eq!(out_of_gas_override(specific, 699_000, 700_000).class, RevertClass::NotProfitable);
+    }
+
+    #[test]
+    fn malformed_known_error_keeps_the_bytes() {
+        // LegFailed selector with truncated arguments: never drop the detail.
+        let mut data = LegFailed { leg: 1, router: Default::default(), rtype: 0, reason: Bytes::new() }.abi_encode();
+        data.truncate(40);
+        let d = classify_revert_bytes(&data);
+        assert_eq!(d.class, RevertClass::Unknown);
+        assert!(d.detail.unwrap().starts_with("malformed executor error data 0x"));
     }
 
     #[test]

@@ -341,10 +341,15 @@ pub struct Tuning {
     pub gas_limit_2hop: u64,
     /// Gas limit for a triangular (3-hop) arb tx.
     pub gas_limit_triangular: u64,
-    /// Bps shaved off the gas-derived minProfit before encoding (slack on the on-chain floor).
-    pub router_min_out_slack_bps: u64,
-    /// Final multiplier (bps of 10_000) on the gas-floor minProfit sent on-chain.
-    pub sell_leg_minprofit_mul_bps: u64,
+    /// On-chain `minProfit` as bps of the gas-cost floor (6076 = 60.76%). The contract
+    /// reverts `NotProfitable` below `amountIn + minProfit`; < 10000 leaves room for
+    /// same-block drift, with the off-chain net-profit check as the economic guard.
+    pub onchain_min_profit_bps: u64,
+    /// Removed knobs, kept only to fail with a migration hint instead of "unknown field".
+    #[serde(rename = "router_min_out_slack_bps")]
+    pub legacy_router_min_out_slack_bps: Option<u64>,
+    #[serde(rename = "sell_leg_minprofit_mul_bps")]
+    pub legacy_sell_leg_minprofit_mul_bps: Option<u64>,
     /// Margin (bps) on the last known gas price when a fetch fails.
     pub gas_fallback_margin_bps: u64,
     /// Max age of the last known gas price to reuse it (ms).
@@ -441,8 +446,9 @@ impl Default for Tuning {
         Self {
             gas_limit_2hop: 700_000,
             gas_limit_triangular: 900_000,
-            router_min_out_slack_bps: 200,
-            sell_leg_minprofit_mul_bps: 6200,
+            onchain_min_profit_bps: 6076, // = the former 98% slack × 62% multiplier
+            legacy_router_min_out_slack_bps: None,
+            legacy_sell_leg_minprofit_mul_bps: None,
             gas_fallback_margin_bps: 2_500,
             gas_fallback_max_age_ms: 120_000,
             quoter_haircut_bps: 15,
@@ -527,8 +533,14 @@ impl Tuning {
         if self.health_hold_max_ms < self.health_hold_base_ms {
             return Err(anyhow!("tuning.health_hold_max_ms must be >= health_hold_base_ms"));
         }
-        if self.sell_leg_minprofit_mul_bps > 10_000 || self.router_min_out_slack_bps > 10_000 {
-            return Err(anyhow!("tuning: *_bps multipliers must be <= 10000"));
+        if self.legacy_router_min_out_slack_bps.is_some() || self.legacy_sell_leg_minprofit_mul_bps.is_some() {
+            return Err(anyhow!(
+                "tuning.router_min_out_slack_bps / sell_leg_minprofit_mul_bps were merged into \
+                 tuning.onchain_min_profit_bps = (10000 - slack) × mul / 10000 (old defaults → 6076)"
+            ));
+        }
+        if self.onchain_min_profit_bps > 10_000 {
+            return Err(anyhow!("tuning.onchain_min_profit_bps must be <= 10000"));
         }
         Ok(())
     }
@@ -618,6 +630,15 @@ routers: []
         assert_eq!(t.quote_cache_max_age(), std::time::Duration::from_secs(6));
         assert_eq!(t.health_monitor_every(), std::time::Duration::from_secs(2));
         assert_eq!(t.phantom_cap_bps, 500);
+    }
+
+    #[test]
+    fn removed_min_profit_knobs_fail_with_migration_hint() {
+        let err = parse_config(&format!("{MIN}tuning:\n  router_min_out_slack_bps: 200\n")).unwrap_err().to_string();
+        assert!(err.contains("onchain_min_profit_bps"), "{err}");
+        let cfg = parse_config(&format!("{MIN}tuning:\n  onchain_min_profit_bps: 7000\n")).unwrap();
+        assert_eq!(cfg.tuning.onchain_min_profit_bps, 7000);
+        assert_eq!(Tuning::default().onchain_min_profit_bps, 6076, "old 98% × 62%");
     }
 
     #[test]

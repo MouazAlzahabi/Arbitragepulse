@@ -22,6 +22,15 @@ function normalizeWsUrl(stored, sameOriginDefault) {
   return d;
 }
 
+/** Log entries with `_id` > `lastId`, oldest first. Ids increase strictly (see useWebSocket),
+ *  so this walks back from the end and stops — O(new entries), not O(buffer). */
+const entriesSince = (logs, lastId) => {
+  let i = logs.length;
+  while (i > 0 && logs[i - 1]._id > lastId) i--;
+  return logs.slice(i);
+};
+const newestId = (logs) => logs.length ? logs[logs.length - 1]._id : 0;
+
 /** ws(s)://host/ws → http(s)://host — swaps the scheme and strips only the trailing /ws path. */
 const wsToHttpBase = (u) => u.replace(/^ws(s?):\/\//i, "http$1://").replace(/\/ws\/?(\?.*)?$/, "");
 /** ws(s)://host/ws → host, for display. */
@@ -41,7 +50,6 @@ function useWebSocket(url, apiKey, httpBaseUrl, enabled) {
   const [logs, setLogs] = useState(() => {
     try { return JSON.parse(localStorage.getItem("ap_logs") || "[]"); } catch { return []; }
   });
-  const [stats, setStats] = useState(null);
   const [engineState, setEngineState] = useState(null);
   const [authError, setAuthError] = useState(false);
   const wsRef = useRef(null);
@@ -50,6 +58,8 @@ function useWebSocket(url, apiKey, httpBaseUrl, enabled) {
   const mountedRef = useRef(true);
   const logPersistRef = useRef(null);
   const attempts = useRef(0);
+  const lastIdRef = useRef(null);
+  if (lastIdRef.current === null) lastIdRef.current = logs.reduce((m, l) => Math.max(m, l._id || 0), 0);
   // Logged out → no connect, no reconnect, no visibility-triggered reconnect.
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
@@ -85,7 +95,6 @@ function useWebSocket(url, apiKey, httpBaseUrl, enabled) {
       if (!r.ok) return;
       const d = await r.json();
       setEngineState({ dryRun: d.dry_run, paused: d.paused });
-      setStats(d);
     } catch {}
   }, [httpBaseUrl, apiKey]);
 
@@ -131,9 +140,12 @@ function useWebSocket(url, apiKey, httpBaseUrl, enabled) {
           const d = JSON.parse(e.data);
           if (d.type === "pong") return;
           if (d.type === "state") { setEngineState(d.data); return; }
-          if (d.data?.stats) setStats(d.data.stats || d.data);
-          // Normalize: Rust engine sends `level`, TS engine sends `type`
-          const entry = { ...d, type: d.type || d.level, _id: Date.now() + Math.random() };
+          // Normalize: Rust engine sends `level`, TS engine sends `type`.
+          // _id strictly increases (µs clock, bumped on ties) so consumers can track
+          // "everything after id X" instead of indexing into the capped buffer.
+          const id = Math.max(Date.now() * 1000, lastIdRef.current + 1);
+          lastIdRef.current = id;
+          const entry = { ...d, type: d.type || d.level, _id: id };
           setLogs((p) => {
             const next = [...p.slice(-499), entry];
             persistLogs(next);
@@ -206,7 +218,8 @@ function useWebSocket(url, apiKey, httpBaseUrl, enabled) {
   }, [connect, enabled]);
 
   return {
-    status, logs, stats, engineState, authError, send,
+    status, logs, engineState, authError, send,
+    resetState: () => setEngineState(null),
     clearLogs: () => { clearTimeout(logPersistRef.current); setLogs([]); try { localStorage.removeItem("ap_logs"); } catch {} },
     reconnect: () => { attempts.current = 0; connect(); },
     refreshState: () => void hydrateFromHttp(),
@@ -361,20 +374,21 @@ function Header({ tab, setTab, status, engineUrl, apiKey, onLogout }) {
   );
 }
 
-function StatsRow({ stats, logs, engineState, apiStats }) {
+function StatsRow({ logs, engineState, apiStats }) {
   // Use HTTP-polled apiStats as the source of truth for counts — WS log counting
   // is unreliable: the Rust engine emits level="info" (not type="trade"), and the
   // log buffer is capped at 500 entries so counts freeze after ~250 arbs.
   const allChains = apiStats?.chains || [];
-  const trades  = allChains.length > 0
-                  ? allChains.reduce((s, c) => s + (c.total_success || 0), 0)
-                  : logs.filter((l) => l.type === "trade").length;
-  const attempts = allChains.reduce((s, c) => s + (c.total_attempts || 0), 0);
+  const sum = (k) => allChains.reduce((s, c) => s + (c[k] || 0), 0);
+  const trades = allChains.length > 0 ? sum("total_success") : logs.filter((l) => l.type === "trade").length;
+  // Dry-run: simulations that passed count as attempts but are never sent — not errors.
+  const sims = sum("total_dry_run_ok");
+  const attempts = sum("total_attempts");
   // opportunities = every execution attempt that passed the gas-profit check
   const opps   = allChains.length > 0 ? attempts
                   : logs.filter((l) => l.type === "opportunity").length;
-  // errors = attempts that did NOT succeed (sim failures, gas check failures, reverts)
-  const errors = allChains.length > 0 ? (attempts - trades)
+  // errors = attempts that neither confirmed nor passed a dry-run simulation
+  const errors = allChains.length > 0 ? Math.max(0, attempts - trades - sims)
                   : logs.filter((l) => l.type === "error").length;
   const uptime = apiStats?.uptime_seconds != null ? formatUptime(apiStats.uptime_seconds * 1000) : "—";
   const dryRun = apiStats?.dry_run ?? engineState?.dryRun ?? true;
@@ -385,7 +399,7 @@ function StatsRow({ stats, logs, engineState, apiStats }) {
     { l: "UPTIME", v: uptime, c: "#94a3b8" },
     { l: "CHAIN", v: allChains[0]?.chain_name ?? "—", c: "#a78bfa" },
     { l: "OPPORTUNITIES", v: opps, c: "#818cf8" },
-    { l: "TRADES", v: trades, c: "#34d399" },
+    { l: "TRADES", v: sims > 0 ? `${trades} (+${sims} sim)` : trades, c: "#34d399", title: "Confirmed on-chain (+ dry-run simulations that passed)" },
     { l: "ERRORS", v: errors, c: errors > 0 ? "#f87171" : "#334155" },
     { l: "GHOST PROFIT", v: `$${ghostProfit.toFixed(2)}`, c: "#64748b", title: "Sum of gross profit from trades rejected due to gas cost" },
     { l: "MODE", v: paused ? "⏸ PAUSED" : dryRun ? "DRY RUN" : "⚡ LIVE", c: paused ? "#f87171" : dryRun ? "#fbbf24" : "#ef4444" },
@@ -467,14 +481,24 @@ function ProfitChart({ fetchTrades, wsLogs }) {
   const [series, setSeries] = useState([{ time: "start", profit: 0 }]);
   const [total, setTotal] = useState(0);
   const loadedRef = useRef(false);
-  // Ids of trade entries already counted. Seeded with the buffer at mount: those trades
-  // (persisted from an earlier session) are already in the DB history loaded below.
-  // Tracking ids, not an index, keeps working once the 500-entry buffer starts rolling
-  // or is cleared.
-  const seenRef = useRef(null);
-  if (seenRef.current === null) seenRef.current = new Set(wsLogs.map((l) => l._id));
+  // Entries up to this id are already accounted for. Seeded with the buffer at mount: those
+  // trades (persisted from an earlier session) are in the DB history loaded below.
+  const lastIdRef = useRef(null);
+  if (lastIdRef.current === null) lastIdRef.current = newestId(wsLogs);
+  // Live trades seen since mount, and the DB history's tx hashes: whichever arrives second
+  // merges with the other, so a trade is neither dropped nor counted twice.
+  const liveRef = useRef([]);
+  const dbHashesRef = useRef(null);
 
-  // Load historical trades from DB on mount (survives restarts)
+  const pointsFrom = (base, trades) => {
+    let cum = base;
+    return trades.map((t) => {
+      cum += t.profit;
+      return { time: ts(t.ts * 1000), profit: parseFloat(cum.toFixed(4)) };
+    });
+  };
+
+  // Load the last 24h of trades from the DB on mount (survives restarts)
   useEffect(() => {
     if (loadedRef.current || !fetchTrades) return;
     loadedRef.current = true;
@@ -483,36 +507,32 @@ function ProfitChart({ fetchTrades, wsLogs }) {
       const cutoff = Date.now() / 1000 - 86400;
       const recent = d.trades
         .filter((t) => t.ts >= cutoff && t.success && !t.dry_run)
-        .sort((a, b) => a.ts - b.ts);
-      let cum = 0;
-      const pts = [{ time: "start", profit: 0 }];
-      recent.forEach((t) => {
-        cum += t.profit_usd;
-        pts.push({ time: ts(t.ts * 1000), profit: parseFloat(cum.toFixed(4)) });
-      });
+        .sort((a, b) => a.ts - b.ts)
+        .map((t) => ({ ts: t.ts, profit: t.profit_usd, hash: t.tx_hash }));
+      const hashes = new Set(recent.map((t) => t.hash));
+      dbHashesRef.current = hashes;
+      const merged = [...recent, ...liveRef.current.filter((t) => !hashes.has(t.hash))];
+      const pts = [{ time: "start", profit: 0 }, ...pointsFrom(0, merged)];
       setSeries(pts);
-      setTotal(parseFloat(cum.toFixed(4)));
+      setTotal(pts[pts.length - 1].profit);
     });
   }, [fetchTrades]);
 
-  // Append new live WS trades
+  // Append new live WS trades (real, successful — the same filter as the DB history)
   useEffect(() => {
-    // Same filter as the DB history: real (not dry-run) successful trades.
-    const liveTrades = wsLogs.filter((l) => l.type === "trade" && l.data?.profit_usd != null && !l.data?.dry_run && !l._historical);
-    const seen = seenRef.current;
-    const newTrades = liveTrades.filter((l) => !seen.has(l._id));
-    // Keep only ids still in the buffer so the set stays bounded.
-    seenRef.current = new Set(wsLogs.map((l) => l._id));
-    if (newTrades.length === 0) return;
+    const fresh = entriesSince(wsLogs, lastIdRef.current);
+    if (fresh.length === 0) return;
+    lastIdRef.current = newestId(wsLogs);
+    const db = dbHashesRef.current;
+    const trades = fresh
+      .filter((l) => l.type === "trade" && l.data?.profit_usd != null && !l.data?.dry_run)
+      .map((l) => ({ ts: l.timestamp, profit: parseFloat(l.data.profit_usd || 0), hash: l.data.tx_hash }))
+      .filter((t) => !db || !db.has(t.hash));
+    if (trades.length === 0) return;
+    liveRef.current = [...liveRef.current, ...trades].slice(-2000);
     setSeries((prev) => {
-      const last = prev[prev.length - 1] || { profit: 0 };
-      let cum = last.profit;
-      const pts = [...prev];
-      newTrades.forEach((l) => {
-        cum += parseFloat(l.data.profit_usd || 0);
-        pts.push({ time: ts(l.timestamp * 1000), profit: parseFloat(cum.toFixed(4)) });
-      });
-      setTotal(parseFloat(cum.toFixed(4)));
+      const pts = [...prev, ...pointsFrom(prev[prev.length - 1]?.profit || 0, trades)];
+      setTotal(pts[pts.length - 1].profit);
       return pts;
     });
   }, [wsLogs]);
@@ -738,25 +758,14 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes, wsStatus }) {
   );
 }
 
-function ControlPanel({ ws, api, apiStats, clearAll, onDbReset }) {
+function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoundOn }) {
   const [confirmLive, setConfirmLive] = useState(false);
   const dryRun = apiStats?.dry_run ?? true;
   const paused = apiStats?.paused ?? false;
-  const [soundOn, setSoundOn] = useState(true);
   const [confirmRestart, setConfirmRestart] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [confirmDbReset, setConfirmDbReset] = useState(false);
   const [dbResetting, setDbResetting] = useState(false);
-
-  // Sound on trade — keyed on the newest entry's id: the buffer length stops changing
-  // once it reaches its 500-entry cap.
-  const lastBeepIdRef = useRef(ws.logs[ws.logs.length - 1]?._id);
-  const newestLog = ws.logs[ws.logs.length - 1];
-  useEffect(() => {
-    if (!newestLog || newestLog._id === lastBeepIdRef.current) return;
-    lastBeepIdRef.current = newestLog._id;
-    if (soundOn && newestLog.type === "trade") playBeep();
-  }, [newestLog?._id, soundOn]);
 
   const handleGoLive = async () => {
     if (!confirmLive) { setConfirmLive(true); return; }
@@ -1017,7 +1026,7 @@ function PairManager({ api }) {
               color: activeChain === cid ? "#a78bfa" : "#475569",
               border: `1px solid ${activeChain === cid ? "#4c1d95" : "#1e293b"}` }}
           >
-            {api.chainNames[cid] ?? `Chain ${cid}`}
+            {api.chainNames[cid]}
           </button>
         ))}
         <span style={{ flex: 1 }} />
@@ -1104,8 +1113,10 @@ export default function Dashboard() {
   const [statsPollError, setStatsPollError] = useState(null);
   /** True when /stats returns 401 — same as bad WS auth but easy to miss in the UI. */
   const [statsAuthFailed, setStatsAuthFailed] = useState(false);
+  // Logged out (even with a stored session) → no polling at all.
+  const active = authenticated && !loggedOut;
   useEffect(() => {
-    if (!authenticated) return;
+    if (!active) return;
     const poll = async () => {
       const t0 = Date.now();
       const d = await api.fetchStats();
@@ -1126,7 +1137,7 @@ export default function Dashboard() {
     poll();
     const iv = setInterval(poll, 3000);
     return () => clearInterval(iv);
-  }, [authenticated, api.fetchStats]);
+  }, [active, api.fetchStats]);
 
   // Poll /stats/pairs every 5s for the pair leaderboard.
   // pairStatsCleared: when true, show empty until user clicks Reload.
@@ -1135,7 +1146,7 @@ export default function Dashboard() {
   const [pairStatsCleared, setPairStatsCleared] = useState(false);
   const pairStats = pairStatsCleared ? [] : pairStatsLive;
   useEffect(() => {
-    if (!authenticated) return;
+    if (!active) return;
     const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
     const poll = async () => {
       try {
@@ -1146,7 +1157,7 @@ export default function Dashboard() {
     poll();
     const iv = setInterval(poll, 5000);
     return () => clearInterval(iv);
-  }, [authenticated, apiUrl, apiKey]);
+  }, [active, apiUrl, apiKey]);
 
   // Clear all monitoring state for fresh tracking (logs + leaderboard display).
   // apiStats is intentionally kept live — it holds engine state (pause/dry_run/base_fee).
@@ -1155,10 +1166,36 @@ export default function Dashboard() {
     setPairStatsCleared(true);
   };
 
-  useEffect(() => { if (ws.status === "connected") setAuthenticated(true); }, [ws.status]);
+  // Trade beep — here, not in ControlPanel, so it works on every tab. Walks every entry
+  // since the last check: a trade followed by another message in one render still beeps.
+  const [soundOn, setSoundOn] = useState(() => localStorage.getItem("ap_sound") !== "0");
+  useEffect(() => { try { localStorage.setItem("ap_sound", soundOn ? "1" : "0"); } catch {} }, [soundOn]);
+  const beepIdRef = useRef(null);
+  if (beepIdRef.current === null) beepIdRef.current = newestId(ws.logs);
+  useEffect(() => {
+    const fresh = entriesSince(ws.logs, beepIdRef.current);
+    if (fresh.length === 0) return;
+    beepIdRef.current = newestId(ws.logs);
+    if (soundOn && fresh.some((l) => l.type === "trade")) playBeep();
+  }, [ws.logs, soundOn]);
+
+  useEffect(() => {
+    if (ws.status !== "connected") return;
+    setAuthenticated(true);
+    // Logs belong to one engine: drop them when this session connects to a different one.
+    try {
+      const prev = localStorage.getItem("ap_last_engine");
+      if (prev && prev !== url) ws.clearLogs();
+      localStorage.setItem("ap_last_engine", url);
+    } catch {}
+  }, [ws.status]);
 
   const handleConnect = () => { setStatsAuthFailed(false); setLoggedOut(false); setAuthenticated(true); };
-  const handleLogout = () => { setLoggedOut(true); setStatsAuthFailed(false); setAuthenticated(false); };
+  const handleLogout = () => {
+    setLoggedOut(true); setStatsAuthFailed(false); setAuthenticated(false);
+    // Nothing from this engine may show when connecting to the next one.
+    setApiStats(null); setApiLatency(null); setStatsPollError(null); setPairStatsLive([]); ws.resetState();
+  };
 
   if (!authenticated || loggedOut || ws.authError || statsAuthFailed) {
     return (
@@ -1180,7 +1217,7 @@ export default function Dashboard() {
       `}</style>
 
       <Header tab={tab} setTab={setTab} status={ws.status} engineUrl={url} apiKey={apiKey} onLogout={handleLogout} />
-      <StatsRow stats={ws.stats} logs={ws.logs} engineState={ws.engineState} apiStats={apiStats} />
+      <StatsRow logs={ws.logs} engineState={ws.engineState} apiStats={apiStats} />
       <GasLatencyBar apiStats={apiStats} apiLatency={apiLatency} statsPollError={statsPollError} />
 
       {tab === "monitor" && (
@@ -1217,7 +1254,7 @@ export default function Dashboard() {
       )}
 
       {tab === "tokens" && <div style={{ flex: 1, overflow: "auto" }}><PairManager api={api} /></div>}
-      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} onDbReset={() => setApiStats(prev => prev ? { ...prev, chains: prev.chains?.map(c => ({ ...c, total_attempts: 0, total_success: 0, total_failed: 0, total_profit_usd: 0, ghost_profit_usd: 0, total_scans: 0 })) } : null)} /></div>}
+      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} soundOn={soundOn} setSoundOn={setSoundOn} onDbReset={() => setApiStats(prev => prev ? { ...prev, chains: prev.chains?.map(c => ({ ...c, total_attempts: 0, total_success: 0, total_failed: 0, total_dry_run_ok: 0, total_profit_usd: 0, ghost_profit_usd: 0, total_scans: 0 })) } : null)} /></div>}
     </div>
   );
 }

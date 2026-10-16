@@ -116,6 +116,9 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     event RouterApproved(address indexed router, bool approved);
     event RouterTypeSet(address indexed router, RouterType rtype);
     event ApprovalRevoked(address indexed token, address indexed spender);
+    /// @notice A leftover allowance could not be cleared (token rejects approve(0) and
+    ///         approve(1)); `revokeApproval` it once the token allows.
+    event AllowanceNotCleared(address indexed token, address indexed spender, uint256 remaining);
 
     // ─── Errors ───────────────────────────────────────────────
 
@@ -133,18 +136,29 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice The same token appears twice in the route.
     error InvalidPath();
     /// @notice A V3 leg was given fee 0 — no such pool; the fee tier is required.
-    error InvalidV3Fee(uint8 leg, address router);
+    /// @notice A V3 leg's fee is not a pool fee tier (hundredths of a bip, 100..999999 —
+    ///         e.g. 30 passed as bps instead of 3000).
+    error InvalidV3Fee(uint8 leg, address router, uint24 fee);
     /// @notice A router call reverted. `reason` is the router's own revert data.
     error LegFailed(uint8 leg, address router, RouterType rtype, bytes reason);
     /// @notice A leg succeeded but the contract received none of its output token.
     error NoOutput(uint8 leg, address router);
     /// @notice setRouter was given an address with no code (EOA or typo).
     error NotAContract(address router);
+    /// @notice A router call ran out of gas (tx gas limit too low for this route).
+    error LegOutOfGas(uint8 leg, address router);
+    /// @notice Ownership can be transferred but not renounced: every withdrawal is onlyOwner.
+    error RenounceDisabled();
 
     // ─── Constructor ──────────────────────────────────────────
 
     /// @dev Ownable2Step: deployer is initial owner; transfer needs acceptOwnership().
     constructor() Ownable(msg.sender) {}
+
+    /// @dev Renouncing would lock every token in the contract (all withdrawals are onlyOwner).
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
+    }
 
     // ─── Router configuration ─────────────────────────────────
 
@@ -212,10 +226,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         RouterType typeB = _checkRouter(routerB);
         uint256 balanceBefore = _checkBalance(tokenIn, amountIn);
 
-        uint256 mid = _swap(1, routerA, typeA, tokenIn, tokenOut, amountIn, feeA, deadline);
-        _swap(2, routerB, typeB, tokenOut, tokenIn, mid, feeB, deadline);
+        (uint256 mid,) = _swap(1, routerA, typeA, tokenIn, tokenOut, amountIn, feeA, deadline);
+        (, uint256 balanceAfter) = _swap(2, routerB, typeB, tokenOut, tokenIn, mid, feeB, deadline);
 
-        uint256 profit = _settle(tokenIn, balanceBefore, minProfit);
+        uint256 profit = _settle(tokenIn, balanceBefore, balanceAfter, minProfit);
         emit ArbitrageExecuted(tokenIn, tokenOut, routerA, routerB, amountIn, profit);
     }
 
@@ -249,11 +263,11 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         RouterType typeCA = _checkRouter(routerCA);
         uint256 balanceBefore = _checkBalance(tokenA, amountIn);
 
-        uint256 amountB = _swap(1, routerAB, typeAB, tokenA, tokenB, amountIn, feeAB, deadline);
-        uint256 amountC = _swap(2, routerBC, typeBC, tokenB, tokenC, amountB, feeBC, deadline);
-        _swap(3, routerCA, typeCA, tokenC, tokenA, amountC, feeCA, deadline);
+        (uint256 amountB,) = _swap(1, routerAB, typeAB, tokenA, tokenB, amountIn, feeAB, deadline);
+        (uint256 amountC,) = _swap(2, routerBC, typeBC, tokenB, tokenC, amountB, feeBC, deadline);
+        (, uint256 balanceAfter) = _swap(3, routerCA, typeCA, tokenC, tokenA, amountC, feeCA, deadline);
 
-        uint256 profit = _settle(tokenA, balanceBefore, minProfit);
+        uint256 profit = _settle(tokenA, balanceBefore, balanceAfter, minProfit);
         emit TriangularArbitrageExecuted(tokenA, tokenB, tokenC, routerAB, routerBC, routerCA, amountIn, profit);
     }
 
@@ -274,8 +288,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         if (balance < needed) revert InsufficientBalance(token, balance, needed);
     }
 
-    function _settle(address token, uint256 balanceBefore, uint256 minProfit) internal returns (uint256 profit) {
-        uint256 balanceAfter = IERC20(token).balanceOf(address(this));
+    /// @dev `balanceAfter` is the last leg's output-token balance — the start token.
+    function _settle(address token, uint256 balanceBefore, uint256 balanceAfter, uint256 minProfit)
+        internal returns (uint256 profit)
+    {
         if (balanceAfter < balanceBefore + minProfit) {
             revert NotProfitable(balanceBefore, balanceAfter, minProfit);
         }
@@ -286,8 +302,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     /**
      * @dev One swap leg on any supported router type. Returns the amount of `tokenOut`
-     *      actually received (balance delta). Router reverts become LegFailed.
-     *      Min-out is 0: profit is enforced once, in _settle.
+     *      actually received (balance delta) and the resulting `tokenOut` balance.
+     *      Router reverts become LegFailed. Min-out is 0: profit is enforced once, in _settle.
      */
     function _swap(
         uint8 leg,
@@ -298,8 +314,10 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 amountIn,
         uint24 fee,
         uint256 deadline
-    ) internal returns (uint256 received) {
-        if (rtype == RouterType.V3 && fee == 0) revert InvalidV3Fee(leg, router);
+    ) internal returns (uint256 received, uint256 outAfter) {
+        // Range check, not a tier list: tiers differ per DEX (Pancake 2500) and can be
+        // added by governance; this catches 0 and bps-style values like 30.
+        if (rtype == RouterType.V3 && (fee < 100 || fee >= 1_000_000)) revert InvalidV3Fee(leg, router, fee);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
         IERC20(tokenIn).forceApprove(router, amountIn);
@@ -331,11 +349,21 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             data = abi.encodeCall(IUniswapV2Router02.swapExactTokensForTokens,
                 (amountIn, 0, path, address(this), deadline));
         }
+        uint256 gasBefore = gasleft();
         (bool ok, bytes memory reason) = router.call(data);
-        if (!ok) revert LegFailed(leg, router, rtype, reason);
+        if (!ok) {
+            // EIP-150: each call level keeps 1/64 of its gas, so a leg that ran out of gas
+            // (directly, or in the pool the router called) leaves only a few percent behind,
+            // while an empty-reason revert for a missing pool / wrong router type returns
+            // almost at once. 1/8 separates the two. Best effort: with real routers ~3% is
+            // left, which at tight limits can't pay for this revert — the tx then fails with
+            // no data, and the engine classifies it from the receipt's gasUsed / gasLimit.
+            if (reason.length == 0 && gasleft() < gasBefore / 8) revert LegOutOfGas(leg, router);
+            revert LegFailed(leg, router, rtype, reason);
+        }
 
         _clearAllowance(tokenIn, router);
-        uint256 outAfter = IERC20(tokenOut).balanceOf(address(this));
+        outAfter = IERC20(tokenOut).balanceOf(address(this));
         // `<=` rather than a checked subtraction: a balance that shrank (rebasing token,
         // router pulling tokenOut) must still name the leg, not panic.
         if (outAfter <= outBefore) revert NoOutput(leg, router);
@@ -346,16 +374,21 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     ///      Best effort: a token that rejects approve(0) must not abort a finished trade,
     ///      so it falls back to a 1-wei allowance (to a whitelisted router).
     function _clearAllowance(address token, address spender) internal {
-        if (IERC20(token).allowance(address(this), spender) != 0 && !_tryApprove(token, spender, 0)) {
-            _tryApprove(token, spender, 1);
+        if (IERC20(token).allowance(address(this), spender) == 0 || _tryApprove(token, spender, 0)) return;
+        if (!_tryApprove(token, spender, 1)) {
+            emit AllowanceNotCleared(token, spender, IERC20(token).allowance(address(this), spender));
         }
     }
 
-    /// @dev approve() that reports failure instead of reverting (handles tokens that
-    ///      return nothing, false, or revert).
+    /// @dev approve() that reports failure instead of reverting: false for a revert, a
+    ///      `false` / malformed return value, or an address with no code.
     function _tryApprove(address token, address spender, uint256 value) internal returns (bool) {
+        if (token.code.length == 0) return false;
         (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20.approve, (spender, value)));
-        return ok && (ret.length == 0 || abi.decode(ret, (bool)));
+        if (!ok) return false;
+        if (ret.length == 0) return true; // USDT-style: no return value
+        // Read the word instead of abi.decode(bool), which reverts on anything but 0/1.
+        return ret.length >= 32 && abi.decode(ret, (uint256)) == 1;
     }
 
     // ═══════════════════════════════════════════════════════════

@@ -11,10 +11,9 @@ async fn diagnose_and_count_revert<P: Provider>(
     chain_name: &str,
     tx_hash: &B256,
     block_number: Option<u64>,
-    sell_leg_is_v3: bool,
+    gas_used: u64,
 ) -> crate::revert::RevertDiagnosis {
-    let diagnosis =
-        crate::revert::diagnose_mined_revert(provider, tx_hash, block_number, sell_leg_is_v3).await;
+    let diagnosis = crate::revert::diagnose_mined_revert(provider, tx_hash, block_number, gas_used).await;
     metrics
         .reverts_on_chain
         .with_label_values(&[chain_name, diagnosis.class.as_str()])
@@ -563,7 +562,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let provider_bg = provider.clone();
                                 let ra_type_bg = crate::revert::router_type_label(&optimized.router_a_type);
                                 let rb_type_bg = crate::revert::router_type_label(&optimized.router_b_type);
-                                let sell_leg_v3_bg = matches!(optimized.router_b_type, RouterType::V3);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
                                 let confirmed_failed_bg = prep.confirmed_failed.clone();
                                 let confirmed_profit_bg = prep.confirmed_profit_bits.clone();
@@ -614,7 +612,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &chain_name_bg,
                                                     &tx_hash_b256,
                                                     block_num,
-                                                    sell_leg_v3_bg,
+                                                    receipt.gas_used(),
                                                 )
                                                 .await;
                                                 revert_class_str = Some(diagnosis.class.as_str());
@@ -986,7 +984,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let provider_bg = provider.clone();
                                 let ra_type_bg = crate::revert::router_type_label(&opp.router_ab_type);
                                 let rb_type_bg = crate::revert::router_type_label(&opp.router_ca_type);
-                                let sell_leg_v3_bg = crate::revert::triangular_sell_leg_is_v3(opp);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
                                 let confirmed_failed_bg = prep.confirmed_failed.clone();
                                 let confirmed_profit_bg = prep.confirmed_profit_bits.clone();
@@ -1038,7 +1035,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &chain_name_bg,
                                                     &tx_hash_b256,
                                                     block_num,
-                                                    sell_leg_v3_bg,
+                                                    receipt.gas_used(),
                                                 )
                                                 .await;
                                                 revert_class_str = Some(diagnosis.class.as_str());
@@ -1296,6 +1293,9 @@ pub(crate) async fn handle_execution_success(
     let mut state = shared_state.write().await;
     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
         chain.total_attempts += 1;
+        if dry_run {
+            chain.total_dry_run_ok += 1;
+        }
     }
 
     if dry_run {

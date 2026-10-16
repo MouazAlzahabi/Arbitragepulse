@@ -54,6 +54,8 @@ pub struct ChainStats {
     pub total_attempts: u64,
     pub total_success: u64,
     pub total_failed: u64,
+    /// Attempts that passed simulation in dry-run (counted in `total_attempts`, never sent).
+    pub total_dry_run_ok: u64,
     pub total_profit_usd: f64,
     /// Sum of gross profit_usd from opportunities rejected due to negative net profit after gas.
     pub ghost_profit_usd: f64,
@@ -363,6 +365,7 @@ async fn stats_reset(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     chain.total_scans = 0;
                     chain.total_success = 0;
                     chain.total_failed = 0;
+                    chain.total_dry_run_ok = 0;
                     chain.total_profit_usd = 0.0;
                     chain.ghost_profit_usd = 0.0;
                 }
@@ -545,11 +548,11 @@ async fn token_remove(
 async fn pair_scan_list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Clone data inside the read lock (fast), then serialize outside the lock
     // so JSON serialization does not hold up other readers (e.g., /stats polls).
-    let (pair_scan_snapshot, disabled_snapshot, names) = {
+    let (pair_scan_snapshot, disabled_snapshot, chain_name) = {
         let engine = state.engine.read().await;
-        let names: std::collections::HashMap<u64, String> =
-            engine.chains.iter().map(|c| (c.chain_id, c.chain_name.clone())).collect();
-        (engine.pair_scan.clone(), engine.disabled_pairs.clone(), names)
+        // One chain per instance: its name labels every pair-scan group.
+        let chain_name = engine.chains.first().map(|c| c.chain_name.clone());
+        (engine.pair_scan.clone(), engine.disabled_pairs.clone(), chain_name)
     };
     let mut result: Vec<serde_json::Value> = Vec::new();
     for (chain_id, pairs) in &pair_scan_snapshot {
@@ -561,7 +564,7 @@ async fn pair_scan_list(State(state): State<Arc<AppState>>) -> impl IntoResponse
             v
         }).collect();
         // chain_name lets the dashboard label the tab without its own id → name table.
-        let name = names.get(chain_id).cloned().unwrap_or_else(|| format!("Chain {chain_id}"));
+        let name = chain_name.clone().unwrap_or_else(|| format!("Chain {chain_id}"));
         result.push(serde_json::json!({ "chain_id": chain_id, "chain_name": name, "pairs": enriched }));
     }
     Json(serde_json::json!({ "chains": result }))

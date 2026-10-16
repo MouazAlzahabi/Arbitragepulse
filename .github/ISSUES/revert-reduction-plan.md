@@ -55,7 +55,7 @@ sell-floor and router min-out rows apply to the pre-v3 executor.
 |---|--------|--------|
 | **1.1** | Apply **`P15_QUOTER_HAIRCUT_BPS` (15 bps)** to **all** opportunities at detection push, including **Phase 2 V2→V2** and **triangular** (Phase 1.5 paths use shared helper — no double haircut). | **Done** |
 | **1.2** | Raise Base **`min_profit_usd`** / per-pair floors for thin routes ($0.30–$0.80). | **Deferred** — skip while trading ~$1k/cycle; absolute $ floors hide most real edges. Prefer **1.1 haircut** + revert telemetry; revisit when size or win rate justifies fewer sends. |
-| **1.3** | **`ROUTER_MIN_OUT_SLACK_BPS` 200 → 250** if Phase 0 shows persistent V3 sell reverts after 1.1 and 1.4 (1.2 is deferred, so it no longer gates this). | Open — see [router-min-out-slack-bps.md](./router-min-out-slack-bps.md) |
+| **1.3** | **`ROUTER_MIN_OUT_SLACK_BPS` 200 → 250** if Phase 0 shows persistent V3 sell reverts after 1.1 and 1.4 (1.2 is deferred, so it no longer gates this). | Superseded on executor v3 — see [router-min-out-slack-bps.md](./router-min-out-slack-bps.md) |
 | **1.4** | Triangular: block or quoter-verify any route with a **V3 leg** before submit. | **Done** |
 | **1.5** | Skip or re-quote if **`scan_to_submit_ms`** &gt; threshold (e.g. 300–500 ms on Base). | Open |
 | **1.6** | Revert-aware cooldown on **fingerprint + pool key**. | Open |

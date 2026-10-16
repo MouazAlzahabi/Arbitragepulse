@@ -91,3 +91,44 @@ contract MockSlashingRouter {
         amounts = new uint256[](2);
     }
 }
+
+/// @dev Router whose every call burns all forwarded gas.
+contract MockGasBurnerRouter {
+    fallback() external {
+        while (true) {}
+    }
+}
+
+/// @dev approve() works but returns the word 2 — not a valid ABI bool.
+contract MockMalformedApproveERC20 is ERC20 {
+    constructor(uint256 supply) ERC20("Malformed Approve", "MAL") { _mint(msg.sender, supply); }
+
+    function approve(address spender, uint256 value) public override returns (bool) {
+        super.approve(spender, value);
+        assembly {
+            mstore(0, 2)
+            return(0, 32)
+        }
+    }
+}
+
+/// @dev Rejects approve(0) and approve(1) — a leftover allowance can't be cleared.
+contract MockStickyAllowanceERC20 is ERC20 {
+    constructor(uint256 supply) ERC20("Sticky Allowance", "STK") { _mint(msg.sender, supply); }
+
+    function approve(address spender, uint256 value) public override returns (bool) {
+        require(value > 1, "sticky");
+        return super.approve(spender, value);
+    }
+}
+
+/// @dev Router whose inner call runs out of gas, then reverts with no reason — the shape
+///      of a real V3 router when the pool's token transfer hits the gas limit.
+contract MockNestedOutOfGasRouter {
+    MockGasBurnerRouter internal immutable burner = new MockGasBurnerRouter();
+
+    fallback() external {
+        (bool ok,) = address(burner).call("");
+        require(ok);
+    }
+}

@@ -18,7 +18,7 @@
 
 ### 1. Raise `ROUTER_MIN_OUT_SLACK_BPS` (200 → 250)
 
-See dedicated ticket: **router-min-out-slack-bps.md**
+See dedicated ticket: **router-min-out-slack-bps.md** (superseded on executor v3 — now `tuning.onchain_min_profit_bps`)
 
 Only if `Too little received` reverts remain high after P0/P1 deploy.
 
@@ -43,8 +43,7 @@ Move from compile-time constants to hot-reloadable config:
 | Constant | File | Purpose |
 |----------|------|---------|
 | `P15_QUOTER_HAIRCUT_BPS` | `strategy/mod.rs` | Detection buffer |
-| `ROUTER_MIN_OUT_SLACK_BPS` | `executor.rs` | On-chain sell minOut |
-| `SELL_LEG_MINPROFIT_MUL_BPS` | `executor.rs` | On-chain sell minOut |
+| `tuning.onchain_min_profit_bps` (was `ROUTER_MIN_OUT_SLACK_BPS` × `SELL_LEG_MINPROFIT_MUL_BPS`) | `executor.rs` | On-chain minProfit floor |
 | `V3_SPOT_MAX_VR_FRACTION_BPS` | `pool_cache.rs` | V3 spot cap |
 
 ---

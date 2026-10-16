@@ -185,8 +185,32 @@ contract ArbitrageExecutorTest is Test {
     }
 
     function test_V3FeeZero_IsRejectedBeforeSwapping() public {
-        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.InvalidV3Fee.selector, uint8(1), address(v3A)));
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.InvalidV3Fee.selector, uint8(1), address(v3A), uint24(0)));
         _arb(address(v3A), address(v3B), 0, FEE, 1 ether);
+    }
+
+    function test_V3FeeInBps_IsRejected() public {
+        // 30 = "0.3%" in bps; the V3 tier is 3000
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.InvalidV3Fee.selector, uint8(2), address(v3B), uint24(30)));
+        _arb(address(v3A), address(v3B), FEE, 30, 1 ether);
+    }
+
+    function test_RouterOutOfGas_ReportsLegOutOfGas() public {
+        MockGasBurnerRouter burner = new MockGasBurnerRouter();
+        executor.setRouter(address(burner), ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.LegOutOfGas.selector, uint8(2), address(burner)));
+        executor.executeArbitrage{gas: 1_000_000}(address(tokenA), address(tokenB), AMT,
+            address(v2A), address(burner), 0, 0, 0, deadline);
+    }
+
+    function test_NestedOutOfGas_ReportsLegOutOfGas() public {
+        MockNestedOutOfGasRouter nested = new MockNestedOutOfGasRouter();
+        executor.setRouter(address(nested), ArbitrageExecutor.RouterType.V2);
+        for (uint256 g = 150_000; g <= 2_000_000; g += 350_000) {
+            vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.LegOutOfGas.selector, uint8(1), address(nested)));
+            executor.executeArbitrage{gas: g}(address(tokenA), address(tokenB), AMT,
+                address(nested), address(v2B), 0, 0, 0, deadline);
+        }
     }
 
     function test_V3RouterTypedAsV2_FailsWithEmptyReason() public {
@@ -333,6 +357,42 @@ contract ArbitrageExecutorTest is Test {
         executor.executeArbitrage(address(nza), address(tokenB), AMT, address(partialBuy), address(sell), 0, 0, 1 ether, deadline);
         assertEq(nza.balanceOf(address(executor)), 1_070 ether);
         assertEq(nza.allowance(address(executor), address(partialBuy)), 1, "approve(0) rejected -> 1 wei left");
+    }
+
+    event AllowanceNotCleared(address indexed token, address indexed spender, uint256 remaining);
+
+    /// @dev Buy router pulls only half the input (leaves an allowance); sell router is 6/10.
+    function _partialTrade(address token) internal returns (MockPartialRouter partialBuy, MockRouter sell) {
+        partialBuy = new MockPartialRouter();
+        sell = new MockRouter(6, 10);
+        tokenB.transfer(address(partialBuy), 100_000 ether);
+        IERC20(token).transfer(address(sell), 100_000 ether);
+        IERC20(token).transfer(address(executor), 1_000 ether);
+        executor.setRouter(address(partialBuy), ArbitrageExecutor.RouterType.V2);
+        executor.setRouter(address(sell), ArbitrageExecutor.RouterType.V2);
+    }
+
+    function test_MalformedApproveReturn_IsAFailureNotADecodePanic() public {
+        // approve returns the word 2. Trading with it fails up front (SafeERC20 at the leg's
+        // approve); revokeApproval must report it the same way, not die inside abi.decode.
+        MockMalformedApproveERC20 mal = new MockMalformedApproveERC20(1 ether);
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(mal)));
+        executor.revokeApproval(address(mal), address(v2A));
+    }
+
+    function test_UnclearableAllowance_EmitsEventAndKeepsTrade() public {
+        MockStickyAllowanceERC20 stk = new MockStickyAllowanceERC20(10_000_000 ether);
+        (MockPartialRouter partialBuy, MockRouter sell) = _partialTrade(address(stk));
+        vm.expectEmit(true, true, false, true);
+        emit AllowanceNotCleared(address(stk), address(partialBuy), 50 ether);
+        executor.executeArbitrage(address(stk), address(tokenB), AMT, address(partialBuy), address(sell), 0, 0, 1 ether, deadline);
+        assertEq(stk.balanceOf(address(executor)), 1_070 ether);
+    }
+
+    function test_RevokeApproval_NonContractToken_Reverts() public {
+        address eoa = makeAddr("notAToken");
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, eoa));
+        executor.revokeApproval(eoa, address(v2A));
     }
 
     function test_RevokeApproval_TokenRejectingZeroApprove() public {
@@ -526,6 +586,36 @@ contract ArbitrageExecutorTest is Test {
     // ════════════════════════════════════════════════════════════
     // Funds
     // ════════════════════════════════════════════════════════════
+
+    function test_RenounceOwnership_Disabled() public {
+        vm.expectRevert(ArbitrageExecutor.RenounceDisabled.selector);
+        executor.renounceOwnership();
+        assertEq(executor.owner(), owner);
+    }
+
+    event WithdrawToken(address indexed token, address indexed to, uint256 amount);
+
+    function test_WithdrawTokenAmount_PaysOwnerAndEmits() public {
+        uint256 before = tokenA.balanceOf(owner);
+        vm.expectEmit(true, true, false, true);
+        emit WithdrawToken(address(tokenA), owner, 250 ether);
+        executor.withdrawTokenAmount(address(tokenA), 250 ether);
+        assertEq(tokenA.balanceOf(owner), before + 250 ether);
+        assertEq(tokenA.balanceOf(address(executor)), 750 ether);
+        vm.expectRevert(ArbitrageExecutor.ZeroAmount.selector);
+        executor.withdrawTokenAmount(address(tokenA), 0);
+        vm.expectRevert(ArbitrageExecutor.ZeroAddress.selector);
+        executor.withdrawTokenAmount(address(0), 1);
+    }
+
+    function test_TotalProfit_AccumulatesAcrossTrades() public {
+        _arb(address(v2A), address(v2B), 0, 0, 1 ether);
+        _arb(address(v3A), address(v3B), FEE, FEE, 1 ether);
+        address bc = _triRouters(ArbitrageExecutor.RouterType.V2);
+        _tri(address(v2A), bc, address(v2B), 0, 0, 0, 1 ether);
+        assertEq(executor.totalProfit(address(tokenA)), 60 ether);
+        assertEq(executor.totalTrades(), 3);
+    }
 
     function test_WithdrawETH() public {
         vm.deal(address(executor), 1 ether);

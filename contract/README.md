@@ -43,12 +43,14 @@ the capital exactly like a router-level minimum.
 | `LegFailed(leg, router, rtype, reason)` | a router reverted; `reason` is its raw revert data (string, custom error such as Aerodrome's, or empty). Empty: no pool for that fee tier / stable flag, or the wrong router type |
 | `NotProfitable(balanceBefore, balanceAfter, minProfit)` | the route completed but returned less than `amountIn + minProfit` — price moved or spread closed |
 | `InsufficientBalance(token, balance, needed)` | the contract does not hold `amountIn` of the start token |
-| `NoOutput(leg, router)` | a router returned without paying anything out |
-| `InvalidV3Fee(leg, router)` | V3 leg with fee 0 |
+| `NoOutput(leg, router)` | a router returned without paying anything out (or the output balance shrank) |
+| `LegOutOfGas(leg, router)` | a router ran out of gas — raise the tx gas limit. Best effort: at tight limits the executor itself runs out first and the tx fails with no data; the engine then classifies it from the receipt (≥97% of the gas limit used) |
+| `InvalidV3Fee(leg, router, fee)` | V3 fee outside 100..999999 — 0, or a bps value like 30 instead of 3000 |
 | `RouterNotAllowed(router)` / `UnsupportedRouterType(router, rtype)` | not whitelisted / retired type |
 | `InvalidPath()` | repeated token in the route |
 | `DeadlineExpired(deadline, now)`, `ZeroAmount()`, `ZeroAddress()` | input checks |
 | `EnforcedPause()`, `OwnableUnauthorizedAccount(caller)` | OpenZeppelin: paused / not owner |
+| `NotAContract(router)`, `RenounceDisabled()` | `setRouter` given an address with no code; `renounceOwnership` is disabled (it would lock every withdrawal) |
 
 `setRouter` is the only way to allow a router (it also rejects addresses with no code), so
 no router is ever allowed with a forgotten type; call it again to change the type.
@@ -58,7 +60,8 @@ leg is measured by balance delta, so a router that misreports (or returns nothin
 make the next leg over-spend, and still fails as `NoOutput`/`LegFailed` naming the leg.
 Each leg approves exactly its input; a leftover allowance is cleared best-effort (a token
 that rejects `approve(0)` is left at 1 wei instead of aborting a finished trade;
-`revokeApproval` does the same).
+`revokeApproval` does the same). If even that fails, `AllowanceNotCleared(token, spender,
+remaining)` is emitted and the trade still completes.
 
 Events: `ArbitrageExecuted(tokenIn, tokenOut, routerA, routerB, amountIn, profit)` for 2-hop,
 `TriangularArbitrageExecuted(tokenA, tokenB, tokenC, routerAB, routerBC, routerCA, amountIn, profit)`
@@ -103,13 +106,14 @@ The Rust lab (`cargo run -p lab -- setup`) deploys from the compiled artifact
 src/
   ArbitrageExecutor.sol      main contract
   mocks/                     MockERC20, MockRouter (V2), MockV3Router, MockAerodromeRouter,
-                             MockOddTokens (fee-on-transfer, approve-0-rejecting, lying/no-op/silent/partial routers)
+                             MockOddTokens (odd tokens and misbehaving routers: fee-on-transfer, approve
+                             quirks, slashing, lying/no-op/silent/partial/gas-burning routers)
 script/
   Deploy.s.sol               executor
   DeployMocks.s.sol          Base Sepolia mock tokens seeded on real Uniswap V2/V3 at a spread
   RewidenMocks.s.sol         restore that spread after arbs narrow it
   MockMarket.sol             shared addresses, prices and sqrtPriceX96 math
 test/
-  ArbitrageExecutor.t.sol    executor (49 tests)
+  ArbitrageExecutor.t.sol    executor (58 tests)
   MockMarket.t.sol           mock-market price math
 ```

@@ -227,6 +227,11 @@ pub enum RpcFailure {
 /// timeouts are matched on [`RPC_TIMEOUT_MARKER`], which this module itself writes.
 pub fn classify_rpc_failure(err: &str) -> RpcFailure {
     let e = err.to_lowercase();
+    // A decoded revert is the contract answering, not the node failing — and its numbers
+    // (balances, minProfit) must not match "429" or other markers.
+    if e.contains(crate::revert::REVERT_MARKER) {
+        return RpcFailure::None;
+    }
     if e.contains(RPC_TIMEOUT_MARKER) {
         RpcFailure::Timeout
     } else if HARD_DOWN_MARKERS.iter().chain(TRANSIENT_UNREACHABLE_MARKERS.iter()).any(|m| e.contains(m))
@@ -309,6 +314,11 @@ mod tests {
         assert_eq!(classify_rpc_failure(&format!("gas price not fetched: {}", RPC_BACKOFF_MARKER)), RpcFailure::Unreachable);
         assert_eq!(classify_rpc_failure("HTTP error 429 Too Many Requests"), RpcFailure::RateLimited);
         assert_eq!(classify_rpc_failure("exceeded compute units per second"), RpcFailure::RateLimited);
+        // Decoded revert text never counts as an RPC failure, whatever numbers it holds.
+        assert_eq!(
+            classify_rpc_failure("Simulation failed: execution reverted: not profitable: balance 1000 → 998, needed +429 | revert_data=0x65dd322e"),
+            RpcFailure::None
+        );
         // "429" inside hex revert data is not a rate limit.
         assert_eq!(classify_rpc_failure("execution reverted, data: 0xa4291f00"), RpcFailure::None);
         assert_eq!(classify_rpc_failure("server returned an error response: nonce too low"), RpcFailure::None);

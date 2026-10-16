@@ -33,18 +33,11 @@ fn gas_fallback_max_age() -> Duration { crate::config::tuning().gas_fallback_max
 // Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
 fn gas_limit_triangular() -> u64 { crate::config::tuning().gas_limit_triangular }
 
-/// Shave this many basis points off the gas-derived `minProfit` before encoding the tx.
-/// The contract requires a final balance of `amountIn + minProfit` (`NotProfitable` otherwise;
-/// pre-v3 executors also passed it as the sell leg's router min-out → "Too little received").
-/// If that sum sits exactly on the quoted edge, inclusion delay / tick crossing / competing
-/// flow reverts the trade even when simulation looked fine.
-fn router_min_out_slack_bps() -> u64 { crate::config::tuning().router_min_out_slack_bps }
-
-/// Final multiplier applied to the gas-floor `minProfit` (basis points): 6200 / 10000 = 62%.
-/// Combined with `router_min_out_slack_bps()`, lowers the on-chain floor vs same-block pool drift.
-/// Tradeoff: profitability on-chain becomes more lenient;
-/// off-chain `net profit` checks remain the economic guard.
-fn sell_leg_minprofit_mul_bps() -> u64 { crate::config::tuning().sell_leg_minprofit_mul_bps }
+/// On-chain `minProfit` as bps of the gas-cost floor. The contract requires a final balance
+/// of `amountIn + minProfit` (`NotProfitable` otherwise). A floor exactly on the quoted edge
+/// reverts on any inclusion-time drift, so it sits below gas cost; the off-chain net-profit
+/// check remains the economic guard.
+fn onchain_min_profit_bps() -> u64 { crate::config::tuning().onchain_min_profit_bps }
 
 // ─── TxPrep ───────────────────────────────────────────────────────────────────
 
@@ -973,14 +966,11 @@ impl Executor {
             / U256::from(1_000_000u64);
         let gas_tokens = gas_tokens.max(U256::from(1u8));
 
-        // Never ask the router for more than the quoted gross edge — that guarantees revert
-        // when `amountOutMinimum` exceeds what any post-quote pool state can deliver.
+        // Never require more than the quoted gross edge — that would guarantee a revert.
         let max_reasonable = expected_profit;
         let capped = gas_tokens.min(max_reasonable);
 
-        let slack_mul = 10_000u64.saturating_sub(router_min_out_slack_bps());
-        let out = (capped.saturating_mul(U256::from(slack_mul))) / U256::from(10_000u64);
-        let out = out.saturating_mul(U256::from(sell_leg_minprofit_mul_bps())) / U256::from(10_000u64);
+        let out = capped.saturating_mul(U256::from(onchain_min_profit_bps())) / U256::from(10_000u64);
         out.max(U256::from(1u8))
     }
 

@@ -2,7 +2,6 @@
 pragma solidity ^0.8.20;
 
 import "forge-std/Script.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./MockMarket.sol";
 
 /**
@@ -38,23 +37,17 @@ contract RewidenMocks is Script {
         IERC20(usdc).approve(MockMarket.V3_SWAP_ROUTER, type(uint256).max);
         IERC20(weth).approve(MockMarket.V3_SWAP_ROUTER, type(uint256).max);
 
-        // ── V2: with k fixed, price P ⇔ rWeth' = sqrt(k / P). The router keeps 0.3% of the
-        //    input, so send delta × 1000/997 to land the effective input on the target.
+        // ── V2: find the input whose swap lands the pool on V2_PRICE. The whole input
+        //    (fee included) stays in the reserve while the output is priced on 99.7% of
+        //    it, so solve with the pair's own formula instead of a k-constant shortcut.
         (uint256 rWeth, uint256 rUsdc) = _v2Reserves(pair, weth);
         require(rWeth > 0 && rUsdc > 0, "V2 pair has no liquidity - run DeployMocks.s.sol");
-        uint256 targetWeth = Math.sqrt(rWeth * rUsdc / MockMarket.V2_PRICE);
-        require(targetWeth > 0, "V2 pair reserves too small to reprice");
         address[] memory path = new address[](2);
-        uint256 amountIn;
-        if (targetWeth > rWeth) {
-            // V2 mWETH too expensive → sell mWETH into it
-            (path[0], path[1]) = (weth, usdc);
-            amountIn = (targetWeth - rWeth) * 1000 / 997;
-        } else if (targetWeth < rWeth) {
-            // V2 mWETH too cheap → buy mWETH with mUSDC
-            (path[0], path[1]) = (usdc, weth);
-            amountIn = (rWeth * rUsdc / targetWeth - rUsdc) * 1000 / 997;
-        }
+        bool sellWeth = rUsdc * 1e18 / rWeth > MockMarket.V2_PRICE * 1e18; // mWETH too dear → sell it
+        (path[0], path[1]) = sellWeth ? (weth, usdc) : (usdc, weth);
+        uint256 amountIn = sellWeth
+            ? _v2InputForPrice(rWeth, rUsdc, true)
+            : _v2InputForPrice(rUsdc, rWeth, false);
         if (amountIn > 0) {
             require(IERC20(path[0]).balanceOf(me) >= amountIn, "deployer balance too low to reprice V2");
             IMockV2Router(MockMarket.V2_ROUTER).swapExactTokensForTokens(amountIn, 0, path, me, block.timestamp + 600);
@@ -84,6 +77,23 @@ contract RewidenMocks is Script {
         console.log("V3 price mUSDC/mWETH (x1e6):", v3PriceE6);
         require(_near(v2PriceE6, MockMarket.V2_PRICE * 1e6), "V2 did not reach its target price");
         require(_near(v3PriceE6, MockMarket.V3_PRICE * 1e6), "V3 did not reach its target - deployer balance too low");
+    }
+
+    /// @dev Smallest input (binary search) after which price = rUsdc'/rWeth' crosses
+    ///      V2_PRICE. `wethIn`: selling mWETH lowers the price; else buying raises it.
+    function _v2InputForPrice(uint256 rIn, uint256 rOut, bool wethIn) internal pure returns (uint256) {
+        uint256 lo = 0;
+        uint256 hi = rIn * 4;
+        for (uint256 i = 0; i < 128 && lo < hi; i++) {
+            uint256 mid = (lo + hi) / 2;
+            uint256 out = mid * 997 * rOut / (rIn * 1000 + mid * 997);
+            (uint256 newWeth, uint256 newUsdc) = wethIn ? (rIn + mid, rOut - out) : (rOut - out, rIn + mid);
+            bool reached = wethIn
+                ? newUsdc * 1e18 / newWeth <= MockMarket.V2_PRICE * 1e18
+                : newUsdc * 1e18 / newWeth >= MockMarket.V2_PRICE * 1e18;
+            if (reached) hi = mid; else lo = mid + 1;
+        }
+        return lo;
     }
 
     function _v2Reserves(address pair, address weth) internal view returns (uint256 rWeth, uint256 rUsdc) {

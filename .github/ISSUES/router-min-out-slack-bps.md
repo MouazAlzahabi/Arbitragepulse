@@ -1,5 +1,10 @@
 # Raise `ROUTER_MIN_OUT_SLACK_BPS` if reverts persist after P15 haircut
 
+> **Superseded (executor v3).** Routers now get min-out 0 and `minProfit` is enforced once on
+> the final balance, so "Too little received" no longer happens. The slack and multiplier were
+> merged into `tuning.onchain_min_profit_bps` (default 6076 = 98% × 62%); the equivalent of
+> "slack 200 → 250" is 6076 → 6045.
+
 **Status:** Open  
 **Priority:** Medium (follow-up — only if needed)  
 **Area:** `engine/src/executor.rs`  
