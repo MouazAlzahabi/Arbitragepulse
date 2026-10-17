@@ -3,6 +3,36 @@ use crate::util::{rpc_timeout, rpc_read_timeout};
 
 static NO_PRICE_SOURCE_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Plausible ETH/USD band. A quote outside it comes from a junk/test pool (Base Sepolia) or a
+/// broken quoter and is ignored; the previous value (initially $2500) stays in use.
+const NATIVE_PRICE_MIN_USD: f64 = 100.0;
+const NATIVE_PRICE_MAX_USD: f64 = 100_000.0;
+/// Warn once after this many consecutive price refreshes without an accepted price.
+const PRICE_STALE_WARN_AFTER: u64 = 10;
+static PRICE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FIRST_PRICE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn plausible_native_price(p: f64) -> bool {
+    p.is_finite() && (NATIVE_PRICE_MIN_USD..=NATIVE_PRICE_MAX_USD).contains(&p)
+}
+
+fn note_price_accepted(cfg: &ChainConfig, price: f64, source: &str) {
+    let missed = PRICE_MISSES.swap(0, Ordering::Relaxed);
+    if !FIRST_PRICE_LOGGED.swap(true, Ordering::Relaxed) {
+        info!("[{}] {} price ${:.2} ({source}) — used for gas-cost and minProfit math", cfg.name, cfg.native_currency, price);
+    } else if missed >= PRICE_STALE_WARN_AFTER {
+        info!("[{}] {} price updated again after {missed} missed refreshes: ${:.2} ({source})", cfg.name, cfg.native_currency, price);
+    }
+}
+
+fn note_price_missed(cfg: &ChainConfig, kept: f64) {
+    let n = PRICE_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == PRICE_STALE_WARN_AFTER {
+        warn!("[{}] {} price not updated for {n} refreshes (no quote in ${:.0}–${:.0}) — gas-cost and minProfit math keep using ${:.2}",
+              cfg.name, cfg.native_currency, NATIVE_PRICE_MIN_USD, NATIVE_PRICE_MAX_USD, kept);
+    }
+}
+
 /// A configured pair with WETH (wrapped native) on one side and a USD stablecoin on the other:
 /// (stablecoin address, decimals). WETH→stable is quoted on that pool in either direction
 /// (pool keys are stored both ways), so a USDC→WETH pair works as well as WETH→USDC.
@@ -73,9 +103,11 @@ pub(crate) async fn update_native_price<P: Provider>(
                 if !out.is_zero() {
                     let price = out.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
                     debug!("[{}] {} price (V2 cache) router={} → ${:.2}", cfg.name, cfg.native_currency, router.id, price);
+                    if !plausible_native_price(price) { continue; }
                     drop(strat);
                     { let mut strat = strategy.write().await; strat.update_native_price(price); }
                     { let mut exec = executor.lock().await; exec.update_native_price(price); }
+                    note_price_accepted(cfg, price, "V2 cache");
                     return;
                 }
             }
@@ -112,7 +144,7 @@ pub(crate) async fn update_native_price<P: Provider>(
                     if !r.amountOut.is_zero() {
                         let price = r.amountOut.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
                         debug!("[{}] {} price V3 router={} fee={} → ${:.2}", cfg.name, cfg.native_currency, router.id, fee, price);
-                        if price > best_v3_price { best_v3_price = price; }
+                        if plausible_native_price(price) && price > best_v3_price { best_v3_price = price; }
                     }
                 }
             }
@@ -121,6 +153,7 @@ pub(crate) async fn update_native_price<P: Provider>(
             debug!("[{}] {} price (V3 best): ${:.2}", cfg.name, cfg.native_currency, best_v3_price);
             { let mut strat = strategy.write().await; strat.update_native_price(best_v3_price); }
             { let mut exec = executor.lock().await; exec.update_native_price(best_v3_price); }
+            note_price_accepted(cfg, best_v3_price, "V3");
             return;
         }
     }
@@ -136,13 +169,19 @@ pub(crate) async fn update_native_price<P: Provider>(
                 if !out.is_zero() {
                     let price = out.to::<u128>() as f64 * probe_scale as f64 / decimal_scale;
                     debug!("[{}] {} price (V2 fallback) updated: ${:.2}", cfg.name, cfg.native_currency, price);
+                    if !plausible_native_price(price) { continue; }
                     { let mut strat = strategy.write().await; strat.update_native_price(price); }
                     { let mut exec = executor.lock().await; exec.update_native_price(price); }
+                    note_price_accepted(cfg, price, "V2 getAmountsOut");
                     return;
                 }
             }
         }
     }
+
+    // All sources failed or quoted outside the plausible band: the previous price stays.
+    let kept = executor.lock().await.native_price_usd;
+    note_price_missed(cfg, kept);
 }
 
 /// True when the signer's ETH (wei) is below `min_eth` (chain.min_native_balance).
@@ -360,6 +399,18 @@ pub(crate) async fn check_contract_setup<P: Provider>(
 mod tests {
     use super::*;
     use alloy::primitives::address;
+
+    #[test]
+    fn plausible_native_price_band() {
+        assert!(plausible_native_price(2500.0));
+        assert!(plausible_native_price(100.0) && plausible_native_price(100_000.0));
+        assert!(!plausible_native_price(99.99));
+        assert!(!plausible_native_price(100_000.01));
+        assert!(!plausible_native_price(0.0));
+        assert!(!plausible_native_price(1e12), "junk testnet pool");
+        assert!(!plausible_native_price(f64::NAN));
+        assert!(!plausible_native_price(f64::INFINITY));
+    }
 
     #[test]
     fn expected_router_type_ordinals() {
