@@ -299,13 +299,15 @@ fn urlencoding_decode(s: &str) -> String {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-/// /health verdict → (status, healthy). Unhealthy = RPC lost, RPC backoff, or no new block for
+/// /health verdict → (status, healthy). Unhealthy = no chain registered yet ("starting"), RPC lost, RPC backoff, or no new block for
 /// `stale_after_secs` (or none yet). A chain paused by the circuit breaker, an auto-pause or a
 /// paused contract is 503 `"paused"`; the operator's global `POST /engine/pause` is not in
 /// `ChainStats` and stays 200.
 fn health_verdict(chains: &[ChainStats], backoff: impl Fn(u64) -> bool, now: u64, stale_after_secs: u64) -> (&'static str, bool) {
+    // No chain registered yet: startup (connect, owner/router check, pool discovery) still
+    // running, or failing and being retried every 5 s.
     if chains.is_empty() {
-        return ("ok", true);
+        return ("starting", false);
     }
     if chains.iter().any(|c| c.paused) {
         return ("paused", false);
@@ -767,7 +769,7 @@ mod tests {
     #[test]
     fn health_verdict_cases() {
         let no = |_| false;
-        assert_eq!(health_verdict(&[], no, 1010, 30), ("ok", true));
+        assert_eq!(health_verdict(&[], no, 1010, 30), ("starting", false), "no chain registered yet");
         assert_eq!(health_verdict(&[chain(true, false, 1000)], no, 1010, 30), ("ok", true));
         assert_eq!(health_verdict(&[chain(true, false, 1000)], no, 1040, 30), ("degraded", false), "stale block");
         assert_eq!(health_verdict(&[chain(true, false, 0)], no, 1010, 30), ("degraded", false), "no block yet");

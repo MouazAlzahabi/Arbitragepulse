@@ -88,13 +88,20 @@ if [ "$DO_BUILD" = true ]; then
     echo "[3/3] Restarting service + health check..."
     ssh "$SERVER" "
         sudo systemctl restart arbitragepulse@${INSTANCE}
-        sleep 6
         source $REMOTE_PATH/engine/${INSTANCE}.env
-        # -s, not -sf: /health answers 503 while degraded (RPC down or in backoff) —
-        # still print the body so the reason is visible.
-        STATUS=\$(curl -s --max-time 5 \
-            -H \"Authorization: Bearer \$API_KEY\" \
-            \"http://localhost:\${PORT:-3000}/health\" | python3 -c \"
+        # /health answers 503 while starting (no chain registered yet) or degraded. Poll every
+        # 3 s for up to 90 s until it is ok (or the chain is paused), then print the last body.
+        BODY=''
+        OK=''
+        for i in \$(seq 1 30); do
+            sleep 3
+            BODY=\$(curl -s --max-time 5 \
+                -H \"Authorization: Bearer \$API_KEY\" \
+                \"http://localhost:\${PORT:-3000}/health\")
+            case \"\$BODY\" in *'\"status\":\"ok\"'*|*'\"status\":\"paused\"'*) OK=1; break ;; esac
+        done
+        [ -n \"\$OK\" ] || echo 'Not ok after 90 s (still starting or degraded) — last /health below; check journalctl -u arbitragepulse@${INSTANCE}'
+        STATUS=\$(printf '%s' \"\$BODY\" | python3 -c \"
 import sys, json
 d = json.load(sys.stdin)
 chains = ', '.join(c['chain_name'] + ':' + ('OK' if c['rpc_ok'] else 'FAIL') for c in d.get('chains',[]))

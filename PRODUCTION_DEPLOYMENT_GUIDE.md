@@ -91,6 +91,8 @@ From your machine (rsync + build on the server + restart + health check):
 ./scripts/deploy.sh                    # default instance: base
 ```
 
+deploy.sh waits up to 90 s for `/health` to report `ok` (or `paused`) and prints the last status either way.
+
 On the server, once:
 
 ```bash
@@ -112,7 +114,7 @@ journalctl -fu arbitragepulse@base
 curl -s -H "Authorization: Bearer $API_KEY" localhost:3000/health | python3 -m json.tool
 ```
 
-- `/health` returns **503** when the RPC is lost, the chain is in **RPC backoff**
+- `/health` returns **503** with `"status":"starting"` (or `"degraded"` if the chain row was seeded from an existing trade DB) until the chain has connected, finished pool discovery and seen its first block (or while startup keeps failing and retrying every 5 s), and when the RPC is lost, the chain is in **RPC backoff**
   (`rpc_backoff: true`: node hanging, down or too slow to simulate on — detection
   continues, execution is off until the monitor sees the node healthy again), or no new
   block arrived for `tuning.heartbeat_stall_warn_ms` (`last_block_age_s`). Point uptime
