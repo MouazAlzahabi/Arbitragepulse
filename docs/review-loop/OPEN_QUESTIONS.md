@@ -19,3 +19,19 @@ options, recommendation. Newest at the bottom.
   2. Engine: in `out_of_gas_override`, when the receipt shows ≥97% of the limit used, reclassify to OutOfGas whatever the replay class, keeping the replay text as detail. No redeploy; covers every fork. Risk: a genuine specific revert that happens to use ≥97% gets relabelled (unlikely — real reverts refund unused gas).
   3. Do nothing while V2 routers are disabled.
 - Recommendation: 3 now; 2 in the engine round (or whenever a V2 router is re-enabled).
+### [engine] UniversalRouter element offset in the pending-tx parser
+- Where: engine/src/chain/pending.rs, `SEL_UNIVERSAL_ROUTER` arm (`elem0_start = inputs_base + offset`)
+- What / why unsure: standard ABI encodes the offsets of a `bytes[]` array's elements relative
+  to the word *after* the length word (alloy gives 0x20 for one element; the real UniversalRouter
+  decodes it the same way). The parser adds the offset to the length word's position (its comment
+  expects 0x40), so a real `execute(bytes,bytes[],uint256)` lands on the wrong word and returns
+  None. Net effect today: UniversalRouter swaps in the mempool never trigger a targeted
+  "pending" scan. Found while writing the round-1A parser test; not part of that plan, so not
+  fixed (it is safe: wrong offsets only produce None). The test patches its calldata to the
+  parser's convention and points here.
+- Options + trade-offs:
+  1. Fix: `elem0_start = inputs_base + 32 + offset` (one line; update the test helper to drop
+     the patch). Enables UR-triggered pending scans that have never run live: more targeted
+     scans and RPC reads on busy blocks; each still goes through the normal simulate-before-send.
+  2. Leave as is (UR pending detection effectively off).
+- Recommendation: 1, verified on the Anvil fork with a real UR calldata sample, in a later round.

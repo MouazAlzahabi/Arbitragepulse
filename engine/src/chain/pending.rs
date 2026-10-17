@@ -102,29 +102,14 @@ pub fn parse_swap_calldata(
         // offset 4:  amountIn     (32 bytes)
         // offset 68: path offset  (32 bytes — ABI dynamic, usually 0xa0 = 5*32)
         // path[0] = tokenIn, path[last] = tokenOut
+        // Every offset/length comes from untrusted calldata: all index math is checked.
         SEL_V2_SWAP_EXACT_TOKENS => {
             if data.len() < 196 {
                 return None;
             }
-            let amount_in = parse_u256(&data[4..36]);
-            let path_offset = parse_u256(&data[68..100]).to::<usize>() + 4; // +4 for selector
-            if data.len() < path_offset + 64 {
-                return None;
-            }
-            let path_len = parse_u256(&data[path_offset..path_offset + 32]).to::<usize>();
-            if path_len < 2 || path_len > 100 {
-                return None;
-            }
-            let path_data_start = path_offset + 32;
-            if data.len() < path_data_start + path_len * 32 {
-                return None;
-            }
-            let token_in  = parse_address(&data[path_data_start..path_data_start + 32])?;
-            let token_out_offset = path_data_start + (path_len - 1) * 32;
-            let token_out = parse_address(&data[token_out_offset..token_out_offset + 32])?;
-            if token_in == token_out {
-                return None;
-            }
+            let amount_in = parse_u256(word_at(data, 4)?);
+            let (token_in, token_out) =
+                address_array_ends(data, usize_at(data, 68)?.checked_add(4)?)?; // +4 for selector
             Some((token_in, token_out, amount_in))
         }
 
@@ -135,24 +120,8 @@ pub fn parse_swap_calldata(
             if data.len() < 100 {
                 return None;
             }
-            let path_offset = parse_u256(&data[36..68]).to::<usize>() + 4;
-            if data.len() < path_offset + 64 {
-                return None;
-            }
-            let path_len = parse_u256(&data[path_offset..path_offset + 32]).to::<usize>();
-            if path_len < 2 || path_len > 100 {
-                return None;
-            }
-            let path_data_start = path_offset + 32;
-            if data.len() < path_data_start + path_len * 32 {
-                return None;
-            }
-            let token_in  = parse_address(&data[path_data_start..path_data_start + 32])?;
-            let token_out_offset = path_data_start + (path_len - 1) * 32;
-            let token_out = parse_address(&data[token_out_offset..token_out_offset + 32])?;
-            if token_in == token_out {
-                return None;
-            }
+            let (token_in, token_out) =
+                address_array_ends(data, usize_at(data, 36)?.checked_add(4)?)?;
             Some((token_in, token_out, eth_value))
         }
 
@@ -180,47 +149,28 @@ pub fn parse_swap_calldata(
                 return None;
             }
             // Offsets are relative to byte 4 (after selector)
-            let commands_offset = parse_u256(&data[4..36]).to::<usize>();
-            let inputs_offset   = parse_u256(&data[36..68]).to::<usize>();
+            let cmd_blob_start = usize_at(data, 4)?.checked_add(4)?;
+            let inputs_base    = usize_at(data, 36)?.checked_add(4)?;
 
             // commands blob
-            let cmd_blob_start = 4 + commands_offset;
-            if data.len() < cmd_blob_start + 33 {
-                return None;
-            }
-            let cmd_len = parse_u256(&data[cmd_blob_start..cmd_blob_start + 32]).to::<usize>();
+            let cmd_len = usize_at(data, cmd_blob_start)?;
             if cmd_len == 0 || cmd_len > 16 {
                 return None; // sanity: skip huge or empty command arrays
             }
-            let first_cmd = data[cmd_blob_start + 32] & 0x3f; // mask off flag bits (top 2)
+            // mask off flag bits (top 2)
+            let first_cmd = *data.get(cmd_blob_start.checked_add(32)?)? & 0x3f;
 
-            // inputs array base
-            let inputs_base = 4 + inputs_offset;
-            if data.len() < inputs_base + 32 {
-                return None;
-            }
-            let inputs_len = parse_u256(&data[inputs_base..inputs_base + 32]).to::<usize>();
-            if inputs_len == 0 {
+            // inputs array
+            if usize_at(data, inputs_base)? == 0 {
                 return None;
             }
             // ABI spec: array element offsets are measured from byte 0 of the array
             // encoding (the length word at inputs_base). With N=1, the header is
             // 64 bytes (32 length + 32 offset), so typical elem0_offset = 0x40 (64).
-            // elem0_start = inputs_base + elem0_offset is correct per the ABI spec.
-            if data.len() < inputs_base + 64 {
-                return None;
-            }
-            let elem0_offset = parse_u256(&data[inputs_base + 32..inputs_base + 64]).to::<usize>();
-            let elem0_start  = inputs_base + elem0_offset;
-            if data.len() < elem0_start + 32 {
-                return None;
-            }
-            let elem0_len = parse_u256(&data[elem0_start..elem0_start + 32]).to::<usize>();
-            let elem0_data_start = elem0_start + 32;
-            if data.len() < elem0_data_start + elem0_len {
-                return None;
-            }
-            let elem0 = &data[elem0_data_start..elem0_data_start + elem0_len];
+            let elem0_start = inputs_base.checked_add(usize_at(data, inputs_base.checked_add(32)?)?)?;
+            let elem0_len = usize_at(data, elem0_start)?;
+            let elem0_data_start = elem0_start.checked_add(32)?;
+            let elem0 = data.get(elem0_data_start..elem0_data_start.checked_add(elem0_len)?)?;
 
             match first_cmd {
                 // V3_SWAP_EXACT_IN: abi.encode(address recipient, uint256 amountIn,
@@ -236,18 +186,16 @@ pub fn parse_swap_calldata(
                     if elem0.len() < 160 {
                         return None;
                     }
-                    let amount_in  = parse_u256(&elem0[32..64]);
-                    let path_off   = parse_u256(&elem0[96..128]).to::<usize>();
-                    if elem0.len() < path_off + 32 {
-                        return None;
-                    }
-                    let path_len = parse_u256(&elem0[path_off..path_off + 32]).to::<usize>();
-                    let path_data_start = path_off + 32;
+                    let amount_in = parse_u256(&elem0[32..64]);
+                    let path_off = usize_at(elem0, 96)?;
+                    let path_len = usize_at(elem0, path_off)?;
                     // Single-hop path = 20 + 3 + 20 = 43 bytes
-                    if path_len < 43 || elem0.len() < path_data_start + path_len {
+                    if path_len < 43 {
                         return None;
                     }
-                    let path = &elem0[path_data_start..path_data_start + path_len];
+                    let ps = path_off.checked_add(32)?;
+                    let path = elem0.get(ps..ps.checked_add(path_len)?)?;
+                    // Safe: path.len() == path_len >= 43.
                     let token_in  = Address::from_slice(&path[0..20]);
                     let token_out = Address::from_slice(&path[path_len - 20..path_len]);
                     if token_in == token_out {
@@ -259,34 +207,12 @@ pub fn parse_swap_calldata(
                 // V2_SWAP_EXACT_IN: abi.encode(address recipient, uint256 amountIn,
                 //   uint256 amountOutMin, address[] path, bool payerIsUser)
                 CMD_V2_SWAP_EXACT_IN => {
-                    // elem0 ABI layout:
-                    //   [0..32]   recipient
-                    //   [32..64]  amountIn
-                    //   [64..96]  amountOutMin
-                    //   [96..128] path_offset (relative to elem0 start)
-                    //   [128..160] payerIsUser
+                    // elem0 ABI layout: as above; [96..128] path_offset (relative to elem0 start)
                     if elem0.len() < 160 {
                         return None;
                     }
                     let amount_in = parse_u256(&elem0[32..64]);
-                    let path_off  = parse_u256(&elem0[96..128]).to::<usize>();
-                    if elem0.len() < path_off + 32 {
-                        return None;
-                    }
-                    let path_len = parse_u256(&elem0[path_off..path_off + 32]).to::<usize>();
-                    if path_len < 2 || path_len > 100 {
-                        return None;
-                    }
-                    let path_data_start = path_off + 32;
-                    if elem0.len() < path_data_start + path_len * 32 {
-                        return None;
-                    }
-                    let token_in  = parse_address(&elem0[path_data_start..path_data_start + 32])?;
-                    let token_out_off = path_data_start + (path_len - 1) * 32;
-                    let token_out = parse_address(&elem0[token_out_off..token_out_off + 32])?;
-                    if token_in == token_out {
-                        return None;
-                    }
+                    let (token_in, token_out) = address_array_ends(elem0, usize_at(elem0, 96)?)?;
                     Some((token_in, token_out, amount_in))
                 }
 
@@ -310,6 +236,28 @@ fn parse_u256(word: &[u8]) -> U256 {
         return U256::ZERO;
     }
     U256::from_be_slice(&word[..32])
+}
+
+/// The 32-byte word at `at`, or None if it is out of bounds.
+fn word_at(data: &[u8], at: usize) -> Option<&[u8]> {
+    data.get(at..at.checked_add(32)?)
+}
+
+/// A word used as an ABI offset / length: None if out of bounds or ≥ 2^64 (can't index anything).
+fn usize_at(data: &[u8], at: usize) -> Option<usize> {
+    usize::try_from(U256::from_be_slice(word_at(data, at)?)).ok()
+}
+
+/// First and last entry of an ABI `address[]` whose length word is at `at` (2..=100 entries).
+fn address_array_ends(data: &[u8], at: usize) -> Option<(Address, Address)> {
+    let len = usize_at(data, at)?;
+    if !(2..=100).contains(&len) {
+        return None;
+    }
+    let start = at.checked_add(32)?;
+    let first = parse_address(word_at(data, start)?)?;
+    let last = parse_address(word_at(data, start.checked_add((len - 1).checked_mul(32)?)?)?)?;
+    (first != last).then_some((first, last))
 }
 
 // ─── Shared tx processor ──────────────────────────────────────────────────────
@@ -555,4 +503,89 @@ pub fn spawn_pending_monitor(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+    use alloy::sol_types::{SolCall, SolValue};
+
+    const A: Address = address!("00000000000000000000000000000000000000aa");
+    const B: Address = address!("00000000000000000000000000000000000000bb");
+
+    #[test]
+    fn crafted_offsets_never_panic() {
+        let sels = [
+            SEL_V2_SWAP_EXACT_TOKENS,
+            SEL_V2_SWAP_EXACT_ETH,
+            SEL_UNIVERSAL_ROUTER,
+            SEL_V3_EXACT_INPUT_SINGLE,
+        ];
+        let fillers = [
+            U256::MAX,
+            U256::from(u64::MAX),
+            U256::from(usize::MAX - 3),
+        ];
+        for sel in sels {
+            for filler in fillers {
+                let mut data = sel.to_vec();
+                for _ in 0..12 {
+                    data.extend_from_slice(&filler.to_be_bytes::<32>());
+                }
+                assert!(
+                    parse_swap_calldata(&Bytes::from(data), U256::ZERO).is_none(),
+                    "sel {:?} filler {}",
+                    sel,
+                    filler
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn valid_v2_calldata_still_parses() {
+        let data = crate::abi::IUniswapV2Router02::swapExactTokensForTokensCall {
+            amountIn: U256::from(5),
+            amountOutMin: U256::ZERO,
+            path: vec![A, B],
+            to: A,
+            deadline: U256::from(1),
+        }
+        .abi_encode();
+        assert_eq!(
+            parse_swap_calldata(&Bytes::from(data), U256::ZERO),
+            Some((A, B, U256::from(5)))
+        );
+    }
+
+    /// UniversalRouter `execute` calldata with one command (0x00) and one input.
+    /// NOTE: standard ABI encodes the `bytes[]` element offset relative to the word after the
+    /// array length (0x20 here); the parser adds it to the length word's position instead
+    /// (expects 0x40). The offset word is patched to the parser's convention so this test
+    /// exercises the full V3 path. See docs/review-loop/OPEN_QUESTIONS.md
+    /// "[engine] UniversalRouter element offset".
+    fn universal_router_data(elem0: Vec<u8>) -> Bytes {
+        let mut data = SEL_UNIVERSAL_ROUTER.to_vec();
+        data.extend(
+            (Bytes::from(vec![0x00u8]), vec![Bytes::from(elem0)], U256::from(1)).abi_encode_params(),
+        );
+        // inputs array at 4 + 0xa0: [length][elem0 offset] → offset word at 4 + 0xa0 + 32.
+        let off = 4 + 0xa0 + 32;
+        assert_eq!(U256::from_be_slice(&data[off..off + 32]), U256::from(0x20));
+        data[off..off + 32].copy_from_slice(&U256::from(0x40).to_be_bytes::<32>());
+        Bytes::from(data)
+    }
+
+    #[test]
+    fn valid_universal_router_v3_parses_and_crafted_path_offset_fails() {
+        let path = Bytes::from([A.as_slice(), &[0x00, 0x01, 0xf4], B.as_slice()].concat());
+        let mut elem0 = (A, U256::from(7), U256::ZERO, path, true).abi_encode_params();
+        assert_eq!(
+            parse_swap_calldata(&universal_router_data(elem0.clone()), U256::ZERO),
+            Some((A, B, U256::from(7)))
+        );
+        elem0[96..128].copy_from_slice(&U256::MAX.to_be_bytes::<32>());
+        assert_eq!(parse_swap_calldata(&universal_router_data(elem0), U256::ZERO), None);
+    }
 }

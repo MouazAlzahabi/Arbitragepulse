@@ -57,12 +57,13 @@ tail -f /var/log/arbitragepulse/base.log
 
 ```bash
 H="Authorization: Bearer $API_KEY"; E=http://localhost:3000
-curl -s -H "$H" $E/health        # 503 = RPC lost or in backoff (see rpc_backoff)
+curl -s -H "$H" $E/health        # 503 = RPC lost, backoff, or no new block (see rpc_backoff, last_block_age_s)
 curl -s -H "$H" $E/stats
 curl -s -H "$H" $E/trades
 curl -s -X POST -H "$H" $E/engine/pause
 curl -s -X POST -H "$H" $E/engine/resume
 curl -s -X POST -H "$H" -H 'Content-Type: application/json' -d '{"enabled":true}' $E/engine/dry-run
+curl -s -X POST -H "$H" $E/engine/restart    # exits 75 → systemd restarts it
 curl -s -H "$H" $E/pair-scan
 curl -s -X POST -H "$H" $E/pair-scan/base-usdc-weth/toggle
 ```

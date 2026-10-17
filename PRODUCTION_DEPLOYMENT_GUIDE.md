@@ -101,10 +101,16 @@ journalctl -fu arbitragepulse@base
 curl -s -H "Authorization: Bearer $API_KEY" localhost:3000/health | python3 -m json.tool
 ```
 
-- `/health` returns **503** when the RPC is lost or the chain is in **RPC backoff**
+- `/health` returns **503** when the RPC is lost, the chain is in **RPC backoff**
   (`rpc_backoff: true`: node hanging, down or too slow to simulate on — detection
-  continues, execution is off until the monitor sees the node healthy again). Point
-  uptime checks at the status code.
+  continues, execution is off until the monitor sees the node healthy again), or no new
+  block arrived for `tuning.heartbeat_stall_warn_ms` (`last_block_age_s`). Point uptime
+  checks at the status code.
+- If no block arrives for `tuning.block_stall_exit_ms` (5 min) the engine exits with
+  code 1 and systemd restarts it, walking the RPC fallback list. The same happens if the
+  chain task dies or the API port can't be bound.
+- `POST /engine/restart` (dashboard "Restart") exits with code 75 and systemd restarts the
+  engine. Restarts count toward `StartLimitBurst` (5 per 2 min).
 - The heartbeat line (`♥ scans=… | last_scan=…s ago`) logs at WARN if no scan ran for
   `tuning.heartbeat_stall_warn_ms`.
 - The circuit breaker pauses the chain after `tuning.max_consecutive_failures`

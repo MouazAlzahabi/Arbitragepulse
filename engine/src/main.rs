@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
                         paused: false,
                         rpc_ok: false,
                         last_block: 0,
+                        last_block_at: 0,
                         rpc_latency_ms: 0.0,
                     });
                     info!("Seeded chain stats from DB: chain_id={}", chain_id);
@@ -167,9 +168,9 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // ── Chain engine (one per instance) ──
-    let mut handles = Vec::new();
-
-    {
+    // Raced against the shutdown signals below: if it ever ends early (panic or return), the
+    // process exits 1 so the service manager restarts it.
+    let mut chain_handle = {
         let chain_cfg = cfg.chain.clone();
         let routers = cfg.routers.clone();
         let pairs = cfg.pairs.clone();
@@ -182,7 +183,7 @@ async fn main() -> Result<()> {
         let mut shutdown_rx = shutdown_tx.subscribe();
         let shutdown_tx_chain = shutdown_tx.clone();
 
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 // Check if shutdown was already requested before restarting
                 if shutdown_rx.try_recv().is_ok() {
@@ -215,10 +216,8 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        });
-
-        handles.push(handle);
-    }
+        })
+    };
 
     info!("Chain engine started. API at http://0.0.0.0:{}", env.port);
 
@@ -230,18 +229,22 @@ async fn main() -> Result<()> {
         _ = wait_sigterm() => {
             info!("Received SIGTERM — shutting down gracefully...");
         }
+        res = &mut chain_handle => {
+            let why = match &res {
+                Ok(()) => "returned".to_string(),
+                Err(e) if e.is_panic() => "panicked".to_string(),
+                Err(e) => e.to_string(),
+            };
+            tracing::error!("Chain engine task {} before shutdown — exiting (code 1) so the service manager restarts the engine", why);
+            std::process::exit(1);
+        }
     }
 
     // Signal all chain engines to stop
     let _ = shutdown_tx.send(());
 
-    // Give engines up to 30 s to drain in-flight work, then force exit
-    let drain = async {
-        for handle in handles {
-            let _ = handle.await;
-        }
-    };
-    if tokio::time::timeout(std::time::Duration::from_secs(30), drain).await.is_err() {
+    // Give the engine up to 30 s to drain in-flight work, then force exit
+    if tokio::time::timeout(std::time::Duration::from_secs(30), chain_handle).await.is_err() {
         tracing::warn!("Shutdown timeout — forcing exit");
     }
 

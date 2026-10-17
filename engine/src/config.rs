@@ -311,6 +311,14 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
     if chain.contract_address.contains("YOUR_") {
         return Err(anyhow!("Chain '{}': contract_address is not set", chain.name));
     }
+    for r in &raw.routers {
+        if let Some(f) = r.fee_tiers.iter().find(|&&f| f == 0 || f >= 1_000_000) {
+            return Err(anyhow!(
+                "router '{}': fee tier {} is out of range — V3 fee tiers are 1..=999999 (hundredths of a bip: 100, 500, 3000, 10000)",
+                r.id, f
+            ));
+        }
+    }
     raw.tuning.validate(chain.block_time_ms)?;
 
     Ok(AppConfig {
@@ -433,6 +441,8 @@ pub struct Tuning {
     pub slow_scan_warn_ms: u64,
     /// Heartbeat warns when no full scan ran this long (ms).
     pub heartbeat_stall_warn_ms: u64,
+    /// Exit (code 1) when no new block header arrived for this long (ms): the WS backend is dead, and a restart walks the RPC fallback list.
+    pub block_stall_exit_ms: u64,
     /// Native-price refresh + heartbeat, contract-balance refresh, config hot-reload (ms).
     pub price_refresh_ms: u64,
     pub balance_refresh_ms: u64,
@@ -492,6 +502,7 @@ impl Default for Tuning {
             max_consecutive_failures: 20,
             slow_scan_warn_ms: 10_000,
             heartbeat_stall_warn_ms: 30_000,
+            block_stall_exit_ms: 300_000,
             price_refresh_ms: 60_000,
             balance_refresh_ms: 30_000,
             config_reload_ms: 30_000,
@@ -510,7 +521,7 @@ impl Tuning {
         if block_time_ms == 0 {
             return Err(anyhow!("chain.block_time_ms must be > 0"));
         }
-        let positive: [(&str, u64); 17] = [
+        let positive: [(&str, u64); 18] = [
             ("balance_refresh_ms", self.balance_refresh_ms),
             ("volatile_pool_max_age_ms", self.volatile_pool_max_age_ms),
             ("stable_pool_max_age_ms", self.stable_pool_max_age_ms),
@@ -528,6 +539,7 @@ impl Tuning {
             ("phantom_cap_bps", self.phantom_cap_bps),
             ("tri_verify_max_rounds", self.tri_verify_max_rounds as u64),
             ("max_consecutive_failures", self.max_consecutive_failures as u64),
+            ("block_stall_exit_ms", self.block_stall_exit_ms),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(anyhow!("tuning.{} must be > 0", name));
@@ -568,6 +580,7 @@ impl Tuning {
     pub fn rate_limit_log_every(&self) -> std::time::Duration { ms(self.rate_limit_log_every_ms) }
     pub fn slow_scan_warn(&self) -> std::time::Duration { ms(self.slow_scan_warn_ms) }
     pub fn heartbeat_stall_warn(&self) -> std::time::Duration { ms(self.heartbeat_stall_warn_ms) }
+    pub fn block_stall_exit(&self) -> std::time::Duration { ms(self.block_stall_exit_ms) }
     pub fn volatile_pool_max_age(&self) -> std::time::Duration { ms(self.volatile_pool_max_age_ms) }
     pub fn stable_pool_max_age(&self) -> std::time::Duration { ms(self.stable_pool_max_age_ms) }
     pub fn v3_fresh_window(&self) -> std::time::Duration { ms(self.v3_fresh_window_ms) }
@@ -626,6 +639,19 @@ routers: []
         assert_eq!(t.quote_cache_max_age(), std::time::Duration::from_secs(6));
         assert_eq!(t.health_monitor_every(), std::time::Duration::from_secs(2));
         assert_eq!(t.phantom_cap_bps, 500);
+        assert_eq!(t.block_stall_exit_ms, 300_000);
+    }
+
+    #[test]
+    fn fee_tiers_validated() {
+        let with_tiers = |tiers: &str| MIN.replace(
+            "routers: []\n",
+            &format!("routers:\n  - id: r\n    name: r\n    address: \"0x0000000000000000000000000000000000000002\"\n    type: v3\n    fee_tiers: {tiers}\n"),
+        );
+        let err = parse_config(&with_tiers("[30000000]")).unwrap_err().to_string();
+        assert!(err.contains("fee tier 30000000"), "{err}");
+        assert!(parse_config(&with_tiers("[0]")).is_err());
+        parse_config(&with_tiers("[100, 500, 3000, 10000]")).unwrap();
     }
 
     #[test]
@@ -654,6 +680,8 @@ routers: []
         assert!(parse_config(&typo).is_err(), "unknown tuning keys must be rejected");
         let zero = format!("{}tuning:\n  multicall_chunk_size: 0\n", MIN);
         assert!(parse_config(&zero).is_err());
+        let stall = format!("{}tuning:\n  block_stall_exit_ms: 0\n", MIN);
+        assert!(parse_config(&stall).is_err());
     }
 
     #[test]

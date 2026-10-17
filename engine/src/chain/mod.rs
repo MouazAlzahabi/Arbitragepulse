@@ -246,6 +246,7 @@ pub async fn run_chain(
                 paused: false,
                 rpc_ok: true,   // we just connected successfully
                 last_block: 0,
+                last_block_at: 0,
                 rpc_latency_ms: 0.0,
             });
         } else if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
@@ -456,6 +457,10 @@ pub async fn run_chain(
     // delay a scan. Each flag stops a slow refresh from overlapping with the next tick.
     let price_refresh_busy   = Arc::new(AtomicBool::new(false));
     let balance_refresh_busy = Arc::new(AtomicBool::new(false));
+    // When the last block header arrived: a long gap means the WS backend is dead (E1-3).
+    let mut last_block_seen = Instant::now();
+    // Last config-reload error, so a persistent one is reported once, not every tick.
+    let mut last_reload_err: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -468,6 +473,10 @@ pub async fn run_chain(
 
             // ── Periodic price update + cache cleanup + status log ────────────
             _ = price_tick.tick() => {
+                if last_block_seen.elapsed() > crate::config::tuning().block_stall_exit() {
+                    tracing::error!("[{}] No new block for {:.0?} — RPC / WebSocket dead; exiting (code 1) so the service manager restarts the engine and walks the RPC fallback list", cfg.name, last_block_seen.elapsed());
+                    std::process::exit(1);
+                }
                 if !price_refresh_busy.swap(true, Ordering::AcqRel) {
                     let (strategy, executor, provider) = (strategy.clone(), executor.clone(), provider.clone());
                     let (routers, pairs, cfg) = (chain_routers.clone(), chain_pairs.clone(), cfg.clone());
@@ -658,43 +667,62 @@ pub async fn run_chain(
 
             // ── Config hot-reload ─────────────────────────────────────────────
             _ = config_tick.tick() => {
-                if let Ok(new_cfg) = config::load_config(&config_path) {
-                    let new_pairs: Vec<_> = new_cfg.pairs.clone();
-                    let new_routers: Vec<_> = new_cfg.routers.clone();
-                    // Same instance, same chain: a reload that switched chains is ignored.
-                    let new_chain_cfg = Some(&new_cfg.chain).filter(|c| c.id == cfg.id);
-                    let new_min_profit = new_chain_cfg
-                        .map(|c| c.min_profit_usd)
-                        .unwrap_or(cfg.min_profit_usd);
-                    let new_min_tri_profit = new_chain_cfg
-                        .and_then(|c| c.min_triangular_profit_usd)
-                        .unwrap_or(new_min_profit);
+                let loaded = config::load_config(&config_path).and_then(|c| {
+                    if c.chain.id == cfg.id {
+                        Ok(c)
+                    } else {
+                        Err(anyhow::anyhow!("chain.id changed to {} — the reload is ignored; restart to switch chains", c.chain.id))
+                    }
+                });
+                match loaded {
+                    Ok(new_cfg) => {
+                        last_reload_err = None;
+                        let new_pairs: Vec<_> = new_cfg.pairs.clone();
+                        let new_routers: Vec<_> = new_cfg.routers.clone();
+                        // Same instance, same chain: a reload that switched chains is ignored.
+                        let new_chain_cfg = Some(&new_cfg.chain).filter(|c| c.id == cfg.id);
+                        let new_min_profit = new_chain_cfg
+                            .map(|c| c.min_profit_usd)
+                            .unwrap_or(cfg.min_profit_usd);
+                        let new_min_tri_profit = new_chain_cfg
+                            .and_then(|c| c.min_triangular_profit_usd)
+                            .unwrap_or(new_min_profit);
 
-                    {
-                        let mut strat = strategy.write().await;
+                        {
+                            let mut strat = strategy.write().await;
 
-                        let profit_changed = strat.min_profit_usd != new_min_profit
-                            || strat.min_triangular_profit_usd != new_min_tri_profit;
+                            let profit_changed = strat.min_profit_usd != new_min_profit
+                                || strat.min_triangular_profit_usd != new_min_tri_profit;
 
-                        strat.pairs = new_pairs;
-                        strat.routers = new_routers;
-                        strat.min_profit_usd = new_min_profit;
-                        strat.min_triangular_profit_usd = new_min_tri_profit;
-                        // Single rebuild with updated pairs, routers, and profit floors.
-                        strat.rebuild_token_pair_index();
-                        strat.rebuild_router_maps();
+                            strat.pairs = new_pairs;
+                            strat.routers = new_routers;
+                            strat.min_profit_usd = new_min_profit;
+                            strat.min_triangular_profit_usd = new_min_tri_profit;
+                            // Single rebuild with updated pairs, routers, and profit floors.
+                            strat.rebuild_token_pair_index();
+                            strat.rebuild_router_maps();
 
-                        if profit_changed {
-                            info!(
-                                "[{}] Config hot-reloaded (min_profit=${:.2}, min_triangular_profit=${:.2})",
-                                cfg.name, new_min_profit, new_min_tri_profit
-                            );
+                            if profit_changed {
+                                info!(
+                                    "[{}] Config hot-reloaded (min_profit=${:.2}, min_triangular_profit=${:.2})",
+                                    cfg.name, new_min_profit, new_min_tri_profit
+                                );
+                            }
+                        } // strategy write lock released here — before acquiring executor lock
+
+                        {
+                            let mut exec = executor.lock().await;
+                            exec.min_profit_usd = new_min_profit;
                         }
-                    } // strategy write lock released here — before acquiring executor lock
-
-                    {
-                        let mut exec = executor.lock().await;
-                        exec.min_profit_usd = new_min_profit;
+                    }
+                    Err(e) => {
+                        let s = e.to_string();
+                        if last_reload_err.as_deref() != Some(s.as_str()) {
+                            let msg = format!("[{}] Config reload failed — still running the previous config: {}", cfg.name, s);
+                            warn!("{}", msg);
+                            broadcast_log(&log_tx, "error", &msg, None);
+                            last_reload_err = Some(s);
+                        }
                     }
                 }
             }
@@ -703,6 +731,7 @@ pub async fn run_chain(
             Some((block_num, base_fee)) = block_rx.recv() => {
                 // Pre-populate gas price cache from block header — eliminates eth_gasPrice RPC calls.
                 executor.lock().await.update_gas_price(base_fee);
+                last_block_seen = Instant::now();
 
                 // Update RPC health + block number in shared state, count each block as a scan
                 {
@@ -712,6 +741,7 @@ pub async fn run_chain(
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
                         chain.rpc_ok = true;
                         chain.last_block = block_num;
+                        chain.last_block_at = crate::api::now_secs();
                         chain.base_fee_gwei = base_fee_gwei;
                     }
                 }
@@ -1004,7 +1034,7 @@ async fn connect_with_fallback(
     for (i, url) in urls.iter().enumerate() {
         match ProviderBuilder::<_, _, Ethereum>::new()
             .wallet(wallet.clone())
-            .connect_ws(WsConnect::new(*url))
+            .connect_ws(WsConnect::new(*url).with_max_retries(u32::MAX))
             .await
         {
             Ok(p) => {

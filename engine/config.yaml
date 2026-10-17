@@ -374,6 +374,7 @@ tuning:
   max_consecutive_failures: 20           # circuit breaker (RPC outages don't count)
   slow_scan_warn_ms: 10000
   heartbeat_stall_warn_ms: 30000
+  block_stall_exit_ms: 300000         # no new block this long → exit 1, systemd restarts (fallback RPCs)
   price_refresh_ms: 60000
   balance_refresh_ms: 30000
   config_reload_ms: 30000

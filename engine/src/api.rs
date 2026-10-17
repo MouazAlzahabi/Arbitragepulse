@@ -70,6 +70,8 @@ pub struct ChainStats {
     pub rpc_ok: bool,
     /// Last block number seen from the block-header subscription (0 = not yet seen).
     pub last_block: u64,
+    /// Unix seconds when `last_block` last advanced (0 = no block yet).
+    pub last_block_at: u64,
     /// Latest eth_blockNumber round-trip latency in ms (measured once per heartbeat interval). 0 = not yet measured.
     pub rpc_latency_ms: f64,
 }
@@ -161,7 +163,8 @@ impl ApiServer {
     }
 
     pub async fn run(self) {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let port = self.port;
+        let addr = format!("0.0.0.0:{}", port);
         let state = Arc::new(AppState {
             engine: self.state,
             log_tx: self.log_tx,
@@ -194,8 +197,17 @@ impl ApiServer {
             .with_state(state);
 
         info!("API server listening on {}", addr);
-        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("API server cannot listen on {}: {} — exiting (code 1); is another instance using PORT {}?", addr, e, port);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("API server stopped: {} — exiting (code 1)", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -287,20 +299,35 @@ fn urlencoding_decode(s: &str) -> String {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+/// /health verdict → (status, healthy). Unhealthy = RPC lost, RPC backoff, or no new block for
+/// `stale_after_secs` (or none yet).
+fn health_verdict(chains: &[ChainStats], backoff: impl Fn(u64) -> bool, now: u64, stale_after_secs: u64) -> (&'static str, bool) {
+    if chains.is_empty() {
+        return ("ok", true);
+    }
+    let stale = |c: &ChainStats| c.last_block_at == 0 || now.saturating_sub(c.last_block_at) > stale_after_secs;
+    let healthy = chains.iter().all(|c| c.rpc_ok && !stale(c) && !backoff(c.chain_id));
+    (if healthy { "ok" } else { "degraded" }, healthy)
+}
+
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let engine = state.engine.read().await;
-    let uptime = now_secs() - engine.uptime_start;
-    let all_rpc_ok = !engine.chains.is_empty() && engine.chains.iter().all(|c| c.rpc_ok);
-    let any_backoff = engine.chains.iter().any(|c| engine.backoff_active(c.chain_id));
+    let now = now_secs();
+    let uptime = now - engine.uptime_start;
     // A chain in backoff isn't executing — report it the same way as a lost RPC (503), so
-    // uptime checks that only read the status code alert on it.
-    let healthy = engine.chains.is_empty() || (all_rpc_ok && !any_backoff);
-    let status = if healthy { "ok" } else { "degraded" };
+    // uptime checks that only read the status code alert on it. Same for a stalled block feed.
+    let (status, healthy) = health_verdict(
+        &engine.chains,
+        |id| engine.backoff_active(id),
+        now,
+        crate::config::tuning().heartbeat_stall_warn().as_secs(),
+    );
     let chain_health: Vec<_> = engine.chains.iter().map(|c| serde_json::json!({
         "chain_id":   c.chain_id,
         "chain_name": c.chain_name,
         "rpc_ok":     c.rpc_ok,
         "last_block": c.last_block,
+        "last_block_age_s": if c.last_block_at == 0 { serde_json::Value::Null } else { now.saturating_sub(c.last_block_at).into() },
         "paused":     c.paused,
         "rpc_backoff": engine.backoff_active(c.chain_id),
     })).collect();
@@ -447,14 +474,17 @@ async fn engine_dry_run(
     Json(serde_json::json!({ "dry_run": body.enabled }))
 }
 
+/// Exit code for POST /engine/restart: non-zero so systemd's Restart=on-failure restarts the engine (0 would not), and not 2 (RestartPreventExitStatus).
+const RESTART_EXIT_CODE: i32 = 75;
+
 async fn engine_restart(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let log_tx = state.log_tx.clone();
     tokio::spawn(async move {
         // Give the HTTP response time to reach the client before exiting.
-        // The process manager (systemd/supervisor) will restart the engine.
+        // systemd (Restart=on-failure) restarts on exit code 75.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         broadcast_log(&log_tx, "info", "[ENGINE] Restarting — process exit requested via API", None);
-        std::process::exit(0);
+        std::process::exit(RESTART_EXIT_CODE);
     });
     Json(serde_json::json!({ "restarting": true }))
 }
@@ -688,4 +718,42 @@ pub fn broadcast_log(tx: &LogBroadcaster, level: &str, message: &str, data: Opti
         data,
     };
     let _ = tx.send(entry); // OK if no subscribers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain(rpc_ok: bool, paused: bool, last_block_at: u64) -> ChainStats {
+        ChainStats {
+            chain_id: 8453,
+            chain_name: String::new(),
+            total_scans: 0,
+            total_attempts: 0,
+            total_success: 0,
+            total_failed: 0,
+            total_dry_run_ok: 0,
+            total_exec_failed: 0,
+            total_profit_usd: 0.0,
+            ghost_profit_usd: 0.0,
+            base_fee_gwei: 0.0,
+            dry_run: false,
+            paused,
+            rpc_ok,
+            last_block: 0,
+            last_block_at,
+            rpc_latency_ms: 0.0,
+        }
+    }
+
+    #[test]
+    fn health_verdict_cases() {
+        let no = |_| false;
+        assert_eq!(health_verdict(&[], no, 1010, 30), ("ok", true));
+        assert_eq!(health_verdict(&[chain(true, false, 1000)], no, 1010, 30), ("ok", true));
+        assert_eq!(health_verdict(&[chain(true, false, 1000)], no, 1040, 30), ("degraded", false), "stale block");
+        assert_eq!(health_verdict(&[chain(true, false, 0)], no, 1010, 30), ("degraded", false), "no block yet");
+        assert_eq!(health_verdict(&[chain(false, false, 1000)], no, 1010, 30), ("degraded", false), "rpc lost");
+        assert_eq!(health_verdict(&[chain(true, false, 1000)], |_| true, 1010, 30), ("degraded", false), "backoff");
+    }
 }
