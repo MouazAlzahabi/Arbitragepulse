@@ -18,7 +18,7 @@ Each router must be whitelisted with a type. Ordinals are part of the engine int
 | Type | Value | Swap call | `fee` argument |
 |------|-------|-----------|----------------|
 | V2 | 0 | `swapExactTokensForTokens` | ignored |
-| V3 | 1 | SwapRouter02 7-field `exactInputSingle` (Uniswap V3, PancakeSwap V3) | pool fee tier, must be non-zero |
+| V3 | 1 | SwapRouter02 7-field `exactInputSingle` (Uniswap V3, PancakeSwap V3) | pool fee tier in hundredths of a bip, 100..999999 (e.g. 500 / 3000) — not bps |
 | — | 2, 3 | retired (Solidly 3-field, SyncSwap) — rejected | |
 | Aerodrome | 4 | 4-field `Route{from,to,stable,factory}` | `0` volatile pool, non-zero stable pool |
 
@@ -43,7 +43,7 @@ the capital exactly like a router-level minimum.
 |-------|---------|
 | `LegFailed(leg, router, rtype, reason)` | a router reverted; `reason` is its raw revert data (string, custom error such as Aerodrome's, or empty). Empty: no pool for that fee tier / stable flag, or the wrong router type |
 | `LegExhaustedGas(leg, router, reason)` | the router used all the gas it was given (with no reason, or Uniswap TransferHelper's "TF"/"STF"/"SA" — how it re-raises an inner out-of-gas; a specific reason such as K() stays `LegFailed`): raise the tx gas limit — or, if it persists at a higher limit, an invalid opcode / assert in the router or pool (the EVM can't tell them apart). At very tight limits the executor can't even pay for this revert; the tx then fails with no data and the engine reads out-of-gas from the receipt (gas used ≥ 97% of the limit) |
-| `NotProfitable(balanceBefore, balanceAfter, minProfit)` | the route completed but returned less than `amountIn + minProfit` — price moved or spread closed |
+| `NotProfitable(balanceBefore, balanceAfter, minProfit)` | the route completed but the start-token balance ended below `balanceBefore + minProfit` (net gain < `minProfit`) — price moved or spread closed |
 | `InsufficientBalance(token, balance, needed)` | the contract does not hold `amountIn` of the start token |
 | `NoOutput(leg, router)` | a router returned without paying anything out (or the output balance shrank) |
 | `InvalidV3Fee(leg, router, fee)` | V3 fee outside 100..999999 — 0, or a bps value like 30 instead of 3000 |

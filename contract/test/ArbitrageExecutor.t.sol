@@ -146,6 +146,16 @@ contract ArbitrageExecutorTest is Test {
         _arb(address(v2A), address(v2B), 0, 0, 1 ether);
     }
 
+    function test_HeldIntermediateToken_IsNotSold() public {
+        // inventory of tokenB already in the executor must not leak into the trade: a leg spends
+        // only what the previous leg delivered (balance delta), never the whole balance
+        tokenB.transfer(address(executor), 50 ether);
+        _arb(address(v2A), address(v2B), 0, 0, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), 1_020 ether, "profit is the real +20");
+        assertEq(tokenB.balanceOf(address(executor)), 50 ether, "held tokenB untouched");
+        assertEq(executor.totalProfit(address(tokenA)), 20 ether);
+    }
+
     // ════════════════════════════════════════════════════════════
     // Readable failures
     // ════════════════════════════════════════════════════════════
@@ -166,6 +176,13 @@ contract ArbitrageExecutorTest is Test {
         // spread is +20; asking for 30 → after 1020, required +30
         vm.expectRevert(_notProfitable(1_020 ether, 30 ether));
         _arb(address(v2A), address(v2B), 0, 0, 30 ether);
+    }
+
+    function test_ProfitExactlyAtFloor_Succeeds() public {
+        // spread is +20 and minProfit is 20: the gate is `>=`, so a trade that lands exactly on the floor executes
+        _arb(address(v2A), address(v2B), 0, 0, 20 ether);
+        assertEq(tokenA.balanceOf(address(executor)), 1_020 ether);
+        assertEq(executor.totalProfit(address(tokenA)), 20 ether);
     }
 
     function test_RouterRevert_ReportsLegAndRouterReason() public {
@@ -513,6 +530,17 @@ contract ArbitrageExecutorTest is Test {
         assertEq(tokenB.balanceOf(address(executor)) + tokenC.balanceOf(address(executor)), 0, "nothing stranded");
     }
 
+    function test_Triangular_HeldIntermediateTokens_AreNotSold() public {
+        address bc = _triRouters(ArbitrageExecutor.RouterType.V2);
+        tokenB.transfer(address(executor), 50 ether);
+        tokenC.transfer(address(executor), 70 ether);
+        _tri(address(v2A), bc, address(v2B), 0, 0, 0, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), 1_020 ether, "profit is the real +20");
+        assertEq(tokenB.balanceOf(address(executor)), 50 ether, "held tokenB untouched");
+        assertEq(tokenC.balanceOf(address(executor)), 70 ether, "held tokenC untouched");
+        assertEq(executor.totalProfit(address(tokenA)), 20 ether);
+    }
+
     event TriangularArbitrageExecuted(
         address indexed tokenA, address indexed tokenB, address indexed tokenC,
         address routerAB, address routerBC, address routerCA, uint256 amountIn, uint256 profit
@@ -553,6 +581,22 @@ contract ArbitrageExecutorTest is Test {
         address bc = _triRouters(ArbitrageExecutor.RouterType.V3);
         vm.expectRevert(_notProfitable(980 ether, 1 ether)); // 100 → 200 → 200 → 80
         _tri(address(v2A), bc, address(v3C), 0, FEE, FEE, 1 ether);
+    }
+
+    function test_Triangular_Leg2Failure_NamesLeg2AndRouterBC() public {
+        // unfunded 1/1 V2 router as BC: 100 TKA -> 200 TKB, then BC can't pay 200 TKC
+        MockRouter dry = new MockRouter(1, 1);
+        executor.setRouter(address(dry), ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(_legFailed(2, address(dry), ArbitrageExecutor.RouterType.V2,
+            abi.encodeWithSignature("ERC20InsufficientBalance(address,uint256,uint256)", address(dry), 0, 200 ether)));
+        _tri(address(v2A), address(dry), address(v2B), 0, 0, 0, 1 ether);
+    }
+
+    function test_Triangular_Leg3Failure_NamesLeg3AndRouterCA() public {
+        // legs 1-2 run, then CA (V3) rejects a bps-style fee: the error must carry leg 3
+        address bc = _triRouters(ArbitrageExecutor.RouterType.V2);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.InvalidV3Fee.selector, uint8(3), address(v3B), uint24(30)));
+        _tri(address(v2A), bc, address(v3B), 0, 0, 30, 1 ether);
     }
 
     function test_Triangular_RepeatedToken() public {
