@@ -213,3 +213,133 @@ pub(crate) async fn check_contract_funding(
         }
     }
 }
+
+// ─── Startup check of the executor contract ───────────────────────────────────
+
+/// `ArbitrageExecutor.RouterType` ordinal for a configured router type (0 = V2, 1 = V3, 4 = Aerodrome).
+pub(crate) fn expected_router_type(t: RouterType) -> u8 {
+    match t {
+        RouterType::V2 => 0,
+        RouterType::V3 => 1,
+        RouterType::Aerodrome => 4,
+    }
+}
+
+pub(crate) fn owner_problem(owner: Address, signer: Address) -> Option<String> {
+    (owner != signer).then(|| format!(
+        "signer {signer} is not the executor owner ({owner}) — every trade would revert OwnableUnauthorizedAccount. Use the owner's PRIVATE_KEY, or transfer ownership to this key (transferOwnership + acceptOwnership)."
+    ))
+}
+
+pub(crate) fn router_problem(id: &str, addr: Address, t: RouterType, allowed: bool, onchain_type: u8) -> Option<String> {
+    let want = expected_router_type(t);
+    if !allowed {
+        Some(format!("router {id} ({addr}) is not allowlisted on the executor — setRouter({addr}, {want})"))
+    } else if onchain_type != want {
+        Some(format!("router {id} ({addr}) is allowlisted as type {onchain_type} but configured as type {want} — setRouter({addr}, {want})"))
+    } else {
+        None
+    }
+}
+
+/// Startup check of the executor against this engine's key and routers. Exits with code 2
+/// when the signer isn't the owner (any mode) or a router isn't allowlisted / typed right (live
+/// mode; dry-run only warns). Returns whether the contract is paused (the chain then starts paused).
+/// RPC errors return Err → run_chain's caller retries in 5 s.
+pub(crate) async fn check_contract_setup<P: Provider>(
+    provider: &P,
+    contract: Address,
+    signer: Address,
+    routers: &[RouterConfig],
+    chain: &str,
+    dry_run: bool,
+    log_tx: &LogBroadcaster,
+) -> Result<bool> {
+    use crate::abi::ArbitrageExecutor;
+    let exec = ArbitrageExecutor::new(contract, provider);
+
+    let owner = rpc_timeout(rpc_read_timeout(), exec.owner().call())
+        .await
+        .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: owner() failed: {e}"))?;
+    if let Some(msg) = owner_problem(owner, signer) {
+        tracing::error!("[{chain}] {msg}");
+        std::process::exit(2);
+    }
+    let paused = rpc_timeout(rpc_read_timeout(), exec.paused().call())
+        .await
+        .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: paused() failed: {e}"))?;
+
+    let mut problems = Vec::new();
+    for r in routers {
+        let addr: Address = match r.address.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                problems.push(format!("router {} has an invalid address: {}", r.id, r.address));
+                continue;
+            }
+        };
+        let allowed = rpc_timeout(rpc_read_timeout(), exec.allowedRouters(addr).call())
+            .await
+            .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: allowedRouters() failed: {e}"))?;
+        let onchain_type = rpc_timeout(rpc_read_timeout(), exec.routerType(addr).call())
+            .await
+            .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: routerType() failed: {e}"))?;
+        if let Some(p) = router_problem(&r.id, addr, r.router_type, allowed, onchain_type) {
+            problems.push(p);
+        }
+    }
+    for p in &problems {
+        tracing::error!("[{chain}] {p}");
+        broadcast_log(log_tx, "error", &format!("[{chain}] {p}"), None);
+    }
+    if !problems.is_empty() {
+        if !dry_run {
+            tracing::error!("[{chain}] refusing to start live trading: fix the router allowlist (setRouter) or run with DRY_RUN=true");
+            std::process::exit(2);
+        }
+        warn!("[{chain}] dry-run continues — trades through these routers would revert on-chain");
+    }
+    if paused {
+        let msg = format!("[{chain}] Executor contract is paused — chain starts paused (no scans, no sends). unpause() it, then POST /engine/resume.");
+        warn!("{msg}");
+        broadcast_log(log_tx, "warn", &msg, None);
+    }
+    info!(
+        "[{chain}] Executor {contract}: owner = signer, {} routers allowlisted{}",
+        routers.len() - problems.len(),
+        if paused { ", PAUSED" } else { "" }
+    );
+    Ok(paused)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn expected_router_type_ordinals() {
+        assert_eq!(expected_router_type(RouterType::V2), 0);
+        assert_eq!(expected_router_type(RouterType::V3), 1);
+        assert_eq!(expected_router_type(RouterType::Aerodrome), 4);
+    }
+
+    #[test]
+    fn owner_problem_cases() {
+        let a = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let b = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
+        assert!(owner_problem(a, a).is_none());
+        let msg = owner_problem(a, b).expect("mismatch");
+        assert!(msg.contains(&a.to_string()) && msg.contains(&b.to_string()), "{msg}");
+    }
+
+    #[test]
+    fn router_problem_cases() {
+        let a = address!("2626664c2603336E57B271c5C0b26F421741e481");
+        let msg = router_problem("r", a, RouterType::V3, false, 0).expect("not allowed");
+        assert!(msg.contains("not allowlisted") && msg.contains("setRouter"), "{msg}");
+        assert!(router_problem("r", a, RouterType::V3, true, 1).is_none());
+        let msg = router_problem("r", a, RouterType::Aerodrome, true, 0).expect("wrong type");
+        assert!(msg.contains("type 0") && msg.contains("type 4"), "{msg}");
+    }
+}

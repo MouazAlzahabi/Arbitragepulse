@@ -62,6 +62,12 @@ impl RevertClass {
             Self::Unavailable => "unavailable",
         }
     }
+
+    /// A mined revert that will repeat on every send until the operator acts (contract paused,
+    /// signer not owner, router not allowlisted): the chain pauses at once.
+    pub fn pauses_chain(self) -> bool {
+        matches!(self, Self::Blocked | Self::RouterNotAllowed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +458,16 @@ mod tests {
 
     fn error_string(msg: &str) -> Vec<u8> {
         alloy::sol_types::Revert { reason: msg.to_string() }.abi_encode()
+    }
+
+    #[test]
+    fn pauses_chain_only_for_operator_fixable_classes() {
+        use RevertClass as C;
+        assert!(C::Blocked.pauses_chain());
+        assert!(C::RouterNotAllowed.pauses_chain());
+        for c in [C::NotProfitable, C::OutOfGas, C::InsufficientBalance, C::InvalidRoute, C::Unavailable, C::Unknown] {
+            assert!(!c.pauses_chain(), "{:?}", c);
+        }
     }
 
     #[test]

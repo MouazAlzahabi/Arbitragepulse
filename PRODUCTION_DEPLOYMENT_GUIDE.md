@@ -53,6 +53,11 @@ Whitelist every active router (types: `0` = V2, `1` = V3, `4` = Aerodrome):
 cast send $EXECUTOR "setRouter(address,uint8)" $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url https://mainnet.base.org
 ```
 
+At startup the engine reads the executor and refuses to start (exit code 2, no systemd
+restart) if its key is not `owner()`, or — in live mode — if a configured router is not
+allowlisted with the type above (dry-run only warns). If the contract is `paused()`, the
+chain starts paused: `unpause()`, then `POST /engine/resume`.
+
 Fund the executor with the pairs' `token_in` (mostly USDC) and the wallet with a little
 ETH for gas (`chain.min_native_balance`). Withdraw with `withdrawToken(token)` /
 `withdrawETH()`; `pause()` freezes the contract.
@@ -67,8 +72,13 @@ cp engine/base.env.example engine/base.env   # on the server
 chmod 600 engine/base.env
 ```
 
-Fill in `PRIVATE_KEY` (the executor owner), `ALCHEMY_KEY`, `API_KEY`. Keep
-`CONFIG_PATH=engine/config.yaml`, `PORT=3000`, `DB_PATH=trades-base.db`,
+Fill in `PRIVATE_KEY` (the executor owner), `ALCHEMY_KEY` and `API_KEY`. `API_KEY` is
+required — the engine refuses to start without it (exit code 2); generate it with
+`openssl rand -hex 32` and enter the same value in the dashboard (`API_INSECURE=1`
+skips the check, for local development only). **Upgrading** a server whose env still
+has `API_KEY=` empty: set it before running `deploy.sh`, or the restart fails.
+
+Keep `CONFIG_PATH=engine/config.yaml`, `PORT=3000`, `DB_PATH=trades-base.db`,
 `DRY_RUN=true` for the first run. `*.env` files are gitignored and are not synced by
 `deploy.sh` — they live only on the server.
 
@@ -105,7 +115,8 @@ curl -s -H "Authorization: Bearer $API_KEY" localhost:3000/health | python3 -m j
   (`rpc_backoff: true`: node hanging, down or too slow to simulate on — detection
   continues, execution is off until the monitor sees the node healthy again), or no new
   block arrived for `tuning.heartbeat_stall_warn_ms` (`last_block_age_s`). Point uptime
-  checks at the status code.
+  checks at the status code. A chain paused by the circuit breaker or an auto-pause
+  reports `"status":"paused"` (503); an operator pause (`POST /engine/pause`) stays 200.
 - If no block arrives for `tuning.block_stall_exit_ms` (5 min) the engine exits with
   code 1 and systemd restarts it, walking the RPC fallback list. The same happens if the
   chain task dies or the API port can't be bound.
@@ -113,13 +124,25 @@ curl -s -H "Authorization: Bearer $API_KEY" localhost:3000/health | python3 -m j
   engine. Restarts count toward `StartLimitBurst` (5 per 2 min).
 - The heartbeat line (`♥ scans=… | last_scan=…s ago`) logs at WARN if no scan ran for
   `tuning.heartbeat_stall_warn_ms`.
-- The circuit breaker pauses the chain after `tuning.max_consecutive_failures`
-  execution failures (RPC outages don't count); resume with `POST /engine/resume`.
+- The circuit breaker pauses the chain after `tuning.max_consecutive_failures` execution
+  failures (RPC outages don't count). The chain is also paused at once when a tx
+  reverts on-chain as `blocked` (contract paused / signer not owner) or
+  `router_not_allowed`, and at startup when the contract is paused. Fix the cause, then
+  `POST /engine/resume` — it clears both the global and the per-chain pause.
 - The dashboard (`dist/`, served by your web server or `npm run dashboard` locally,
   e.g. through an SSH tunnel to port 3000) shows the live feed, stats and backoff state.
 
 Tuning (`tuning:` in the config) needs a restart; routers, pairs and profit floors
 hot-reload.
+
+## 7. Exit codes
+
+| Code | Meaning | systemd |
+|---|---|---|
+| 0 | stopped (SIGTERM / Ctrl-C) | stays stopped |
+| 1 | crash, chain task died, config error, no new block for `tuning.block_stall_exit_ms`, API port unusable | restarts (5 per 2 min, then `failed`) |
+| 2 | refused to start: RPC chain id ≠ `chain.id`, signer not the executor owner, router not allowlisted (live), empty `API_KEY` | not restarted — fix and `systemctl restart` |
+| 75 | `POST /engine/restart` | restarts |
 
 ## Running another chain
 

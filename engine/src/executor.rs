@@ -501,6 +501,11 @@ impl Executor {
         self.stats.total_failed += 1;
     }
 
+    /// Forget the local nonce; the next send re-fetches the PENDING count (fills a gap left by a dropped tx).
+    pub fn forget_nonce(&mut self) {
+        self.nonce = None;
+    }
+
     /// Pre-fetch and cache the on-chain nonce so the first submission has zero
     /// RPC overhead. Called at startup and can be called after reverts to avoid
     /// the ~50ms nonce fetch on the next submission. All nonce fetches use the PENDING

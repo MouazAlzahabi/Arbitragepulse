@@ -80,7 +80,7 @@ In `engine/config-testnet.yaml`:
 - uncomment the `base-sepolia-mock-usdc-weth` pair and paste the mUSDC / mWETH addresses
 
 Create `engine/base-sepolia.env` from `engine/base-sepolia.env.example` (testnet key,
-`PORT=3001`, `DB_PATH=trades-base-sepolia.db`, `DRY_RUN=true`).
+`PORT=3001`, `DB_PATH=trades-base-sepolia.db`, `DRY_RUN=true`). Set API_KEY (required — openssl rand -hex 32). PRIVATE_KEY must be the key that ran Deploy.s.sol (the executor owner), or the engine exits with code 2.
 
 ## 6. Run — dry run first
 
@@ -117,10 +117,15 @@ breaker trips, and `/health` stays `ok`. Then follow
 |---|---|
 | `refusing to start (wrong RPC URL or wrong config file?)` | RPC chain id ≠ `chain.id` — e.g. the mainnet config pointed at a Sepolia RPC |
 | `contract_address is not set` | `YOUR_…` placeholder still in the config |
+| `API_KEY is empty — refusing to start` | set `API_KEY` in the env file (or `API_INSECURE=1` for a local run) |
+| `signer 0x… is not the executor owner` (exit 2) | `PRIVATE_KEY` is not the deployer / owner of `$EXECUTOR` |
+| `router … is not allowlisted on the executor` | `setRouter(router, type)`; live mode refuses to start, dry-run warns |
+| `Executor contract is paused — chain starts paused` | `unpause()` the executor, then `POST /engine/resume` |
+| `Chain paused: tx reverted on-chain with blocked / router_not_allowed` | fix ownership / pause / allowlist, then `POST /engine/resume` |
 | Simulation reverts `0x118cdaa7` | the engine's key is not the executor owner |
 | `RouterNotAllowed(0x…)` | router not whitelisted — `setRouter(router, type)` |
 | `leg N (… router 0x…) reverted with no reason` | wrong router type for that router — re-run `setRouter` with the right type |
 | `leg N (… router 0x…) reverted: …` | the router's own reason (e.g. a token transfer failing) |
 | `not profitable: balance X → Y, needed +Z` | route completed but the price moved / spread closed before inclusion |
 | `InsufficientBalance(token, balance, needed)` / `insufficient token_a balance` | executor holds too little mUSDC |
-| `/health` 503, `rpc_backoff: true` | RPC hanging, down or slower than the simulation timeout — execution resumes automatically when it recovers |
+| `/health` 503, `rpc_backoff: true` | RPC hanging, down or slower than the simulation timeout — execution resumes automatically when it recovers; `"status":"paused"` means a breaker/auto pause (`POST /engine/resume`) |

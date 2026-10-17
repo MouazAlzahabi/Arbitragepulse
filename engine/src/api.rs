@@ -300,10 +300,15 @@ fn urlencoding_decode(s: &str) -> String {
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// /health verdict → (status, healthy). Unhealthy = RPC lost, RPC backoff, or no new block for
-/// `stale_after_secs` (or none yet).
+/// `stale_after_secs` (or none yet). A chain paused by the circuit breaker, an auto-pause or a
+/// paused contract is 503 `"paused"`; the operator's global `POST /engine/pause` is not in
+/// `ChainStats` and stays 200.
 fn health_verdict(chains: &[ChainStats], backoff: impl Fn(u64) -> bool, now: u64, stale_after_secs: u64) -> (&'static str, bool) {
     if chains.is_empty() {
         return ("ok", true);
+    }
+    if chains.iter().any(|c| c.paused) {
+        return ("paused", false);
     }
     let stale = |c: &ChainStats| c.last_block_at == 0 || now.saturating_sub(c.last_block_at) > stale_after_secs;
     let healthy = chains.iter().all(|c| c.rpc_ok && !stale(c) && !backoff(c.chain_id));
@@ -454,10 +459,23 @@ async fn engine_pause(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({ "paused": true }))
 }
 
+/// Clears the operator's global pause and any per-chain pause (circuit breaker, auto-pause on a
+/// deterministic on-chain revert, or contract paused at startup).
 async fn engine_resume(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut engine = state.engine.write().await;
-    engine.paused = false;
-    Json(serde_json::json!({ "paused": false }))
+    let cleared = {
+        let mut engine = state.engine.write().await;
+        engine.paused = false;
+        let mut n = 0;
+        for c in engine.chains.iter_mut().filter(|c| c.paused) {
+            c.paused = false;
+            n += 1;
+        }
+        n
+    };
+    if cleared > 0 {
+        broadcast_log(&state.log_tx, "info", &format!("[ENGINE] Resume: cleared the circuit-breaker / auto pause on {} chain(s)", cleared), None);
+    }
+    Json(serde_json::json!({ "paused": false, "chains_resumed": cleared }))
 }
 
 #[derive(Deserialize)]
@@ -755,5 +773,29 @@ mod tests {
         assert_eq!(health_verdict(&[chain(true, false, 0)], no, 1010, 30), ("degraded", false), "no block yet");
         assert_eq!(health_verdict(&[chain(false, false, 1000)], no, 1010, 30), ("degraded", false), "rpc lost");
         assert_eq!(health_verdict(&[chain(true, false, 1000)], |_| true, 1010, 30), ("degraded", false), "backoff");
+    }
+
+    #[test]
+    fn health_verdict_paused_chain() {
+        assert_eq!(health_verdict(&[chain(true, true, 1000)], |_| false, 1000, 30), ("paused", false));
+    }
+
+    #[tokio::test]
+    async fn resume_clears_chain_pause() {
+        let engine: SharedState = Arc::new(RwLock::new(EngineState {
+            paused: true,
+            chains: vec![chain(true, true, 1)],
+            ..Default::default()
+        }));
+        let state = AppState {
+            engine: engine.clone(),
+            log_tx: broadcast::channel(8).0,
+            api_key: String::new(),
+            db: None,
+            metrics: Metrics::new().unwrap(),
+        };
+        let _ = engine_resume(State(Arc::new(state))).await;
+        let e = engine.read().await;
+        assert!(!e.paused && !e.chains[0].paused);
     }
 }

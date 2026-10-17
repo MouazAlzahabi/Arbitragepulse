@@ -5,6 +5,31 @@ use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout, rpc_simulate_
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// A mined revert of a class that repeats on every send (`RevertClass::pauses_chain`): pause
+/// the chain until the operator fixes it and calls POST /engine/resume.
+async fn pause_chain_for_revert(
+    shared_state: &SharedState,
+    chain_id: u64,
+    chain_name: &str,
+    log_tx: &LogBroadcaster,
+    class: &str,
+    detail: Option<&str>,
+) {
+    {
+        let mut st = shared_state.write().await;
+        match st.chains.iter_mut().find(|c| c.chain_id == chain_id) {
+            Some(c) if !c.paused => c.paused = true,
+            _ => return, // already paused (another receipt got here first) or unknown chain
+        }
+    }
+    let msg = format!(
+        "[{}] Chain paused: tx reverted on-chain with `{}`{} — it will fail the same way on every send (contract paused, signer not the owner, or router not allowlisted). Fix it, then POST /engine/resume.",
+        chain_name, class, detail.map(|d| format!(" ({d})")).unwrap_or_default(),
+    );
+    warn!("{}", msg);
+    broadcast_log(log_tx, "error", &msg, None);
+}
+
 async fn diagnose_and_count_revert<P: Provider>(
     provider: &P,
     metrics: &Metrics,
@@ -586,6 +611,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let submit_at_bg = submit_at;
                                 let log_tx_bg = log_tx.clone();
                                 let metrics_bg = metrics.clone();
+                                let shared_state_bg = shared_state.clone();
+                                let executor_bg = executor.clone();
                                 tokio::spawn(async move {
                                     let receipt_result = tokio::time::timeout(
                                         std::time::Duration::from_secs(300),
@@ -594,7 +621,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     let receipt_result = match receipt_result {
                                         Ok(r) => r,
                                         Err(_) => {
-                                            warn!("[{}] Receipt wait timed out after 300s for tx {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                            executor_bg.lock().await.forget_nonce();
+                                            let msg = format!("[{}] No receipt after 300s for tx {} — outcome unknown (dropped, stuck, or lost by the RPC); nonce will be re-fetched", chain_name_bg, tx_hash_bg);
+                                            warn!("{}", msg);
+                                            broadcast_log(&log_tx_bg, "warn", &msg, None);
                                             return;
                                         }
                                     };
@@ -605,6 +635,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             let block_num = receipt.block_number();
                                             let revert_class_str: Option<&str>;
                                             let revert_detail: Option<String>;
+                                            let mut pause = false;
                                             if ok {
                                                 revert_class_str = None;
                                                 revert_detail = None;
@@ -619,6 +650,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     gas_limit_bg,
                                                 )
                                                 .await;
+                                                pause = diagnosis.class.pauses_chain();
                                                 revert_class_str = Some(diagnosis.class.as_str());
                                                 revert_detail = diagnosis.detail;
                                             }
@@ -694,12 +726,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "tx_hash":             tx_hash_bg,
                                                         "success":             false,
                                                         "revert_class":        revert_class_str,
-                                                        "revert_detail":       revert_detail,
+                                                        "revert_detail":       revert_detail.clone(),
                                                         "scan_to_submit_ms":   scan_to_submit_bg,
                                                         "router_a_type":       ra_type_bg,
                                                         "router_b_type":       rb_type_bg,
                                                     })),
                                                 );
+                                                if pause {
+                                                    pause_chain_for_revert(&shared_state_bg, chain_id_bg, &chain_name_bg, &log_tx_bg, revert_class_str.unwrap_or("unknown"), revert_detail.as_deref()).await;
+                                                }
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -753,11 +788,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     // A send that died on a reset/closed connection may also
                                     // have reached the node — same treatment.
                                     let rpc = crate::util::classify_rpc_failure(&err_str);
-                                    let nonce_consumed = err_str.contains("nonce too low")
-                                        || rpc == RpcFailure::Unreachable
-                                        || err_str.contains(crate::util::RPC_OUTCOME_UNKNOWN_MARKER)
-                                        || err_str.contains("already known")
-                                        || err_str.contains("replacement transaction");
+                                    // Once the signed tx went to the secondary RPCs, a rate-limit or server
+                                    // error on the primary says nothing about whether it landed.
+                                    let broadcast_fired = prep.raw_tx.is_some() && !prep.submission_rpcs.is_empty();
+                                    let nonce_consumed = crate::util::send_nonce_consumed(&err_str, broadcast_fired);
                                     let mut exec = executor.lock().await;
                                     exec.record_failed(nonce_consumed);
                                     // Only re-fetch nonce from chain when it was consumed by
@@ -1011,6 +1045,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let submit_at_bg = submit_at;
                                 let log_tx_bg = log_tx.clone();
                                 let metrics_bg = metrics.clone();
+                                let shared_state_bg = shared_state.clone();
+                                let executor_bg = executor.clone();
                                 tokio::spawn(async move {
                                     let receipt_result = tokio::time::timeout(
                                         std::time::Duration::from_secs(300),
@@ -1019,7 +1055,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     let receipt_result = match receipt_result {
                                         Ok(r) => r,
                                         Err(_) => {
-                                            warn!("[{}] Receipt wait timed out after 300s for tx {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())]);
+                                            executor_bg.lock().await.forget_nonce();
+                                            let msg = format!("[{}] No receipt after 300s for tx {} — outcome unknown (dropped, stuck, or lost by the RPC); nonce will be re-fetched", chain_name_bg, tx_hash_bg);
+                                            warn!("{}", msg);
+                                            broadcast_log(&log_tx_bg, "warn", &msg, None);
                                             return;
                                         }
                                     };
@@ -1030,6 +1069,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             let block_num = receipt.block_number();
                                             let revert_class_str: Option<&str>;
                                             let revert_detail: Option<String>;
+                                            let mut pause = false;
                                             if ok {
                                                 revert_class_str = None;
                                                 revert_detail = None;
@@ -1044,6 +1084,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     gas_limit_bg,
                                                 )
                                                 .await;
+                                                pause = diagnosis.class.pauses_chain();
                                                 revert_class_str = Some(diagnosis.class.as_str());
                                                 revert_detail = diagnosis.detail;
                                             }
@@ -1118,12 +1159,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "tx_hash":             tx_hash_bg,
                                                         "success":             false,
                                                         "revert_class":        revert_class_str,
-                                                        "revert_detail":       revert_detail,
+                                                        "revert_detail":       revert_detail.clone(),
                                                         "scan_to_submit_ms":   scan_to_submit_bg,
                                                         "router_a_type":       ra_type_bg,
                                                         "router_b_type":       rb_type_bg,
                                                     })),
                                                 );
+                                                if pause {
+                                                    pause_chain_for_revert(&shared_state_bg, chain_id_bg, &chain_name_bg, &log_tx_bg, revert_class_str.unwrap_or("unknown"), revert_detail.as_deref()).await;
+                                                }
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -1177,11 +1221,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     // A send that died on a reset/closed connection may also
                                     // have reached the node — same treatment.
                                     let rpc = crate::util::classify_rpc_failure(&err_str);
-                                    let nonce_consumed = err_str.contains("nonce too low")
-                                        || rpc == RpcFailure::Unreachable
-                                        || err_str.contains(crate::util::RPC_OUTCOME_UNKNOWN_MARKER)
-                                        || err_str.contains("already known")
-                                        || err_str.contains("replacement transaction");
+                                    // Once the signed tx went to the secondary RPCs, a rate-limit or server
+                                    // error on the primary says nothing about whether it landed.
+                                    let broadcast_fired = prep.raw_tx.is_some() && !prep.submission_rpcs.is_empty();
+                                    let nonce_consumed = crate::util::send_nonce_consumed(&err_str, broadcast_fired);
                                     let mut exec = executor.lock().await;
                                     exec.record_failed(nonce_consumed);
                                     // Not after an RPC-class failure: the node is hanging or down,

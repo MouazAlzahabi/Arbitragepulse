@@ -109,6 +109,13 @@ pub async fn run_chain(
         return Err(anyhow::anyhow!("[{}] contract_address is zero — check config", cfg.name));
     }
 
+    // ── Executor setup check: owner = signer (exit 2), router allowlist (exit 2 live), paused ──
+    // Runs before pool discovery so a wrong key fails within seconds. Startup only.
+    let dry_run_at_start = shared_state.read().await.dry_run;
+    let start_paused = state::check_contract_setup(
+        provider.as_ref(), contract_addr, signer_address, &routers, &cfg.name, dry_run_at_start, &log_tx,
+    ).await?;
+
     // ── Executor ──
     let submission_rpc_urls: Vec<url::Url> = cfg.submission_rpcs.iter()
         .filter_map(|s| s.parse().ok())
@@ -243,7 +250,7 @@ pub async fn run_chain(
                 ghost_profit_usd: 0.0,
                 base_fee_gwei: 0.0,
                 dry_run: true,
-                paused: false,
+                paused: start_paused,
                 rpc_ok: true,   // we just connected successfully
                 last_block: 0,
                 last_block_at: 0,
@@ -251,6 +258,9 @@ pub async fn run_chain(
             });
         } else if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
             chain.rpc_ok = true;
+            if start_paused {
+                chain.paused = true;
+            }
         }
         // Register this run's RPC health (replacing a previous run's after a reconnect).
         state.rpc_health.insert(cfg.id, rpc_health.clone());
@@ -754,6 +764,9 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
+                if reset_breaker_on_resume(chain_paused, &mut consecutive_failures) {
+                    info!("[{}] Circuit breaker cleared by resume", cfg.name);
+                }
                 if global_paused || chain_paused {
                     on_paused(&mut last_scan_at, &rpc_health);
                     continue;
@@ -793,6 +806,9 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
+                if reset_breaker_on_resume(chain_paused, &mut consecutive_failures) {
+                    info!("[{}] Circuit breaker cleared by resume", cfg.name);
+                }
                 if global_paused || chain_paused {
                     on_paused(&mut last_scan_at, &rpc_health);
                     continue;
@@ -873,6 +889,9 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
+                if reset_breaker_on_resume(chain_paused, &mut consecutive_failures) {
+                    info!("[{}] Circuit breaker cleared by resume", cfg.name);
+                }
                 if global_paused || chain_paused {
                     on_paused(&mut last_scan_at, &rpc_health);
                     continue;
@@ -922,6 +941,9 @@ pub async fn run_chain(
                     let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
                     (state.paused, cp, state.disabled_pairs.clone())
                 };
+                if reset_breaker_on_resume(chain_paused, &mut consecutive_failures) {
+                    info!("[{}] Circuit breaker cleared by resume", cfg.name);
+                }
                 if global_paused || chain_paused {
                     on_paused(&mut last_scan_at, &rpc_health);
                     continue;
@@ -1010,6 +1032,17 @@ fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
     });
 }
 
+/// A breaker pause that was just cleared by /engine/resume left the failure count at the
+/// threshold; reset it so the next single failure doesn't re-trip at once.
+fn reset_breaker_on_resume(chain_paused: bool, consecutive_failures: &mut u32) -> bool {
+    if !chain_paused && *consecutive_failures >= max_consecutive_failures() {
+        *consecutive_failures = 0;
+        true
+    } else {
+        false
+    }
+}
+
 /// A scan trigger fired while the chain is paused: no scan is expected (keeps the
 /// heartbeat's stall check quiet, also right after resume), and any RPC backoff from
 /// before the pause is stale.
@@ -1055,4 +1088,23 @@ async fn connect_with_fallback(
         urls.len(),
         last_err
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_breaker_on_resume_cases() {
+        // Default tuning: threshold 20.
+        let mut n = 20;
+        assert!(reset_breaker_on_resume(false, &mut n));
+        assert_eq!(n, 0);
+        let mut n = 20;
+        assert!(!reset_breaker_on_resume(true, &mut n));
+        assert_eq!(n, 20);
+        let mut n = 3;
+        assert!(!reset_breaker_on_resume(false, &mut n));
+        assert_eq!(n, 3);
+    }
 }

@@ -106,6 +106,8 @@ sol! {
             uint256 totalTrades,
             uint256 contractBalance
         );
+        function owner() external view returns (address);
+        function paused() external view returns (bool);
         function pause() external;
         function unpause() external;
         function withdrawToken(address token) external;

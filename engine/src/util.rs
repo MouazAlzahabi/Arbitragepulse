@@ -243,6 +243,24 @@ pub fn classify_rpc_failure(err: &str) -> RpcFailure {
     }
 }
 
+/// Whether a failed primary send may still have put the tx (and its nonce) on chain.
+/// `broadcast_fired`: the signed tx was already sent to the secondary submission RPCs, so a
+/// rate-limit or server error on the primary says nothing about whether it landed.
+pub fn send_nonce_consumed(err: &str, broadcast_fired: bool) -> bool {
+    let e = err.to_lowercase();
+    let rpc = classify_rpc_failure(&e);
+    e.contains("nonce too low")
+        || rpc == RpcFailure::Unreachable
+        || e.contains(RPC_OUTCOME_UNKNOWN_MARKER)
+        || e.contains("already known")
+        || e.contains("replacement transaction")
+        || (broadcast_fired
+            && (rpc == RpcFailure::RateLimited
+                || ["internal error", "server error", "bad gateway", "service unavailable", "gateway timeout"]
+                    .iter()
+                    .any(|m| e.contains(m))))
+}
+
 /// "429" as a standalone number (HTTP status), not as digits inside hex revert data.
 fn contains_status_429(e: &str) -> bool {
     let b = e.as_bytes();
@@ -267,6 +285,17 @@ pub fn is_sim_failure(err: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn send_nonce_consumed_cases() {
+        assert!(send_nonce_consumed("nonce too low", false));
+        assert!(!send_nonce_consumed("HTTP 429 Too Many Requests", false));
+        assert!(send_nonce_consumed("HTTP 429 Too Many Requests", true));
+        assert!(send_nonce_consumed("server returned an error response: error code -32603: internal error", true));
+        assert!(!send_nonce_consumed("insufficient funds for gas * price + value", true));
+        assert!(!send_nonce_consumed("execution reverted", true));
+        assert!(send_nonce_consumed("RPC request timed out after 5s (outcome unknown)", false));
+    }
 
     #[test]
     fn hold_starts_at_base_and_doubles_only_on_relapse() {

@@ -73,12 +73,12 @@ async fn main() -> Result<()> {
     };
 
     // ── API server ──
-    if env.api_key.is_empty() {
-        tracing::warn!(
-            "API_KEY is not set — HTTP API has NO authentication. \
-             Anyone on the network can pause/restart the engine. \
-             Set API_KEY=<secret> in .env for production."
-        );
+    if let Err(e) = config::check_api_key(&env.api_key, env.api_insecure) {
+        tracing::error!("{e}");
+        std::process::exit(2);
+    }
+    if env.api_key.trim().is_empty() {
+        tracing::warn!("API_INSECURE=1 — HTTP API has NO authentication. Local development only.");
     }
     let api_server = api::ApiServer::new(env.port, env.api_key.clone(), db.clone(), metrics.clone(), env.dry_run);
     let log_tx = api_server.log_sender();

@@ -238,6 +238,8 @@ pub struct Env {
     pub dry_run: bool,
     /// SQLite trade database. One per instance (DB_PATH, default `trades.db`).
     pub db_path: String,
+    /// API_INSECURE=1: allow an empty API_KEY (no HTTP auth). Local development only.
+    pub api_insecure: bool,
 }
 
 pub fn load_env() -> Result<Env> {
@@ -258,6 +260,9 @@ pub fn load_env() -> Result<Env> {
             .unwrap_or(3000),
         log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
         api_key: std::env::var("API_KEY").unwrap_or_default(),
+        api_insecure: std::env::var("API_INSECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
         config_path: std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".into()),
         dry_run: std::env::var("DRY_RUN")
             .map(|v| v.to_lowercase() != "false")
@@ -327,6 +332,16 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
         pairs: raw.pairs,
         tuning: raw.tuning,
     })
+}
+
+/// An empty API_KEY leaves every route (dry-run toggle, restart, stats reset) open to anyone
+/// who can reach PORT — refuse unless explicitly allowed for local development.
+pub fn check_api_key(api_key: &str, insecure: bool) -> Result<()> {
+    if api_key.trim().is_empty() && !insecure {
+        Err(anyhow!("API_KEY is empty — refusing to start: the HTTP API (pause, restart, dry-run toggle, stats reset) would have no authentication. Set API_KEY=<secret> in the instance env (e.g. `openssl rand -hex 32`) and use the same value in the dashboard, or set API_INSECURE=1 for local development only."))
+    } else {
+        Ok(())
+    }
 }
 
 /// Fail fast when the RPC serves a different chain than the config describes (e.g. a
@@ -682,6 +697,14 @@ routers: []
         assert!(parse_config(&zero).is_err());
         let stall = format!("{}tuning:\n  block_stall_exit_ms: 0\n", MIN);
         assert!(parse_config(&stall).is_err());
+    }
+
+    #[test]
+    fn api_key_required() {
+        assert!(check_api_key("", false).is_err());
+        assert!(check_api_key("  ", false).is_err());
+        assert!(check_api_key("", true).is_ok());
+        assert!(check_api_key("k", false).is_ok());
     }
 
     #[test]

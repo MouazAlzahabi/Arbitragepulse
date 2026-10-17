@@ -98,7 +98,7 @@ forge script script/Deploy.s.sol --rpc-url base --broadcast --verify
 `ETHERSCAN_API_KEY` (Etherscan API V2 — one etherscan.io key verifies on both chains; needs
 Foundry ≥ 1.3, where V2 is the default — run `foundryup` if verification hits the old BaseScan API).
 The deployer becomes `owner`, and both trade entry points are `onlyOwner`, so the engine must sign
-with this same `PRIVATE_KEY`; that key can also withdraw all funds (see docs/review-loop/OPEN_QUESTIONS.md).
+with this same `PRIVATE_KEY` (it checks `owner()` at startup and refuses to start otherwise); that key can also withdraw all funds (see docs/review-loop/OPEN_QUESTIONS.md).
 
 The Rust lab (`cargo run -p lab -- setup`) deploys from the compiled artifact
 `out/ArbitrageExecutor.sol/ArbitrageExecutor.json`, so run `forge build` first.

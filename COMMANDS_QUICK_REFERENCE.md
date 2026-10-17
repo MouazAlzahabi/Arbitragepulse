@@ -33,6 +33,9 @@ MUSDC=… MWETH=… forge script script/RewidenMocks.s.sol --rpc-url $RPC --broa
 cast send $EXECUTOR "setRouter(address,uint8)"        $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url $RPC
 cast send $EXECUTOR "revokeRouter(address)"           $ROUTER       --private-key $PRIVATE_KEY --rpc-url $RPC   # revoke
 cast call $EXECUTOR "allowedRouters(address)(bool)" $ROUTER --rpc-url $RPC
+cast call $EXECUTOR "routerType(address)(uint8)" $ROUTER --rpc-url $RPC   # must match the type
+cast call $EXECUTOR "owner()(address)" --rpc-url $RPC                      # must be the engine key
+cast send $EXECUTOR "unpause()" --private-key $PRIVATE_KEY --rpc-url $RPC
 
 cast send $EXECUTOR "withdrawToken(address)" $TOKEN --private-key $PRIVATE_KEY --rpc-url $RPC
 cast send $EXECUTOR "withdrawETH()"                 --private-key $PRIVATE_KEY --rpc-url $RPC
@@ -51,6 +54,7 @@ sudo systemctl restart arbitragepulse@base
 systemctl status arbitragepulse@base
 journalctl -fu arbitragepulse@base
 tail -f /var/log/arbitragepulse/base.log
+# Exit codes: 1 = restart, 2 = refused to start (no restart), 75 = API restart — see PRODUCTION_DEPLOYMENT_GUIDE.md §7
 ```
 
 ## Engine API
@@ -61,7 +65,7 @@ curl -s -H "$H" $E/health        # 503 = RPC lost, backoff, or no new block (see
 curl -s -H "$H" $E/stats
 curl -s -H "$H" $E/trades
 curl -s -X POST -H "$H" $E/engine/pause
-curl -s -X POST -H "$H" $E/engine/resume
+curl -s -X POST -H "$H" $E/engine/resume   # also clears breaker / auto pauses
 curl -s -X POST -H "$H" -H 'Content-Type: application/json' -d '{"enabled":true}' $E/engine/dry-run
 curl -s -X POST -H "$H" $E/engine/restart    # exits 75 → systemd restarts it
 curl -s -H "$H" $E/pair-scan
