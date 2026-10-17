@@ -41,10 +41,10 @@ the capital exactly like a router-level minimum.
 | Error | Meaning |
 |-------|---------|
 | `LegFailed(leg, router, rtype, reason)` | a router reverted; `reason` is its raw revert data (string, custom error such as Aerodrome's, or empty). Empty: no pool for that fee tier / stable flag, or the wrong router type |
+| `LegExhaustedGas(leg, router, reason)` | the router used all the gas it was given (whatever it reverted with — Uniswap re-raises an inner out-of-gas as "TF"/"STF"): raise the tx gas limit — or, if it persists at a higher limit, an invalid opcode / assert in the router or pool (the EVM can't tell them apart). At very tight limits the executor can't even pay for this revert; the tx then fails with no data and the engine reads out-of-gas from the receipt (gas used ≥ 97% of the limit) |
 | `NotProfitable(balanceBefore, balanceAfter, minProfit)` | the route completed but returned less than `amountIn + minProfit` — price moved or spread closed |
 | `InsufficientBalance(token, balance, needed)` | the contract does not hold `amountIn` of the start token |
 | `NoOutput(leg, router)` | a router returned without paying anything out (or the output balance shrank) |
-| `LegOutOfGas(leg, router)` | a router ran out of gas — raise the tx gas limit. Best effort: at tight limits the executor itself runs out first and the tx fails with no data; the engine then classifies it from the receipt (≥97% of the gas limit used) |
 | `InvalidV3Fee(leg, router, fee)` | V3 fee outside 100..999999 — 0, or a bps value like 30 instead of 3000 |
 | `RouterNotAllowed(router)` / `UnsupportedRouterType(router, rtype)` | not whitelisted / retired type |
 | `InvalidPath()` | repeated token in the route |

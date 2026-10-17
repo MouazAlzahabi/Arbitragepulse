@@ -573,10 +573,7 @@ impl Executor {
                 Err(e) => {
                     self.stats.total_failed += 1;
                     self.persist_trade(opp, "", false);
-                    return Err(anyhow!(
-                        "Simulation failed: {}",
-                        format_eth_call_transport_error(&e),
-                    ));
+                    return Err(crate::revert::eth_call_error("Simulation failed", &e));
                 }
             }
         }
@@ -780,10 +777,7 @@ impl Executor {
                 }
                 Err(e) => {
                     self.stats.total_failed += 1;
-                    return Err(anyhow!(
-                        "Triangular simulation failed: {}",
-                        format_eth_call_transport_error(&e),
-                    ));
+                    return Err(crate::revert::eth_call_error("Triangular simulation failed", &e));
                 }
             }
         }
@@ -1036,9 +1030,4 @@ impl Executor {
             }
         });
     }
-}
-
-/// Format JSON-RPC failures from `eth_call`, including revert hex when the node returns it.
-pub(crate) fn format_eth_call_transport_error(e: &alloy::transports::TransportError) -> String {
-    crate::revert::format_eth_call_transport_error(e)
 }

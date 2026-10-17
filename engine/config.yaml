@@ -328,6 +328,8 @@ tuning:
   gas_limit_2hop: 700000
   gas_limit_triangular: 900000
   onchain_min_profit_bps: 6076           # on-chain minProfit = 60.76% of the gas-cost floor
+                                         # (replaces router_min_out_slack_bps × sell_leg_minprofit_mul_bps:
+                                         #  (10000 − slack) × mul / 10000; old 200 / 6200 → 6076)
   gas_fallback_margin_bps: 2500          # last known gas price +25% if a fetch fails
   gas_fallback_max_age_ms: 120000        # …only if it is at most this old
   # ── Detection ──

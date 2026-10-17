@@ -195,22 +195,48 @@ contract ArbitrageExecutorTest is Test {
         _arb(address(v3A), address(v3B), FEE, 30, 1 ether);
     }
 
-    function test_RouterOutOfGas_ReportsLegOutOfGas() public {
-        MockGasBurnerRouter burner = new MockGasBurnerRouter();
-        executor.setRouter(address(burner), ArbitrageExecutor.RouterType.V2);
-        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.LegOutOfGas.selector, uint8(2), address(burner)));
-        executor.executeArbitrage{gas: 1_000_000}(address(tokenA), address(tokenB), AMT,
-            address(v2A), address(burner), 0, 0, 0, deadline);
+    bytes4 immutable LEG_EXHAUSTED = ArbitrageExecutor.LegExhaustedGas.selector;
+
+    /// @dev Revert data of an executeArbitrage call through `router` as leg 1 at `gasLimit`.
+    function _revertDataAt(address router, uint256 gasLimit) internal returns (bytes memory data) {
+        (bool ok, bytes memory ret) = address(executor).call{gas: gasLimit}(abi.encodeCall(
+            ArbitrageExecutor.executeArbitrage,
+            (address(tokenA), address(tokenB), AMT, router, address(v2B), 0, 0, 0, deadline)));
+        assertFalse(ok, "must revert");
+        return ret;
     }
 
-    function test_NestedOutOfGas_ReportsLegOutOfGas() public {
-        MockNestedOutOfGasRouter nested = new MockNestedOutOfGasRouter();
-        executor.setRouter(address(nested), ArbitrageExecutor.RouterType.V2);
-        for (uint256 g = 150_000; g <= 2_000_000; g += 350_000) {
-            vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.LegOutOfGas.selector, uint8(1), address(nested)));
-            executor.executeArbitrage{gas: g}(address(tokenA), address(tokenB), AMT,
-                address(nested), address(v2B), 0, 0, 0, deadline);
+    function test_ExhaustedGas_AcrossLimits_NamedOrNoData() public {
+        // Direct, nested and INVALID-opcode routers, from tight to generous limits: the leg
+        // is named (LegExhaustedGas) whenever the executor can still pay for the revert;
+        // otherwise the tx has no data at all (the engine reads that from the receipt) —
+        // never a misleading LegFailed "no pool / wrong router type".
+        address[3] memory routers = [
+            address(new MockGasBurnerRouter()), address(new MockNestedOutOfGasRouter()),
+            address(new MockInvalidOpcodeRouter())
+        ];
+        for (uint256 r = 0; r < 3; r++) {
+            executor.setRouter(routers[r], ArbitrageExecutor.RouterType.V2);
+            bool named;
+            for (uint256 g = 120_000; g <= 2_000_000; g += 80_000) {
+                bytes memory d = _revertDataAt(routers[r], g);
+                if (d.length == 0) continue;
+                assertEq(bytes4(d), LEG_EXHAUSTED, "only LegExhaustedGas or no data");
+                named = true;
+            }
+            assertTrue(named, "named at generous limits");
+            assertEq(_revertDataAt(routers[r], 2_000_000),
+                abi.encodeWithSelector(LEG_EXHAUSTED, uint8(1), routers[r], bytes("")));
         }
+    }
+
+    function test_InnerOutOfGasReraisedAsString_IsStillExhaustedGas() public {
+        // Like Uniswap's TransferHelper: an inner call runs out of gas, the router reverts
+        // with a string. Gas tells the truth, the string doesn't.
+        MockStringifyingOutOfGasRouter r = new MockStringifyingOutOfGasRouter();
+        executor.setRouter(address(r), ArbitrageExecutor.RouterType.V2);
+        assertEq(_revertDataAt(address(r), 2_000_000),
+            abi.encodeWithSelector(LEG_EXHAUSTED, uint8(1), address(r), _err("STF")));
     }
 
     function test_V3RouterTypedAsV2_FailsWithEmptyReason() public {
@@ -372,12 +398,33 @@ contract ArbitrageExecutorTest is Test {
         executor.setRouter(address(sell), ArbitrageExecutor.RouterType.V2);
     }
 
-    function test_MalformedApproveReturn_IsAFailureNotADecodePanic() public {
-        // approve returns the word 2. Trading with it fails up front (SafeERC20 at the leg's
-        // approve); revokeApproval must report it the same way, not die inside abi.decode.
+    function test_MalformedApproveReturn_OnClear_KeepsTrade() public {
+        // Leftover allowance + approve(0) returning the word 2: treated as a failed clear
+        // (falls back to 1 wei), never an abi.decode revert that throws the trade away.
+        MockMalformedApproveERC20 mal = new MockMalformedApproveERC20(10_000_000 ether);
+        (MockPartialRouter partialBuy, MockRouter sell) = _partialTrade(address(mal));
+        executor.executeArbitrage(address(mal), address(tokenB), AMT, address(partialBuy), address(sell), 0, 0, 1 ether, deadline);
+        assertEq(mal.balanceOf(address(executor)), 1_070 ether);
+        assertEq(mal.allowance(address(executor), address(partialBuy)), 1);
+    }
+
+    function test_MalformedApproveReturn_RevokeApproval_FallsBack() public {
         MockMalformedApproveERC20 mal = new MockMalformedApproveERC20(1 ether);
-        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(mal)));
+        vm.prank(address(executor));
+        mal.approve(address(v2A), 500);
         executor.revokeApproval(address(mal), address(v2A));
+        assertEq(mal.allowance(address(executor), address(v2A)), 1);
+    }
+
+    function test_AlwaysMalformedApprove_FailsUpFrontAndOnRevoke() public {
+        // approve returns 2 for every value: the leg's own approve fails cleanly (SafeERC20),
+        // and revokeApproval reports failure instead of dying inside abi.decode.
+        MockAlwaysMalformedApproveERC20 bad = new MockAlwaysMalformedApproveERC20(10_000_000 ether);
+        (MockPartialRouter partialBuy, MockRouter sell) = _partialTrade(address(bad));
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(bad)));
+        executor.executeArbitrage(address(bad), address(tokenB), AMT, address(partialBuy), address(sell), 0, 0, 0, deadline);
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(bad)));
+        executor.revokeApproval(address(bad), address(v2A));
     }
 
     function test_UnclearableAllowance_EmitsEventAndKeepsTrade() public {

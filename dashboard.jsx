@@ -278,7 +278,7 @@ function useApi(baseUrl, apiKey) {
 function LoginScreen({ engineUrl, setEngineUrl, apiKey, setApiKey, onConnect, error }) {
   const [localUrl, setLocalUrl] = useState(engineUrl);
   const [localKey, setLocalKey] = useState(apiKey);
-  const handleSubmit = () => { setEngineUrl(localUrl); setApiKey(localKey); onConnect(); };
+  const handleSubmit = () => { setEngineUrl(localUrl); setApiKey(localKey); onConnect(localUrl); };
   return (
     <div style={{ minHeight: "100vh", background: "#020617", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'JetBrains Mono', monospace" }}>
       <div style={{ width: 420, padding: 40 }}>
@@ -322,9 +322,14 @@ function ts(d) {
   return `${t.getHours().toString().padStart(2, "0")}:${t.getMinutes().toString().padStart(2, "0")}:${t.getSeconds().toString().padStart(2, "0")}`;
 }
 
+// One shared context: browsers cap live AudioContexts, and one per beep leaks until beeps
+// silently stop working.
+let beepCtx = null;
 function playBeep() {
   try {
-    const ctx = new AudioContext();
+    if (!beepCtx || beepCtx.state === "closed") beepCtx = new AudioContext();
+    const ctx = beepCtx;
+    if (ctx.state === "suspended") ctx.resume();
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.connect(gain); gain.connect(ctx.destination);
@@ -387,8 +392,9 @@ function StatsRow({ logs, engineState, apiStats }) {
   // opportunities = every execution attempt that passed the gas-profit check
   const opps   = allChains.length > 0 ? attempts
                   : logs.filter((l) => l.type === "opportunity").length;
-  // errors = attempts that neither confirmed nor passed a dry-run simulation
-  const errors = allChains.length > 0 ? Math.max(0, attempts - trades - sims)
+  // errors = counted by the engine, not derived: a tx still awaiting its receipt is
+  // neither a success nor an error yet.
+  const errors = allChains.length > 0 ? chainErrors(allChains)
                   : logs.filter((l) => l.type === "error").length;
   const uptime = apiStats?.uptime_seconds != null ? formatUptime(apiStats.uptime_seconds * 1000) : "—";
   const dryRun = apiStats?.dry_run ?? engineState?.dryRun ?? true;
@@ -417,13 +423,16 @@ function StatsRow({ logs, engineState, apiStats }) {
   );
 }
 
+/** On-chain reverts + attempts that failed before reaching the chain (engine counters). */
+const chainErrors = (chains) => chains.reduce((s, c) => s + (c.total_failed || 0) + (c.total_exec_failed || 0), 0);
+
 function ChainCards({ apiStats }) {
   const chains = apiStats?.chains || [];
   if (chains.length === 0) return null;
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 10, padding: "10px 14px" }}>
       {chains.map((c) => {
-        const failed = c.total_attempts - c.total_success;
+        const failed = chainErrors([c]);
         return (
           <div key={c.chain_id} style={{ background: "linear-gradient(135deg, #0f172a, #1e1b4b)", border: "1px solid #1e293b", borderRadius: 8, padding: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
@@ -479,14 +488,15 @@ function GasLatencyBar({ apiStats, apiLatency, statsPollError }) {
 // ─── 1. 24h PnL chart (DB-backed, live WS appends) ────────
 function ProfitChart({ fetchTrades, wsLogs }) {
   const [series, setSeries] = useState([{ time: "start", profit: 0 }]);
-  const [total, setTotal] = useState(0);
+  const total = series[series.length - 1].profit;
   const loadedRef = useRef(false);
   // Entries up to this id are already accounted for. Seeded with the buffer at mount: those
   // trades (persisted from an earlier session) are in the DB history loaded below.
   const lastIdRef = useRef(null);
   if (lastIdRef.current === null) lastIdRef.current = newestId(wsLogs);
-  // Live trades seen since mount, and the DB history's tx hashes: whichever arrives second
-  // merges with the other, so a trade is neither dropped nor counted twice.
+  // Live trades that arrive while the DB history is loading, and the history's tx hashes:
+  // whichever arrives second merges with the other, so a trade is neither dropped nor
+  // counted twice. liveRef is only needed until the history lands.
   const liveRef = useRef([]);
   const dbHashesRef = useRef(null);
 
@@ -512,9 +522,8 @@ function ProfitChart({ fetchTrades, wsLogs }) {
       const hashes = new Set(recent.map((t) => t.hash));
       dbHashesRef.current = hashes;
       const merged = [...recent, ...liveRef.current.filter((t) => !hashes.has(t.hash))];
-      const pts = [{ time: "start", profit: 0 }, ...pointsFrom(0, merged)];
-      setSeries(pts);
-      setTotal(pts[pts.length - 1].profit);
+      liveRef.current = [];
+      setSeries([{ time: "start", profit: 0 }, ...pointsFrom(0, merged)]);
     });
   }, [fetchTrades]);
 
@@ -529,12 +538,8 @@ function ProfitChart({ fetchTrades, wsLogs }) {
       .map((l) => ({ ts: l.timestamp, profit: parseFloat(l.data.profit_usd || 0), hash: l.data.tx_hash }))
       .filter((t) => !db || !db.has(t.hash));
     if (trades.length === 0) return;
-    liveRef.current = [...liveRef.current, ...trades].slice(-2000);
-    setSeries((prev) => {
-      const pts = [...prev, ...pointsFrom(prev[prev.length - 1]?.profit || 0, trades)];
-      setTotal(pts[pts.length - 1].profit);
-      return pts;
-    });
+    if (!db) liveRef.current.push(...trades);
+    setSeries((prev) => [...prev, ...pointsFrom(prev[prev.length - 1]?.profit || 0, trades)]);
   }, [wsLogs]);
 
   return (
@@ -1117,9 +1122,12 @@ export default function Dashboard() {
   const active = authenticated && !loggedOut;
   useEffect(() => {
     if (!active) return;
+    // Responses that land after logout / an engine switch must not write old data back.
+    let live = true;
     const poll = async () => {
       const t0 = Date.now();
       const d = await api.fetchStats();
+      if (!live) return;
       if (d?._authError) {
         setStatsPollError("unauthorized");
         setStatsAuthFailed(true);
@@ -1136,7 +1144,7 @@ export default function Dashboard() {
     };
     poll();
     const iv = setInterval(poll, 3000);
-    return () => clearInterval(iv);
+    return () => { live = false; clearInterval(iv); };
   }, [active, api.fetchStats]);
 
   // Poll /stats/pairs every 5s for the pair leaderboard.
@@ -1147,16 +1155,17 @@ export default function Dashboard() {
   const pairStats = pairStatsCleared ? [] : pairStatsLive;
   useEffect(() => {
     if (!active) return;
+    let live = true;
     const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
     const poll = async () => {
       try {
         const r = await fetch(`${apiUrl}/stats/pairs`, { headers });
-        if (r.ok) { const d = await r.json(); setPairStatsLive(d.pairs || []); }
+        if (r.ok) { const d = await r.json(); if (live) setPairStatsLive(d.pairs || []); }
       } catch {}
     };
     poll();
     const iv = setInterval(poll, 5000);
-    return () => clearInterval(iv);
+    return () => { live = false; clearInterval(iv); };
   }, [active, apiUrl, apiKey]);
 
   // Clear all monitoring state for fresh tracking (logs + leaderboard display).
@@ -1179,18 +1188,23 @@ export default function Dashboard() {
     if (soundOn && fresh.some((l) => l.type === "trade")) playBeep();
   }, [ws.logs, soundOn]);
 
-  useEffect(() => {
-    if (ws.status !== "connected") return;
-    setAuthenticated(true);
-    // Logs belong to one engine: drop them when this session connects to a different one.
-    try {
-      const prev = localStorage.getItem("ap_last_engine");
-      if (prev && prev !== url) ws.clearLogs();
-      localStorage.setItem("ap_last_engine", url);
-    } catch {}
-  }, [ws.status]);
+  useEffect(() => { if (ws.status === "connected") setAuthenticated(true); }, [ws.status]);
 
-  const handleConnect = () => { setStatsAuthFailed(false); setLoggedOut(false); setAuthenticated(true); };
+  // Persisted logs belong to one engine. Claimed before any socket message can arrive (at
+  // mount and on Connect), so a new engine's first messages are never wiped, and logs of
+  // unknown origin (no owner recorded) are not shown as this engine's.
+  const claimLogsFor = (engineUrl) => {
+    try {
+      if (localStorage.getItem("ap_last_engine") !== engineUrl) ws.clearLogs();
+      localStorage.setItem("ap_last_engine", engineUrl);
+    } catch {}
+  };
+  useEffect(() => { claimLogsFor(url); }, []);
+
+  const handleConnect = (engineUrl) => {
+    claimLogsFor(engineUrl);
+    setStatsAuthFailed(false); setLoggedOut(false); setAuthenticated(true);
+  };
   const handleLogout = () => {
     setLoggedOut(true); setStatsAuthFailed(false); setAuthenticated(false);
     // Nothing from this engine may show when connecting to the next one.
@@ -1254,7 +1268,7 @@ export default function Dashboard() {
       )}
 
       {tab === "tokens" && <div style={{ flex: 1, overflow: "auto" }}><PairManager api={api} /></div>}
-      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} soundOn={soundOn} setSoundOn={setSoundOn} onDbReset={() => setApiStats(prev => prev ? { ...prev, chains: prev.chains?.map(c => ({ ...c, total_attempts: 0, total_success: 0, total_failed: 0, total_dry_run_ok: 0, total_profit_usd: 0, ghost_profit_usd: 0, total_scans: 0 })) } : null)} /></div>}
+      {tab === "controls" && <div style={{ flex: 1, overflow: "auto" }}><ControlPanel ws={ws} api={api} apiStats={apiStats} clearAll={clearAll} soundOn={soundOn} setSoundOn={setSoundOn} onDbReset={() => setApiStats(prev => prev ? { ...prev, chains: prev.chains?.map(c => ({ ...c, total_attempts: 0, total_success: 0, total_failed: 0, total_dry_run_ok: 0, total_exec_failed: 0, total_profit_usd: 0, ghost_profit_usd: 0, total_scans: 0 })) } : null)} /></div>}
     </div>
   );
 }

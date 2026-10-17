@@ -135,7 +135,6 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     error InsufficientBalance(address token, uint256 balance, uint256 needed);
     /// @notice The same token appears twice in the route.
     error InvalidPath();
-    /// @notice A V3 leg was given fee 0 — no such pool; the fee tier is required.
     /// @notice A V3 leg's fee is not a pool fee tier (hundredths of a bip, 100..999999 —
     ///         e.g. 30 passed as bps instead of 3000).
     error InvalidV3Fee(uint8 leg, address router, uint24 fee);
@@ -145,8 +144,12 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     error NoOutput(uint8 leg, address router);
     /// @notice setRouter was given an address with no code (EOA or typo).
     error NotAContract(address router);
-    /// @notice A router call ran out of gas (tx gas limit too low for this route).
-    error LegOutOfGas(uint8 leg, address router);
+    /// @notice A router call used (nearly) all the gas forwarded to it: out of gas — raise
+    ///         the tx gas limit — or, if it persists at higher limits, an invalid opcode /
+    ///         failed assert inside the router or pool (the EVM can't tell the two apart).
+    ///         `reason` is whatever the router reverted with — Uniswap's transfer helpers turn
+    ///         an inner out-of-gas into "TF" / "STF", which alone would read as a transfer failure.
+    error LegExhaustedGas(uint8 leg, address router, bytes reason);
     /// @notice Ownership can be transferred but not renounced: every withdrawal is onlyOwner.
     error RenounceDisabled();
 
@@ -288,7 +291,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         if (balance < needed) revert InsufficientBalance(token, balance, needed);
     }
 
-    /// @dev `balanceAfter` is the last leg's output-token balance — the start token.
+    /// @dev `balanceAfter` is the final leg's output balance (the start token), read by
+    ///      _swap — passed in so a trade doesn't pay for the same balanceOf twice.
     function _settle(address token, uint256 balanceBefore, uint256 balanceAfter, uint256 minProfit)
         internal returns (uint256 profit)
     {
@@ -302,8 +306,9 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     /**
      * @dev One swap leg on any supported router type. Returns the amount of `tokenOut`
-     *      actually received (balance delta) and the resulting `tokenOut` balance.
-     *      Router reverts become LegFailed. Min-out is 0: profit is enforced once, in _settle.
+     *      actually received (balance delta) and the resulting `tokenOut` balance (used by
+     *      the final leg's caller as the settle balance). Router reverts become LegFailed.
+     *      Min-out is 0: profit is enforced once, in _settle.
      */
     function _swap(
         uint8 leg,
@@ -352,13 +357,14 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 gasBefore = gasleft();
         (bool ok, bytes memory reason) = router.call(data);
         if (!ok) {
-            // EIP-150: each call level keeps 1/64 of its gas, so a leg that ran out of gas
-            // (directly, or in the pool the router called) leaves only a few percent behind,
-            // while an empty-reason revert for a missing pool / wrong router type returns
-            // almost at once. 1/8 separates the two. Best effort: with real routers ~3% is
-            // left, which at tight limits can't pay for this revert — the tx then fails with
-            // no data, and the engine classifies it from the receipt's gasUsed / gasLimit.
-            if (reason.length == 0 && gasleft() < gasBefore / 8) revert LegOutOfGas(leg, router);
+            // EIP-150: every call level keeps 1/64 of its gas, so a router that burned all it
+            // was given (directly or several calls deep) leaves only a few percent here, while
+            // a real failure (missing pool, wrong type, insufficient balance) reverts early with
+            // most of it left. Checked whatever the reason: routers re-raise an inner
+            // out-of-gas as a string ("TF", "STF"). Out of gas and an INVALID opcode both burn
+            // everything — hence the error's name. At very tight limits even this revert can't
+            // be paid for: the tx then has no data and the engine reads the receipt instead.
+            if (gasleft() < gasBefore / 8) revert LegExhaustedGas(leg, router, reason);
             revert LegFailed(leg, router, rtype, reason);
         }
 
@@ -381,7 +387,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// @dev approve() that reports failure instead of reverting: false for a revert, a
-    ///      `false` / malformed return value, or an address with no code.
+    ///      `false` / malformed return value, or an address with no code (a call there
+    ///      "succeeds" with no data). The code check is warm (~100 gas) on the trade path.
     function _tryApprove(address token, address spender, uint256 value) internal returns (bool) {
         if (token.code.length == 0) return false;
         (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20.approve, (spender, value)));

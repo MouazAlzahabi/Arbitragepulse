@@ -12,8 +12,10 @@ async fn diagnose_and_count_revert<P: Provider>(
     tx_hash: &B256,
     block_number: Option<u64>,
     gas_used: u64,
+    gas_limit: u64,
 ) -> crate::revert::RevertDiagnosis {
-    let diagnosis = crate::revert::diagnose_mined_revert(provider, tx_hash, block_number, gas_used).await;
+    let diagnosis =
+        crate::revert::diagnose_mined_revert(provider, tx_hash, block_number, gas_used, gas_limit).await;
     metrics
         .reverts_on_chain
         .with_label_values(&[chain_name, diagnosis.class.as_str()])
@@ -481,7 +483,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         });
                                     }
                                     failure |= handle_execution_failure(&mut scan_rpc, 
-                                        anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
+                                        crate::revert::eth_call_error("Pre-flight eth_call rejected", &e),
                                         &fingerprint, &router_ids, pending_pairs, cooldowns, send_cooldown_secs(),
                                         consecutive_failures, cfg, shared_state, metrics, log_tx,
                                         &ghost_profit_bits, prep.profit_usd,
@@ -558,6 +560,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
                                 // Fire-and-forget receipt task using cloned prep fields
                                 let tx_hash_bg = tx_hash.clone();
+                                let gas_limit_bg = prep.tx.gas.unwrap_or_default();
                                 let tx_hash_b256 = pending.tx_hash().clone();
                                 let provider_bg = provider.clone();
                                 let ra_type_bg = crate::revert::router_type_label(&optimized.router_a_type);
@@ -613,6 +616,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &tx_hash_b256,
                                                     block_num,
                                                     receipt.gas_used(),
+                                                    gas_limit_bg,
                                                 )
                                                 .await;
                                                 revert_class_str = Some(diagnosis.class.as_str());
@@ -916,7 +920,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         });
                                     }
                                     failure |= handle_execution_failure(&mut scan_rpc, 
-                                        anyhow::anyhow!("Pre-flight eth_call rejected: {}", detail),
+                                        crate::revert::eth_call_error("Pre-flight eth_call rejected", &e),
                                         &fingerprint, &router_ids, pending_pairs, cooldowns, send_cooldown_secs(),
                                         consecutive_failures, cfg, shared_state, metrics, log_tx,
                                         &ghost_profit_bits, prep.profit_usd,
@@ -980,6 +984,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
                                 // Fire-and-forget receipt task
                                 let tx_hash_bg = tx_hash.clone();
+                                let gas_limit_bg = prep.tx.gas.unwrap_or_default();
                                 let tx_hash_b256 = pending.tx_hash().clone();
                                 let provider_bg = provider.clone();
                                 let ra_type_bg = crate::revert::router_type_label(&opp.router_ab_type);
@@ -1036,6 +1041,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                     &tx_hash_b256,
                                                     block_num,
                                                     receipt.gas_used(),
+                                                    gas_limit_bg,
                                                 )
                                                 .await;
                                                 revert_class_str = Some(diagnosis.class.as_str());
@@ -1363,7 +1369,12 @@ pub(crate) async fn handle_execution_failure(
     let err_str = error.to_string();
     // Simulation / pre-flight failures, matched on the engine's own message prefixes.
     let is_sim_failure = crate::util::is_sim_failure(&err_str);
-    let rpc = crate::util::classify_rpc_failure(&err_str);
+    // The contract rejecting a simulation is never RPC trouble, whatever its text says.
+    let rpc = if error.is::<crate::revert::SimReverted>() {
+        RpcFailure::None
+    } else {
+        crate::util::classify_rpc_failure(&err_str)
+    };
     // One simulation timeout = that candidate is stale. Two in one scan = the node is
     // too slow to simulate on (in dry-run / pre-flight mode the simulation is the only
     // RPC call), which is what degraded means — no reset heuristics.
@@ -1442,6 +1453,7 @@ pub(crate) async fn handle_execution_failure(
     let mut state = shared_state.write().await;
     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
         chain.total_attempts += 1;
+        chain.total_exec_failed += 1;
     }
 
     // Circuit breaker

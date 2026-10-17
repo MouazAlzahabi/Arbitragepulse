@@ -83,7 +83,8 @@ contract RewidenMocks is Script {
     ///      V2_PRICE. `wethIn`: selling mWETH lowers the price; else buying raises it.
     function _v2InputForPrice(uint256 rIn, uint256 rOut, bool wethIn) internal pure returns (uint256) {
         uint256 lo = 0;
-        uint256 hi = rIn * 4;
+        uint256 cap = rIn * 100; // ~10_000× price move — far beyond any narrowing by arbs
+        uint256 hi = cap + 1;    // one past the cap: lo == cap + 1 means "never reached"
         for (uint256 i = 0; i < 128 && lo < hi; i++) {
             uint256 mid = (lo + hi) / 2;
             uint256 out = mid * 997 * rOut / (rIn * 1000 + mid * 997);
@@ -93,6 +94,8 @@ contract RewidenMocks is Script {
                 : newUsdc * 1e18 / newWeth >= MockMarket.V2_PRICE * 1e18;
             if (reached) hi = mid; else lo = mid + 1;
         }
+        // Fail before any swap when even `cap` doesn't reach the target.
+        require(lo <= cap, "V2 target price out of search range - pool far off, redeploy mocks");
         return lo;
     }
 

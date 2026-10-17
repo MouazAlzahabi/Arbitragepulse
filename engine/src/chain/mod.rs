@@ -229,6 +229,7 @@ pub async fn run_chain(
                 total_success: 0,
                 total_failed: 0,
                 total_dry_run_ok: 0,
+                total_exec_failed: 0,
                 total_profit_usd: 0.0,
                 ghost_profit_usd: 0.0,
                 base_fee_gwei: 0.0,

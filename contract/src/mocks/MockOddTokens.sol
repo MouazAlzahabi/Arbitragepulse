@@ -99,12 +99,14 @@ contract MockGasBurnerRouter {
     }
 }
 
-/// @dev approve() works but returns the word 2 — not a valid ABI bool.
+/// @dev approve() works, but approve(0) returns the word 2 — not a valid ABI bool. The
+///      leg's own approve (non-zero) succeeds, so only the leftover-allowance clear sees it.
 contract MockMalformedApproveERC20 is ERC20 {
     constructor(uint256 supply) ERC20("Malformed Approve", "MAL") { _mint(msg.sender, supply); }
 
     function approve(address spender, uint256 value) public override returns (bool) {
         super.approve(spender, value);
+        if (value != 0) return true;
         assembly {
             mstore(0, 2)
             return(0, 32)
@@ -130,5 +132,36 @@ contract MockNestedOutOfGasRouter {
     fallback() external {
         (bool ok,) = address(burner).call("");
         require(ok);
+    }
+}
+
+/// @dev approve() returns the word 2 for every value — never a valid ABI bool.
+contract MockAlwaysMalformedApproveERC20 is ERC20 {
+    constructor(uint256 supply) ERC20("Always Malformed", "AMAL") { _mint(msg.sender, supply); }
+
+    function approve(address spender, uint256 value) public override returns (bool) {
+        super.approve(spender, value);
+        assembly {
+            mstore(0, 2)
+            return(0, 32)
+        }
+    }
+}
+
+/// @dev Router that hits INVALID (0xfe) — like a pre-0.8 assert. Burns all forwarded gas.
+contract MockInvalidOpcodeRouter {
+    fallback() external {
+        assembly { invalid() }
+    }
+}
+
+/// @dev Like Uniswap's TransferHelper: an inner call runs out of gas and the router re-raises
+///      it as the string "STF".
+contract MockStringifyingOutOfGasRouter {
+    MockGasBurnerRouter internal immutable burner = new MockGasBurnerRouter();
+
+    fallback() external {
+        (bool ok,) = address(burner).call("");
+        require(ok, "STF");
     }
 }
