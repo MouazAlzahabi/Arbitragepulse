@@ -384,7 +384,7 @@ pub struct Tuning {
     /// Gas limit for a triangular (3-hop) arb tx.
     pub gas_limit_triangular: u64,
     /// On-chain `minProfit` as bps of the gas-cost floor (6076 = 60.76%). The contract
-    /// reverts `NotProfitable` below `amountIn + minProfit`; < 10000 leaves room for
+    /// reverts `NotProfitable` unless final balance ≥ starting balance + minProfit; < 10000 leaves room for
     /// same-block drift, with the off-chain net-profit check as the economic guard.
     pub onchain_min_profit_bps: u64,
     /// Margin (bps) on the last known gas price when a fetch fails.

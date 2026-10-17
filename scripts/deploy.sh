@@ -63,6 +63,7 @@ if [ "$DO_SYNC" = true ]; then
         --exclude 'lab/' \
         --exclude '*.log' \
         --exclude '*.db' \
+        --exclude '*.db-*' \
         --exclude '*.env' \
         "$PROJECT_ROOT/" "$SERVER:$REMOTE_PATH/"
     echo "      Sync complete"

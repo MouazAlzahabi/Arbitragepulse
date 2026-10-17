@@ -320,7 +320,7 @@ pub fn spawn_pending_monitor(
 
         loop {
             let url = &ws_urls[url_idx % ws_urls.len()];
-            let short_url = url.split('?').next().unwrap_or(url);
+            let short_url = crate::util::redact_url(url);
             info!("[{}] Pending TX monitor: connecting to {}", chain_name, short_url);
 
             let connect_result = ProviderBuilder::<_, _, Ethereum>::new()

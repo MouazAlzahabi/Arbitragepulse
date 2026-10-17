@@ -33,8 +33,8 @@ fn gas_fallback_max_age() -> Duration { crate::config::tuning().gas_fallback_max
 // Triangular arb gas limit — 900k covers 3-hop paths (V2+V2+V2, V3+V3+V3, mixed).
 fn gas_limit_triangular() -> u64 { crate::config::tuning().gas_limit_triangular }
 
-/// On-chain `minProfit` as bps of the gas-cost floor. The contract requires a final balance
-/// of `amountIn + minProfit` (`NotProfitable` otherwise). A floor exactly on the quoted edge
+/// On-chain `minProfit` as bps of the gas-cost floor. The contract requires final balance
+/// ≥ starting balance + minProfit (`NotProfitable` otherwise). A floor exactly on the quoted edge
 /// reverts on any inclusion-time drift, so it sits below gas cost; the off-chain net-profit
 /// check remains the economic guard.
 fn onchain_min_profit_bps() -> u64 { crate::config::tuning().onchain_min_profit_bps }

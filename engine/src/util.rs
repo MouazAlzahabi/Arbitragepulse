@@ -281,10 +281,34 @@ pub fn is_sim_failure(err: &str) -> bool {
     SIM_FAILURE_PREFIXES.iter().any(|p| e.starts_with(p))
 }
 
+/// URL for logs: scheme + host[:port], path and query masked — API keys live in the path
+/// (Alchemy `/v2/<KEY>`) or query.
+pub fn redact_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(u) => {
+            let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+            let masked = !(u.path().is_empty() || u.path() == "/") || u.query().is_some();
+            format!("{}://{}{}{}", u.scheme(), u.host_str().unwrap_or("?"), port, if masked { "/…" } else { "" })
+        }
+        Err(_) => "<unparseable url>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn redact_url_masks_keys() {
+        let r = redact_url("wss://base-mainnet.g.alchemy.com/v2/SECRETKEY");
+        assert_eq!(r, "wss://base-mainnet.g.alchemy.com/…");
+        assert!(!r.contains("SECRETKEY"));
+        assert_eq!(redact_url("wss://mainnet.base.org"), "wss://mainnet.base.org");
+        assert_eq!(redact_url("ws://127.0.0.1:8547"), "ws://127.0.0.1:8547");
+        assert_eq!(redact_url("https://user:pw@h.example/x?k=1"), "https://h.example/…");
+        assert_eq!(redact_url("not a url"), "<unparseable url>");
+    }
 
     #[test]
     fn send_nonce_consumed_cases() {

@@ -13,7 +13,7 @@ use tracing::debug;
 pub enum RevertClass {
     /// Pre-v3 executor: V3 sell leg's router min-out ("Too little received").
     V3TooLittle,
-    /// Route completed below `amountIn + minProfit`. On executor v3 this is where every
+    /// Route completed with final balance < starting balance + minProfit. On executor v3 this is where every
     /// price-moved failure lands (routers get min-out 0).
     NotProfitable,
     /// Router-level output check: pre-v3 min-out, or a pool rejecting a dust output.

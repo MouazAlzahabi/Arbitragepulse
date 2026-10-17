@@ -1018,12 +1018,12 @@ async fn connect_with_fallback(
         {
             Ok(p) => {
                 if i > 0 {
-                    info!("[{}] Connected via fallback RPC #{}: {}", cfg.name, i, url);
+                    info!("[{}] Connected via fallback RPC #{}: {}", cfg.name, i, crate::util::redact_url(url));
                 }
                 return Ok(p);
             }
             Err(e) => {
-                warn!("[{}] RPC endpoint {} failed: {}", cfg.name, url, e);
+                warn!("[{}] RPC endpoint {} failed: {}", cfg.name, crate::util::redact_url(url), e);
                 last_err = e.to_string();
             }
         }

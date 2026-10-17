@@ -519,7 +519,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         }
                         // Pre-flight skipped by default: on Base, gas per revert is <$0.02 and adding
                         // an eth_call round-trip (~200ms) closes the opportunity window.
-                        // The contract enforces amountIn+minProfit on-chain; reverts are atomic.
+                        // The contract enforces final balance ≥ starting balance + minProfit on-chain; reverts are atomic.
                         debug!(
                             "[{}] Submitting | pair={} amountIn={} gross=${:.4} gas=${:.4} net=${:.4} feeA={} feeB={}",
                             cfg.name, optimized.pair_id, optimized.amount_in,
@@ -550,7 +550,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         async move {
                                             match c.post(url.as_str()).json(&b).send().await {
                                                 Ok(r) => debug!("[{}] secondary RPC: {}", cname, r.status()),
-                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e),
+                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e.without_url()),
                                             }
                                         }
                                     });
@@ -988,7 +988,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                         async move {
                                             match c.post(url.as_str()).json(&b).send().await {
                                                 Ok(r) => debug!("[{}] secondary RPC: {}", cname, r.status()),
-                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e),
+                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e.without_url()),
                                             }
                                         }
                                     });

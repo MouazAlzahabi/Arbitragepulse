@@ -194,6 +194,10 @@ impl Listener {
             IPancakeV3Pool::Swap::SIGNATURE_HASH,
         ];
 
+        if !poll_fallback {
+            return Ok(());
+        }
+
         let sync_count = Arc::new(AtomicU64::new(0));
         let v3_count = Arc::new(AtomicU64::new(0));
 
@@ -221,10 +225,6 @@ impl Listener {
                 }
             }
         });
-
-        if !poll_fallback {
-            return Ok(());
-        }
 
         let cache = pool_cache.clone();
         let log_tx_poll = log_tx.clone();

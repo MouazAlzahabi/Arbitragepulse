@@ -35,3 +35,69 @@ options, recommendation. Newest at the bottom.
      scans and RPC reads on busy blocks; each still goes through the normal simulate-before-send.
   2. Leave as is (UR pending detection effectively off).
 - Recommendation: 1, verified on the Anvil fork with a real UR calldata sample, in a later round.
+
+### [engine] Pause after N consecutive mined reverts of any class
+- Where: engine/src/chain/scan.rs (both receipt tasks); engine/src/revert.rs `RevertClass::pauses_chain`
+- What / why unsure: Round 1 pauses the chain at once only on deterministic reverts (`blocked`, `router_not_allowed`). Other repeating causes — `insufficient_balance`, `invalid_route`, persistent `not_profitable` phantom edges, `out_of_gas` with a too-tight limit — still cost gas on every send with only warn lines. `not_profitable` is part of the normal steady state (engine/config.yaml:43-45), so a low N would pause a working engine.
+- Options + trade-offs:
+  1. Pause after N consecutive mined reverts of any class, reset on a confirmed success. Needs N picked from live revert rates.
+  2. Add `insufficient_balance` and `invalid_route` to the immediate-pause list. Deterministic per pair, but pauses the whole chain for one underfunded pair.
+  3. Escalate the per-pair cooldown instead of pausing the chain.
+- Recommendation: measure the revert mix during the first live runs, then option 1 with N ≈ 3× the worst observed streak.
+
+### [engine] Hot reload of pairs and routers
+- Where: engine/src/chain/mod.rs config_tick; pool discovery only at startup (chain/mod.rs:161, :166); `contract_balances` built once (chain/mod.rs:202-210)
+- What / why unsure: A reload swaps `strategy.pairs`/`routers` but discovers no pools, adds no `token_in` to the balance guard and doesn't check new routers against the executor allowlist, so an added pair or router never quotes. Round 1 changed the docs to "adding pairs or routers needs a restart".
+- Options + trade-offs:
+  1. Keep restart-required (docs now say so).
+  2. On a reload that changes pairs/routers: discover pools for the new entries, rebuild the log-subscription filter, extend `contract_balances`, re-run the startup router check. Costs a discovery RPC burst mid-run and a subscription restart.
+- Recommendation: 1.
+
+### [engine] Per-pair `routers:` lists
+- Where: engine/src/config.rs `PairConfig` (now `deny_unknown_fields`); engine/config.yaml pairs
+- What / why unsure: The YAML listed routers per pair, but the engine never read the key — every pair is quoted on every router. Round 1 removed the stale lists (they named routers that are no longer configured) and made unknown pair keys an error, so behaviour is unchanged. Whether per-pair venue restriction should exist is a product decision.
+- Options + trade-offs:
+  1. No per-pair lists (today's behaviour).
+  2. Implement `routers:` as a filter in discovery and `rebuild_router_maps`. Changes which venues each pair trades (e.g. USDC/EURC would lose aerodrome-base).
+- Recommendation: 1 until a specific pair needs it.
+
+### [engine] Realised P&L: L1 data fee, receipt-based profit, gas in the DB
+- Where: engine/src/chain/scan.rs receipt tasks; engine/src/db.rs trades table; engine/src/api.rs `ChainStats.total_profit_usd`
+- What / why unsure: Round 1 made profit accounting net of *estimated* L2 gas and added `arb_gas_spent_usd_total{outcome}` (Prometheus) from receipts. Still missing: the OP-stack L1 data fee (not in alloy's Ethereum receipt type), realised profit from the contract's balance delta / event, and reverted-tx gas in the DB and dashboard.
+- Options + trade-offs:
+  1. Keep estimates + the Prometheus counter.
+  2. Raw `eth_getTransactionReceipt` for `l1Fee`, new `gas_usd` / `net_usd` DB columns (migration) and dashboard fields.
+  3. Switch the receipt types to op-alloy.
+- Recommendation: 2 before scaling capital.
+
+### [engine] Relabel ≥97%-gas reverts as out-of-gas whatever the replay class
+- Where: engine/src/revert.rs `out_of_gas_override`
+- What / why unsure: Engine half of "[contract] Out-of-gas inside a V2 pair's token transfer…" above (review E1-17). Still undecided; exposure ~nil while V2 routers are disabled.
+- Options + trade-offs:
+  1. Leave as is.
+  2. When the receipt used ≥97% of the limit, relabel every class except NotProfitable, DeadlineExpired, Blocked, RouterNotAllowed, InsufficientBalance and InvalidRoute to OutOfGas (replay text kept in detail). Tests: LegFailed("Pancake: TRANSFER_FAILED") at 99% → OutOfGas; NotProfitable at 99% stays. Risk: a genuine InsufficientOutput / PoolNotFound at ≥97% gets relabelled.
+- Recommendation: 2 when a V2 router is re-enabled.
+
+### [engine] Dead live branches of `Executor::execute` / `execute_triangular`
+- Where: engine/src/executor.rs (the parts of `execute` and `execute_triangular` after the dry-run return)
+- What / why unsure: scan.rs calls these only in dry-run, so ~340 lines of live send / receipt code are unreachable and have drifted from the real live path (`prepare_*` in scan.rs: different tip, no persistence, no revert diagnosis). Round 1 only fixed the triangular dry-run tip and DB row.
+- Options + trade-offs:
+  1. Delete the live halves (the functions become dry-run simulators), or route dry-run through `prepare_*` + `eth_call` with a nonce rollback. Pure cleanup; merge-conflict risk with other executor work.
+  2. Leave.
+- Recommendation: 1 (delete) in a separate cleanup commit.
+
+### [engine] Watch the tx by hash when the primary send fails after the secondary broadcast
+- Where: engine/src/chain/scan.rs send-error arms (2-hop and triangular)
+- What / why unsure: Round 1 treats a rate-limit / server error on the primary, after the signed tx already went to the secondary submission RPCs, as "nonce consumed" (no nonce reuse). The tx itself is still not watched: if it lands, its success/revert is missing from stats, DB and revert diagnosis, and it is logged as a send failure.
+- Options + trade-offs:
+  1. Leave (rare undercount).
+  2. Compute the hash from `raw_tx` (keccak256 of the bytes) and spawn the normal receipt task for it instead of counting a send failure.
+- Recommendation: 2 if rate-limited primary sends show up in production logs.
+
+### [repo] Verify skill update is untracked (.claude/ is gitignored)
+- Where: .claude/skills/verify/SKILL.md; .gitignore:23 (`.claude/`)
+- What / why unsure: Engine round 1 updated the local verify skill (owner storage cheat before start, mandatory API_KEY=verifykey, exit-code contract 2/1/75, router allowlist checks). Because `.claude/` is gitignored, that update exists only on this machine: it isn't in the branch history, and a fresh clone or another operator gets the old (now wrong) recipe or none.
+- Options + trade-offs:
+  1. Track the skill: add `!.claude/skills/` (or just `!.claude/skills/verify/`) to .gitignore and commit it. Shares the safe-run recipe with the repo; must stay free of secrets (it is today — it only names Anvil test keys by index and reads ALCHEMY_KEY from .env without printing it).
+  2. Keep it local-only. No risk of committing other `.claude/` state, but the recipe drifts from the code and is lost with the machine.
+- Recommendation: 1, tracking only `.claude/skills/` so settings and local state stay ignored.
