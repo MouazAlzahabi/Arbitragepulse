@@ -291,7 +291,7 @@ function LoginScreen({ engineUrl, setEngineUrl, apiKey, setApiKey, onConnect, er
           <input value={localUrl} onChange={(e) => setLocalUrl(e.target.value)} placeholder="ws://localhost:3000/ws" style={{ width: "100%", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, color: "#e2e8f0", fontFamily: "inherit", padding: "10px 14px", fontSize: 13 }} />
         </div>
         <div style={{ marginBottom: 24 }}>
-          <label style={{ display: "block", fontSize: 10, color: "#475569", letterSpacing: 1.2, marginBottom: 6, textTransform: "uppercase", fontWeight: 700 }}>API Key <span style={{ color: "#334155", fontWeight: 400 }}>(leave empty if auth disabled)</span></label>
+          <label style={{ display: "block", fontSize: 10, color: "#475569", letterSpacing: 1.2, marginBottom: 6, textTransform: "uppercase", fontWeight: 700 }}>API Key <span style={{ color: "#334155", fontWeight: 400 }}>(required — API_KEY from {"engine/<instance>.env"}; empty only if the engine runs with API_INSECURE=1)</span></label>
           <input value={localKey} onChange={(e) => setLocalKey(e.target.value)} type="password" placeholder="Same value as API_KEY in engine/<instance>.env on the server" style={{ width: "100%", background: "#0f172a", border: "1px solid #1e293b", borderRadius: 6, color: "#e2e8f0", fontFamily: "inherit", padding: "10px 14px", fontSize: 13 }} autoComplete="off" />
         </div>
         {error && <div style={{ background: "#450a0a", border: "1px solid #7f1d1d", borderRadius: 6, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 12 }}>Authentication failed. Use the exact <code style={{ color: "#fecaca" }}>API_KEY</code> from the engine&apos;s <code style={{ color: "#fecaca" }}>.env</code> on the server (REST and WebSocket require it).</div>}
@@ -398,7 +398,7 @@ function StatsRow({ logs, engineState, apiStats }) {
                   : logs.filter((l) => l.type === "error").length;
   const uptime = apiStats?.uptime_seconds != null ? formatUptime(apiStats.uptime_seconds * 1000) : "—";
   const dryRun = apiStats?.dry_run ?? engineState?.dryRun ?? true;
-  const paused = apiStats?.paused ?? engineState?.paused ?? false;
+  const { opPaused, chainPaused, paused } = engineStatus(apiStats, engineState);
   const ghostProfit = allChains.reduce((s, c) => s + (c.ghost_profit_usd || 0), 0);
 
   const items = [
@@ -408,7 +408,8 @@ function StatsRow({ logs, engineState, apiStats }) {
     { l: "TRADES", v: sims > 0 ? `${trades} (+${sims} sim)` : trades, c: "#34d399", title: "Confirmed on-chain (+ dry-run simulations that passed)" },
     { l: "ERRORS", v: errors, c: errors > 0 ? "#f87171" : "#334155" },
     { l: "GHOST PROFIT", v: `$${ghostProfit.toFixed(2)}`, c: "#64748b", title: "Sum of gross profit from trades rejected due to gas cost" },
-    { l: "MODE", v: paused ? "⏸ PAUSED" : dryRun ? "DRY RUN" : "⚡ LIVE", c: paused ? "#f87171" : dryRun ? "#fbbf24" : "#ef4444" },
+    { l: "MODE", v: opPaused ? "⏸ PAUSED" : paused ? "⏸ AUTO-PAUSED" : dryRun ? "DRY RUN" : "⚡ LIVE", c: paused ? "#f87171" : dryRun ? "#fbbf24" : "#ef4444",
+      title: !opPaused && paused ? `Paused by the engine on ${chainPaused.map((c) => c.chain_name).join(", ")} (circuit breaker, auto-pause on a blocked/router_not_allowed revert, or contract paused at startup). Fix the cause, then Resume on Controls.` : undefined },
   ];
 
   return (
@@ -426,6 +427,28 @@ function StatsRow({ logs, engineState, apiStats }) {
 /** On-chain reverts + attempts that failed before reaching the chain (engine counters). */
 const chainErrors = (chains) => chains.reduce((s, c) => s + (c.total_failed || 0) + (c.total_exec_failed || 0), 0);
 
+/** No new block for this long → STALE (the engine's heartbeat_stall_warn default). */
+const STALE_BLOCK_MS = 30_000;
+
+/** Status of one /stats chain row, highest priority first. `_block_seen_at` is the client time
+ *  when this tab last saw `last_block` change (set by the /stats poll; no clock skew). */
+function chainStatus(c, now = Date.now()) {
+  if (c.paused) return { label: "PAUSED", color: "#f87171", bg: "#450a0a", why: "paused by the engine (circuit breaker, auto-pause on a blocked/router_not_allowed revert, or contract paused at startup) — fix the cause, then Resume on Controls" };
+  if (c.rpc_backoff) return { label: "BACKOFF", color: "#fbbf24", bg: "#422006", why: "RPC backoff — detecting, not executing" };
+  if (!c.last_block) return { label: "WAITING", color: "#fbbf24", bg: "#422006", why: "no block received yet — chain still connecting" };
+  if (c._block_seen_at && now - c._block_seen_at > STALE_BLOCK_MS) return { label: "STALE", color: "#f87171", bg: "#450a0a", why: `no new block for ${Math.round((now - c._block_seen_at) / 1000)}s — the engine exits and restarts after block_stall_exit_ms (default 5 min)` };
+  return { label: "ACTIVE", color: "#34d399", bg: "#052e16", why: "receiving blocks" };
+}
+
+/** Engine-wide state for the MODE tile and Controls: the operator's pause, chains the engine
+ *  paused itself, and "starting" (stats loaded, no chain registered yet). */
+function engineStatus(apiStats, engineState) {
+  const chains = apiStats?.chains || [];
+  const opPaused = apiStats?.paused ?? engineState?.paused ?? false;
+  const chainPaused = chains.filter((c) => c.paused);
+  return { opPaused, chainPaused, paused: opPaused || chainPaused.length > 0, starting: Array.isArray(apiStats?.chains) && chains.length === 0 };
+}
+
 function ChainCards({ apiStats }) {
   const chains = apiStats?.chains || [];
   if (chains.length === 0) return null;
@@ -433,18 +456,20 @@ function ChainCards({ apiStats }) {
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 10, padding: "10px 14px" }}>
       {chains.map((c) => {
         const failed = chainErrors([c]);
+        const st = chainStatus(c);
         return (
           <div key={c.chain_id} style={{ background: "linear-gradient(135deg, #0f172a, #1e1b4b)", border: "1px solid #1e293b", borderRadius: 8, padding: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
               <span style={{ fontWeight: 700, fontSize: 13 }}>{c.chain_name}</span>
-              <span style={{ fontSize: 9, color: "#34d399", background: "#052e16", padding: "2px 8px", borderRadius: 10 }}>ACTIVE</span>
+              <span title={st.why} style={{ fontSize: 9, color: st.color, background: st.bg, padding: "2px 8px", borderRadius: 10 }}>{st.label}</span>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 11 }}>
               <div><span style={{ color: "#475569" }}>Scans </span><span style={{ color: "#94a3b8" }}>{c.total_scans || 0}</span></div>
               <div><span style={{ color: "#475569" }}>Executions </span><span style={{ color: "#94a3b8" }}>{c.total_attempts}</span></div>
               <div><span style={{ color: "#475569" }}>Success </span><span style={{ color: "#34d399" }}>{c.total_success}</span></div>
-              <div><span style={{ color: "#475569" }}>Profit </span><span style={{ color: "#a78bfa" }}>${(c.total_profit_usd || 0).toFixed(2)}</span></div>
+              <div><span style={{ color: "#475569" }}>Net profit (est.) </span><span style={{ color: "#a78bfa" }}>${(c.total_profit_usd || 0).toFixed(2)}</span></div>
               <div><span style={{ color: "#475569" }}>Fail </span><span style={{ color: failed > 0 ? "#f87171" : "#334155" }}>{failed}</span></div>
+              <div><span style={{ color: "#475569" }}>Block </span><span style={{ color: "#94a3b8" }}>{c.last_block ? `#${c.last_block}` : "—"}</span></div>
             </div>
           </div>
         );
@@ -457,16 +482,21 @@ function ChainCards({ apiStats }) {
 function GasLatencyBar({ apiStats, apiLatency, statsPollError }) {
   // Show RPC latency per chain (only chains that have a measurement)
   const rpcChains = (apiStats?.chains || []).filter((c) => c.rpc_latency_ms > 0);
-  const backoffChains = (apiStats?.chains || []).filter((c) => c.rpc_backoff);
-  if (statsPollError == null && apiLatency == null && rpcChains.length === 0 && backoffChains.length === 0) return null;
+  // PAUSED / BACKOFF / WAITING / STALE chains (same status as the chain card).
+  const alerts = (apiStats?.chains || []).map((c) => [c, chainStatus(c)]).filter(([, s]) => s.label !== "ACTIVE");
+  const { starting } = engineStatus(apiStats);
+  if (statsPollError == null && apiLatency == null && rpcChains.length === 0 && alerts.length === 0 && !starting) return null;
   return (
     <div style={{ display: "flex", gap: 24, padding: "4px 16px", background: "#0a0f1a", borderBottom: "1px solid #1e293b", fontSize: 11, alignItems: "center", flexWrap: "wrap" }}>
       {statsPollError != null && (
         <span style={{ color: "#f87171" }}>⚠ /stats: {statsPollError}</span>
       )}
-      {backoffChains.map((c) => (
-        <span key={`backoff-${c.chain_id}`} style={{ color: "#f87171" }}>
-          ⚠ {c.chain_name}: RPC backoff — detecting, not executing
+      {starting && (
+        <span style={{ color: "#f87171" }}>⚠ STARTING — no chain registered yet: the engine is connecting or retrying every 5 s (check the engine log: RPC URLs / ALCHEMY_KEY / owner and router checks)</span>
+      )}
+      {alerts.map(([c, s]) => (
+        <span key={`alert-${c.chain_id}`} style={{ color: s.color }}>
+          ⚠ {c.chain_name}: {s.label} — {s.why}
         </span>
       ))}
       {rpcChains.map((c) => {
@@ -550,7 +580,7 @@ function ProfitChart({ fetchTrades, wsLogs }) {
   return (
     <div style={{ background: "#0f172a", borderRadius: 8, border: "1px solid #1e293b", overflow: "hidden" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderBottom: "1px solid #1e293b" }}>
-        <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }}>24h PnL</span>
+        <span style={{ fontSize: 9, color: "#475569", letterSpacing: 1.5, fontWeight: 700 }} title="Estimated net profit of real trades (after estimated gas; gas of reverted txs is not subtracted): the last 24h from the DB when this tab opened, plus live trades since. The window does not roll forward while the tab stays open.">EST. NET 24h PnL</span>
         <span style={{ fontSize: 14, color: total >= 0 ? "#34d399" : "#f87171", fontWeight: 700 }}>${total.toFixed(4)}</span>
       </div>
       <div style={{ height: 160, padding: "4px 0" }}>
@@ -562,7 +592,7 @@ function ProfitChart({ fetchTrades, wsLogs }) {
               <defs><linearGradient id="pg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#34d399" stopOpacity={0.25} /><stop offset="100%" stopColor="#34d399" stopOpacity={0} /></linearGradient></defs>
               <XAxis dataKey="time" tick={{ fill: "#334155", fontSize: 9 }} axisLine={{ stroke: "#1e293b" }} tickLine={false} />
               <YAxis tick={{ fill: "#334155", fontSize: 9 }} axisLine={false} tickLine={false} tickFormatter={(v) => `$${v}`} />
-              <Tooltip contentStyle={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 6, fontSize: 11, color: "#e2e8f0" }} formatter={(v) => [`$${v}`, "Profit"]} />
+              <Tooltip contentStyle={{ background: "#1e293b", border: "1px solid #334155", borderRadius: 6, fontSize: 11, color: "#e2e8f0" }} formatter={(v) => [`$${v}`, "Net profit"]} />
               <Area type="monotone" dataKey="profit" stroke="#34d399" strokeWidth={2} fill="url(#pg)" dot={false} />
             </AreaChart>
           </ResponsiveContainer>
@@ -583,7 +613,7 @@ function OpportunityTable({ logs }) {
     <div style={{ overflow: "auto", maxHeight: 260 }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
         <thead><tr style={{ borderBottom: "1px solid #1e293b" }}>
-          {["Time", "Chain", "Pair", "Buy → Sell", "Profit USD"].map((h) => (
+          {["Time", "Chain", "Pair", "Buy → Sell", "Gross profit (pre-gas)"].map((h) => (
             <th key={h} style={{ textAlign: "left", padding: "6px 8px", color: "#334155", fontSize: 9, letterSpacing: 1.2, textTransform: "uppercase", fontWeight: 700, position: "sticky", top: 0, background: "#0f172a" }}>{h}</th>
           ))}
         </tr></thead>
@@ -604,6 +634,7 @@ function OpportunityTable({ logs }) {
               </td>
               <td style={{ padding: "5px 8px", color: "#34d399", fontWeight: 600 }}>
                 ${parseFloat(o.data.profit_usd || o.data.profit || 0).toFixed(4)}
+                {o.data.detect_only && <span style={{ marginLeft: 6, fontSize: 9, color: "#64748b", fontWeight: 400 }}>detect only</span>}
               </td>
             </tr>
           ))}
@@ -771,31 +802,40 @@ function LogFeed({ logs, enabledTypes, setEnabledTypes, wsStatus }) {
 function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoundOn }) {
   const [confirmLive, setConfirmLive] = useState(false);
   const dryRun = apiStats?.dry_run ?? true;
-  const paused = apiStats?.paused ?? false;
+  const { opPaused, chainPaused, paused } = engineStatus(apiStats);
   const [confirmRestart, setConfirmRestart] = useState(false);
+  const [actionError, setActionError] = useState(null);
+  // Runs one control request and shows why it failed (f() gives null when the engine is
+  // unreachable, {_authError} on 401, {error} on a 500). Returns the body on success, else null.
+  const run = async (label, call) => {
+    const r = await call();
+    const err = !r ? "engine unreachable" : r._authError ? "unauthorized" : r.error ? String(r.error) : null;
+    setActionError(err ? `${label} failed: ${err}` : null);
+    return err ? null : r;
+  };
   const [restarting, setRestarting] = useState(false);
   const [confirmDbReset, setConfirmDbReset] = useState(false);
   const [dbResetting, setDbResetting] = useState(false);
 
   const handleGoLive = async () => {
     if (!confirmLive) { setConfirmLive(true); return; }
-    await api.setDryRun(false);
+    await run("Go Live", () => api.setDryRun(false));
     setConfirmLive(false);
   };
 
   const handleGoDry = async () => {
-    await api.setDryRun(true);
+    await run("Switch to Dry Run", () => api.setDryRun(true));
     setConfirmLive(false);
   };
 
-  const handlePause = () => api.pauseEngine();
-  const handleResume = () => api.resumeEngine();
+  const handlePause = () => run("Pause", api.pauseEngine);
+  const handleResume = () => run("Resume", api.resumeEngine);
 
   const handleRestart = async () => {
     if (!confirmRestart) { setConfirmRestart(true); return; }
     setRestarting(true);
     setConfirmRestart(false);
-    await api.restartEngine();
+    if (!(await run("Restart", api.restartEngine))) { setRestarting(false); return; }
     // Give process time to exit and restart before re-enabling button
     setTimeout(() => setRestarting(false), 5000);
   };
@@ -803,13 +843,16 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoun
   return (
     <div style={{ padding: 20, maxWidth: 700 }}>
       <h2 style={{ fontSize: 14, color: "#475569", letterSpacing: 1.5, marginBottom: 20, textTransform: "uppercase", fontWeight: 700 }}>Engine Controls</h2>
+      {actionError && (
+        <div role="alert" style={{ background: "#450a0a", border: "1px solid #7f1d1d", borderRadius: 6, padding: "10px 14px", marginBottom: 16, color: "#fca5a5", fontSize: 12 }}>⚠ {actionError}</div>
+      )}
 
       {/* Pause / Resume */}
       <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 20, marginBottom: 16 }}>
         <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, marginBottom: 12, fontWeight: 700 }}>EXECUTION STATE</div>
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ fontSize: 22, fontWeight: 700, color: paused ? "#f87171" : "#34d399" }}>
-            {paused ? "⏸ PAUSED" : "▶ RUNNING"}
+            {opPaused ? "⏸ PAUSED" : paused ? "⏸ AUTO-PAUSED" : "▶ RUNNING"}
           </div>
           <span style={{ flex: 1 }} />
           {paused ? (
@@ -818,6 +861,12 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoun
             <button onClick={handlePause} style={{ ...btn, background: "#450a0a", color: "#f87171", padding: "10px 24px", fontSize: 14, fontWeight: 700, borderRadius: 6 }}>⏸ Pause</button>
           )}
         </div>
+        {!opPaused && chainPaused.length > 0 && (
+          <div style={{ marginTop: 12, padding: 10, background: "#450a0a", borderRadius: 6, color: "#fca5a5", fontSize: 11, lineHeight: 1.6 }}>
+            ⚠ {chainPaused.map((c) => c.chain_name).join(", ")} paused by the engine: circuit breaker, auto-pause on a blocked / router_not_allowed revert, or the contract was paused at startup. Find the cause in the live feed or engine log and fix it first (e.g. contract unpause(), setRouter). Resume clears this pause too; an unfixed cause pauses again, and each failed live attempt costs gas.
+          </div>
+        )}
+        <div style={{ marginTop: 10, fontSize: 11, color: "#475569" }}>The operator Pause lives in engine memory until restart: any restart (button below, crash, block-stall exit) comes back unpaused.</div>
       </div>
 
       {/* Dry Run / Live */}
@@ -825,12 +874,12 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoun
         <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, marginBottom: 12, fontWeight: 700 }}>TRADING MODE</div>
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ fontSize: 22, fontWeight: 700, color: dryRun ? "#fbbf24" : "#ef4444" }}>
-            {dryRun ? "?? DRY RUN" : "?? LIVE TRADING"}
+            {dryRun ? "\u{1F9EA} DRY RUN" : "\u26A1 LIVE TRADING"}
           </div>
           <span style={{ flex: 1 }} />
           {dryRun ? (
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              {confirmLive && <span style={{ color: "#f87171", fontSize: 12, fontWeight: 600 }}>Are you sure? Real money!</span>}
+              {confirmLive && <span style={{ color: "#f87171", fontSize: 12, fontWeight: 600, maxWidth: 340, lineHeight: 1.5 }}>Real money. Prefer DRY_RUN=false in {"engine/<instance>.env"} + restart: that re-runs the router allowlist check. This switch skips it and resets on the next restart.</span>}
               <button onClick={handleGoLive} style={{
                 ...btn, padding: "10px 24px", fontSize: 14, fontWeight: 700, borderRadius: 6,
                 background: confirmLive ? "#7f1d1d" : "#422006", color: confirmLive ? "#fecaca" : "#fbbf24",
@@ -849,16 +898,17 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoun
             ⚠ Live trading is active. Real transactions will be sent. The on-chain contract still has its atomic safety check — unprofitable trades will revert (costing only gas). Monitor closely and pause if anything looks wrong.
           </div>
         )}
+        <div style={{ marginTop: 10, fontSize: 11, color: "#475569" }}>This switch lives in engine memory until restart: any restart goes back to DRY_RUN from {"engine/<instance>.env"}.</div>
       </div>
 
       {/* Sound */}
       <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <div>
           <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, fontWeight: 700 }}>SOUND ALERTS</div>
-          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Beep on trade execution</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Beep on each live trade (not on dry-run simulations)</div>
         </div>
         <button onClick={() => setSoundOn(!soundOn)} style={{ ...btn, background: soundOn ? "#052e16" : "#1e293b", color: soundOn ? "#34d399" : "#475569", padding: "8px 20px" }}>
-          {soundOn ? "?? ON" : "?? OFF"}
+          {soundOn ? "\u{1F50A} ON" : "\u{1F507} OFF"}
         </button>
       </div>
 
@@ -866,7 +916,7 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoun
       <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <div>
           <div style={{ fontSize: 11, color: "#475569", letterSpacing: 1, fontWeight: 700 }}>RESTART ENGINE</div>
-          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>Send SIGTERM — systemd/supervisor will restart the process</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2, lineHeight: 1.5 }}>Exits with code 75; systemd restarts it (without systemd the engine just stops). Pause, the Dry Run switch and pair toggles reset to {"engine/<instance>.env"} (DRY_RUN=…). Restarts count toward systemd&apos;s limit of 5 per 2 min: past it the unit stays failed until <code>systemctl reset-failed</code>.</div>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           {confirmRestart && <span style={{ color: "#fbbf24", fontSize: 12, fontWeight: 600 }}>Confirm restart?</span>}
@@ -904,9 +954,8 @@ function ControlPanel({ ws, api, apiStats, clearAll, onDbReset, soundOn, setSoun
               if (!confirmDbReset) { setConfirmDbReset(true); return; }
               setDbResetting(true);
               setConfirmDbReset(false);
-              await api.resetDb();
-              clearAll();
-              onDbReset?.();
+              // Clear the display only when the engine confirms the delete.
+              if (await run("Delete DB", api.resetDb)) { clearAll(); onDbReset?.(); }
               setDbResetting(false);
             }}
             disabled={dbResetting}
@@ -1085,7 +1134,7 @@ function PairManager({ api }) {
       )}
 
       <div style={{ fontSize: 10, color: "#334155", marginTop: 4 }}>
-        Tokens tab refreshes pair-scan every ~10s; engine heartbeat log ~60s. Toggle disables a pair or triplet from future scans — takes effect on the next cycle.
+        Tokens tab refreshes pair-scan every ~10s; engine heartbeat log ~60s. Toggle disables a 2-hop pair from future scans from the next cycle, until the engine restarts; triplets are automatic.
       </div>
     </div>
   );
@@ -1123,6 +1172,17 @@ export default function Dashboard() {
   const [statsPollError, setStatsPollError] = useState(null);
   /** True when /stats returns 401 — same as bad WS auth but easy to miss in the UI. */
   const [statsAuthFailed, setStatsAuthFailed] = useState(false);
+  // chain_id → { block, at }: when this tab last saw each chain's last_block change. Client
+  // clock only, so STALE needs no browser/server clock agreement.
+  const blockSeenRef = useRef({});
+  const withBlockSeen = (d) => {
+    if (!Array.isArray(d.chains)) return d;
+    const now = Date.now(), seen = blockSeenRef.current;
+    return { ...d, chains: d.chains.map((c) => {
+      if (seen[c.chain_id]?.block !== c.last_block) seen[c.chain_id] = { block: c.last_block, at: now };
+      return { ...c, _block_seen_at: seen[c.chain_id].at };
+    }) };
+  };
   // Logged out (even with a stored session) → no polling at all.
   const active = authenticated && !loggedOut;
   useEffect(() => {
@@ -1142,7 +1202,7 @@ export default function Dashboard() {
         setStatsPollError(null);
         setStatsAuthFailed(false);
         setApiLatency(Date.now() - t0);
-        setApiStats(d);
+        setApiStats(withBlockSeen(d));
       } else {
         setStatsPollError("unreachable");
       }
@@ -1190,7 +1250,7 @@ export default function Dashboard() {
     const fresh = entriesSince(ws.logs, beepIdRef.current);
     if (fresh.length === 0) return;
     beepIdRef.current = newestId(ws.logs);
-    if (soundOn && fresh.some((l) => l.type === "trade")) playBeep();
+    if (soundOn && fresh.some((l) => l.type === "trade" && !l.data?.dry_run)) playBeep();
   }, [ws.logs, soundOn]);
 
   useEffect(() => { if (ws.status === "connected") setAuthenticated(true); }, [ws.status]);
@@ -1214,6 +1274,7 @@ export default function Dashboard() {
     setLoggedOut(true); setStatsAuthFailed(false); setAuthenticated(false);
     // Nothing from this engine may show when connecting to the next one.
     setApiStats(null); setApiLatency(null); setStatsPollError(null); setPairStatsLive([]); ws.resetState();
+    blockSeenRef.current = {};
   };
 
   if (!authenticated || loggedOut || ws.authError || statsAuthFailed) {

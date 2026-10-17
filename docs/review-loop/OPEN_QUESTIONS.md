@@ -101,3 +101,23 @@ options, recommendation. Newest at the bottom.
   1. Track the skill: add `!.claude/skills/` (or just `!.claude/skills/verify/`) to .gitignore and commit it. Shares the safe-run recipe with the repo; must stay free of secrets (it is today — it only names Anvil test keys by index and reads ALCHEMY_KEY from .env without printing it).
   2. Keep it local-only. No risk of committing other `.claude/` state, but the recipe drifts from the code and is lost with the machine.
 - Recommendation: 1, tracking only `.claude/skills/` so settings and local state stay ignored.
+
+### [engine/dashboard] Persist operator controls across restarts (Pause, Dry Run switch, pair toggles)
+- Where: engine/src/api.rs `engine_pause` / `engine_dry_run` / pair toggle (flags live only in `EngineState`); engine_restart exit(75); dashboard.jsx Controls + Tokens tab
+- What / why unsure: Review D1-3. Every restart (dashboard Restart, crash, 5-min block-stall exit 1) comes back unpaused, in DRY_RUN from the env file, with every pair enabled. The dashboard now says so ("until restart"), but an operator who pauses or disables a misbehaving pair and then restarts gets it trading again. Making state durable is a product decision.
+- Options + trade-offs:
+  1. Leave in-memory (today, now documented in the UI). Restarts always return to the env-file state. Predictable, and a restart is a deliberate reset.
+  2. Persist pause + disabled pairs in SQLite (not dry_run). Survives restarts. Risk: a persisted pause leaves a bot silently idle after a deploy or upgrade (the dashboard now shows PAUSED, but uptime monitors don't page on it; /health says `paused`).
+  3. Also persist dry_run=false. Rejected direction: the API flip would then skip the startup router-allowlist check on every restart (see the Go Live entry below).
+  4. Start paused after a non-clean exit (code ≠ 75). Stops a crash loop from trading unattended, but a block stall at night (exit 1 → auto-restart) would then need a human to resume.
+- Recommendation: 1 for the first mainnet runs. Revisit 2 (pause + pairs only) if operators rely on pair toggles in production.
+
+### [dashboard] "Go Live" button skips the startup router-allowlist check
+- Where: dashboard.jsx Controls "Go Live" → POST /engine/dry-run {enabled:false} (engine/src/api.rs `engine_dry_run`); PRODUCTION_DEPLOYMENT_GUIDE.md "Prefer [env + restart] over POST /engine/dry-run"
+- What / why unsure: Review D1-4. The flip goes live without the startup router-allowlist check that DRY_RUN=false + restart runs. A router missing from the allowlist then costs one reverted tx before `router_not_allowed` auto-pauses the chain (which the dashboard now shows as AUTO-PAUSED). The confirm text now points to env + restart. Whether to keep the button is a workflow decision; it is handy on Base Sepolia.
+- Options + trade-offs:
+  1. Keep the button with the new confirm text (today). Fast for testnet; one possible reverted tx on mainnet.
+  2. Hide/disable Go Live when the chain id is Base mainnet (8453) and point to env + restart. Keeps testnet convenience; mainnet go-live always passes the router check. Small dashboard change.
+  3. Engine: run the router-allowlist check inside `engine_dry_run` before accepting enabled:false (reject with an error the dashboard now displays). Keeps the button safe everywhere; needs an RPC call in the handler and a test.
+  4. Remove the button. Simplest; loses the testnet convenience.
+- Recommendation: 3 if the button stays long-term, else 2.
