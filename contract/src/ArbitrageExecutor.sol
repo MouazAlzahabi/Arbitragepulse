@@ -59,8 +59,9 @@ interface IAerodromeRouter {
  *   • a router call that reverts is re-raised as LegFailed(leg, router, type, reason),
  *     with the router's own revert data in `reason` (e.g. "Too little received");
  *   • missing funds → InsufficientBalance; a leg that delivers nothing → NoOutput;
- *   • misconfiguration (unknown / retired router type, V3 fee 0, repeated tokens) has
- *     its own error, checked before any swap.
+ *   • misconfiguration (unknown / retired router type, V3 fee out of range, repeated
+ *     tokens) has its own error. Router and token checks run before any swap; a bad
+ *     V3 fee is reported when the leg that carries it is reached.
  *
  * Amounts between legs are measured as balance deltas, not taken from router return
  * values, so a router that misreports its output cannot make the next leg over-spend.

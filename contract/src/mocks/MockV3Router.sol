@@ -13,6 +13,9 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 contract MockV3Router {
     uint256 public rateNumerator;
     uint256 public rateDenominator;
+    /// @dev Last call's fee / price limit, so tests can assert what the executor encoded.
+    uint24 public lastFee;
+    uint160 public lastSqrtPriceLimitX96;
 
     constructor(uint256 _rateNumerator, uint256 _rateDenominator) {
         rateNumerator = _rateNumerator;
@@ -33,6 +36,8 @@ contract MockV3Router {
         external
         returns (uint256 amountOut)
     {
+        lastFee = params.fee;
+        lastSqrtPriceLimitX96 = params.sqrtPriceLimitX96;
 
         // Pull tokenIn from caller
         IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);

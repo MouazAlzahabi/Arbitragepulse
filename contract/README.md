@@ -7,7 +7,8 @@ Atomic cross-DEX arbitrage executor for Base. The engine calls one of two entry 
 | `executeArbitrage(tokenIn, tokenOut, amountIn, routerA, routerB, feeA, feeB, minProfit, deadline)` | `tokenIn → tokenOut` on A, back on B |
 | `executeTriangularArbitrage(tokenA, tokenB, tokenC, amountIn, routerAB, routerBC, routerCA, feeAB, feeBC, feeCA, minProfit, deadline)` | `A → B → C → A` |
 
-Both revert unless the contract ends with at least `amountIn + minProfit` of the start token.
+Both revert unless the contract ends with at least `minProfit` more of the start token than it
+started with (`balanceAfter >= balanceBefore + minProfit`).
 The trade uses the contract's own balance; profit stays in the contract until `withdrawToken`.
 
 ## Router types
@@ -96,6 +97,8 @@ forge script script/Deploy.s.sol --rpc-url base --broadcast --verify
 `.env` (see `.env.example`): `PRIVATE_KEY`, `BASE_RPC`, `BASE_SEPOLIA_RPC`, and
 `ETHERSCAN_API_KEY` (Etherscan API V2 — one etherscan.io key verifies on both chains; needs
 Foundry ≥ 1.3, where V2 is the default — run `foundryup` if verification hits the old BaseScan API).
+The deployer becomes `owner`, and both trade entry points are `onlyOwner`, so the engine must sign
+with this same `PRIVATE_KEY`; that key can also withdraw all funds (see docs/review-loop/OPEN_QUESTIONS.md).
 
 The Rust lab (`cargo run -p lab -- setup`) deploys from the compiled artifact
 `out/ArbitrageExecutor.sol/ArbitrageExecutor.json`, so run `forge build` first.
@@ -114,6 +117,6 @@ script/
   RewidenMocks.s.sol         restore that spread after arbs narrow it
   MockMarket.sol             shared addresses, prices and sqrtPriceX96 math
 test/
-  ArbitrageExecutor.t.sol    executor (58 tests)
+  ArbitrageExecutor.t.sol    executor
   MockMarket.t.sol           mock-market price math
 ```

@@ -533,6 +533,22 @@ contract ArbitrageExecutorTest is Test {
         assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
     }
 
+    function test_V3FeeReachesRouterPerLeg() public {
+        // 2-hop: distinct tiers per leg, each must reach its own router unchanged
+        _arb(address(v3A), address(v3B), 500, 3000, 1 ether);
+        assertEq(v3A.lastFee(), 500, "2-hop leg 1 fee");
+        assertEq(v3B.lastFee(), 3000, "2-hop leg 2 fee");
+        assertEq(v3A.lastSqrtPriceLimitX96(), 0, "no price limit");
+        assertEq(v3B.lastSqrtPriceLimitX96(), 0, "no price limit");
+
+        // triangular: 100 -> 200 (v3A 2/1) -> 200 (bc 1/1) -> 120 (v3B 6/10), three distinct tiers
+        address bc = _triRouters(ArbitrageExecutor.RouterType.V3);
+        _tri(address(v3A), bc, address(v3B), 100, 2500, 10000, 1 ether);
+        assertEq(v3A.lastFee(), 100, "tri leg AB fee");
+        assertEq(MockV3Router(bc).lastFee(), 2500, "tri leg BC fee");
+        assertEq(v3B.lastFee(), 10000, "tri leg CA fee");
+    }
+
     function test_Triangular_LossReportsNotProfitable() public {
         address bc = _triRouters(ArbitrageExecutor.RouterType.V3);
         vm.expectRevert(_notProfitable(980 ether, 1 ether)); // 100 → 200 → 200 → 80

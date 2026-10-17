@@ -55,5 +55,7 @@ contract DeployExecutor is Script {
         ));
         console.log("  3. Fund:    send the pair's start token (e.g. USDC) to", address(executor));
         console.log("  4. Engine:  chain.contract_address =", address(executor));
+        console.log("     Trades are onlyOwner: the engine's PRIVATE_KEY must be this owner:", executor.owner());
+        console.log("     The same key can withdraw everything - keep only working capital in the contract.");
     }
 }
