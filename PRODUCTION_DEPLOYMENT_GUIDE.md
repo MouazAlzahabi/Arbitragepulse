@@ -104,7 +104,10 @@ This installs the systemd template `arbitragepulse@.service`, log rotation, and 
 It also removes the old single-unit `arbitragepulse.service` if present.
 
 Go live after a clean dry-run period: set `DRY_RUN=false` in `engine/base.env` and
-`sudo systemctl restart arbitragepulse@base` (or `POST /engine/dry-run {"enabled":false}`).
+`sudo systemctl restart arbitragepulse@base`. Prefer this over `POST /engine/dry-run
+{"enabled":false}`: the restart re-runs the startup router-allowlist check (a router that
+is not allowlisted exits 2), while the API switch skips it and would only catch such a
+router with one reverted tx (`router_not_allowed`, chain auto-paused).
 
 ## 6. Monitoring
 
@@ -136,6 +139,7 @@ curl -s -H "Authorization: Bearer $API_KEY" localhost:3000/health | python3 -m j
   estimated L2 gas at the live ETH price. Gas actually paid by mined txs, including
   reverts, is `arb_gas_spent_usd_total{outcome="success"|"reverted"}` on `/metrics`
   (L2 execution gas only — the L1 data fee isn't included).
+  Dry-run rows (`dry_run=1` in the trade DB, "DRY-RUN ok" in the feed) store the gross simulated profit; judge go-live by the `net=` figure in the DRY-RUN log line, which subtracts the estimated gas.
 - The dashboard (`dist/`, served by your web server or `npm run dashboard` locally,
   e.g. through an SSH tunnel to port 3000) shows the live feed, stats and backoff state.
 
@@ -148,8 +152,8 @@ restart; profit floors hot-reload. A config edit that fails to parse is logged
 | Code | Meaning | systemd |
 |---|---|---|
 | 0 | stopped (SIGTERM / Ctrl-C) | stays stopped |
-| 1 | crash, chain task died, config error, no new block for `tuning.block_stall_exit_ms`, API port unusable | restarts (5 per 2 min, then `failed`) |
-| 2 | refused to start: RPC chain id ≠ `chain.id`, signer not the executor owner, router not allowlisted (live), empty `API_KEY` | not restarted — fix and `systemctl restart` |
+| 1 | crash, chain task died, no new block for `tuning.block_stall_exit_ms`, API port unusable | restarts (5 per 2 min, then `failed`) |
+| 2 | refused to start: config file unreadable or invalid, env (`.env` / unit env) invalid, RPC chain id ≠ `chain.id`, signer not the executor owner, router not allowlisted (live), empty `API_KEY` | not restarted — fix and `systemctl restart` |
 | 75 | `POST /engine/restart` | restarts |
 
 ## Running another chain

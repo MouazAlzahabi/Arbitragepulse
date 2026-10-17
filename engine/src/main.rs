@@ -22,8 +22,9 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     // ── Logging ──
     let env = config::load_env().unwrap_or_else(|e| {
+        // Not retryable: exit 2 so systemd doesn't restart it (RestartPreventExitStatus=2).
         eprintln!("Config error: {e}");
-        std::process::exit(1);
+        std::process::exit(2);
     });
 
     tracing_subscriber::fmt()
@@ -37,8 +38,8 @@ async fn main() -> Result<()> {
 
     // ── Config ──
     let cfg = config::load_config(&env.config_path).unwrap_or_else(|e| {
-        tracing::error!("Config load failed: {e}");
-        std::process::exit(1);
+        tracing::error!("Config load failed: {e} — exiting (code 2, not restarted)");
+        std::process::exit(2);
     });
 
     // One instance = one chain (see config::AppConfig).
