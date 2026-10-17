@@ -5,8 +5,9 @@
 # another instance with its own config, .env, PORT and database (see
 # PRODUCTION_DEPLOYMENT_GUIDE.md). Testing stage: config-testnet.yaml (Base Sepolia).
 #
-# Routers, pairs and min-profit values hot-reload every `tuning.config_reload_ms`.
-# The `chain:` block and `tuning:` need a restart.
+# Profit floors (chain.min_profit_usd, min_triangular_profit_usd, per-pair min_profit_usd)
+# hot-reload every `tuning.config_reload_ms`. Adding pairs or routers needs a restart
+# (pools are discovered at startup). The rest of `chain:` and `tuning:` need a restart.
 # ============================================================
 
 
@@ -81,12 +82,12 @@ routers:
     # IMPORTANT: Must be whitelisted on-chain after contract redeployment:
     #   executor.setRouter(0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43, 4)   # 4 = Aerodrome
 
-  # DISABLED (commented out, and removed from every pair's routers list): Slipstream keys pools
+  # DISABLED (commented out): Slipstream keys pools
   # by int24 tickSpacing, not uint24 fee. Its factory reverts the Uniswap getPool(…, uint24) the
   # engine uses, so no pools were ever discovered; its quoter takes int24 tickSpacing; and its
   # router's exactInputSingle selector differs from SwapRouter02's, which ArbitrageExecutor has
   # no RouterType for. Real support needs a Slipstream RouterType in the contract (+ redeploy),
-  # tickSpacing pool discovery, and tickSpacing quoting. Then restore this entry and the pair refs.
+  # tickSpacing pool discovery, and tickSpacing quoting. Then restore this entry.
   # - id: "aerodrome-slipstream-base"
   #   name: "Aerodrome Slipstream CL (Base)"
   #   address: "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
@@ -134,9 +135,6 @@ pairs:
     token_out_decimals: 18
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
-    watch_pools: []
 
   # base-usdbc-weth disabled — contract has no USDbC; re-enable after funding with USDbC
   # - id: "base-usdbc-weth"
@@ -148,9 +146,6 @@ pairs:
   #   token_out_decimals: 18
   #   trade_amount: "99"
   #   max_trade: "99"
-  #   min_swap_size: "10"
-  #   routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
-  #   watch_pools: []
 
   - id: "base-usdc-usdbc"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -161,9 +156,6 @@ pairs:
     token_out_decimals: 6
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
-    watch_pools: []
 
   - id: "base-usdc-usdt"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -174,9 +166,6 @@ pairs:
     token_out_decimals: 6
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
-    watch_pools: []
 
   # USDT → WETH: Aerodrome Slipstream 0.05% ($221K TVL, $775K/day) vs UniV3 0.05% ($41K TVL)
   - id: "base-usdt-weth"
@@ -188,9 +177,6 @@ pairs:
     token_out_decimals: 18
     trade_amount: "270"
     max_trade: "270"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
 
   - id: "base-usdc-cbbtc"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -201,9 +187,6 @@ pairs:
     token_out_decimals: 8
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
-    watch_pools: []
 
   - id: "base-usdc-aero"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
@@ -214,11 +197,9 @@ pairs:
     token_out_decimals: 18
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base", "baseswap-v2", "alienbase-v2"]
-    watch_pools: []
 
   # cbETH disabled until contract funded with cbETH
+  # NOTE: token_in must be a USD stablecoin or WETH (profit is priced in USD) — cbETH is rejected at load.
   # - id: "base-cbeth-weth"
   #   token_in: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH
   #   token_out: "0x4200000000000000000000000000000000000006"   # WETH
@@ -228,8 +209,6 @@ pairs:
   #   token_out_decimals: 18
   #   trade_amount: "0.05"
   #   max_trade: "0.2"
-  #   min_swap_size: "0.01"
-  #   watch_pools: []
 
   # USDC → DAI: stablecoin spread — enabled now that contract holds 1000+ USDC
   - id: "base-usdc-dai"
@@ -241,9 +220,6 @@ pairs:
     token_out_decimals: 18
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
 
   # USDC → cbETH: Coinbase staked ETH — LST premium divergence across DEXes
   - id: "base-usdc-cbeth"
@@ -255,9 +231,6 @@ pairs:
     token_out_decimals: 18
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
 
   # USDC → ZORA: Zora Network token — $2.7M/day UniV3 + $685K PancakeV3
   - id: "base-usdc-zora"
@@ -269,9 +242,6 @@ pairs:
     token_out_decimals: 18
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
 
   # USDC → VIRTUAL: Virtuals Protocol — $3M/day PancakeV3 + $217K UniV3
   - id: "base-usdc-virtual"
@@ -283,14 +253,11 @@ pairs:
     token_out_decimals: 18
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
 
   # USDC → EURC: stablecoin arb — Circle EUR stablecoin, both 6 decimals
   # Aerodrome Slipstream CL1 pool: ~$817K TVL, $8.3M/day volume (fee tier 100 = 0.01%)
   # UniV3 0.05% pool: ~$22K TVL — shallow, creates price divergence on large Slipstream flows
-  # NOTE: aerodrome-base (V2 AMM) removed — EURC main liquidity is in Slipstream CL, not V2 AMM
+  # NOTE: every pair is quoted on every configured router (no per-pair router lists)
   - id: "base-usdc-eurc"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1aDb42"   # EURC (Circle EUR stablecoin)
@@ -300,9 +267,6 @@ pairs:
     token_out_decimals: 6
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base"]
-    watch_pools: []
 
   # USDC → wstETH: Lido wrapped staked ETH — LST premium divergence across DEXes
   - id: "base-usdc-wsteth"
@@ -314,9 +278,6 @@ pairs:
     token_out_decimals: 18
     trade_amount: "1000"
     max_trade: "1000"
-    min_swap_size: "10"
-    routers: ["uniswap-v3-base", "pancake-v3-base", "aerodrome-base"]
-    watch_pools: []
 
 
 # ─── TUNING ────────────────────────────────────────────────
@@ -348,7 +309,6 @@ tuning:
   volatile_pool_max_age_ms: 120000
   stable_pool_max_age_ms: 30000
   v3_fresh_window_ms: 30000
-  pool_prune_after_ms: 2700000
   # ── RPC ──
   rpc_read_timeout_ms: 5000
   # rpc_simulate_timeout_ms: 1000        # block-relative: ½ block

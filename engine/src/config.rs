@@ -5,6 +5,7 @@ use serde::Deserialize;
 // ─── Raw YAML config structures ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub id: u64,
     pub name: String,
@@ -20,10 +21,6 @@ pub struct ChainConfig {
     /// Optional QuoterV2 address for V3 quoting (chain-specific)
     #[serde(default)]
     pub quoter_v2_address: Option<String>,
-    /// Minimum swap amount to trigger opportunity evaluation (filters dust swaps).
-    /// Default: 1e17 (0.1 ETH or 100k USDC). Set to 0 to disable filtering.
-    #[serde(default = "default_min_swap_amount")]
-    pub min_swap_amount_filter: u128,
     /// Fallback WS endpoints tried in order if the primary ws_rpc fails.
     /// Leave empty to use only the primary.
     #[serde(default)]
@@ -121,10 +118,6 @@ fn default_priority_fee_wei() -> u128 {
     1_000_000 // 1 Mwei = 0.001 gwei — safe default for non-competitive chains
 }
 
-fn default_min_swap_amount() -> u128 {
-    100_000_000_000_000_000 // 1e17 = 0.1 ETH or 100k USDC (6 decimals)
-}
-
 fn default_large_swap_threshold_bps() -> u32 {
     200 // 2% reserve shift
 }
@@ -152,6 +145,7 @@ impl Default for RouterType {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RouterConfig {
     pub id: String,
     pub name: String,
@@ -180,6 +174,7 @@ pub struct RouterConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PairConfig {
     pub id: String,
     pub token_in: String,
@@ -189,7 +184,6 @@ pub struct PairConfig {
     pub token_in_decimals: u8,
     pub token_out_decimals: u8,
     pub trade_amount: String,
-    pub min_swap_size: String,
     /// Optional cap: if set, actual trade size = min(trade_amount, max_trade)
     #[serde(default)]
     pub max_trade: Option<String>,
@@ -198,8 +192,6 @@ pub struct PairConfig {
     /// low for less-contested pairs (ZORA, VIRTUAL) that share the same chain config.
     #[serde(default)]
     pub min_profit_usd: Option<f64>,
-    #[serde(default)]
-    pub watch_pools: Vec<String>,
 }
 
 /// One config file = one chain = one engine instance. To run another chain, deploy
@@ -324,6 +316,24 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
             ));
         }
     }
+    if !(10..=600).contains(&chain.deadline_seconds) {
+        return Err(anyhow!("chain.deadline_seconds must be 10..=600 (got {})", chain.deadline_seconds));
+    }
+    {
+        use crate::strategy::{NATIVE_SYMBOLS, USD_STABLE_SYMBOLS};
+        for p in &raw.pairs {
+            let s = p.token_in_symbol.as_str();
+            let stable = USD_STABLE_SYMBOLS.iter().any(|x| x.eq_ignore_ascii_case(s));
+            let native = NATIVE_SYMBOLS.iter().any(|x| x.eq_ignore_ascii_case(s))
+                && p.token_in.eq_ignore_ascii_case(&chain.wrapped_native);
+            if !stable && !native {
+                return Err(anyhow!(
+                    "pair '{}': token_in_symbol '{}' has no USD price — token_in must be a USD stablecoin ({}) or the wrapped native token ({}) at chain.wrapped_native",
+                    p.id, s, USD_STABLE_SYMBOLS.join(", "), NATIVE_SYMBOLS.join(", ")
+                ));
+            }
+        }
+    }
     raw.tuning.validate(chain.block_time_ms)?;
 
     Ok(AppConfig {
@@ -412,8 +422,6 @@ pub struct Tuning {
     pub stable_pool_max_age_ms: u64,
     /// V3 pools with no Swap event for this long count as stale in the heartbeat (ms).
     pub v3_fresh_window_ms: u64,
-    /// Evict pools whose state hasn't been refreshed for this long (ms).
-    pub pool_prune_after_ms: u64,
 
     // ── RPC ──
     /// Timeout for background reads: price, balances, gas, nonce, ping (ms).
@@ -493,7 +501,6 @@ impl Default for Tuning {
             volatile_pool_max_age_ms: 120_000,
             stable_pool_max_age_ms: 30_000,
             v3_fresh_window_ms: 30_000,
-            pool_prune_after_ms: 45 * 60 * 1000,
             rpc_read_timeout_ms: 5_000,
             rpc_simulate_timeout_ms: None,
             rpc_send_timeout_ms: 5_000,
@@ -599,7 +606,6 @@ impl Tuning {
     pub fn volatile_pool_max_age(&self) -> std::time::Duration { ms(self.volatile_pool_max_age_ms) }
     pub fn stable_pool_max_age(&self) -> std::time::Duration { ms(self.stable_pool_max_age_ms) }
     pub fn v3_fresh_window(&self) -> std::time::Duration { ms(self.v3_fresh_window_ms) }
-    pub fn pool_prune_after(&self) -> std::time::Duration { ms(self.pool_prune_after_ms) }
     pub fn price_refresh(&self) -> std::time::Duration { ms(self.price_refresh_ms) }
     pub fn balance_refresh(&self) -> std::time::Duration { ms(self.balance_refresh_ms) }
     pub fn config_reload(&self) -> std::time::Duration { ms(self.config_reload_ms) }
@@ -697,6 +703,49 @@ routers: []
         assert!(parse_config(&zero).is_err());
         let stall = format!("{}tuning:\n  block_stall_exit_ms: 0\n", MIN);
         assert!(parse_config(&stall).is_err());
+        let prune = format!("{}tuning:\n  pool_prune_after_ms: 1\n", MIN);
+        assert!(parse_config(&prune).is_err(), "pool_prune_after_ms was removed");
+    }
+
+    fn with_pair(sym: &str, token_in: &str) -> String {
+        format!(
+            "{MIN}pairs:\n  - id: p\n    token_in: \"{token_in}\"\n    token_out: \"0x0000000000000000000000000000000000000003\"\n    token_in_symbol: \"{sym}\"\n    token_out_symbol: \"X\"\n    token_in_decimals: 6\n    token_out_decimals: 18\n    trade_amount: \"1\"\n"
+        )
+    }
+
+    #[test]
+    fn token_in_must_have_usd_price() {
+        let usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        let err = parse_config(&with_pair("ZORA", usdc)).unwrap_err().to_string();
+        assert!(err.contains("has no USD price"), "{err}");
+        parse_config(&with_pair("usdc", usdc)).unwrap();
+        parse_config(&with_pair("WETH", "0x4200000000000000000000000000000000000006")).unwrap();
+        assert!(parse_config(&with_pair("WETH", "0x0000000000000000000000000000000000000004")).is_err());
+    }
+
+    #[test]
+    fn unknown_keys_rejected() {
+        let chain_key = MIN.replace("  deadline_seconds: 60\n", "  deadline_seconds: 60\n  min_swap_amount_filter: 1\n");
+        let err = parse_config(&chain_key).unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "{err}");
+        let pair_key = format!("{}    routers: [\"x\"]\n", with_pair("USDC", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"));
+        let err = parse_config(&pair_key).unwrap_err().to_string();
+        assert!(err.contains("routers"), "{err}");
+    }
+
+    #[test]
+    fn token_amount_to_usd_case_insensitive() {
+        use crate::strategy::token_amount_to_usd;
+        use alloy::primitives::U256;
+        assert_eq!(token_amount_to_usd(U256::from(2_000_000u64), 6, "usdc", 3000.0), 2.0);
+        assert_eq!(token_amount_to_usd(U256::from(10u64).pow(U256::from(18)), 18, "weth", 3000.0), 3000.0);
+    }
+
+    #[test]
+    fn deadline_seconds_validated() {
+        let err = parse_config(&MIN.replace("deadline_seconds: 60", "deadline_seconds: 5")).unwrap_err().to_string();
+        assert!(err.contains("deadline_seconds"), "{err}");
+        parse_config(MIN).unwrap();
     }
 
     #[test]

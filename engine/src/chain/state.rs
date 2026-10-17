@@ -1,6 +1,22 @@
 use super::*;
 use crate::util::{rpc_timeout, rpc_read_timeout};
 
+static NO_PRICE_SOURCE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// A configured pair with WETH (wrapped native) on one side and a USD stablecoin on the other:
+/// (stablecoin address, decimals). WETH→stable is quoted on that pool in either direction
+/// (pool keys are stored both ways), so a USDC→WETH pair works as well as WETH→USDC.
+pub(crate) fn native_price_source(pairs: &[PairConfig], wrapped_native: Address) -> Option<(Address, u8)> {
+    const STABLES: [&str; 3] = ["USDC", "USDT", "DAI"];
+    let is_stable = |s: &str| STABLES.iter().any(|x| x.eq_ignore_ascii_case(s));
+    pairs.iter().find_map(|p| {
+        let (tin, tout) = (p.token_in.parse::<Address>().ok()?, p.token_out.parse::<Address>().ok()?);
+        if tin == wrapped_native && is_stable(&p.token_out_symbol) { Some((tout, p.token_out_decimals)) }
+        else if tout == wrapped_native && is_stable(&p.token_in_symbol) { Some((tin, p.token_in_decimals)) }
+        else { None }
+    })
+}
+
 pub(crate) async fn update_native_price<P: Provider>(
     strategy: &Arc<RwLock<Strategy>>,
     executor: &Arc<Mutex<Executor>>,
@@ -30,19 +46,18 @@ pub(crate) async fn update_native_price<P: Provider>(
         }
     };
 
-    // Find a pair: WrappedNative → Stablecoin (USDC, USDT, DAI)
-    let stable_pair = pairs.iter().find(|p| {
-        p.token_in == cfg.wrapped_native
-            && ["USDC", "USDT", "DAI"].contains(&p.token_out_symbol.as_str())
-    });
-    let stable_pair = match stable_pair { Some(p) => p, None => return };
-
-    let token_out: Address = match stable_pair.token_out.parse() { Ok(a) => a, Err(_) => return };
+    let Some((token_out, stable_decimals)) = native_price_source(pairs, wrapped_native) else {
+        if !NO_PRICE_SOURCE_WARNED.swap(true, Ordering::Relaxed) {
+            warn!("[{}] No WETH/stablecoin pair configured — {} price stays at ${:.0}; gas-cost and minProfit math use that fixed value",
+                  cfg.name, cfg.native_currency, 2500.0);
+        }
+        return;
+    };
     // Use 0.01 native token to minimise price impact on thin pools (result scaled ×100).
     // Quoting 1 full ETH on a low-TVL pool shifts the price significantly (~$200 off).
     let probe_amount = U256::from(10_000_000_000_000_000u128); // 0.01 ETH (1e16 wei)
     let probe_scale = 100_u128; // multiply back to get per-1-ETH price
-    let decimal_scale = 10_f64.powi(stable_pair.token_out_decimals as i32);
+    let decimal_scale = 10_f64.powi(stable_decimals as i32);
 
     // ── Try local V2 pool cache first (zero RPC on the 60s tick) ────────────
     {
@@ -127,6 +142,35 @@ pub(crate) async fn update_native_price<P: Provider>(
                 }
             }
         }
+    }
+}
+
+/// True when the signer's ETH (wei) is below `min_eth` (chain.min_native_balance).
+pub(crate) fn signer_gas_low(balance_wei: U256, min_eth: f64) -> bool {
+    crate::util::u256_to_f64(balance_wei) / 1e18 < min_eth
+}
+
+/// Warn once per low period when the signer's ETH is below chain.min_native_balance.
+pub(crate) async fn check_signer_gas<P: Provider>(
+    provider: &P,
+    signer: Address,
+    min_eth: f64,
+    warned: &AtomicBool,
+    log_tx: &LogBroadcaster,
+    chain: &str,
+) {
+    let Ok(bal) = rpc_timeout(rpc_read_timeout(), provider.get_balance(signer)).await else { return };
+    if signer_gas_low(bal, min_eth) {
+        if !warned.swap(true, Ordering::Relaxed) {
+            let msg = format!(
+                "[{}] Signer {} has {:.5} ETH for gas — below chain.min_native_balance {} — top it up or sends will fail",
+                chain, signer, crate::util::u256_to_f64(bal) / 1e18, min_eth
+            );
+            warn!("{}", msg);
+            broadcast_log(log_tx, "warn", &msg, None);
+        }
+    } else {
+        warned.store(false, Ordering::Relaxed);
     }
 }
 
@@ -341,5 +385,30 @@ mod tests {
         assert!(router_problem("r", a, RouterType::V3, true, 1).is_none());
         let msg = router_problem("r", a, RouterType::Aerodrome, true, 0).expect("wrong type");
         assert!(msg.contains("type 0") && msg.contains("type 4"), "{msg}");
+    }
+
+    #[test]
+    fn shipped_configs_have_native_price_source() {
+        let weth = address!("4200000000000000000000000000000000000006");
+        let load = |name: &str| {
+            let full = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), name);
+            let content = std::fs::read_to_string(&full).unwrap().replace("YOUR_", "0000");
+            crate::config::parse_config(&content).unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        assert_eq!(
+            native_price_source(&load("config.yaml").pairs, weth),
+            Some((address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), 6))
+        );
+        assert_eq!(
+            native_price_source(&load("config-testnet.yaml").pairs, weth),
+            Some((address!("036CbD53842c5426634e7929541eC2318f3dCF7e"), 6))
+        );
+        assert_eq!(native_price_source(&[], weth), None);
+    }
+
+    #[test]
+    fn signer_gas_low_threshold() {
+        assert!(signer_gas_low(U256::from(4_000_000_000_000_000u64), 0.005));
+        assert!(!signer_gas_low(U256::from(6_000_000_000_000_000u64), 0.005));
     }
 }

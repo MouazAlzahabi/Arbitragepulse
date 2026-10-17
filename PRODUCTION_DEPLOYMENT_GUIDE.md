@@ -59,7 +59,8 @@ allowlisted with the type above (dry-run only warns). If the contract is `paused
 chain starts paused: `unpause()`, then `POST /engine/resume`.
 
 Fund the executor with the pairs' `token_in` (mostly USDC) and the wallet with a little
-ETH for gas (`chain.min_native_balance`). Withdraw with `withdrawToken(token)` /
+ETH for gas (`chain.min_native_balance` — the engine warns when the signer's ETH drops
+below it). Withdraw with `withdrawToken(token)` /
 `withdrawETH()`; `pause()` freezes the contract.
 
 Failed trades are logged with the decoded contract error — which leg, which router and the
@@ -129,11 +130,16 @@ curl -s -H "Authorization: Bearer $API_KEY" localhost:3000/health | python3 -m j
   reverts on-chain as `blocked` (contract paused / signer not owner) or
   `router_not_allowed`, and at startup when the contract is paused. Fix the cause, then
   `POST /engine/resume` — it clears both the global and the per-chain pause.
+- Profit figures (dashboard, `/stats`, `arb_profit_usd_total`, trade DB) are net of the
+  estimated L2 gas at the live ETH price. Gas actually paid by mined txs, including
+  reverts, is `arb_gas_spent_usd_total{outcome="success"|"reverted"}` on `/metrics`
+  (L2 execution gas only — the L1 data fee isn't included).
 - The dashboard (`dist/`, served by your web server or `npm run dashboard` locally,
   e.g. through an SSH tunnel to port 3000) shows the live feed, stats and backoff state.
 
-Tuning (`tuning:` in the config) needs a restart; routers, pairs and profit floors
-hot-reload.
+Tuning (`tuning:` in the config), the `chain:` block and added pairs or routers need a
+restart; profit floors hot-reload. A config edit that fails to parse is logged
+(`Config reload failed`) and the previous config keeps running.
 
 ## 7. Exit codes
 

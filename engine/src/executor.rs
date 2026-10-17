@@ -57,6 +57,8 @@ pub struct TxPrep {
     pub nonce: u64,
     pub net_profit_usd: f64,
     pub gas_cost_usd: f64,
+    /// ETH/USD used for this prep's gas math.
+    pub native_price_usd: f64,
     // ── Fields cloned for the receipt background task ──
     pub chain_name: String,
     pub chain_id: u64,
@@ -170,7 +172,9 @@ pub struct Executor {
     /// EIP-1559 maxPriorityFeePerGas (tip) in Wei. Set from chain config.
     /// Higher values land earlier in the block on sequencer chains that order by gas price.
     priority_fee_wei: u128,
-    /// Cached unix second + deadline (now + 120s) — avoids syscall per prepare.
+    /// Trade deadline = host clock + this (chain.deadline_seconds).
+    deadline_secs: u64,
+    /// Cached unix second + deadline (now + deadline_secs) — avoids syscall per prepare.
     deadline_cache: StdMutex<(u64, U256)>,
 }
 
@@ -185,6 +189,7 @@ impl Executor {
         min_profit_usd: f64,
         block_time_ms: u64,
         priority_fee_wei: u128,
+        deadline_secs: u64,
         db: Option<Arc<Database>>,
     ) -> Self {
         // Gas price cache TTL = 2× block time (cache valid for 2 blocks)
@@ -213,6 +218,7 @@ impl Executor {
             wallet,
             submission_rpcs,
             priority_fee_wei,
+            deadline_secs,
             deadline_cache: StdMutex::new((0, U256::ZERO)),
             http_client: Arc::new(
                 reqwest::Client::builder()
@@ -382,6 +388,7 @@ impl Executor {
             nonce,
             net_profit_usd,
             gas_cost_usd,
+            native_price_usd: self.native_price_usd,
             chain_name: self.chain_name.clone(),
             chain_id: self.chain_id,
             db: self.db.clone(),
@@ -454,6 +461,7 @@ impl Executor {
             nonce,
             net_profit_usd,
             gas_cost_usd,
+            native_price_usd: self.native_price_usd,
             chain_name: self.chain_name.clone(),
             chain_id: self.chain_id,
             db: self.db.clone(),
@@ -745,7 +753,7 @@ impl Executor {
         let gas_price = self.get_gas_price(provider).await?;
 
         let gas_cost_usd = {
-            let cost_wei = gas_price * gas_limit_triangular() as u128;
+            let cost_wei = (gas_price + self.priority_fee_wei) * gas_limit_triangular() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -778,10 +786,12 @@ impl Executor {
                         "[{}] DRY-RUN triangular ok | gross=${:.4} gas≈${:.4} net=${:.4}",
                         self.chain_name, opp.profit_usd, gas_cost_usd, net_profit_usd
                     );
+                    self.persist_triangular(opp, &tx_hash, true);
                     return Ok(tx_hash);
                 }
                 Err(e) => {
                     self.stats.total_failed += 1;
+                    self.persist_triangular(opp, "", false);
                     return Err(crate::revert::eth_call_error("Triangular simulation failed", &e));
                 }
             }
@@ -937,11 +947,11 @@ impl Executor {
             if cache.0 == now {
                 return cache.1;
             }
-            let d = U256::from(now + 120);
+            let d = U256::from(now + self.deadline_secs);
             *cache = (now, d);
             return d;
         }
-        U256::from(now + 120)
+        U256::from(now + self.deadline_secs)
     }
 
     /// Convert gas cost from USD to token-in units using the same exchange rate
@@ -1026,6 +1036,37 @@ impl Executor {
                 &router_a,
                 &router_b,
                 None, // No router_c for 2-hop arbs
+                profit_usd,
+                success,
+                &tx_hash,
+                dry_run,
+            ) {
+                tracing::warn!("DB write failed: {}", e);
+            }
+        });
+    }
+
+    /// Fire-and-forget: persist a triangular trade to SQLite off the async thread.
+    fn persist_triangular(&self, opp: &TriangularOpportunity, tx_hash: &str, success: bool) {
+        let Some(db) = self.db.clone() else { return };
+        let chain_id = self.chain_id;
+        let chain_name = self.chain_name.clone();
+        let pair_id = opp.triplet_id.clone();
+        let router_a = opp.router_ab_id.clone();
+        let router_b = opp.router_bc_id.clone();
+        let router_c = opp.router_ca_id.clone();
+        let profit_usd = opp.profit_usd;
+        let dry_run = self.dry_run;
+        let tx_hash = tx_hash.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db.insert_trade(
+                chain_id,
+                &chain_name,
+                &pair_id,
+                &router_a,
+                &router_b,
+                Some(&router_c),
                 profit_usd,
                 success,
                 &tx_hash,

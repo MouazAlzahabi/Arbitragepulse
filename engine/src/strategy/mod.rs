@@ -765,12 +765,21 @@ pub fn parse_amount_capped(trade_amount: &str, max_trade: Option<&str>, decimals
     Some(capped)
 }
 
+/// `token_in` symbols priced at $1. Config validation requires every pair's `token_in`
+/// to be one of these or the wrapped native token (case-insensitive).
+pub(crate) const USD_STABLE_SYMBOLS: [&str; 6] = ["USDC", "USDT", "DAI", "WXDAI", "USDC.E", "USDBC"];
+/// `token_in` symbols priced at the live native price.
+pub(crate) const NATIVE_SYMBOLS: [&str; 4] = ["WETH", "ETH", "WMATIC", "MATIC"];
+
 pub(crate) fn token_amount_to_usd(amount: U256, decimals: u8, symbol: &str, native_price: f64) -> f64 {
     let scale = 10_f64.powi(decimals as i32);
     let float_amount = u256_to_f64(amount) / scale;
-    match symbol {
-        "USDC" | "USDT" | "DAI" | "WXDAI" | "USDC.E" | "USDBC" => float_amount,
-        "WETH" | "ETH" | "WMATIC" | "MATIC" => float_amount * native_price,
-        _ => float_amount,
+    if USD_STABLE_SYMBOLS.iter().any(|s| s.eq_ignore_ascii_case(symbol)) {
+        float_amount
+    } else if NATIVE_SYMBOLS.iter().any(|s| s.eq_ignore_ascii_case(symbol)) {
+        float_amount * native_price
+    } else {
+        // Unreachable for token_in: config validation rejects other symbols.
+        float_amount
     }
 }

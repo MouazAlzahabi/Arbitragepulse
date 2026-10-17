@@ -443,56 +443,6 @@ impl PoolCache {
         }
     }
 
-    /// Evict V2/Solidly and V3 pools whose reserves/state have not been refreshed
-    /// by an on-chain event for longer than `v2_ttl` or `v3_ttl` respectively.
-    ///
-    /// Called periodically (e.g. every 10 min) to reclaim memory from pools that
-    /// became inactive or were removed from a DEX. Both `by_key` indexes are cleaned
-    /// up by reconstructing the keys from the evicted pool's metadata.
-    pub fn prune_stale(&self, v2_ttl: Duration, v3_ttl: Duration) -> (usize, usize) {
-        // ── V2 / Aerodrome ───────────────────────────────────────────────────
-        let stale_v2: Vec<(Address, PoolInfo)> = self
-            .by_address
-            .iter()
-            .filter(|e| e.last_sync.elapsed() > v2_ttl)
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-
-        for (pool, info) in &stale_v2 {
-            self.by_address.remove(pool);
-            let rid = info.router_id.as_str();
-            self.by_key
-                .remove(&V2PoolKey::new(rid, info.token0, info.token1));
-            self.by_key
-                .remove(&V2PoolKey::new(rid, info.token1, info.token0));
-        }
-
-        // ── V3 ───────────────────────────────────────────────────────────────
-        let stale_v3: Vec<(Address, V3PoolState)> = self
-            .v3_by_address
-            .iter()
-            .filter(|e| e.last_updated.elapsed() > v3_ttl)
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-
-        for (pool, state) in &stale_v3 {
-            self.v3_by_address.remove(pool);
-            let rid = state.router_id.as_str();
-            let fee = state.fee;
-            self.v3_by_key
-                .remove(&V3PoolKey::new(rid, state.token0, state.token1, fee));
-            self.v3_by_key
-                .remove(&V3PoolKey::new(rid, state.token1, state.token0, fee));
-        }
-
-        if !stale_v2.is_empty() || !stale_v3.is_empty() {
-            self.mark_watch_addrs_dirty();
-            self.mark_v3_metrics_dirty();
-        }
-
-        (stale_v2.len(), stale_v3.len())
-    }
-
     /// Spot-price screen for a V3 pool.
     ///
     /// Returns `Some((estimated_amount_out, current_liquidity))` when:

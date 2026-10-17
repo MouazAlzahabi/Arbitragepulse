@@ -75,8 +75,6 @@ pairs:
     token_out_decimals: 18
     trade_amount: "10"
     max_trade: "10"
-    min_swap_size: "1"
-    watch_pools: []
 
   # Mock-token pair seeded by DeployMocks.s.sol (V2 at 2500, V3 at 2575 mUSDC/mWETH).
   # Uncomment and paste the token addresses the script prints.
@@ -89,8 +87,6 @@ pairs:
   #   token_out_decimals: 18
   #   trade_amount: "100"
   #   max_trade: "100"
-  #   min_swap_size: "1"
-  #   watch_pools: []
 
 
 # ─── TUNING ────────────────────────────────────────────────

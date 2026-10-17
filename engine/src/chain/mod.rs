@@ -44,26 +44,6 @@ pub(crate) fn gas_reject_cooldown_secs() -> u64 { crate::config::tuning().gas_re
 /// Gas-profitability rejects ("below threshold") do NOT count — they're pre-flight skips.
 pub(crate) fn max_consecutive_failures() -> u32 { crate::config::tuning().max_consecutive_failures }
 
-/// Non-blocking flush of WS logs queued before a scan. Uses `pool_cache` directly —
-/// avoids acquiring the strategy read lock on every block/swap scan.
-fn drain_pending_logs(
-    log_rx: &mut mpsc::Receiver<alloy::rpc::types::Log>,
-    pool_cache: &PoolCache,
-    solidly_sync_hash: alloy::primitives::B256,
-    large_swap_bps: u32,
-    large_v3_bps: u32,
-) {
-    while let Ok(log) = log_rx.try_recv() {
-        let _ = crate::listener::apply_log_to_cache(
-            &log,
-            pool_cache,
-            solidly_sync_hash,
-            large_swap_bps,
-            large_v3_bps,
-        );
-    }
-}
-
 // ─── Per-chain engine task ────────────────────────────────────────────────────
 
 pub async fn run_chain(
@@ -130,6 +110,7 @@ pub async fn run_chain(
         cfg.min_profit_usd,
         cfg.block_time_ms,
         cfg.priority_fee_wei,
+        cfg.deadline_seconds,
         db,
     )));
     // Shared RPC health — its backoff is cleared on pause so a resume executes at once.
@@ -217,6 +198,9 @@ pub async fn run_chain(
     };
     // Fetch initial balances so the optimizer has data from the first scan.
     state::refresh_contract_balances(provider.as_ref(), contract_addr, &contract_balances).await;
+    // Signer gas check (chain.min_native_balance): warn once per low period.
+    let gas_low_warned = Arc::new(AtomicBool::new(false));
+    state::check_signer_gas(provider.as_ref(), signer_address, cfg.min_native_balance, &gas_low_warned, &log_tx, &cfg.name).await;
     // Startup funding check: warn for any underfunded pair.
     state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances).await;
     // Wire balances into executor for post-trade immediate refresh.
@@ -319,7 +303,6 @@ pub async fn run_chain(
     // Logs arrive on the WS connection before the next newHeads event,
     // so pool state is current when block_rx fires the scanner.
     let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
-    let (log_tx_sub, mut log_rx) = mpsc::channel::<alloy::rpc::types::Log>(1024);
     {
         let log_addrs = pool_cache.watch_addresses();
         let log_filter = alloy::rpc::types::Filter::new()
@@ -331,7 +314,6 @@ pub async fn run_chain(
                 IPancakeV3Pool::Swap::SIGNATURE_HASH,
             ]);
         let provider_logs = (*provider).clone();
-        let log_tx_sub2 = log_tx_sub.clone();
         let swap_tx_sub = swap_tx_for_sub;
         let cache_for_sub = pool_cache.clone();
         let chain_id_sub = cfg.id;
@@ -363,8 +345,6 @@ pub async fn run_chain(
                                     magnitude,
                                 });
                             }
-                            // Forward raw log to log_rx for pre-scan drain (idempotent safety net)
-                            let _ = log_tx_sub2.send(log).await;
                         }
                         debug!("[{}] log subscription ended, reconnecting...", cname);
                     }
@@ -392,9 +372,7 @@ pub async fn run_chain(
         pending::spawn_pending_monitor(
             cfg.name.clone(),
             pending_ws_urls,
-            // Use 0 here — min_swap_amount_filter is calibrated for 18-decimal tokens
-            // (1e17 = 0.1 ETH) and would silently filter ALL USDC/USDT swaps (6 decimals).
-            // Profitability filtering happens naturally inside evaluate_and_execute().
+            // 0 = no size filter: profitability is decided in evaluate_and_execute().
             0u128,
             pending_tx_chan,
         );
@@ -502,17 +480,6 @@ pub async fn run_chain(
                 // amount_in each time) never get re-seen and accumulate indefinitely.
                 let now = Instant::now();
                 cooldowns.retain(|_, expire_at| *expire_at > now);
-
-                let (pruned_v2, pruned_v3) = pool_cache.prune_stale(
-                    crate::config::tuning().pool_prune_after(),
-                    crate::config::tuning().pool_prune_after(),
-                );
-                if pruned_v2 > 0 || pruned_v3 > 0 {
-                    debug!(
-                        "[{}] pruned stale pool cache entries: v2={} v3={}",
-                        cfg.name, pruned_v2, pruned_v3
-                    );
-                }
 
                 // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
                 let rpc_ping_start = Instant::now();
@@ -667,8 +634,11 @@ pub async fn run_chain(
                 if !balance_refresh_busy.swap(true, Ordering::AcqRel) {
                     let (provider, balances) = (provider.clone(), contract_balances.clone());
                     let busy = balance_refresh_busy.clone();
+                    let (log_tx, chain_name, min_eth, warned) =
+                        (log_tx.clone(), cfg.name.clone(), cfg.min_native_balance, gas_low_warned.clone());
                     tokio::spawn(async move {
                         state::refresh_contract_balances(provider.as_ref(), contract_addr, &balances).await;
+                        state::check_signer_gas(provider.as_ref(), signer_address, min_eth, &warned, &log_tx, &chain_name).await;
                         busy.store(false, Ordering::Release);
                     });
                 }
@@ -772,14 +742,6 @@ pub async fn run_chain(
                     continue;
                 }
 
-                drain_pending_logs(
-                    &mut log_rx,
-                    &pool_cache,
-                    solidly_sync_hash_sub,
-                    cfg.large_swap_threshold_bps,
-                    cfg.large_v3_threshold_bps,
-                );
-
                 scan::evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
@@ -813,14 +775,6 @@ pub async fn run_chain(
                     on_paused(&mut last_scan_at, &rpc_health);
                     continue;
                 }
-
-                drain_pending_logs(
-                    &mut log_rx,
-                    &pool_cache,
-                    solidly_sync_hash_sub,
-                    cfg.large_swap_threshold_bps,
-                    cfg.large_v3_threshold_bps,
-                );
 
                 scan::evaluate_and_execute(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
@@ -896,14 +850,6 @@ pub async fn run_chain(
                     on_paused(&mut last_scan_at, &rpc_health);
                     continue;
                 }
-
-                drain_pending_logs(
-                    &mut log_rx,
-                    &pool_cache,
-                    solidly_sync_hash_sub,
-                    cfg.large_swap_threshold_bps,
-                    cfg.large_v3_threshold_bps,
-                );
 
                 if is_large {
                     let msg = format!(

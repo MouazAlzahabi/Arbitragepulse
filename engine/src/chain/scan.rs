@@ -599,7 +599,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let opp_id_bg = prep.opp_id.clone();
                                 let router_a_bg = prep.router_a.clone();
                                 let router_b_bg = prep.router_b.clone();
-                                let profit_bg = prep.profit_usd;
+                                let profit_bg = prep.net_profit_usd;
+                                let native_price_bg = prep.native_price_usd;
                                 let contract_addr_bg = prep.contract_addr;
                                 let contract_balances_bg = prep.contract_balances.clone();
                                 let detected_profit_bg = prep.profit_usd;
@@ -631,6 +632,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
+                                            let gas_usd = receipt.gas_used() as f64 * receipt.effective_gas_price() as f64 / 1e18 * native_price_bg;
+                                            metrics_bg.gas_spent_usd.with_label_values(&[&chain_name_bg, if ok { "success" } else { "reverted" }]).inc_by(gas_usd.max(0.0));
                                             let submit_to_confirm_ms = submit_at_bg.elapsed().as_millis() as u64;
                                             let block_num = receipt.block_number();
                                             let revert_class_str: Option<&str>;
@@ -723,6 +726,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "chain":               chain_name_bg,
                                                         "pair_id":             opp_id_bg,
                                                         "profit_usd":          profit_bg,
+                                                        "gas_usd":          gas_usd,
                                                         "tx_hash":             tx_hash_bg,
                                                         "success":             false,
                                                         "revert_class":        revert_class_str,
@@ -1033,7 +1037,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let router_a_bg = prep.router_a.clone();
                                 let router_b_bg = prep.router_b.clone();
                                 let router_c_bg = prep.router_c.clone();
-                                let profit_bg = prep.profit_usd;
+                                let profit_bg = prep.net_profit_usd;
+                                let native_price_bg = prep.native_price_usd;
                                 let contract_addr_bg = prep.contract_addr;
                                 let contract_balances_bg = prep.contract_balances.clone();
                                 let detected_profit_bg = prep.profit_usd;
@@ -1065,6 +1070,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
+                                            let gas_usd = receipt.gas_used() as f64 * receipt.effective_gas_price() as f64 / 1e18 * native_price_bg;
+                                            metrics_bg.gas_spent_usd.with_label_values(&[&chain_name_bg, if ok { "success" } else { "reverted" }]).inc_by(gas_usd.max(0.0));
                                             let submit_to_confirm_ms = submit_at_bg.elapsed().as_millis() as u64;
                                             let block_num = receipt.block_number();
                                             let revert_class_str: Option<&str>;
@@ -1156,6 +1163,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "chain":               chain_name_bg,
                                                         "pair_id":             opp_id_bg,
                                                         "profit_usd":          profit_bg,
+                                                        "gas_usd":          gas_usd,
                                                         "tx_hash":             tx_hash_bg,
                                                         "success":             false,
                                                         "revert_class":        revert_class_str,

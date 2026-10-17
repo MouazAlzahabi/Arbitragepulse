@@ -79,11 +79,14 @@ A config file has four sections:
 Block-relative timings (simulation timeout, quote-cache age, RPC monitor interval)
 default to multiples of `chain.block_time_ms`, so a chain with a different block
 interval gets sensible values without overriding them. Unknown `tuning` keys are
-rejected. Routers, pairs and profit floors hot-reload; `chain:` and `tuning:` need a
-restart.
+rejected. Profit floors hot-reload; adding pairs or routers, `chain:` and `tuning:` need a
+restart. Unknown keys in `chain:`, `routers:` and `pairs:` are rejected too.
 
-Safety checks at startup: the RPC's chain id must match `chain.id` (the engine exits
-otherwise), and an unset `contract_address` (`YOUR_…`) is rejected.
+Safety checks at startup: the RPC's chain id must match `chain.id`, the engine's key must be
+the executor's `owner()`, every configured router must be allowlisted with its type (live
+mode), and `API_KEY` must be set — otherwise the engine exits with code 2. An unset
+`contract_address` (`YOUR_…`), V3 fee tiers outside 1..=999999, a `token_in` that isn't a
+USD stablecoin or WETH, and `deadline_seconds` outside 10..=600 are rejected at load.
 
 Environment (`engine/<instance>.env`, see `engine/base.env.example`):
 `PRIVATE_KEY`, `ALCHEMY_KEY`, `CONFIG_PATH`, `PORT`, `DB_PATH`, `API_KEY`, `LOG_LEVEL`,
@@ -93,11 +96,11 @@ Environment (`engine/<instance>.env`, see `engine/base.env.example`):
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | status (`ok` / `degraded` → 503), RPC and backoff state |
+| `GET /health` | status (`ok`; `degraded` / `paused` → 503): RPC, backoff, block freshness, breaker pause |
 | `GET /stats` | counters, gas, latency, `rpc_backoff` |
 | `GET /trades`, `GET /stats/pairs` | trade history, per-pair stats |
 | `GET /ws` | live log/opportunity stream |
-| `POST /engine/pause`, `/engine/resume`, `/engine/dry-run` | control |
+| `POST /engine/pause`, `/engine/resume` (also clears breaker/auto pauses), `/engine/dry-run`, `/engine/restart` (exit 75) | control |
 | `GET /pair-scan`, `POST /pair-scan/{id}/toggle` | per-pair scan state, enable/disable |
 | `GET /metrics` | Prometheus metrics |
 
