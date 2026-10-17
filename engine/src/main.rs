@@ -92,20 +92,21 @@ async fn main() -> Result<()> {
         match tokio::task::spawn_blocking(move || db_for_seed.get_chain_stats()).await {
             Ok(Ok(rows)) => {
                 let mut state = shared_state.write().await;
-                for (chain_id, chain_name, attempts, successes, profit) in rows {
-                    if chain_id != this_chain_id {
+                for seed in rows {
+                    if seed.chain_id != this_chain_id {
                         continue; // another chain's rows
                     }
+                    let chain_id = seed.chain_id;
                     state.chains.push(api::ChainStats {
                         chain_id,
-                        chain_name,
+                        chain_name: seed.chain_name,
                         total_scans: 0,
-                        total_attempts: attempts,
-                        total_success: successes,
-                        total_failed: 0,
+                        total_attempts: seed.attempts,
+                        total_success: seed.successes,
+                        total_failed: seed.reverted,
                         total_dry_run_ok: 0,
-                        total_exec_failed: 0,
-                        total_profit_usd: profit,
+                        total_exec_failed: seed.exec_failed,
+                        total_profit_usd: seed.profit_usd,
                         ghost_profit_usd: 0.0,
                         base_fee_gwei: 0.0,
                         dry_run: env.dry_run,

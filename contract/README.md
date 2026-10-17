@@ -41,7 +41,7 @@ the capital exactly like a router-level minimum.
 | Error | Meaning |
 |-------|---------|
 | `LegFailed(leg, router, rtype, reason)` | a router reverted; `reason` is its raw revert data (string, custom error such as Aerodrome's, or empty). Empty: no pool for that fee tier / stable flag, or the wrong router type |
-| `LegExhaustedGas(leg, router, reason)` | the router used all the gas it was given (whatever it reverted with — Uniswap re-raises an inner out-of-gas as "TF"/"STF"): raise the tx gas limit — or, if it persists at a higher limit, an invalid opcode / assert in the router or pool (the EVM can't tell them apart). At very tight limits the executor can't even pay for this revert; the tx then fails with no data and the engine reads out-of-gas from the receipt (gas used ≥ 97% of the limit) |
+| `LegExhaustedGas(leg, router, reason)` | the router used all the gas it was given (with no reason, or Uniswap TransferHelper's "TF"/"STF"/"SA" — how it re-raises an inner out-of-gas; a specific reason such as K() stays `LegFailed`): raise the tx gas limit — or, if it persists at a higher limit, an invalid opcode / assert in the router or pool (the EVM can't tell them apart). At very tight limits the executor can't even pay for this revert; the tx then fails with no data and the engine reads out-of-gas from the receipt (gas used ≥ 97% of the limit) |
 | `NotProfitable(balanceBefore, balanceAfter, minProfit)` | the route completed but returned less than `amountIn + minProfit` — price moved or spread closed |
 | `InsufficientBalance(token, balance, needed)` | the contract does not hold `amountIn` of the start token |
 | `NoOutput(leg, router)` | a router returned without paying anything out (or the output balance shrank) |

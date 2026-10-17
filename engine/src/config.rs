@@ -290,6 +290,15 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
     // router type) would hide the real reason.
     let doc: serde_yaml::Value = serde_yaml::from_str(content)
         .map_err(|e| anyhow!("Invalid config YAML: {}", e))?;
+    // Keys removed from `tuning:` — say what replaced them (serde would only say "unknown field").
+    if let Some(t) = doc.get("tuning") {
+        if t.get("router_min_out_slack_bps").is_some() || t.get("sell_leg_minprofit_mul_bps").is_some() {
+            return Err(anyhow!(
+                "tuning.router_min_out_slack_bps / sell_leg_minprofit_mul_bps were merged into \
+                 tuning.onchain_min_profit_bps = (10000 - slack) × mul / 10000 (old defaults 200 / 6200 → 6076)"
+            ));
+        }
+    }
     if doc.get("chains").is_some() {
         return Err(anyhow!(
             "`chains:` list is no longer supported — one chain per instance. \
@@ -621,8 +630,8 @@ routers: []
 
     #[test]
     fn onchain_min_profit_replaces_removed_knobs() {
-        // Removed keys fail as unknown fields (deny_unknown_fields).
-        assert!(parse_config(&format!("{MIN}tuning:\n  router_min_out_slack_bps: 200\n")).is_err());
+        let err = parse_config(&format!("{MIN}tuning:\n  router_min_out_slack_bps: 200\n")).unwrap_err().to_string();
+        assert!(err.contains("onchain_min_profit_bps") && err.contains("6076"), "{err}");
         let cfg = parse_config(&format!("{MIN}tuning:\n  onchain_min_profit_bps: 7000\n")).unwrap();
         assert_eq!(cfg.tuning.onchain_min_profit_bps, 7000);
         assert_eq!(Tuning::default().onchain_min_profit_bps, 6076, "old 98% × 62%");

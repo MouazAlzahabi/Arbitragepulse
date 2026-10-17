@@ -239,6 +239,14 @@ contract ArbitrageExecutorTest is Test {
             abi.encodeWithSelector(LEG_EXHAUSTED, uint8(1), address(r), _err("STF")));
     }
 
+    function test_LateRealRevert_StaysLegFailed() public {
+        // Used most of its gas, but said why: the router's answer wins over the gas heuristic.
+        MockLateRevertRouter late = new MockLateRevertRouter();
+        executor.setRouter(address(late), ArbitrageExecutor.RouterType.V2);
+        assertEq(_revertDataAt(address(late), 2_000_000), _legFailed(1, address(late),
+            ArbitrageExecutor.RouterType.V2, abi.encodeWithSelector(MockLateRevertRouter.K.selector)));
+    }
+
     function test_V3RouterTypedAsV2_FailsWithEmptyReason() public {
         // V3 router registered with the wrong type → it has no V2 function.
         MockV3Router misconfigured = new MockV3Router(2, 1);

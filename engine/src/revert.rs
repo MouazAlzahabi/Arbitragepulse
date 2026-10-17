@@ -163,15 +163,7 @@ fn explain_executor(e: Executor::ExecutorErrors) -> (RevertClass, String) {
                 (C::RouterNoReason,
                  "reverted with no reason (no pool for this pair/fee tier, wrong router type — check setRouter — or out of gas)".to_string())
             } else {
-                // A router's own reason: its errors first. Aerodrome's InvalidPath() and
-                // ZeroAddress() share selectors with the executor's and must not read as ours.
-                let (inner, text) = match explain_router(&e.reason) {
-                    Some((name, meaning, class)) => (class, format!("{name} ({meaning})")),
-                    None => {
-                        let (class, text) = explain(&e.reason);
-                        (class, text.unwrap_or_default())
-                    }
-                };
+                let (inner, text) = explain_router_reason(&e.reason);
                 (inner, format!("reverted: {text}"))
             };
             (class, format!("leg {} ({} router {}) {}", e.leg, router_type_name(e.rtype), e.router, why))
@@ -195,7 +187,7 @@ fn explain_executor(e: Executor::ExecutorErrors) -> (RevertClass, String) {
              limit, the router or pool hit an invalid opcode / assert)",
             e.leg, e.router,
             if e.reason.is_empty() { String::new() }
-            else { format!(" (router said {})", explain(&e.reason).1.unwrap_or_default()) })),
+            else { format!(" (router said {})", explain_router_reason(&e.reason).1) })),
         X::InvalidPath(_) => (C::InvalidRoute, "route repeats a token".to_string()),
         X::ZeroAmount(_) => (C::InvalidRoute, "amount is zero".to_string()),
         X::ZeroAddress(_) => (C::InvalidRoute, "zero address in route".to_string()),
@@ -208,6 +200,19 @@ fn explain_executor(e: Executor::ExecutorErrors) -> (RevertClass, String) {
         X::TransferFailed(_) => (C::TransferFailed, "ETH transfer failed".to_string()),
         X::InsufficientOutput(e) => (C::InsufficientOutput, format!("output {} below minimum {}", e.got, e.min)),
         X::PoolNotFound(e) => (C::PoolNotFound, format!("pool not found ({})", e.factory)),
+    }
+}
+
+/// `(class, text)` for revert data a ROUTER returned (inside LegFailed / LegExhaustedGas):
+/// router errors first — Aerodrome's InvalidPath() and ZeroAddress() share selectors with
+/// the executor's and must not read as ours.
+fn explain_router_reason(reason: &[u8]) -> (RevertClass, String) {
+    match explain_router(reason) {
+        Some((name, meaning, class)) => (class, format!("{name} ({meaning})")),
+        None => {
+            let (class, text) = explain(reason);
+            (class, text.unwrap_or_default())
+        }
     }
 }
 
@@ -295,18 +300,18 @@ fn spelunk_revert_hex_in_json(raw: &str) -> Option<Vec<u8>> {
     walk(&v)
 }
 
-/// Revert data carried by a JSON-RPC error — only when the error *is* an execution failure:
-/// code 3 (geth/reth/anvil), or a message saying so ("execution reverted", Nethermind's
-/// -32015 "VM execution error", …). Other errors (rate limits, timeouts) may carry
-/// unrelated hex such as request ids, which must not be decoded as a revert.
+/// Revert data carried by a JSON-RPC error — only when the error *is* a revert: code 3
+/// (geth/reth/anvil), Nethermind's -32015 "VM execution error", or a message starting
+/// "execution reverted". Anything else (rate limits, timeouts, even ones whose text mentions
+/// "execution") may carry unrelated hex such as a request id, which must not be decoded as
+/// a revert — and must keep its RPC-failure handling.
 fn revert_bytes_from_transport(e: &TransportError) -> Option<Vec<u8>> {
     let payload = e.as_error_resp()?;
     let msg = payload.message.to_ascii_lowercase();
-    let is_execution_failure = payload.code == 3
-        || msg.contains("revert")
-        || msg.contains("execution error")
-        || msg.contains("vm execution");
-    if !is_execution_failure {
+    let is_revert = payload.code == 3
+        || (payload.code == -32015 && msg.contains("vm execution error"))
+        || msg.starts_with("execution reverted");
+    if !is_revert {
         return None;
     }
     if let Some(b) = payload.as_revert_data() {
@@ -360,8 +365,10 @@ fn out_of_gas_override(d: RevertDiagnosis, gas_used: u64, gas_limit: u64) -> Rev
 }
 
 /// Re-run the mined tx as an `eth_call` (same sender, calldata, value and gas limit) on the
-/// state before its block — the closest available to what it ran on. `latest` would replay
-/// against pools that moved since, giving a different (or no) error.
+/// state at the END of its block. That includes the earlier txs in the block — usually what
+/// made an arb revert (a competitor closed the spread) — and not our tx's effects, since it
+/// reverted. The parent block would miss those txs and replay as a success; `latest` would
+/// see pools that moved in later blocks.
 async fn replay_revert<P: Provider>(
     provider: &P,
     tx: &<alloy::network::Ethereum as alloy::network::Network>::TransactionResponse,
@@ -378,8 +385,8 @@ async fn replay_revert<P: Provider>(
     req.gas = Some(inner.gas_limit());
     let call = provider.call(req);
     let call = match block_number {
-        Some(n) if n > 0 => call.block(alloy::eips::BlockId::number(n - 1)),
-        _ => call,
+        Some(n) => call.block(alloy::eips::BlockId::number(n)),
+        None => call,
     };
     match call.await {
         Ok(_) => {
@@ -481,6 +488,14 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_gas_reason_is_read_as_the_router() {
+        let router = address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
+        let reason = Bytes::from(InvalidPath {}.abi_encode());
+        let d = classify_revert_bytes(&LegExhaustedGas { leg: 2, router, reason }.abi_encode());
+        assert!(d.detail.unwrap().contains("router said InvalidPath() (router rejected the route)"));
+    }
+
+    #[test]
     fn bad_fee_is_named() {
         let router = address!("2626664c2603336E57B271c5C0b26F421741e481");
         let fee = alloy::primitives::Uint::<24, 1>::from(30u32);
@@ -533,6 +548,9 @@ mod tests {
             assert_eq!(crate::util::classify_rpc_failure(&e.to_string()), crate::util::RpcFailure::RateLimited,
                        "the text alone would look like a rate limit — the type is what saves it");
         }
+        // Errors that merely mention "execution" keep their RPC handling.
+        let e = eth_call_error("Simulation failed", &rpc_error(-32000, "execution error: request timed out", "0xdeadbeef"));
+        assert!(!e.is::<SimReverted>());
         // A rate-limit error with hex in its data is not a revert.
         let e = eth_call_error("Simulation failed", &rpc_error(-32005, "rate limit exceeded", "0xdeadbeef"));
         assert!(!e.is::<SimReverted>());

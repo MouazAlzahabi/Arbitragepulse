@@ -513,7 +513,12 @@ function ProfitChart({ fetchTrades, wsLogs }) {
     if (loadedRef.current || !fetchTrades) return;
     loadedRef.current = true;
     fetchTrades(2000).then((d) => {
-      if (!d?.trades) return;
+      if (!d?.trades) {
+        // No history (request failed): stop buffering — live trades are already charted.
+        dbHashesRef.current = new Set();
+        liveRef.current = [];
+        return;
+      }
       const cutoff = Date.now() / 1000 - 86400;
       const recent = d.trades
         .filter((t) => t.ts >= cutoff && t.success && !t.dry_run)
@@ -538,7 +543,7 @@ function ProfitChart({ fetchTrades, wsLogs }) {
       .map((l) => ({ ts: l.timestamp, profit: parseFloat(l.data.profit_usd || 0), hash: l.data.tx_hash }))
       .filter((t) => !db || !db.has(t.hash));
     if (trades.length === 0) return;
-    if (!db) liveRef.current.push(...trades);
+    if (!db) liveRef.current = [...liveRef.current, ...trades].slice(-2000);
     setSeries((prev) => [...prev, ...pointsFrom(prev[prev.length - 1]?.profit || 0, trades)]);
   }, [wsLogs]);
 

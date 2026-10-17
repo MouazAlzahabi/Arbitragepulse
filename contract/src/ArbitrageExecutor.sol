@@ -147,8 +147,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice A router call used (nearly) all the gas forwarded to it: out of gas — raise
     ///         the tx gas limit — or, if it persists at higher limits, an invalid opcode /
     ///         failed assert inside the router or pool (the EVM can't tell the two apart).
-    ///         `reason` is whatever the router reverted with — Uniswap's transfer helpers turn
-    ///         an inner out-of-gas into "TF" / "STF", which alone would read as a transfer failure.
+    ///         `reason` is the router's own revert data: empty, or Uniswap TransferHelper's
+    ///         "TF"/"STF"/"SA", which is how it re-raises an inner out-of-gas.
     error LegExhaustedGas(uint8 leg, address router, bytes reason);
     /// @notice Ownership can be transferred but not renounced: every withdrawal is onlyOwner.
     error RenounceDisabled();
@@ -359,12 +359,16 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         if (!ok) {
             // EIP-150: every call level keeps 1/64 of its gas, so a router that burned all it
             // was given (directly or several calls deep) leaves only a few percent here, while
-            // a real failure (missing pool, wrong type, insufficient balance) reverts early with
-            // most of it left. Checked whatever the reason: routers re-raise an inner
-            // out-of-gas as a string ("TF", "STF"). Out of gas and an INVALID opcode both burn
-            // everything — hence the error's name. At very tight limits even this revert can't
-            // be paid for: the tx then has no data and the engine reads the receipt instead.
-            if (gasleft() < gasBefore / 8) revert LegExhaustedGas(leg, router, reason);
+            // a missing pool / wrong type reverts early with most of it left. Applied only to
+            // reasons that can hide an out-of-gas: none at all, or Uniswap TransferHelper's
+            // "TF"/"STF"/"SA" re-raise of a failed inner call. A specific reason (K(),
+            // InsufficientLiquidity, …) is the router's real answer even when it came late
+            // in an expensive swap, and stays LegFailed. Out of gas and an INVALID opcode both
+            // burn everything — hence the error's name. At very tight limits even this revert
+            // can't be paid for: the tx then has no data and the engine reads the receipt.
+            if (gasleft() < gasBefore / 8 && _mayHideOutOfGas(reason)) {
+                revert LegExhaustedGas(leg, router, reason);
+            }
             revert LegFailed(leg, router, rtype, reason);
         }
 
@@ -374,6 +378,16 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         // router pulling tokenOut) must still name the leg, not panic.
         if (outAfter <= outBefore) revert NoOutput(leg, router);
         unchecked { received = outAfter - outBefore; }
+    }
+
+    /// @dev True for revert data an out-of-gas inner call can turn into: empty, or Uniswap
+    ///      TransferHelper's Error("TF" | "STF" | "SA"). Failure path only — gas is no concern.
+    function _mayHideOutOfGas(bytes memory reason) internal pure returns (bool) {
+        if (reason.length == 0) return true;
+        bytes32 h = keccak256(reason);
+        return h == keccak256(abi.encodeWithSignature("Error(string)", "TF"))
+            || h == keccak256(abi.encodeWithSignature("Error(string)", "STF"))
+            || h == keccak256(abi.encodeWithSignature("Error(string)", "SA"));
     }
 
     /// @dev Routers normally pull exactly the approved amount; only write when they didn't.

@@ -165,3 +165,15 @@ contract MockStringifyingOutOfGasRouter {
         require(ok, "STF");
     }
 }
+
+/// @dev Burns ~95% of the gas it gets (an expensive swap), then reverts with a real custom
+///      error — like Aerodrome's K() at the end of a large trade.
+contract MockLateRevertRouter {
+    error K();
+
+    fallback() external {
+        uint256 stopAt = gasleft() / 20;
+        while (gasleft() > stopAt) {}
+        revert K();
+    }
+}

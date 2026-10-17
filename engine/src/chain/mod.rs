@@ -218,6 +218,15 @@ pub async fn run_chain(
     { executor.lock().await.prefetch_nonce(provider.as_ref()).await; }
 
     // ── Register initial chain stats ──
+    // Totals already in shared state (seeded from the DB, or from a previous run of this
+    // chain after a reconnect). The executor's atomics count from 0 for this run, so the
+    // heartbeat reports baseline + atomic — never the atomic alone.
+    let (mut base_success, mut base_failed, mut base_profit) = {
+        let state = shared_state.read().await;
+        state.chains.iter().find(|c| c.chain_id == cfg.id)
+            .map(|c| (c.total_success, c.total_failed, c.total_profit_usd))
+            .unwrap_or((0, 0, 0.0))
+    };
     {
         let mut state = shared_state.write().await;
         if !state.chains.iter().any(|c| c.chain_id == cfg.id) {
@@ -506,6 +515,7 @@ pub async fn run_chain(
                     {
                         let mut state = shared_state.write().await;
                         if state.stats_reset_requested {
+                            (base_success, base_failed, base_profit) = (0, 0, 0.0);
                             exec.confirmed_success.store(0, Ordering::Relaxed);
                             exec.confirmed_failed.store(0, Ordering::Relaxed);
                             exec.confirmed_profit_usd_bits.store(0, Ordering::Relaxed);
@@ -521,14 +531,14 @@ pub async fn run_chain(
                     // Sync executor atomics + lock-free scan_count → shared_state.
                     let mut state = shared_state.write().await;
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
-                        chain.total_success = ok;
-                        chain.total_failed = fail;
-                        chain.total_profit_usd = profit;
+                        chain.total_success = base_success + ok;
+                        chain.total_failed = base_failed + fail;
+                        chain.total_profit_usd = base_profit + profit;
                         chain.rpc_latency_ms = rpc_latency_ms;
                         chain.ghost_profit_usd = ghost;
                         chain.total_scans = scan_count.load(Ordering::Relaxed);
                     }
-                    ok
+                    base_success + ok
                 };
                 let (attempts, success, paused) = {
                     let state = shared_state.read().await;

@@ -37,6 +37,20 @@ pub struct PairStat {
     pub profit_usd: f64,
 }
 
+/// Persisted live-trade totals for one chain, used to seed ChainStats after a restart.
+#[derive(Debug, Clone)]
+pub struct ChainSeed {
+    pub chain_id: u64,
+    pub chain_name: String,
+    pub attempts: u64,
+    pub successes: u64,
+    pub profit_usd: f64,
+    /// Mined and reverted.
+    pub reverted: u64,
+    /// Failed before reaching the chain.
+    pub exec_failed: u64,
+}
+
 // ─── Database ─────────────────────────────────────────────────────────────────
 
 pub struct Database {
@@ -214,27 +228,50 @@ impl Database {
     }
 
     /// Per-chain cumulative stats for seeding ChainStats on restart (live trades only).
-    pub fn get_chain_stats(&self) -> Result<Vec<(u64, String, u64, u64, f64)>> {
+    pub fn get_chain_stats(&self) -> Result<Vec<ChainSeed>> {
         let conn = self.conn.lock().unwrap();
+        // Failed rows with a tx hash were mined and reverted; without one they failed before
+        // reaching the chain (pre-flight / send) — the same split as ChainStats.
         let mut stmt = conn.prepare(
             "SELECT chain_id, chain_name,
                     COUNT(*) as attempts,
                     SUM(success) as successes,
-                    SUM(CASE WHEN success=1 THEN profit_usd ELSE 0.0 END) as profit
+                    SUM(CASE WHEN success=1 THEN profit_usd ELSE 0.0 END) as profit,
+                    SUM(CASE WHEN success=0 AND tx_hash<>'' THEN 1 ELSE 0 END) as reverted,
+                    SUM(CASE WHEN success=0 AND tx_hash='' THEN 1 ELSE 0 END) as exec_failed
              FROM trades WHERE dry_run=0
              GROUP BY chain_id",
         )?;
         let records = stmt
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)? as u64,
-                    row.get::<_, i64>(3)? as u64,
-                    row.get::<_, f64>(4)?,
-                ))
+                Ok(ChainSeed {
+                    chain_id: row.get::<_, i64>(0)? as u64,
+                    chain_name: row.get(1)?,
+                    attempts: row.get::<_, i64>(2)? as u64,
+                    successes: row.get::<_, i64>(3)? as u64,
+                    profit_usd: row.get(4)?,
+                    reverted: row.get::<_, i64>(5)? as u64,
+                    exec_failed: row.get::<_, i64>(6)? as u64,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_seed_splits_successes_reverts_and_exec_failures() {
+        let db = Database::open(":memory:").unwrap();
+        db.insert_trade(8453, "Base", "p", "a", "b", None, 2.0, true, "0xaa", false).unwrap();
+        db.insert_trade(8453, "Base", "p", "a", "b", None, 1.0, false, "0xbb", false).unwrap(); // mined revert
+        db.insert_trade(8453, "Base", "p", "a", "b", None, 1.0, false, "", false).unwrap();     // pre-flight / send
+        db.insert_trade(8453, "Base", "p", "a", "b", None, 9.0, true, "0x00", true).unwrap();   // dry-run: ignored
+        let s = db.get_chain_stats().unwrap().remove(0);
+        assert_eq!((s.attempts, s.successes, s.reverted, s.exec_failed), (3, 1, 1, 1));
+        assert_eq!(s.profit_usd, 2.0);
     }
 }
