@@ -430,15 +430,18 @@ pub(crate) async fn discover_mc<P: Provider>(
         let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
         let tx = TransactionRequest::default().to(mc3).input(calldata.into());
 
-        // Some(raw): answered. None after the loop: every attempt hit a transport error or
-        // timeout. An error *response* (node rejected the multicall) skips the retries and
-        // goes to the sequential fallback below.
+        // Some(raw): answered. None after the loop: every attempt hit a transport error,
+        // timeout or retryable error response (rate limit). Any other error *response* (node
+        // rejected the multicall) skips the retries and goes to the sequential fallback below.
         let mut answered: Option<Result<alloy::primitives::Bytes, ()>> = None;
         for attempt in 1..=attempts {
             // Bounded: a hung RPC otherwise blocks startup forever (seen on a cold fork).
             match tokio::time::timeout(discover_call_timeout(), provider.call(tx.clone())).await {
                 Ok(Ok(raw)) => { answered = Some(Ok(raw)); break; }
-                Ok(Err(alloy::transports::RpcError::ErrorResp(_))) => { answered = Some(Err(())); break; }
+                Ok(Err(alloy::transports::RpcError::ErrorResp(p))) if !p.is_retry_err() => {
+                    answered = Some(Err(()));
+                    break;
+                }
                 Ok(Err(e)) => tracing::warn!("Pool discovery multicall failed (attempt {attempt}/{attempts}): {e}"),
                 Err(_) => tracing::warn!("Pool discovery multicall timed out after {:?} (attempt {attempt}/{attempts})",
                                          discover_call_timeout()),
@@ -466,14 +469,14 @@ pub(crate) async fn discover_mc<P: Provider>(
             }
         }
         // Fallback: sequential calls for this chunk. An error response is a revert (no pool);
-        // a transport error or timeout is a lost call.
+        // a transport error, timeout or retryable error response (rate limit) is a lost call.
         for (target, data) in chunk {
             let tx2 = TransactionRequest::default()
                 .to(*target)
                 .input(data.clone().into());
             match tokio::time::timeout(crate::util::rpc_read_timeout(), provider.call(tx2)).await {
                 Ok(Ok(b)) => results.push(Some(b.to_vec())),
-                Ok(Err(alloy::transports::RpcError::ErrorResp(_))) => results.push(None),
+                Ok(Err(alloy::transports::RpcError::ErrorResp(p))) if !p.is_retry_err() => results.push(None),
                 _ => { results.push(None); rpc_failed += 1; }
             }
         }
@@ -524,5 +527,30 @@ mod tests {
         assert_eq!(Some(q5), crate::pool_cache::amount_out_stable(amt, r, r, 6, 6, U256::from(9_995u64)));
         assert_eq!(Some(q200), crate::pool_cache::amount_out_stable(amt, r, r, 6, 6, U256::from(9_800u64)));
         assert!(q200 < q5);
+    }
+
+    /// A rate-limit error response is a lost call (retried, then counted), not a revert;
+    /// a plain error response (revert) is a missing pool, not counted.
+    #[tokio::test]
+    async fn rate_limit_error_response_counts_as_lost() {
+        use alloy::transports::mock::Asserter;
+        // ErrorPayload (alloy's json-rpc feature isn't enabled, so build it from JSON).
+        fn err<T: serde::de::DeserializeOwned>(code: i64, msg: &str) -> T {
+            serde_json::from_value(serde_json::json!({ "code": code, "message": msg })).unwrap()
+        }
+        let calls = vec![(Address::repeat_byte(7), vec![0u8; 4])];
+
+        let asserter = Asserter::new();
+        for _ in 0..DISCOVER_ATTEMPTS {
+            asserter.push_failure(err(429, "Too Many Requests"));
+        }
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        assert_eq!(discover_mc(calls.clone(), &provider).await, (vec![None], 1));
+
+        let asserter = Asserter::new();
+        asserter.push_failure(err(3, "execution reverted")); // multicall
+        asserter.push_failure(err(3, "execution reverted")); // sequential fallback
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        assert_eq!(discover_mc(calls, &provider).await, (vec![None], 0));
     }
 }
