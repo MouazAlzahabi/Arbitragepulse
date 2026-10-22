@@ -291,9 +291,12 @@ impl Strategy {
                             None => continue,
                         }
                     }
-                    _ => (0, trip.amount_in, self.local_leg_out(
-                        &router.id, router.router_type, trip.token_a, trip.token_b, trip.amount_in,
-                    )),
+                    _ => {
+                        let best = self.best_local_leg(
+                            &router.id, router.router_type, trip.token_a, trip.token_b, trip.amount_in,
+                        );
+                        (best.map_or(0, |(_, f)| f), trip.amount_in, best.map(|(out, _)| out))
+                    }
                 };
                 if local_ab.is_none() { continue; }
                 if router.router_type == RouterType::V3 { tri_v3_spot += 1; }
@@ -355,9 +358,12 @@ impl Strategy {
                             None => continue,
                         }
                     }
-                    _ => (0, self.local_leg_out(
-                        &router.id, router.router_type, trip.token_b, trip.token_c, amount_b,
-                    )),
+                    _ => {
+                        let best = self.best_local_leg(
+                            &router.id, router.router_type, trip.token_b, trip.token_c, amount_b,
+                        );
+                        (best.map_or(0, |(_, f)| f), best.map(|(out, _)| out))
+                    }
                 };
                 if local_bc.is_none() { continue; }
                 if router.router_type == RouterType::V3 { tri_v3_spot += 1; }
@@ -425,9 +431,12 @@ impl Strategy {
                             None => continue,
                         }
                     }
-                    _ => (0, self.local_leg_out(
-                        &router.id, router.router_type, trip.token_c, trip.token_a, amount_c,
-                    )),
+                    _ => {
+                        let best = self.best_local_leg(
+                            &router.id, router.router_type, trip.token_c, trip.token_a, amount_c,
+                        );
+                        (best.map_or(0, |(_, f)| f), best.map(|(out, _)| out))
+                    }
                 };
                 if local_ca.is_none() { continue; }
                 if router.router_type == RouterType::V3 { tri_v3_spot += 1; }
@@ -720,7 +729,7 @@ impl Strategy {
             let mut amt = opp.amount_in;
             let mut input_uncertain = false;
             for (leg, key) in keys[i].iter().enumerate() {
-                let (router_id, router_type, _, token_in, token_out) = leg_params(opp, leg);
+                let (router_id, router_type, fee, token_in, token_out) = leg_params(opp, leg);
                 let next = match key {
                     Some(key) => {
                         requests.push((i, leg, amt));
@@ -731,7 +740,7 @@ impl Strategy {
                         input_uncertain = true;
                         self.pool_cache.quote_v3_marginal(key, token_in, amt)
                     }
-                    None => self.local_leg_out(router_id, router_type, token_in, token_out, amt),
+                    None => self.local_leg_out(router_id, router_type, fee, token_in, token_out, amt),
                 };
                 match next.filter(|a| !a.is_zero()) {
                     Some(a) => amt = a,
@@ -829,7 +838,7 @@ impl Strategy {
     ) -> RouteWalk {
         let mut amt = opp.amount_in;
         for (leg, pts) in points.iter().enumerate() {
-            let (router_id, router_type, _, token_in, token_out) = leg_params(opp, leg);
+            let (router_id, router_type, fee, token_in, token_out) = leg_params(opp, leg);
             let next = if router_type == RouterType::V3 {
                 let Some((bound, tight)) = v3_leg_lower_bound(pts, amt) else {
                     return RouteWalk::Dead("V3 leg has no quote");
@@ -839,7 +848,7 @@ impl Strategy {
                 }
                 Some(bound)
             } else {
-                self.local_leg_out(router_id, router_type, token_in, token_out, amt)
+                self.local_leg_out(router_id, router_type, fee, token_in, token_out, amt)
             };
             match next.filter(|a| !a.is_zero()) {
                 Some(a) => amt = a,
@@ -849,11 +858,42 @@ impl Strategy {
         RouteWalk::Done(amt)
     }
 
-    /// Local pool-cache quote for one non-V3 triangular leg.
+    /// Best local pool-cache quote for one non-V3 triangular leg, with the fee that makes
+    /// the executor trade through the quoted pool (Aerodrome: 0 = volatile, 1 = stable).
+    fn best_local_leg(
+        &self,
+        router_id: &str,
+        router_type: RouterType,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+    ) -> Option<(U256, u32)> {
+        match router_type {
+            RouterType::V2 => self.pool_cache.get_amount_out_by_v2_key(
+                &V2PoolKey::new(router_id, token_in, token_out),
+                token_in,
+                amount_in,
+                None,
+            ).map(|out| (out, 0)),
+            RouterType::Aerodrome => solidly_out(
+                &self.pool_cache,
+                &self.solidly_pool_keys,
+                router_id,
+                token_in,
+                token_out,
+                amount_in,
+            ),
+            RouterType::V3 => None,
+        }
+    }
+
+    /// Local pool-cache quote for one non-V3 leg of a found route, through exactly the pool
+    /// its `fee` selects (the one the transaction will use).
     fn local_leg_out(
         &self,
         router_id: &str,
         router_type: RouterType,
+        fee: u32,
         token_in: Address,
         token_out: Address,
         amount_in: U256,
@@ -865,10 +905,11 @@ impl Strategy {
                 amount_in,
                 None,
             ),
-            RouterType::Aerodrome => solidly_out(
+            RouterType::Aerodrome => solidly_pool_out(
                 &self.pool_cache,
                 &self.solidly_pool_keys,
                 router_id,
+                fee != 0,
                 token_in,
                 token_out,
                 amount_in,
@@ -922,6 +963,23 @@ fn best_v3_spot(
         .max_by_key(|(out, _)| *out)
 }
 
+/// Quote through one Aerodrome pool (volatile or stable), None when it is missing or stale.
+fn solidly_pool_out(
+    cache: &PoolCache,
+    solidly_keys: &std::collections::HashMap<String, (String, String)>,
+    router_id: &str,
+    stable: bool,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> Option<U256> {
+    let (vol, sta) = solidly_keys.get(router_id)?;
+    let (pool_id, max_age) = if stable { (sta, stable_max_age()) } else { (vol, volatile_max_age()) };
+    cache.get_amount_out_by_v2_key(&V2PoolKey::new(pool_id, token_in, token_out), token_in, amount_in, Some(max_age))
+}
+
+/// Better of the fresh Aerodrome volatile and stable pools for this leg, with the fee the
+/// contract reads as the pool choice (`stable = fee != 0`): 0 volatile, 1 stable.
 fn solidly_out(
     cache: &PoolCache,
     solidly_keys: &std::collections::HashMap<String, (String, String)>,
@@ -929,21 +987,77 @@ fn solidly_out(
     token_in: Address,
     token_out: Address,
     amount_in: U256,
-) -> Option<U256> {
-    let (vol, sta) = solidly_keys.get(router_id)?;
-    cache
-        .get_amount_out_by_v2_key(
-            &V2PoolKey::new(vol, token_in, token_out),
-            token_in,
-            amount_in,
-            Some(volatile_max_age()),
-        )
-        .or_else(|| {
-            cache.get_amount_out_by_v2_key(
-                &V2PoolKey::new(sta, token_in, token_out),
-                token_in,
-                amount_in,
-                Some(stable_max_age()),
-            )
-        })
+) -> Option<(U256, u32)> {
+    let vol = solidly_pool_out(cache, solidly_keys, router_id, false, token_in, token_out, amount_in);
+    let sta = solidly_pool_out(cache, solidly_keys, router_id, true, token_in, token_out, amount_in);
+    match (vol, sta) {
+        (Some(v), Some(s)) if s > v => Some((s, 1)),
+        (Some(v), _) => Some((v, 0)),
+        (None, Some(s)) => Some((s, 1)),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool_cache::PoolInfo;
+    use std::time::{Duration, Instant};
+
+    const USDC: Address = alloy::primitives::address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    const USDT: Address = alloy::primitives::address!("fde4C96c8593536E31F229EA8f37b2ADa2699bb2");
+
+    fn pool(id: &str, stable: bool, r0: u64, r1: u64, fee_bps: u32, age_secs: u64) -> PoolInfo {
+        PoolInfo {
+            token0: USDC,
+            token1: USDT,
+            reserve0: U256::from(r0),
+            reserve1: U256::from(r1),
+            fee_bps,
+            router_id: id.into(),
+            is_stable: stable,
+            decimals0: 6,
+            decimals1: 6,
+            last_sync: Instant::now().checked_sub(Duration::from_secs(age_secs)).unwrap(),
+            fee_num: U256::ZERO,
+        }
+    }
+
+    /// Aerodrome USDC/USDT on Base: ~$326 volatile pool next to an ~$8.2k stable pool.
+    fn setup(vol_age: u64, vol_r: (u64, u64)) -> (PoolCache, std::collections::HashMap<String, (String, String)>) {
+        let cache = PoolCache::new();
+        cache.insert(Address::repeat_byte(1), pool("aero::volatile", false, vol_r.0, vol_r.1, 30, vol_age));
+        cache.insert(Address::repeat_byte(2), pool("aero::stable", true, 3_727_000_000, 4_432_000_000, 5, 0));
+        let keys = [("aero".to_string(), ("aero::volatile".to_string(), "aero::stable".to_string()))].into();
+        (cache, keys)
+    }
+
+    #[test]
+    fn aerodrome_leg_carries_the_fee_of_the_pool_it_quoted() {
+        let amt = U256::from(1_000_000_000u64); // $1000 USDC
+        let stable_quote = |c: &PoolCache, k| solidly_pool_out(c, k, "aero", true, USDC, USDT, amt).unwrap();
+
+        // Stale volatile + fresh stable: quoted on the stable pool, so fee 1 (stable).
+        let (cache, keys) = setup(200, (162_700_000, 163_300_000));
+        let (out, fee) = solidly_out(&cache, &keys, "aero", USDC, USDT, amt).unwrap();
+        assert_eq!(fee, 1);
+        assert_eq!(out, stable_quote(&cache, &keys));
+        assert!(out > U256::from(990_000_000u64), "stable quote {out}");
+        // Verification quotes only the pool the leg's fee selects — no fallback.
+        assert!(solidly_pool_out(&cache, &keys, "aero", false, USDC, USDT, amt).is_none());
+
+        // Both fresh, thin volatile: the deep stable pool still wins.
+        let (cache, keys) = setup(0, (162_700_000, 163_300_000));
+        let (out, fee) = solidly_out(&cache, &keys, "aero", USDC, USDT, amt).unwrap();
+        assert_eq!(fee, 1);
+        assert_eq!(out, stable_quote(&cache, &keys));
+        let vol = solidly_pool_out(&cache, &keys, "aero", false, USDC, USDT, amt).unwrap();
+        assert!(vol < U256::from(150_000_000u64), "volatile quote {vol}");
+
+        // Both fresh, deep volatile: volatile wins with fee 0.
+        let (cache, keys) = setup(0, (1_000_000_000_000, 1_010_000_000_000));
+        let (out, fee) = solidly_out(&cache, &keys, "aero", USDC, USDT, amt).unwrap();
+        assert_eq!(fee, 0);
+        assert_eq!(out, solidly_pool_out(&cache, &keys, "aero", false, USDC, USDT, amt).unwrap());
+    }
 }
