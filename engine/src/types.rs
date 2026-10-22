@@ -75,16 +75,28 @@ impl Opportunity {
         }
     }
 
-    /// Full opportunity fingerprint for deduplication.
+    /// Full opportunity fingerprint for deduplication. Starts with the pair/triplet id
+    /// (large-swap cooldown clearing matches on it) and includes each leg's fee, so V3
+    /// fee tiers and Aerodrome volatile/stable legs are separate routes.
     pub fn fingerprint(&self) -> String {
         match self {
-            Opportunity::TwoHop(o) => {
-                format!("{}|{}|{}|{}", o.pair_id, o.router_a_id, o.router_b_id, o.amount_in)
-            }
-            Opportunity::Triangular(o) => {
-                format!("{}|{}|{}|{}|{}", o.triplet_id, o.router_ab_id, o.router_bc_id, o.router_ca_id, o.amount_in)
-            }
+            Opportunity::TwoHop(o) => format!(
+                "{}|{}:{}|{}:{}|{}",
+                o.pair_id, o.router_a_id, o.fee_a, o.router_b_id, o.fee_b, o.amount_in
+            ),
+            Opportunity::Triangular(o) => format!(
+                "{}|{}:{}|{}:{}|{}:{}|{}",
+                o.triplet_id, o.router_ab_id, o.fee_ab, o.router_bc_id, o.fee_bc,
+                o.router_ca_id, o.fee_ca, o.amount_in
+            ),
         }
+    }
+
+    /// Cooldown-map key that throttles the opportunity log and ghost-profit accounting for a
+    /// route whose last attempt was rejected as unprofitable after gas. It never gates
+    /// execution: the route is re-evaluated on every scan.
+    pub fn gas_log_key(fingerprint: &str) -> String {
+        format!("{fingerprint}|gaslog")
     }
 }
 
@@ -110,4 +122,34 @@ pub struct PairScanInfo {
     pub opp_count: u64,
     /// Whether this pair is disabled via the dashboard toggle.
     pub disabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_separates_fee_tiers_and_starts_with_pair_id() {
+        let opp = |fee_a| Opportunity::TwoHop(ArbOpportunity {
+            chain_id: 8453,
+            pair_id: "base-usdc-weth".into(),
+            token_in: Address::ZERO,
+            token_out: Address::ZERO,
+            amount_in: U256::from(1_000_000_000u64),
+            router_a: Address::ZERO,
+            router_b: Address::ZERO,
+            router_a_type: RouterType::V3,
+            router_b_type: RouterType::Aerodrome,
+            fee_a,
+            fee_b: 0,
+            expected_profit: U256::ZERO,
+            profit_usd: 1.0,
+            router_a_id: "uniswap-v3-base".into(),
+            router_b_id: "aerodrome-base::volatile".into(),
+        });
+        let (a, b) = (opp(500).fingerprint(), opp(3000).fingerprint());
+        assert_ne!(a, b);
+        assert!(a.starts_with("base-usdc-weth|"));
+        assert!(Opportunity::gas_log_key(&a).starts_with(&a));
+    }
 }

@@ -338,6 +338,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         }
     let fingerprint = best_opp.fingerprint();
     let display_id = best_opp.pair_id();
+    // Route was rejected as unprofitable after gas within gas_reject_cooldown_secs: still
+    // evaluated and attempted (the edge may have grown), but its opportunity log goes to debug.
+    let gas_log_throttled = cooldowns
+        .get(&Opportunity::gas_log_key(&fingerprint))
+        .is_some_and(|t| *t > Instant::now());
 
     // Cooldown check (deadline style)
     let expire_at_opt = cooldowns.get(&fingerprint).copied();
@@ -421,21 +426,28 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             };
 
             // Log the opportunity first so detection is always visible.
-            broadcast_log(
-                log_tx,
-                "opportunity",
-                &format!(
-                    "[{}] 2-hop {} | profit=${:.4} | {}/{}",
+            if gas_log_throttled {
+                debug!(
+                    "[{}] 2-hop {} | profit=${:.4} | {}/{} (recently below gas)",
                     cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
-                ),
-                Some(serde_json::json!({
-                    "chain":      cfg.name,
-                    "pair_id":    optimized.pair_id,
-                    "profit_usd": optimized.profit_usd,
-                    "router_a":   optimized.router_a_id,
-                    "router_b":   optimized.router_b_id,
-                })),
-            );
+                );
+            } else {
+                broadcast_log(
+                    log_tx,
+                    "opportunity",
+                    &format!(
+                        "[{}] 2-hop {} | profit=${:.4} | {}/{}",
+                        cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
+                    ),
+                    Some(serde_json::json!({
+                        "chain":      cfg.name,
+                        "pair_id":    optimized.pair_id,
+                        "profit_usd": optimized.profit_usd,
+                        "router_a":   optimized.router_a_id,
+                        "router_b":   optimized.router_b_id,
+                    })),
+                );
+            }
 
             // Guard: cached balance (refreshed every 30s) must cover amount_in.
             // Prevents sending txs that will STF when contract has no token_in.
@@ -884,23 +896,30 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
         Opportunity::Triangular(opp) => {
             // Log the opportunity first so detection is always visible.
-            broadcast_log(
-                log_tx,
-                "opportunity",
-                &format!(
-                    "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
+            if gas_log_throttled {
+                debug!(
+                    "[{}] triangular {} | profit=${:.4} | {}/{}/{} (recently below gas)",
                     cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
-                ),
-                Some(serde_json::json!({
-                    "chain":        cfg.name,
-                    "pair_id":      opp.triplet_id,
-                    "triplet_id":   opp.triplet_id,
-                    "profit_usd":   opp.profit_usd,
-                    "router_ab":    opp.router_ab_id,
-                    "router_bc":    opp.router_bc_id,
-                    "router_ca":    opp.router_ca_id,
-                })),
-            );
+                );
+            } else {
+                broadcast_log(
+                    log_tx,
+                    "opportunity",
+                    &format!(
+                        "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
+                        cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
+                    ),
+                    Some(serde_json::json!({
+                        "chain":        cfg.name,
+                        "pair_id":      opp.triplet_id,
+                        "triplet_id":   opp.triplet_id,
+                        "profit_usd":   opp.profit_usd,
+                        "router_ab":    opp.router_ab_id,
+                        "router_bc":    opp.router_bc_id,
+                        "router_ca":    opp.router_ca_id,
+                    })),
+                );
+            }
 
             // Guard: check cached token_a balance (the starting capital) before executing.
             // Triangular arb starting with an unfunded token (e.g. WETH) will STF on Leg 1.
@@ -1468,6 +1487,22 @@ pub(crate) async fn handle_execution_success(
     }
 }
 
+/// Records a gas reject for `fingerprint` and says whether to log it (and sample ghost
+/// profit): true at most once per `mute_secs` per route. Never cools the route itself down.
+fn gas_reject_log_due(
+    cooldowns: &mut HashMap<String, Instant>,
+    fingerprint: &str,
+    now: Instant,
+    mute_secs: u64,
+) -> bool {
+    let log_key = Opportunity::gas_log_key(fingerprint);
+    if cooldowns.get(&log_key).is_some_and(|t| *t > now) {
+        return false;
+    }
+    cooldowns.insert(log_key, now + Duration::from_secs(mute_secs));
+    true
+}
+
 /// Handle execution failure (both 2-hop and triangular).
 pub(crate) async fn handle_execution_failure(
     scan_rpc: &mut ScanRpc<'_>,
@@ -1487,10 +1522,9 @@ pub(crate) async fn handle_execution_failure(
 ) -> FailureAction {
     pending_pairs.remove(pair_id);
 
-    // Gas-profitability rejects: route has a real spread but profit < gas cost.
-    // Apply a much longer cooldown (gas_reject_cooldown_secs()=120s) so the same
-    // route doesn't spam the log every 15s. Gas prices are stable on L2s, and the
-    // spread is unlikely to change in 15s — there's no value in retrying sooner.
+    // Gas-profitability rejects (profit < gas cost) put no cooldown on the route: the next
+    // scan may see a much larger edge on it. They only throttle the "Skipped" log and the
+    // ghost-profit sample for gas_reject_cooldown_secs() via the route's gas-log key.
     let err_str = error.to_string();
     // Simulation / pre-flight failures, matched on the engine's own message prefixes.
     let is_sim_failure = crate::util::is_sim_failure(&err_str);
@@ -1515,20 +1549,23 @@ pub(crate) async fn handle_execution_failure(
     // more calls now just prolong the limit. It doesn't start the chain backoff.
     let action = FailureAction { outage, stop_scan: outage || rpc == RpcFailure::RateLimited };
     let is_gas_reject = err_str.contains("below threshold") || err_str.contains("negative after gas");
-    let effective_cooldown = if is_gas_reject { gas_reject_cooldown_secs() } else { cooldown_secs };
-    cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(effective_cooldown));
-
     if is_gas_reject {
-        // Accumulate ghost profit: gross USD that was left on the table due to gas cost.
+        debug!("[{}] Skipped (unprofitable after gas): {}", cfg.name, err_str);
+        if !gas_reject_log_due(cooldowns, pair_id, Instant::now(), gas_reject_cooldown_secs()) {
+            return action;
+        }
+        // Ghost profit: gross USD left on the table due to gas cost, sampled once per
+        // throttle window per route.
         ghost_profit_bits.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
             Some((f64::from_bits(bits) + opportunity_profit_usd).to_bits())
         }).ok();
-        debug!("[{}] Skipped (unprofitable after gas): {}", cfg.name, err_str);
         broadcast_log(log_tx, "info",
-            &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4}, cooldown={}s)", cfg.name, pair_id, opportunity_profit_usd, gas_reject_cooldown_secs()),
+            &format!("[{}] Skipped {} — unprofitable after gas (gross=${:.4}, log muted {}s)", cfg.name, pair_id, opportunity_profit_usd, gas_reject_cooldown_secs()),
             None);
         return action;
     }
+    let effective_cooldown = cooldown_secs;
+    cooldowns.insert(pair_id.to_string(), Instant::now() + Duration::from_secs(effective_cooldown));
 
     // RPC rate-limits and outages (timeout / unreachable) are infra issues, not strategy
     // failures. Don't increment the circuit-breaker counter — just log and cool down.
@@ -1608,4 +1645,26 @@ pub(crate) async fn handle_execution_failure(
         None,
     );
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gas_reject_mutes_log_but_never_cools_the_route() {
+        let mut cooldowns: HashMap<String, Instant> = HashMap::new();
+        let fp = "base-usdc-weth|uniswap-v3-base:500|aerodrome-base::volatile:0|1000000000";
+        let t0 = Instant::now();
+        assert!(gas_reject_log_due(&mut cooldowns, fp, t0, 60));
+        // Within the window: muted, and the route's own fingerprint is still not in cooldown,
+        // so the candidate loop keeps evaluating (and executing) it.
+        assert!(!gas_reject_log_due(&mut cooldowns, fp, t0 + Duration::from_secs(30), 60));
+        assert!(!cooldowns.contains_key(fp));
+        // A different fee tier is a different route with its own log window.
+        let fp3000 = "base-usdc-weth|uniswap-v3-base:3000|aerodrome-base::volatile:0|1000000000";
+        assert!(gas_reject_log_due(&mut cooldowns, fp3000, t0 + Duration::from_secs(30), 60));
+        // After the window: logged again.
+        assert!(gas_reject_log_due(&mut cooldowns, fp, t0 + Duration::from_secs(61), 60));
+    }
 }

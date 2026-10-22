@@ -479,7 +479,8 @@ pub struct Tuning {
     pub rate_limit_log_every_ms: u64,
 
     // ── Scan loop ──
-    /// Cooldowns after a failed attempt, after a send, and after a gas-unprofitable skip (s).
+    /// Cooldowns after a failed attempt and after a send (s); after a gas-unprofitable skip
+    /// the route stays live and only its opportunity/skip log is muted this long.
     pub cooldown_secs: u64,
     pub send_cooldown_secs: u64,
     pub gas_reject_cooldown_secs: u64,
