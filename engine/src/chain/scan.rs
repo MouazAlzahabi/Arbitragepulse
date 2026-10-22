@@ -30,6 +30,29 @@ async fn pause_chain_for_revert(
     broadcast_log(log_tx, "error", &msg, None);
 }
 
+/// `get_receipt` failed (e.g. the node saw the tx mined but its receipt lookup returned
+/// null on a lagging backend, or the WS reconnected): wait briefly and look it up once more.
+async fn requery_receipt<P: Provider>(
+    provider: &P,
+    tx_hash: B256,
+    first_err: String,
+) -> Result<alloy::rpc::types::TransactionReceipt, String> {
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    match crate::util::rpc_timeout(crate::util::rpc_read_timeout(), provider.get_transaction_receipt(tx_hash)).await {
+        Ok(Some(r)) => Ok(r),
+        Ok(None) => Err(format!("{first_err}; still no receipt on re-query")),
+        Err(e) => Err(format!("{first_err}; re-query: {e}")),
+    }
+}
+
+/// Receipt still unknown after the re-query: the tx may have succeeded, so it's reported
+/// as unknown (dashboard warning), not counted as failed.
+fn warn_receipt_unknown(log_tx: &LogBroadcaster, chain_name: &str, tx_hash: &str, err: &str) {
+    let msg = format!("[{}] receipt lookup failed — outcome unknown | tx={} | {}", chain_name, tx_hash, err);
+    warn!("{}", msg);
+    broadcast_log(log_tx, "warn", &msg, None);
+}
+
 async fn diagnose_and_count_revert<P: Provider>(
     provider: &P,
     metrics: &Metrics,
@@ -643,6 +666,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             return;
                                         }
                                     };
+                                    let receipt_result = match receipt_result {
+                                        Ok(r) => Ok(r),
+                                        Err(e) => requery_receipt(provider_bg.as_ref(), tx_hash_b256, e.to_string()).await,
+                                    };
                                     match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
@@ -787,10 +814,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }).await;
                                             }
                                         }
-                                        Err(e) => {
-                                            confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                            warn!("[{}] Receipt error for {}: {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
-                                        }
+                                        Err(e) => warn_receipt_unknown(&log_tx_bg, &chain_name_bg, &tx_hash_bg, &e),
                                     }
                                     drop(provider_bg);
                                 });
@@ -1104,6 +1128,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                             return;
                                         }
                                     };
+                                    let receipt_result = match receipt_result {
+                                        Ok(r) => Ok(r),
+                                        Err(e) => requery_receipt(provider_bg.as_ref(), tx_hash_b256, e.to_string()).await,
+                                    };
                                     match receipt_result {
                                         Ok(receipt) => {
                                             let ok = receipt.status();
@@ -1247,10 +1275,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }).await;
                                             }
                                         }
-                                        Err(e) => {
-                                            confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
-                                            warn!("[{}] Triangular receipt error for {}: {}", chain_name_bg, &tx_hash_bg[..10.min(tx_hash_bg.len())], e);
-                                        }
+                                        Err(e) => warn_receipt_unknown(&log_tx_bg, &chain_name_bg, &tx_hash_bg, &e),
                                     }
                                     drop(provider_bg);
                                 });
