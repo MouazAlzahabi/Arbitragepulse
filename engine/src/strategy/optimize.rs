@@ -1,11 +1,11 @@
-use alloy::primitives::{Address, Uint, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use futures::future::join_all;
 use std::future::Future;
 use std::pin::Pin;
 use tracing::debug;
 
-use crate::abi::{IAerodromeRouter, IQuoterV2, IUniswapV2Router02};
+use crate::abi::{IAerodromeRouter, IUniswapV2Router02};
 use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, volatile_max_age, stable_max_age};
 use crate::types::ArbOpportunity;
@@ -82,8 +82,9 @@ impl Strategy {
             return opp.clone();
         }
 
-        let quoter_a = self.quoter_by_router.get(&opp.router_a_id).copied();
-        let quoter_b = self.quoter_by_router.get(&opp.router_b_id).copied();
+        // (quoter, is Slipstream's quoter)
+        let quoter_a = self.quoter_by_router.get(&opp.router_a_id).map(|&q| (q, self.slipstream_quoters.contains(&q)));
+        let quoter_b = self.quoter_by_router.get(&opp.router_b_id).map(|&q| (q, self.slipstream_quoters.contains(&q)));
 
         // ── Round 1: Coarse scan across full range ────────────────────────────
         let coarse_winner = probe_range(
@@ -175,8 +176,8 @@ async fn probe_range<P: Provider + Clone + 'static>(
     provider: &P,
     pool_cache: &crate::pool_cache::PoolCache,
     solidly_keys: &std::collections::HashMap<String, (String, String)>,
-    quoter_a: Option<Address>,
-    quoter_b: Option<Address>,
+    quoter_a: Option<(Address, bool)>,
+    quoter_b: Option<(Address, bool)>,
     min_amount: U256,
     max_amount: U256,
     steps: usize,
@@ -224,7 +225,7 @@ async fn probe_range<P: Provider + Clone + 'static>(
                     Some(volatile_max_age()),
                 ),
                 RouterType::V3 => match quoter_a {
-                    Some(q) => quote_v3(&p, block, q, probe_amount, token_in, token_out, fa).await,
+                    Some((q, slip)) => quote_v3(&p, block, q, slip, probe_amount, token_in, token_out, fa).await,
                     None => None,
                 },
                 RouterType::Aerodrome => {
@@ -249,7 +250,7 @@ async fn probe_range<P: Provider + Clone + 'static>(
                     Some(volatile_max_age()),
                 ),
                 RouterType::V3 => match quoter_b {
-                    Some(q) => quote_v3(&p, block, q, mid, token_out, token_in, fb).await,
+                    Some((q, slip)) => quote_v3(&p, block, q, slip, mid, token_out, token_in, fb).await,
                     None => None,
                 },
                 RouterType::Aerodrome => {
@@ -331,27 +332,21 @@ async fn quote_v3<P: Provider>(
     provider: &P,
     block: alloy::eips::BlockId,
     quoter: Address,
+    slipstream: bool,
     amount_in: U256,
     token_in: Address,
     token_out: Address,
     fee: u32,
 ) -> Option<U256> {
-    let fee_u24: alloy::primitives::Uint<24, 1> = Uint::from(fee);
-    let sqrt_zero: alloy::primitives::Uint<160, 3> = Uint::ZERO;
-
-    match IQuoterV2::new(quoter, provider)
-        .quoteExactInputSingle(IQuoterV2::QuoteExactInputSingleParams {
-            tokenIn: token_in,
-            tokenOut: token_out,
-            amountIn: amount_in,
-            fee: fee_u24,
-            sqrtPriceLimitX96: sqrt_zero,
-        })
-        .call()
-        .block(block)
-        .await
-    {
-        Ok(r) => Some(r.amountOut),
+    // `fee` is the tick spacing for a Slipstream quoter; both return QuoterV2's 4 values.
+    let data = if slipstream {
+        super::encode_slipstream_quote(token_in, token_out, fee, amount_in)
+    } else {
+        super::encode_v3_quote(token_in, token_out, fee, amount_in)
+    };
+    let tx = alloy::rpc::types::TransactionRequest::default().to(quoter).input(data.into());
+    match provider.call(tx).block(block).await {
+        Ok(raw) => super::decode_v3_quote(Some(&raw.to_vec())),
         Err(e) => {
             debug!("V3 quote failed on {:?} fee={}: {}", quoter, fee, e);
             None

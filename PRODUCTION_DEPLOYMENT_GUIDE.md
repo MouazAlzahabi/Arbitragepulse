@@ -54,21 +54,24 @@ paths in `scripts/server/arbitragepulse@.service` otherwise.
 
 ## 3. Executor contract
 
-The current Base executor is configured in `engine/config.yaml`
-(`contract_address`). To deploy a new one:
+The executor is configured in `engine/config.yaml` (`contract_address`). **The Aerodrome
+Slipstream router (type 5) needs the current contract**: an executor deployed before it
+rejects `setRouter(…, 5)`, so redeploy, allowlist the routers below, move the funds, and
+set the new `contract_address`. To deploy:
 
 ```bash
 cd contract
 forge script script/Deploy.s.sol --rpc-url base --broadcast --verify   # BASE_RPC + ETHERSCAN_API_KEY in contract/.env
 ```
 
-Whitelist every active router (types: `0` = V2, `1` = V3, `4` = Aerodrome):
+Whitelist every active router (types: `0` = V2, `1` = V3, `4` = Aerodrome, `5` = Slipstream):
 
 | Router | Address | Type |
 |---|---|---|
 | Uniswap V3 SwapRouter02 | `0x2626664c2603336E57B271c5C0b26F421741e481` | 1 |
 | PancakeSwap V3 SmartRouter | `0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86` | 1 |
 | Aerodrome V2 Router | `0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43` | 4 |
+| Aerodrome Slipstream SwapRouter | `0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5` | 5 |
 
 ```bash
 cast send $EXECUTOR "setRouter(address,uint8)" $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url https://mainnet.base.org
@@ -79,8 +82,9 @@ restart) if its key is not `owner()`, or — in live mode — if a configured ro
 allowlisted with the type above (dry-run only warns). If the contract is `paused()`, the
 chain starts paused: `unpause()`, then `POST /engine/resume`.
 
-Fund the executor with the pairs' `token_in` (mostly USDC) and the wallet with a little
-ETH for gas (`chain.min_native_balance` — the engine warns when the signer's ETH drops
+Fund the executor with the pairs' `token_in` — USDC and USDT in the shipped config, at least
+`trade_amount` (1000) of each; triangles start from the same two tokens, so no WETH is
+needed — and the wallet with a little ETH for gas (`chain.min_native_balance` — the engine warns when the signer's ETH drops
 below it). Withdraw with `withdrawToken(token)` /
 `withdrawETH()`; `pause()` freezes the contract.
 

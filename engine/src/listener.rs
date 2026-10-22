@@ -443,6 +443,7 @@ mod tests {
             token0: address!("0000000000000000000000000000000000000001"),
             token1: address!("0000000000000000000000000000000000000002"),
             fee: 500,
+            swap_fee: 500,
             sqrt_price_x96: U256::from(1u64) << 96,
             liquidity: 1_000_000,
             tick: 100,

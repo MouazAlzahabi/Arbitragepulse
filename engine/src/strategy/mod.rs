@@ -54,6 +54,21 @@ pub(crate) fn encode_v3_quote(token_in: Address, token_out: Address, fee: u32, a
     }.abi_encode()
 }
 
+/// Slipstream quoter calldata: `int24 tickSpacing` in place of the fee tier (`fee` carries
+/// the tick spacing for Slipstream routers). Returns the same 4 values as QuoterV2.
+pub(crate) fn encode_slipstream_quote(token_in: Address, token_out: Address, tick_spacing: u32, amount_in: U256) -> Vec<u8> {
+    use crate::abi::ISlipstreamQuoter;
+    ISlipstreamQuoter::quoteExactInputSingleCall {
+        params: ISlipstreamQuoter::QuoteExactInputSingleParams {
+            tokenIn: token_in,
+            tokenOut: token_out,
+            amountIn: amount_in,
+            tickSpacing: alloy::primitives::aliases::I24::try_from(tick_spacing as i32).unwrap_or_default(),
+            sqrtPriceLimitX96: Uint::ZERO,
+        },
+    }.abi_encode()
+}
+
 /// Decode one QuoterV2 result from [`run_multicall`]. None = call failed or quoted 0.
 pub(crate) fn decode_v3_quote(raw: Option<&Vec<u8>>) -> Option<U256> {
     raw.and_then(|r| IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(r).ok())
@@ -250,6 +265,8 @@ pub struct Strategy {
     pub router_addr_map: HashMap<String, Address>,
     /// Per-router QuoterV2 address (router.quoter_address ?? chain quoter_v2_address).
     pub quoter_by_router: HashMap<String, Address>,
+    /// Quoters of Slipstream routers — they take a tick spacing, see [`Strategy::encode_quote`].
+    pub slipstream_quoters: std::collections::HashSet<Address>,
     /// Solidly/Aerodrome effective pool-cache IDs: router_id → (volatile, stable).
     pub solidly_pool_keys: HashMap<String, (String, String)>,
     /// Reverse index: token address → pair indices that include that token.
@@ -293,6 +310,7 @@ impl Strategy {
             .filter_map(|r| r.address.parse::<Address>().ok().map(|a| (r.id.clone(), a)))
             .collect();
 
+        let slipstream_quoters = slipstream_quoters(&routers);
         let quoter_by_router: HashMap<String, Address> = routers
             .iter()
             .filter_map(|r| {
@@ -345,6 +363,7 @@ impl Strategy {
             http_provider,
             quote_block: BlockId::latest(),
             router_addr_map,
+            slipstream_quoters,
             quoter_by_router,
             solidly_pool_keys,
             token_pair_index: HashMap::new(),
@@ -520,6 +539,7 @@ impl Strategy {
                 q.map(|addr| (r.id.clone(), addr))
             })
             .collect();
+        self.slipstream_quoters = slipstream_quoters(&self.routers);
         self.solidly_pool_keys = self
             .routers
             .iter()
@@ -569,7 +589,7 @@ impl Strategy {
                 Entry::Occupied(e) => sent[*e.get()].1.push(i),
                 Entry::Vacant(e) => {
                     e.insert(sent.len());
-                    mc.push((quoter, encode_v3_quote(k.token_in, k.token_out, k.fee, leg.amount_in)));
+                    mc.push((quoter, self.encode_quote(quoter, k.token_in, k.token_out, k.fee, leg.amount_in)));
                     sent.push((&k.router_id, vec![i]));
                 }
             }
@@ -642,9 +662,25 @@ impl Strategy {
         if self.quote_block == BlockId::pending() { self.http_provider.clone() } else { None }
     }
 
+    /// Quote calldata for `quoter`: Slipstream's ABI for Slipstream quoters, QuoterV2's otherwise.
+    pub(crate) fn encode_quote(&self, quoter: Address, token_in: Address, token_out: Address, fee: u32, amount_in: U256) -> Vec<u8> {
+        if self.slipstream_quoters.contains(&quoter) {
+            encode_slipstream_quote(token_in, token_out, fee, amount_in)
+        } else {
+            encode_v3_quote(token_in, token_out, fee, amount_in)
+        }
+    }
+
     pub fn update_native_price(&mut self, price: f64) {
         self.native_price_usd = price;
     }
+}
+
+fn slipstream_quoters(routers: &[RouterConfig]) -> std::collections::HashSet<Address> {
+    routers.iter()
+        .filter(|r| r.slipstream)
+        .filter_map(|r| r.quoter_address.as_deref()?.parse::<Address>().ok())
+        .collect()
 }
 
 // ─── Multicall3 batch helper ───────────────────────────────────────────────────
@@ -793,5 +829,26 @@ pub(crate) fn token_amount_to_usd(amount: U256, decimals: u8, symbol: &str, nati
     } else {
         // Unreachable for token_in: config validation rejects other symbols.
         float_amount
+    }
+}
+
+#[cfg(test)]
+mod quote_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn slipstream_quote_uses_int24_tick_spacing_selector_and_same_decoder() {
+        use alloy::sol_types::SolValue;
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let uni = encode_v3_quote(a, b, 100, U256::from(5u64));
+        let slip = encode_slipstream_quote(a, b, 100, U256::from(5u64));
+        // quoteExactInputSingle((address,address,uint256,uint24,uint160)) vs (…,int24,…)
+        assert_eq!(&uni[..4], &[0xc6, 0xa5, 0x02, 0x6a]);
+        assert_eq!(&slip[..4], &[0x9e, 0x7d, 0xef, 0xe6]);
+        // A positive int24 encodes like the uint24 word: only the selector differs.
+        assert_eq!(&uni[4..], &slip[4..]);
+        // Both quoters return (uint256 amountOut, uint160, uint32, uint256).
+        let ret = (U256::from(42u64), U256::ZERO, U256::ZERO, U256::ZERO).abi_encode_params();
+        assert_eq!(decode_v3_quote(Some(&ret)), Some(U256::from(42u64)));
     }
 }

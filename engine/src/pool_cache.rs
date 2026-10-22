@@ -84,8 +84,12 @@ pub struct V3PoolState {
     /// token0 = lower address (EVM convention).
     pub token0: Address,
     pub token1: Address,
-    /// Fee in ppm: 100, 500, 2500, 3000, 10000.
+    /// Pool id within its router — the `fee` of the pool key and of trade calldata: the fee
+    /// tier in ppm (100, 500, 2500, 3000, 10000), or the tick spacing for Aerodrome Slipstream.
     pub fee: u32,
+    /// Swap fee in ppm used by the local quote. Equals `fee` for Uniswap/Pancake V3; read
+    /// per pool for Slipstream (its fee is not implied by the tick spacing).
+    pub swap_fee: u32,
     /// Current sqrt price as Q64.96 fixed-point (from slot0 / Swap event).
     pub sqrt_price_x96: U256,
     /// Active-tick liquidity (only valid for the current tick — not total TVL).
@@ -112,7 +116,7 @@ impl V3PoolState {
     /// Called once at insert and once per Swap event — amortises 2 U256 muls +
     /// 1 U256 div across all quote_v3_spot() calls until the next price change.
     pub fn refresh_vr(&mut self) {
-        self.fee_num_v3 = FEE_DENOM_V3.saturating_sub(U256::from(self.fee));
+        self.fee_num_v3 = FEE_DENOM_V3.saturating_sub(U256::from(self.swap_fee));
         let l = U256::from(self.liquidity);
         if self.sqrt_price_x96.is_zero() || l.is_zero() {
             self.vr0 = U256::ZERO;

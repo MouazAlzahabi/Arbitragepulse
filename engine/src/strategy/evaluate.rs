@@ -6,7 +6,7 @@ use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, V3PoolKey, volatile_max_age, stable_max_age};
 use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
-use super::{ForwardTask, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, encode_v3_quote, run_multicall, token_amount_to_usd, min_v3_liquidity};
+use super::{ForwardTask, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, run_multicall, token_amount_to_usd, min_v3_liquidity};
 
 impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
@@ -501,7 +501,7 @@ impl Strategy {
                 } else {
                     p15_pre.push(None);         // cache miss — queue for MC
                     p15_sent_state.push(self.pool_cache.v3_price_state(&v3_cache_key));
-                    p15_mc.push((quoter, encode_v3_quote(fwd_task.token_in, fwd_task.token_out, *fee_a, full_amount)));
+                    p15_mc.push((quoter, self.encode_quote(quoter, fwd_task.token_in, fwd_task.token_out, *fee_a, full_amount)));
                 }
             }
 
@@ -601,7 +601,7 @@ impl Strategy {
                                 } else {
                                     p15b_pre.push(None);
                                     p15b_sent_state.push(self.pool_cache.v3_price_state(&p15b_key));
-                                    p15b_mc.push((quoter_b, encode_v3_quote(token_out, token_in, fee_b, quoter_out)));
+                                    p15b_mc.push((quoter_b, self.encode_quote(quoter_b, token_out, token_in, fee_b, quoter_out)));
                                 }
                             }
                             continue;
@@ -724,7 +724,7 @@ impl Strategy {
                     Some(q) => q, None => continue,
                 };
 
-                p15c_mc.push((quoter_b, encode_v3_quote(task.token_out, task.token_in, task.fee_b, task.token_out_amount)));
+                p15c_mc.push((quoter_b, self.encode_quote(quoter_b, task.token_out, task.token_in, task.fee_b, task.token_out_amount)));
                 p15c_candidates.push((
                     task.pair_idx,
                     task.router_a_id.clone(), task.fee_a, task.router_a_addr,

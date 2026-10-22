@@ -91,6 +91,7 @@ alloy::sol! {
         error InsufficientBalance(address token, uint256 balance, uint256 needed);
         error InvalidPath();
         error InvalidV3Fee(uint8 leg, address router, uint24 fee);
+        error InvalidTickSpacing(uint8 leg, address router, uint24 tickSpacing);
         error LegFailed(uint8 leg, address router, uint8 rtype, bytes reason);
         error NoOutput(uint8 leg, address router);
         error NotAContract(address router);
@@ -120,7 +121,7 @@ alloy::sol! {
 }
 
 fn router_type_name(t: u8) -> &'static str {
-    match t { 0 => "V2", 1 => "V3", 4 => "Aerodrome", _ => "retired type" }
+    match t { 0 => "V2", 1 => "V3", 4 => "Aerodrome", 5 => "Slipstream", _ => "retired type" }
 }
 
 /// Classify revert bytes from `eth_call` replay or RPC error payload. `detail` is a
@@ -186,6 +187,8 @@ fn explain_executor(e: Executor::ExecutorErrors) -> (RevertClass, String) {
             format!("executor holds {} of token {} but the trade needs {}", e.balance, e.token, e.needed)),
         X::InvalidV3Fee(e) => (C::InvalidRoute,
             format!("leg {}: fee {} is not a V3 fee tier (router {})", e.leg, e.fee, e.router)),
+        X::InvalidTickSpacing(e) => (C::InvalidRoute,
+            format!("leg {}: tick spacing {} is not a Slipstream tick spacing (router {})", e.leg, e.tickSpacing, e.router)),
         X::NoOutput(e) => (C::NoOutput, format!("leg {}: router {} delivered no output", e.leg, e.router)),
         X::NotAContract(e) => (C::InvalidRoute, format!("{} has no code — not a router", e.router)),
         X::LegExhaustedGas(e) => (C::OutOfGas, format!(

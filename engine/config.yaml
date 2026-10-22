@@ -86,7 +86,7 @@ routers:
     address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
     type: "aerodrome"    # 4-field Route{from,to,stable,factory}
     fee_bps: 30        # volatile pools (0.3%)
-    stable_fee_bps: 5  # stable pools (0.05%, factory stableFee()): USDC/USDbC, USDC/USDT, etc.
+    stable_fee_bps: 5  # stable pools (0.05%, factory stableFee()): USDC/USDT, USDC/EURC, etc.
     # Both are fallbacks only: discovery reads each pool's actual fee via factory.getFee(pool, stable)
     # (pools can carry a custom fee, e.g. USDC/AERO stable = 200 bps) and uses these when that call fails.
     # Aerodrome Router V2 exposes defaultFactory() not factory() — must be configured explicitly.
@@ -94,20 +94,20 @@ routers:
     # IMPORTANT: Must be whitelisted on-chain after contract redeployment:
     #   executor.setRouter(0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43, 4)   # 4 = Aerodrome
 
-  # DISABLED (commented out): Slipstream keys pools
-  # by int24 tickSpacing, not uint24 fee. Its factory reverts the Uniswap getPool(…, uint24) the
-  # engine uses, so no pools were ever discovered; its quoter takes int24 tickSpacing; and its
-  # router's exactInputSingle selector differs from SwapRouter02's, which ArbitrageExecutor has
-  # no RouterType for. Real support needs a Slipstream RouterType in the contract (+ redeploy),
-  # tickSpacing pool discovery, and tickSpacing quoting. Then restore this entry.
-  # - id: "aerodrome-slipstream-base"
-  #   name: "Aerodrome Slipstream CL (Base)"
-  #   address: "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"
-  #   type: "v3"
-  #   fee_tiers: [100, 200, 500, 3000]   # 100 = 0.01% (USDC/EURC CL1 pool fee tier)
-  #   fee_bps: 1
-  #   quoter_address: "0x254cF9E1E6e233aa1AC962CB9B05b2cfeAAE15b0"
-  #   factory_address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"
+  # Aerodrome Slipstream (concentrated liquidity). Same pool events as Uniswap V3, but pools
+  # are keyed by tick spacing: fee_tiers lists TICK SPACINGS here (they travel in every `fee`
+  # field), and each pool's swap fee is read at discovery (e.g. WETH/USDC ts 100 = 0.015%).
+  # Executor type 5 — needs the contract with the Slipstream router type:
+  #   executor.setRouter(0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5, 5)
+  - id: "aerodrome-slipstream-base"
+    name: "Aerodrome Slipstream (Base)"
+    address: "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"   # Slipstream SwapRouter
+    type: "v3"
+    slipstream: true
+    fee_tiers: [1, 10, 50, 100, 200, 2000]                   # factory.tickSpacings()
+    fee_bps: 0
+    quoter_address: "0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0"   # Slipstream QuoterV2
+    factory_address: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"  # Slipstream CLFactory
 
   - id: "pancake-v3-base"
     name: "PancakeSwap V3 (Base)"
@@ -137,10 +137,17 @@ routers:
 
 
 # ─── PAIRS ─────────────────────────────────────────────────
+# Chosen 2026-10-22 from GeckoTerminal 24h volume per venue (≥ $50k depth on ≥ 2 venues).
+# token_in is USDC or USDT only — the executor is funded with those two (each 2-hop trade
+# needs trade_amount of its token_in; triangles start from either). Pools are discovered
+# for EVERY pair of these tokens, so triangles also cover the WETH/cbBTC, WETH/AERO,
+# WETH/VIRTUAL, … legs (e.g. USDC→WETH→cbBTC→USDC) without WETH funding.
+# Dropped (no deep second venue): USDbC, DAI, ZORA, cbETH, wstETH against USDC.
 pairs:
+  # $166M/day: UniV3, Slipstream, PancakeV3, AerodromeV2 (+V4)
   - id: "base-usdc-weth"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x4200000000000000000000000000000000000006"   # WETH
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x4200000000000000000000000000000000000006"
     token_in_symbol: "USDC"
     token_out_symbol: "WETH"
     token_in_decimals: 6
@@ -148,51 +155,10 @@ pairs:
     trade_amount: "1000"
     max_trade: "1000"
 
-  # base-usdbc-weth disabled — contract has no USDbC; re-enable after funding with USDbC
-  # - id: "base-usdbc-weth"
-  #   token_in: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC (bridged USDC)
-  #   token_out: "0x4200000000000000000000000000000000000006"   # WETH
-  #   token_in_symbol: "USDBC"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 6
-  #   token_out_decimals: 18
-  #   trade_amount: "99"
-  #   max_trade: "99"
-
-  - id: "base-usdc-usdbc"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"   # USDbC
-    token_in_symbol: "USDC"
-    token_out_symbol: "USDBC"
-    token_in_decimals: 6
-    token_out_decimals: 6
-    trade_amount: "1000"
-    max_trade: "1000"
-
-  - id: "base-usdc-usdt"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"   # USDT (bridged)
-    token_in_symbol: "USDC"
-    token_out_symbol: "USDT"
-    token_in_decimals: 6
-    token_out_decimals: 6
-    trade_amount: "1000"
-    max_trade: "1000"
-
-  # USDT → WETH: Aerodrome Slipstream 0.05% ($221K TVL, $775K/day) vs UniV3 0.05% ($41K TVL)
-  - id: "base-usdt-weth"
-    token_in: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"   # USDT (bridged)
-    token_out: "0x4200000000000000000000000000000000000006"   # WETH
-    token_in_symbol: "USDT"
-    token_out_symbol: "WETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "270"
-    max_trade: "270"
-
+  # $38M/day: UniV3, Slipstream, PancakeV3
   - id: "base-usdc-cbbtc"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"   # cbBTC (Coinbase Wrapped BTC, 8 decimals)
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
     token_in_symbol: "USDC"
     token_out_symbol: "CBBTC"
     token_in_decimals: 6
@@ -200,9 +166,32 @@ pairs:
     trade_amount: "1000"
     max_trade: "1000"
 
+  # $14M/day: Slipstream (deepest), UniV3, PancakeV3
+  - id: "base-usdc-usdt"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"
+    token_in_symbol: "USDC"
+    token_out_symbol: "USDT"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "1000"
+    max_trade: "1000"
+
+  # $5.7M/day: Slipstream $2.9M deep vs UniV3
+  - id: "base-usdt-weth"
+    token_in: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"
+    token_out: "0x4200000000000000000000000000000000000006"
+    token_in_symbol: "USDT"
+    token_out_symbol: "WETH"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "1000"
+    max_trade: "1000"
+
+  # $5.2M/day: AerodromeV2 $17.8M, Slipstream, UniV3
   - id: "base-usdc-aero"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x940181a94A35A4569E4529A3CDfB74e38FD98631"   # AERO (Aerodrome governance token)
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
     token_in_symbol: "USDC"
     token_out_symbol: "AERO"
     token_in_decimals: 6
@@ -210,70 +199,10 @@ pairs:
     trade_amount: "1000"
     max_trade: "1000"
 
-  # cbETH disabled until contract funded with cbETH
-  # NOTE: token_in must be a USD stablecoin or WETH (profit is priced in USD) — cbETH is rejected at load.
-  # - id: "base-cbeth-weth"
-  #   token_in: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH
-  #   token_out: "0x4200000000000000000000000000000000000006"   # WETH
-  #   token_in_symbol: "CBETH"
-  #   token_out_symbol: "WETH"
-  #   token_in_decimals: 18
-  #   token_out_decimals: 18
-  #   trade_amount: "0.05"
-  #   max_trade: "0.2"
-
-  # USDC → DAI: stablecoin spread — trades only while the executor holds ≥ trade_amount USDC
-  # (the heartbeat shows `unfunded=k/n` while any pair's token_in balance is short)
-  - id: "base-usdc-dai"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI
-    token_in_symbol: "USDC"
-    token_out_symbol: "DAI"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "1000"
-    max_trade: "1000"
-
-  # USDC → cbETH: Coinbase staked ETH — LST premium divergence across DEXes
-  - id: "base-usdc-cbeth"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"   # cbETH (Coinbase staked ETH)
-    token_in_symbol: "USDC"
-    token_out_symbol: "cbETH"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "1000"
-    max_trade: "1000"
-
-  # USDC → ZORA: Zora Network token — $2.7M/day UniV3 + $685K PancakeV3
-  - id: "base-usdc-zora"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x1111111111166b7fe7bd91427724b487980afc69"   # ZORA (Zora Network)
-    token_in_symbol: "USDC"
-    token_out_symbol: "ZORA"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "1000"
-    max_trade: "1000"
-
-  # USDC → VIRTUAL: Virtuals Protocol — $3M/day PancakeV3 + $217K UniV3
-  - id: "base-usdc-virtual"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b"   # VIRTUAL (Virtuals Protocol)
-    token_in_symbol: "USDC"
-    token_out_symbol: "VIRTUAL"
-    token_in_decimals: 6
-    token_out_decimals: 18
-    trade_amount: "1000"
-    max_trade: "1000"
-
-  # USDC → EURC: stablecoin arb — Circle EUR stablecoin, both 6 decimals
-  # Aerodrome Slipstream CL1 pool: ~$817K TVL, $8.3M/day volume (fee tier 100 = 0.01%)
-  # UniV3 0.05% pool: ~$22K TVL — shallow, creates price divergence on large Slipstream flows
-  # NOTE: every pair is quoted on every configured router (no per-pair router lists)
+  # $5.2M/day: Slipstream (deepest), PancakeV3, UniV3
   - id: "base-usdc-eurc"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1aDb42"   # EURC (Circle EUR stablecoin)
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1aDb42"
     token_in_symbol: "USDC"
     token_out_symbol: "EURC"
     token_in_decimals: 6
@@ -281,12 +210,12 @@ pairs:
     trade_amount: "1000"
     max_trade: "1000"
 
-  # USDC → wstETH: Lido wrapped staked ETH — LST premium divergence across DEXes
-  - id: "base-usdc-wsteth"
-    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
-    token_out: "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"   # wstETH (Lido)
+  # $0.5M/day: UniV3, PancakeV3, AerodromeV2
+  - id: "base-usdc-virtual"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b"
     token_in_symbol: "USDC"
-    token_out_symbol: "wstETH"
+    token_out_symbol: "VIRTUAL"
     token_in_decimals: 6
     token_out_decimals: 18
     trade_amount: "1000"

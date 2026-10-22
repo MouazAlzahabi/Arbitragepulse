@@ -185,6 +185,13 @@ pub struct RouterConfig {
     /// fee from factory.getFee(pool, stable).
     #[serde(default)]
     pub stable_fee_bps: Option<u32>,
+    /// Aerodrome Slipstream (with `type: "v3"`): concentrated-liquidity pools keyed by tick
+    /// spacing. `fee_tiers` then lists tick spacings (1, 10, 50, 100, 200, 2000), which travel
+    /// in every `fee` field (pool key, quote, calldata); each pool's swap fee is read at
+    /// discovery. Needs the Slipstream factory and quoter, and the executor allowlisting the
+    /// router as type 5.
+    #[serde(default)]
+    pub slipstream: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -323,6 +330,15 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
         return Err(anyhow!("Chain '{}': contract_address is not set", chain.name));
     }
     for r in &raw.routers {
+        if r.slipstream && (r.router_type != RouterType::V3 || r.factory_address.is_none() || r.quoter_address.is_none()) {
+            return Err(anyhow!(
+                "router '{}': slipstream: true needs type \"v3\", factory_address (Slipstream CL factory) and quoter_address (Slipstream quoter)",
+                r.id
+            ));
+        }
+        if r.slipstream && r.fee_tiers.iter().any(|&t| t == 0 || t > 16_384) {
+            return Err(anyhow!("router '{}': Slipstream fee_tiers are tick spacings, 1..=16384", r.id));
+        }
         if let Some(f) = r.fee_tiers.iter().find(|&&f| f == 0 || f >= 1_000_000) {
             return Err(anyhow!(
                 "router '{}': fee tier {} is out of range — V3 fee tiers are 1..=999999 (hundredths of a bip: 100, 500, 3000, 10000)",

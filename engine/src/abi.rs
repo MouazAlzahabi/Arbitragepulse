@@ -62,6 +62,46 @@ sol! {
     }
 }
 
+// ─── Aerodrome Slipstream (concentrated liquidity) ───────────────────────────
+// Uniswap-V3-style pools keyed by int24 tickSpacing instead of a fee tier. Same Swap /
+// Mint / Burn events as Uniswap V3; slot0 has 6 fields (no feeProtocol); the swap fee is
+// per pool (fee()). The quoter returns QuoterV2's 4 values, so decode_v3_quote serves both.
+
+sol! {
+    interface ISlipstreamQuoter {
+        struct QuoteExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint256 amountIn;
+            int24 tickSpacing;
+            uint160 sqrtPriceLimitX96;
+        }
+        function quoteExactInputSingle(QuoteExactInputSingleParams memory params)
+            external
+            returns (
+                uint256 amountOut,
+                uint160 sqrtPriceX96After,
+                uint32 initializedTicksCrossed,
+                uint256 gasEstimate
+            );
+    }
+
+    interface ISlipstreamFactory {
+        function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address pool);
+    }
+
+    interface ISlipstreamPool {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            bool unlocked
+        );
+    }
+}
+
 // ─── ArbitrageExecutor ────────────────────────────────────────────────────────
 
 sol! {

@@ -120,7 +120,8 @@ pub(crate) async fn update_native_price<P: Provider>(
     // the deepest pool gives the most accurate market price.
     {
         let mut best_v3_price = 0.0;
-        for router in routers.iter().filter(|r| r.router_type == RouterType::V3) {
+        // Slipstream quoters take a tick spacing — the Uniswap/Pancake V3 routers suffice here.
+        for router in routers.iter().filter(|r| r.router_type == RouterType::V3 && !r.slipstream) {
             // Effective quoter: per-router first, chain-level fallback
             let quoter_str = router.quoter_address.as_deref()
                 .map(str::to_owned)
@@ -307,9 +308,10 @@ pub(crate) async fn check_contract_funding(
 // ─── Startup check of the executor contract ───────────────────────────────────
 
 /// `ArbitrageExecutor.RouterType` ordinal for a configured router type (0 = V2, 1 = V3, 4 = Aerodrome).
-pub(crate) fn expected_router_type(t: RouterType) -> u8 {
+pub(crate) fn expected_router_type(t: RouterType, slipstream: bool) -> u8 {
     match t {
         RouterType::V2 => 0,
+        RouterType::V3 if slipstream => 5,
         RouterType::V3 => 1,
         RouterType::Aerodrome => 4,
     }
@@ -321,8 +323,8 @@ pub(crate) fn owner_problem(owner: Address, signer: Address) -> Option<String> {
     ))
 }
 
-pub(crate) fn router_problem(id: &str, addr: Address, t: RouterType, allowed: bool, onchain_type: u8) -> Option<String> {
-    let want = expected_router_type(t);
+pub(crate) fn router_problem(id: &str, addr: Address, t: RouterType, slipstream: bool, allowed: bool, onchain_type: u8) -> Option<String> {
+    let want = expected_router_type(t, slipstream);
     if !allowed {
         Some(format!("router {id} ({addr}) is not allowlisted on the executor — setRouter({addr}, {want})"))
     } else if onchain_type != want {
@@ -374,7 +376,7 @@ pub(crate) async fn check_contract_setup<P: Provider>(
         let onchain_type = rpc_timeout(rpc_read_timeout(), exec.routerType(addr).call())
             .await
             .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: routerType() failed: {e}"))?;
-        if let Some(p) = router_problem(&r.id, addr, r.router_type, allowed, onchain_type) {
+        if let Some(p) = router_problem(&r.id, addr, r.router_type, r.slipstream, allowed, onchain_type) {
             problems.push(p);
         }
     }
@@ -421,9 +423,10 @@ mod tests {
 
     #[test]
     fn expected_router_type_ordinals() {
-        assert_eq!(expected_router_type(RouterType::V2), 0);
-        assert_eq!(expected_router_type(RouterType::V3), 1);
-        assert_eq!(expected_router_type(RouterType::Aerodrome), 4);
+        assert_eq!(expected_router_type(RouterType::V2, false), 0);
+        assert_eq!(expected_router_type(RouterType::V3, false), 1);
+        assert_eq!(expected_router_type(RouterType::V3, true), 5);
+        assert_eq!(expected_router_type(RouterType::Aerodrome, false), 4);
     }
 
     #[test]
@@ -438,10 +441,10 @@ mod tests {
     #[test]
     fn router_problem_cases() {
         let a = address!("2626664c2603336E57B271c5C0b26F421741e481");
-        let msg = router_problem("r", a, RouterType::V3, false, 0).expect("not allowed");
+        let msg = router_problem("r", a, RouterType::V3, false, false, 0).expect("not allowed");
         assert!(msg.contains("not allowlisted") && msg.contains("setRouter"), "{msg}");
-        assert!(router_problem("r", a, RouterType::V3, true, 1).is_none());
-        let msg = router_problem("r", a, RouterType::Aerodrome, true, 0).expect("wrong type");
+        assert!(router_problem("r", a, RouterType::V3, false, true, 1).is_none());
+        let msg = router_problem("r", a, RouterType::Aerodrome, false, true, 0).expect("wrong type");
         assert!(msg.contains("type 0") && msg.contains("type 4"), "{msg}");
     }
 

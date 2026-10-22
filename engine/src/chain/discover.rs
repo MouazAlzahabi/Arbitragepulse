@@ -2,7 +2,28 @@ use super::*;
 
 // ─── Pool discovery (startup) ─────────────────────────────────────────────────
 
-/// Discover V2 and Solidly-volatile pools for all configured pairs and routers.
+/// Every unordered pair of tokens appearing in the configured pairs, with decimals:
+/// pools are discovered for all of them, not just the configured pairs, so triangular
+/// routes have their middle legs (e.g. WETH/cbBTC for USDC→WETH→cbBTC→USDC).
+pub(crate) fn token_pairs(pairs: &[PairConfig]) -> Vec<(Address, u8, Address, u8)> {
+    let mut tokens: Vec<(Address, u8)> = Vec::new();
+    for p in pairs {
+        for (t, d) in [(&p.token_in, p.token_in_decimals), (&p.token_out, p.token_out_decimals)] {
+            if let Ok(a) = t.parse::<Address>() {
+                if !tokens.iter().any(|(x, _)| *x == a) { tokens.push((a, d)); }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        for j in i + 1..tokens.len() {
+            out.push((tokens[i].0, tokens[i].1, tokens[j].0, tokens[j].1));
+        }
+    }
+    out
+}
+
+/// Discover V2 and Solidly-volatile pools for every pair of configured tokens ([`token_pairs`]).
 /// Populates `pool_cache` with initial reserves so strategy can quote locally.
 ///
 /// Three multicall rounds:
@@ -70,11 +91,8 @@ pub(crate) async fn discover_pools<P: Provider>(
 
     for (ri, rm) in target_routers.iter().enumerate() {
         let factory = match factories[ri] { Some(f) => f, None => continue };
-        for pair in pairs {
-            let ta: Address = match pair.token_in.parse() { Ok(a) => a, Err(_) => continue };
-            let tb: Address = match pair.token_out.parse() { Ok(a) => a, Err(_) => continue };
-            // Decimals from the pair config (what trade sizing uses too) — no decimals() round.
-            let (dec_ta, dec_tb) = (pair.token_in_decimals, pair.token_out_decimals);
+        // Decimals from the pair config (what trade sizing uses too) — no decimals() round.
+        for &(ta, dec_ta, tb, dec_tb) in &token_pairs(pairs) {
             match rm.rtype {
                 RouterType::V2 => {
                     let cd = IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode();
@@ -213,8 +231,10 @@ fn decode_addr(raw: &[u8]) -> Option<Address> {
 /// and keeps state fresh via `pool_cache.update_v3_state()`.
 ///
 /// Two multicall rounds:
-///   1. factory.getPool(A, B, fee)  per (V3 router × pair × fee_tier)
-///   2. pool.slot0() + pool.liquidity() per discovered pool
+///   1. factory.getPool(A, B, fee)  per (V3 router × token pair × fee_tier); Slipstream:
+///      getPool(A, B, int24 tickSpacing)
+///   2. pool.slot0() + pool.liquidity() per discovered pool (+ pool.fee() for Slipstream,
+///      whose swap fee isn't implied by the tick spacing)
 ///
 /// Returns how many discovery calls were lost to RPC failure after retries (0 = complete).
 pub(crate) async fn discover_v3_pools<P: Provider>(
@@ -229,14 +249,14 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     use std::time::Instant;
 
     // ── Collect V3 routers with factory_address ───────────────────────────────
-    struct V3Router { id: String, factory: Address, fee_tiers: Vec<u32> }
+    struct V3Router { id: String, factory: Address, fee_tiers: Vec<u32>, slipstream: bool }
     let v3_routers: Vec<V3Router> = routers
         .iter()
         .filter(|r| r.router_type == RouterType::V3)
         .filter_map(|r| {
             let factory = r.factory_address.as_deref()?.parse::<Address>().ok()?;
             let tiers = if r.fee_tiers.is_empty() { vec![500u32, 3000, 10000] } else { r.fee_tiers.clone() };
-            Some(V3Router { id: r.id.clone(), factory, fee_tiers: tiers })
+            Some(V3Router { id: r.id.clone(), factory, fee_tiers: tiers, slipstream: r.slipstream })
         })
         .collect();
 
@@ -245,23 +265,26 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     }
 
     // ── Round 1: getPool(A, B, fee) per (router × pair × fee_tier) ───────────
-    struct PoolQuery { router_id: String, ta: Address, tb: Address, fee: u32 }
+    struct PoolQuery { router_id: String, ta: Address, tb: Address, fee: u32, slipstream: bool }
     let mut pool_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pool_queries: Vec<PoolQuery> = Vec::new();
 
     for vr in &v3_routers {
-        for pair in pairs {
-            let ta: Address = match pair.token_in.parse() { Ok(a) => a, Err(_) => continue };
-            let tb: Address = match pair.token_out.parse() { Ok(a) => a, Err(_) => continue };
+        for &(ta, _, tb, _) in &token_pairs(pairs) {
             for &fee in &vr.fee_tiers {
-                use alloy::primitives::Uint;
-                let cd = IUniswapV3Factory::getPoolCall {
-                    tokenA: ta,
-                    tokenB: tb,
-                    fee: Uint::from(fee),
-                }.abi_encode();
+                use alloy::primitives::{aliases::I24, Uint};
+                // Both return one address word, so the getPool decode below serves both.
+                let cd = if vr.slipstream {
+                    crate::abi::ISlipstreamFactory::getPoolCall {
+                        tokenA: ta,
+                        tokenB: tb,
+                        tickSpacing: I24::try_from(fee as i32).unwrap_or(I24::ZERO),
+                    }.abi_encode()
+                } else {
+                    IUniswapV3Factory::getPoolCall { tokenA: ta, tokenB: tb, fee: Uint::from(fee) }.abi_encode()
+                };
                 pool_calls.push((vr.factory, cd));
-                pool_queries.push(PoolQuery { router_id: vr.id.clone(), ta, tb, fee });
+                pool_queries.push(PoolQuery { router_id: vr.id.clone(), ta, tb, fee, slipstream: vr.slipstream });
             }
         }
     }
@@ -298,7 +321,8 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     }
 
     // ── Round 2: slot0() + liquidity() per discovered pool ────────────────────
-    struct StateQuery { pool: Address, router_id: String, ta: Address, tb: Address, fee: u32 }
+    // idx: this pool's slot0 call in state_calls; liquidity follows, then fee() for Slipstream.
+    struct StateQuery { pool: Address, router_id: String, ta: Address, tb: Address, fee: u32, slipstream: bool, idx: usize }
     let mut state_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut state_queries: Vec<StateQuery> = Vec::new();
     let mut seen: HashSet<Address> = HashSet::new();
@@ -314,15 +338,21 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
             continue;
         }
 
-        // Two calls per pool: slot0() and liquidity()
+        // slot0() and liquidity() per pool (same selectors on Slipstream), + fee() for Slipstream
+        let idx = state_calls.len();
         state_calls.push((pool, IUniswapV3Pool::slot0Call {}.abi_encode()));
         state_calls.push((pool, IUniswapV3Pool::liquidityCall {}.abi_encode()));
+        if pq.slipstream {
+            state_calls.push((pool, IUniswapV3Pool::feeCall {}.abi_encode()));
+        }
         state_queries.push(StateQuery {
             pool,
             router_id: pq.router_id.clone(),
             ta: pq.ta,
             tb: pq.tb,
             fee: pq.fee,
+            slipstream: pq.slipstream,
+            idx,
         });
     }
 
@@ -334,20 +364,38 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
 
     // ── Insert into pool_cache ────────────────────────────────────────────────
     // Also need token0 to know direction. We derive it: token0 = min(ta, tb) by address.
-    for (i, sq) in state_queries.iter().enumerate() {
-        let slot0_raw = match state_raw.get(2 * i) { Some(Some(r)) => r, _ => continue };
-        let liq_raw   = match state_raw.get(2 * i + 1) { Some(Some(r)) => r, _ => continue };
+    for sq in state_queries.iter() {
+        let slot0_raw = match state_raw.get(sq.idx) { Some(Some(r)) => r, _ => continue };
+        let liq_raw   = match state_raw.get(sq.idx + 1) { Some(Some(r)) => r, _ => continue };
 
-        let slot0 = match IUniswapV3Pool::slot0Call::abi_decode_returns(slot0_raw).ok() {
-            Some(s) => s,
-            None => continue,
+        // (sqrtPriceX96, tick): Slipstream's slot0 has 6 fields, Uniswap/Pancake's 7.
+        let slot0 = if sq.slipstream {
+            crate::abi::ISlipstreamPool::slot0Call::abi_decode_returns(slot0_raw).ok()
+                .map(|s| (s.sqrtPriceX96, s.tick.as_i32()))
+        } else {
+            IUniswapV3Pool::slot0Call::abi_decode_returns(slot0_raw).ok()
+                .map(|s| (s.sqrtPriceX96, s.tick.as_i32()))
+        };
+        let Some((sqrt_p, tick)) = slot0 else { continue };
+        // Slipstream: the pool's own swap fee; skip the pool if it can't be read (a wrong
+        // fee would misprice every local quote on it).
+        let swap_fee = if sq.slipstream {
+            match state_raw.get(sq.idx + 2)
+                .and_then(|r| r.as_deref())
+                .and_then(|r| IUniswapV3Pool::feeCall::abi_decode_returns(r).ok())
+            {
+                Some(f) => f.to::<u32>(),
+                None => continue,
+            }
+        } else {
+            sq.fee
         };
         let liquidity = match IUniswapV3Pool::liquidityCall::abi_decode_returns(liq_raw).ok() {
             Some(l) => l,
             None => continue,
         };
 
-        let sqrt_price_x96 = U256::from(slot0.sqrtPriceX96);
+        let sqrt_price_x96 = U256::from(sqrt_p);
         if sqrt_price_x96.is_zero() {
             continue; // pool not initialised
         }
@@ -363,9 +411,10 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
             token0,
             token1,
             fee: sq.fee,
+            swap_fee,
             sqrt_price_x96,
             liquidity: liquidity.into(),
-            tick: slot0.tick.as_i32(),
+            tick,
             router_id: sq.router_id.clone(),
             last_updated: Instant::now(),
             // Derived fields: insert_v3 calls refresh_vr() to populate these.
@@ -490,6 +539,33 @@ mod tests {
     use super::*;
     use alloy::primitives::U256;
     use alloy::sol_types::SolValue;
+
+    fn pair(tin: &str, tout: &str, dout: u8) -> PairConfig {
+        PairConfig {
+            id: format!("{tin}-{tout}"),
+            token_in: tin.into(),
+            token_out: tout.into(),
+            token_in_symbol: "IN".into(),
+            token_out_symbol: "OUT".into(),
+            token_in_decimals: 6,
+            token_out_decimals: dout,
+            trade_amount: "1".into(),
+            max_trade: None,
+            min_profit_usd: None,
+        }
+    }
+
+    #[test]
+    fn token_pairs_cover_every_pair_of_configured_tokens() {
+        let usdc = "0x0000000000000000000000000000000000000001";
+        let weth = "0x0000000000000000000000000000000000000002";
+        let btc = "0x0000000000000000000000000000000000000003";
+        // USDC/WETH and USDC/BTC configured → WETH/BTC (a triangle's middle leg) included too.
+        let tp = token_pairs(&[pair(usdc, weth, 18), pair(usdc, btc, 8), pair(usdc, weth, 18)]);
+        assert_eq!(tp.len(), 3, "3 tokens → 3 unordered pairs, duplicates ignored");
+        let (w, b): (Address, Address) = (weth.parse().unwrap(), btc.parse().unwrap());
+        assert!(tp.iter().any(|&(a, da, c, dc)| (a, da, c, dc) == (w, 18, b, 8)), "WETH/BTC with config decimals");
+    }
 
     #[test]
     fn aerodrome_fee_uses_per_pool_getfee_with_config_fallback() {
