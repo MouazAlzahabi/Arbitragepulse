@@ -258,42 +258,49 @@ pub(crate) async fn refresh_contract_balances<P: Provider + Clone>(
     }
 }
 
-/// Startup check: log a warning for any pair whose token_in balance in the
-/// ArbitrageExecutor contract is below the configured trade_amount.
+/// Pairs whose token_in balance in the executor is below their trade size (trade_amount,
+/// capped by max_trade). Such a pair can detect but never execute. No RPC: reads the cache.
+pub(crate) fn underfunded_pairs<'a>(
+    pairs: &'a [crate::config::PairConfig],
+    balances: &HashMap<Address, U256>,
+) -> Vec<(&'a crate::config::PairConfig, U256, U256)> {
+    pairs.iter().filter_map(|pair| {
+        let token_addr = pair.token_in.parse::<Address>().ok()?;
+        let balance = balances.get(&token_addr).copied().unwrap_or(U256::ZERO);
+        let required = crate::strategy::parse_amount_capped(
+            &pair.trade_amount,
+            pair.max_trade.as_deref(),
+            pair.token_in_decimals,
+        )?;
+        (balance < required).then_some((pair, balance, required))
+    }).collect()
+}
+
+/// Startup check: warn (journal + dashboard feed) for any pair whose token_in balance in
+/// the ArbitrageExecutor contract is below the configured trade_amount.
 /// The engine continues running — detection is still valid; only execution
 /// will fail (caught by pre-flight simulation) until the contract is funded.
+/// The heartbeat keeps showing `unfunded=k/n` while any pair stays underfunded.
 pub(crate) async fn check_contract_funding(
     chain_name: &str,
     pairs: &[crate::config::PairConfig],
     contract_addr: Address,
     balances: &Arc<RwLock<HashMap<Address, U256>>>,
+    log_tx: &LogBroadcaster,
 ) {
     let b = balances.read().await;
-    for pair in pairs {
-        let token_addr = match pair.token_in.parse::<Address>() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        let balance = b.get(&token_addr).copied().unwrap_or(U256::ZERO);
-        let required = match crate::strategy::parse_amount_capped(
-            &pair.trade_amount,
-            pair.max_trade.as_deref(),
-            pair.token_in_decimals,
-        ) {
-            Some(a) => a,
-            None => continue,
-        };
-        if balance < required {
-            warn!(
-                "[{}] ⚠ Contract underfunded for {} | balance={} trade_amount={} {} | fund {}",
-                chain_name,
-                pair.id,
-                balance,
-                required,
-                pair.token_in_symbol,
-                contract_addr,
-            );
-        }
+    for (pair, balance, required) in underfunded_pairs(pairs, &b) {
+        let msg = format!(
+            "[{}] ⚠ Contract underfunded for {} | balance={} trade_amount={} {} | fund {} — this pair cannot trade",
+            chain_name,
+            pair.id,
+            balance,
+            required,
+            pair.token_in_symbol,
+            contract_addr,
+        );
+        warn!("{}", msg);
+        broadcast_log(log_tx, "warn", &msg, None);
     }
 }
 
@@ -455,6 +462,22 @@ mod tests {
             Some((address!("036CbD53842c5426634e7929541eC2318f3dCF7e"), 6))
         );
         assert_eq!(native_price_source(&[], weth), None);
+    }
+
+    #[test]
+    fn underfunded_pairs_compares_balance_to_capped_trade_size() {
+        let cfg = crate::config::parse_config(
+            &std::fs::read_to_string(format!("{}/config.yaml", env!("CARGO_MANIFEST_DIR"))).unwrap()
+                .replace("YOUR_", "0000"),
+        ).unwrap();
+        let pairs = &cfg.pairs;
+        assert!(!pairs.is_empty());
+        let empty = HashMap::new();
+        assert_eq!(underfunded_pairs(pairs, &empty).len(), pairs.len(), "nothing funded");
+        let rich: HashMap<Address, U256> = pairs.iter()
+            .map(|p| (p.token_in.parse().unwrap(), U256::MAX))
+            .collect();
+        assert!(underfunded_pairs(pairs, &rich).is_empty());
     }
 
     #[test]

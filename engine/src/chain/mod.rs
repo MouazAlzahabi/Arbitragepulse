@@ -223,7 +223,7 @@ pub async fn run_chain(
     let gas_low_warned = Arc::new(AtomicBool::new(false));
     state::check_signer_gas(provider.as_ref(), signer_address, cfg.min_native_balance, &gas_low_warned, &log_tx, &cfg.name).await;
     // Startup funding check: warn for any underfunded pair.
-    state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances).await;
+    state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances, &log_tx).await;
     // Wire balances into executor for post-trade immediate refresh.
     { executor.lock().await.contract_balances = Some(contract_balances.clone()); }
     // Pre-fetch nonce at startup so first submission has zero RPC overhead.
@@ -578,10 +578,13 @@ pub async fn run_chain(
                 let (v3_fresh, v3_total) =
                     pool_cache.count_fresh_v3_pools(crate::config::tuning().v3_fresh_window());
                 let preconf_n = preconf_logs.swap(0, Ordering::Relaxed);
+                // Pairs the executor can't fund (cached balances, no RPC): they detect but never trade.
+                let unfunded = state::underfunded_pairs(&chain_pairs, &*contract_balances.read().await).len();
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}{}",
-                    cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, v3_fresh, v3_total,
+                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v2={} v3={}/{}{}{}",
+                    cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, pool_cache.by_address.len(), v3_fresh, v3_total,
                     if cfg.preconf_ws_rpc.is_some() { format!(" | preconf_logs={}", preconf_n) } else { String::new() },
+                    if unfunded > 0 { format!(" | unfunded={}/{}", unfunded, total_pairs) } else { String::new() },
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 // A full scan normally runs every block (~2 s); a long gap means scanning has

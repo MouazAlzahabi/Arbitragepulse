@@ -222,7 +222,8 @@ pairs:
   #   trade_amount: "0.05"
   #   max_trade: "0.2"
 
-  # USDC → DAI: stablecoin spread — enabled now that contract holds 1000+ USDC
+  # USDC → DAI: stablecoin spread — trades only while the executor holds ≥ trade_amount USDC
+  # (the heartbeat shows `unfunded=k/n` while any pair's token_in balance is short)
   - id: "base-usdc-dai"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (native)
     token_out: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"   # DAI
