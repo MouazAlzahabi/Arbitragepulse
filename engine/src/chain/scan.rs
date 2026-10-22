@@ -408,8 +408,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         Opportunity::TwoHop(opp) => {
             // Two-round adaptive size optimizer (only for 2-hop)
             let max_bal = {
+                // A token missing from the cache (pair added by a config reload) counts as
+                // unfunded: the balance guard below must not be skipped.
                 let bals = contract_balances.read().await;
-                bals.get(&opp.token_in).copied()
+                Some(bals.get(&opp.token_in).copied().unwrap_or(U256::ZERO))
             };
             // Skip optimizer in optimistic mode — each round costs ~100ms of QuoterV2 calls.
             // On FCFS chains (Base), 200ms of optimizer latency = ~65 positions lost.
@@ -930,7 +932,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             {
                 let bal = {
                     let bals = contract_balances.read().await;
-                    bals.get(&opp.token_a).copied()
+                    // Missing (token added by a config reload) = unfunded, as for 2-hop.
+                    Some(bals.get(&opp.token_a).copied().unwrap_or(U256::ZERO))
                 };
                 if let Some(b) = bal {
                     if b < opp.amount_in {

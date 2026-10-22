@@ -52,6 +52,7 @@ options, recommendation. Newest at the bottom.
   1. Keep restart-required (docs now say so).
   2. On a reload that changes pairs/routers: discover pools for the new entries, rebuild the log-subscription filter, extend `contract_balances`, re-run the startup router check. Costs a discovery RPC burst mid-run and a subscription restart.
 - Recommendation: 1.
+- Update (review loop 2, R3-1): "never quotes" is not true when the new pair's pools are already cached (e.g. the reverse of an existing pair) — it starts trading after the 30 s reload. Its token_in was missing from `contract_balances`, which skipped the balance guard and let unfunded sends revert InsufficientBalance every 15 s. Fixed: a token missing from the cache now counts as unfunded (skipped with a warning) until a restart seeds it.
 
 ### [engine] Per-pair `routers:` lists
 - Where: engine/src/config.rs `PairConfig` (now `deny_unknown_fields`); engine/config.yaml pairs
