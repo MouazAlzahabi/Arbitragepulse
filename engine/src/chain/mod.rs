@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use alloy::sol_types::SolEvent;
-use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, IAerodromeFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool, IPancakeV3Pool};
+use crate::abi::{IERC20, IRouterWithFactory, IUniswapV2Factory, IAerodromeFactory, IUniswapV2Pair, IUniswapV3Factory, IUniswapV3Pool};
 use crate::api::{broadcast_log, ChainStats, LogBroadcaster, SharedState};
 use crate::config::{self, ChainConfig, PairConfig, RouterConfig, RouterType};
 use crate::db::Database;
@@ -331,12 +330,7 @@ pub async fn run_chain(
     {
         let log_filter = alloy::rpc::types::Filter::new()
             .address(pool_cache.watch_addresses())
-            .event_signature(vec![
-                crate::abi::Sync::SIGNATURE_HASH,
-                solidly_sync_hash_sub,
-                crate::abi::Swap::SIGNATURE_HASH,
-                IPancakeV3Pool::Swap::SIGNATURE_HASH,
-            ]);
+            .event_signature(crate::listener::pool_log_topics(solidly_sync_hash_sub));
         let feed = LogFeed {
             cache: pool_cache.clone(),
             swap_tx: swap_tx_for_sub.clone(),

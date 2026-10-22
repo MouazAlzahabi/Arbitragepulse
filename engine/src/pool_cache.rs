@@ -77,7 +77,8 @@ pub struct PoolInfo {
 
 /// Concentrated-liquidity pool state, kept fresh from `Swap` events.
 /// Both `sqrt_price_x96` and `liquidity` are emitted by every V3 Swap event —
-/// so one event handler updates both with zero extra RPC calls.
+/// so one event handler updates both with zero extra RPC calls. In-range Mint/Burn
+/// change `liquidity` between Swaps; they are applied as deltas (see `apply_v3_liquidity_delta`).
 #[derive(Debug, Clone)]
 pub struct V3PoolState {
     /// token0 = lower address (EVM convention).
@@ -89,6 +90,8 @@ pub struct V3PoolState {
     pub sqrt_price_x96: U256,
     /// Active-tick liquidity (only valid for the current tick — not total TVL).
     pub liquidity: u128,
+    /// Current tick (slot0 / Swap event). Decides whether a Mint/Burn is in range.
+    pub tick: i32,
     /// Router ID that routes through this pool.
     pub router_id: String,
     /// When this entry was last updated (used for staleness check).
@@ -451,14 +454,31 @@ impl PoolCache {
     /// Update sqrtPriceX96 and liquidity from a V3 Swap event.
     /// Also resets the staleness timer and recomputes cached virtual reserves
     /// so quote_v3_spot() reads pre-built values without any per-call maths.
-    pub fn update_v3_state(&self, pool: Address, sqrt_price_x96: U256, liquidity: u128) {
+    pub fn update_v3_state(&self, pool: Address, sqrt_price_x96: U256, liquidity: u128, tick: i32) {
         if let Some(mut e) = self.v3_by_address.get_mut(&pool) {
             e.sqrt_price_x96 = sqrt_price_x96;
             e.liquidity = liquidity;
+            e.tick = tick;
             e.last_updated = Instant::now();
             e.refresh_vr();
             self.mark_v3_metrics_dirty();
         }
+    }
+
+    /// Apply a V3 Mint (`add`) or Burn (`!add`) of `amount` liquidity on `[tick_lower, tick_upper)`.
+    /// Only a position containing the current tick changes active liquidity (the pool's
+    /// own rule: `tickLower <= tick < tickUpper`). Not idempotent — the caller must apply
+    /// each log once. Returns whether the active liquidity changed.
+    pub fn apply_v3_liquidity_delta(&self, pool: Address, tick_lower: i32, tick_upper: i32, amount: u128, add: bool) -> bool {
+        let Some(mut e) = self.v3_by_address.get_mut(&pool) else { return false };
+        if amount == 0 || !(tick_lower <= e.tick && e.tick < tick_upper) {
+            return false;
+        }
+        e.liquidity = if add { e.liquidity.saturating_add(amount) } else { e.liquidity.saturating_sub(amount) };
+        e.last_updated = Instant::now();
+        e.refresh_vr();
+        self.mark_v3_metrics_dirty();
+        true
     }
 
     /// Spot-price screen for a V3 pool.

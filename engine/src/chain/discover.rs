@@ -365,6 +365,7 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
             fee: sq.fee,
             sqrt_price_x96,
             liquidity: liquidity.into(),
+            tick: slot0.tick.as_i32(),
             router_id: sq.router_id.clone(),
             last_updated: Instant::now(),
             // Derived fields: insert_v3 calls refresh_vr() to populate these.

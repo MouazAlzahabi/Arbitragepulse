@@ -298,5 +298,26 @@ sol! {
             bool unlocked
         );
         function liquidity() external view returns (uint128);
+
+        /// Liquidity added to [tickLower, tickUpper). Same signature on PancakeSwap V3
+        /// and Aerodrome Slipstream. topic0 = 0x7a53080b…
+        event Mint(
+            address sender,
+            address indexed owner,
+            int24 indexed tickLower,
+            int24 indexed tickUpper,
+            uint128 amount,
+            uint256 amount0,
+            uint256 amount1
+        );
+        /// Liquidity removed from [tickLower, tickUpper). topic0 = 0x0c396cd9…
+        event Burn(
+            address indexed owner,
+            int24 indexed tickLower,
+            int24 indexed tickUpper,
+            uint128 amount,
+            uint256 amount0,
+            uint256 amount1
+        );
     }
 }

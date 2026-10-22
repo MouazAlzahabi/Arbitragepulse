@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::{IPancakeV3Pool, Swap, Sync};
+use crate::abi::{IPancakeV3Pool, IUniswapV3Pool, Swap, Sync};
 use crate::api::{broadcast_log, LogBroadcaster};
 use crate::pool_cache::PoolCache;
 
@@ -29,11 +29,28 @@ fn sqrtp_delta_bps(old: U256, new: U256, threshold_bps: u32) -> bool {
     delta * U256::from(10_000u32) >= old * U256::from(threshold_bps)
 }
 
+/// topic0s of every pool log the engine applies: V2 Sync, Solidly Sync, V3 Swap (Uniswap,
+/// Pancake), and V3 Mint/Burn (same signature on Uniswap V3, Pancake V3 and Slipstream).
+/// Used by both log feeds (sealed + pendingLogs) and the poll fallback.
+pub fn pool_log_topics(solidly_sync_hash: B256) -> Vec<B256> {
+    vec![
+        Sync::SIGNATURE_HASH,
+        solidly_sync_hash,
+        Swap::SIGNATURE_HASH,
+        IPancakeV3Pool::Swap::SIGNATURE_HASH,
+        IUniswapV3Pool::Mint::SIGNATURE_HASH,
+        IUniswapV3Pool::Burn::SIGNATURE_HASH,
+    ]
+}
+
 /// Decode a single Swap/Sync log, apply it to the pool cache, and classify magnitude.
 /// Returns `Some(magnitude)` when the log was recognized, applied, and is new — the caller
 /// should trigger a scan. A log older than the pool's last applied one is skipped; the
 /// same log seen again (pre-confirmed, then sealed) is re-applied but returns `None` so it
 /// doesn't trigger a second scan. Removed (reorged) logs are ignored.
+/// V3 Mint/Burn are liquidity deltas: applied once (a repeat is a no-op), and they only
+/// update state — liquidity alone doesn't move the price, so no scan is triggered; the
+/// changed liquidity invalidates the pool's QuoteCache entries.
 pub fn apply_log_to_cache(
     log: &alloy::rpc::types::Log,
     cache: &PoolCache,
@@ -102,7 +119,7 @@ pub fn apply_log_to_cache(
                 magnitude = SwapMagnitude::Large;
             }
         }
-        cache.update_v3_state(pool, sqrtp, liq);
+        cache.update_v3_state(pool, sqrtp, liq, decoded.tick.as_i32());
         return (!repeat).then_some(magnitude);
     }
 
@@ -115,8 +132,24 @@ pub fn apply_log_to_cache(
                 magnitude = SwapMagnitude::Large;
             }
         }
-        cache.update_v3_state(pool, sqrtp, liq);
+        cache.update_v3_state(pool, sqrtp, liq, decoded.tick.as_i32());
         return (!repeat).then_some(magnitude);
+    }
+
+    if topic0 == IUniswapV3Pool::Mint::SIGNATURE_HASH {
+        if !repeat {
+            let d = IUniswapV3Pool::Mint::decode_log(log.as_ref()).ok()?;
+            cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, true);
+        }
+        return None;
+    }
+
+    if topic0 == IUniswapV3Pool::Burn::SIGNATURE_HASH {
+        if !repeat {
+            let d = IUniswapV3Pool::Burn::decode_log(log.as_ref()).ok()?;
+            cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, false);
+        }
+        return None;
     }
 
     None
@@ -200,12 +233,7 @@ impl Listener {
         use alloy::primitives::keccak256;
         let solidly_sync_hash = keccak256(b"Sync(uint256,uint256)");
 
-        let event_sigs = vec![
-            Sync::SIGNATURE_HASH,
-            solidly_sync_hash,
-            Swap::SIGNATURE_HASH,
-            IPancakeV3Pool::Swap::SIGNATURE_HASH,
-        ];
+        let event_sigs = pool_log_topics(solidly_sync_hash);
 
         if !poll_fallback {
             return Ok(());
@@ -398,6 +426,98 @@ mod tests {
         // Removed (reorged) logs are ignored.
         assert!(apply(&cache, &sync_log(12, 0, 9_999, true)).is_none());
         assert_eq!(reserve0(&cache), U256::from(2_100u64));
+    }
+
+    const V3: Address = address!("00000000000000000000000000000000000000bb");
+
+    /// V3 pool at tick 100 with liquidity 1_000_000.
+    fn cache_with_v3_pool() -> PoolCache {
+        let cache = PoolCache::new();
+        cache.insert_v3(V3, crate::pool_cache::V3PoolState {
+            token0: address!("0000000000000000000000000000000000000001"),
+            token1: address!("0000000000000000000000000000000000000002"),
+            fee: 500,
+            sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1_000_000,
+            tick: 100,
+            router_id: "r".into(),
+            last_updated: std::time::Instant::now(),
+            vr0: U256::ZERO,
+            vr1: U256::ZERO,
+            fee_num_v3: U256::ZERO,
+        });
+        cache
+    }
+
+    fn at(data: alloy::primitives::LogData, block: u64, index: u64) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address: V3, data },
+            block_number: Some(block),
+            log_index: Some(index),
+            ..Default::default()
+        }
+    }
+
+    fn i24(v: i32) -> alloy::primitives::aliases::I24 {
+        alloy::primitives::aliases::I24::try_from(v).unwrap()
+    }
+
+    fn mint(lo: i32, hi: i32, amount: u128, block: u64, index: u64) -> alloy::rpc::types::Log {
+        at(IUniswapV3Pool::Mint {
+            sender: Address::ZERO, owner: Address::ZERO, tickLower: i24(lo), tickUpper: i24(hi),
+            amount, amount0: U256::ZERO, amount1: U256::ZERO,
+        }.encode_log_data(), block, index)
+    }
+
+    fn burn(lo: i32, hi: i32, amount: u128, block: u64, index: u64) -> alloy::rpc::types::Log {
+        at(IUniswapV3Pool::Burn {
+            owner: Address::ZERO, tickLower: i24(lo), tickUpper: i24(hi),
+            amount, amount0: U256::ZERO, amount1: U256::ZERO,
+        }.encode_log_data(), block, index)
+    }
+
+    fn liq(cache: &PoolCache) -> u128 {
+        cache.v3_by_address.get(&V3).unwrap().liquidity
+    }
+
+    #[test]
+    fn v3_mint_burn_update_in_range_liquidity_once() {
+        let cache = cache_with_v3_pool();
+        // In range (lower inclusive): liquidity grows, no scan.
+        assert!(apply(&cache, &mint(100, 200, 500, 10, 1)).is_none());
+        assert_eq!(liq(&cache), 1_000_500);
+        // Its sealed copy (same position) must not double-apply.
+        apply(&cache, &mint(100, 200, 500, 10, 1));
+        assert_eq!(liq(&cache), 1_000_500);
+        // Out of range (upper exclusive / below): unchanged.
+        apply(&cache, &mint(0, 100, 7, 10, 2));
+        apply(&cache, &mint(150, 300, 7, 10, 3));
+        assert_eq!(liq(&cache), 1_000_500);
+        // In-range Burn decreases; a repeat is a no-op.
+        apply(&cache, &burn(-50, 150, 300, 10, 4));
+        apply(&cache, &burn(-50, 150, 300, 10, 4));
+        assert_eq!(liq(&cache), 1_000_200);
+        // An older log (already covered by newer state) is skipped.
+        apply(&cache, &mint(-50, 150, 999, 9, 0));
+        assert_eq!(liq(&cache), 1_000_200);
+    }
+
+    #[test]
+    fn v3_swap_sets_tick_used_by_mint() {
+        let cache = cache_with_v3_pool();
+        let swap = Swap {
+            sender: Address::ZERO, recipient: Address::ZERO,
+            amount0: alloy::primitives::I256::ZERO, amount1: alloy::primitives::I256::ZERO,
+            sqrtPriceX96: alloy::primitives::aliases::U160::from(1u64) << 96,
+            liquidity: 2_000_000, tick: i24(-500),
+        }.encode_log_data();
+        assert!(apply(&cache, &at(swap, 10, 0)).is_some());
+        assert_eq!(liq(&cache), 2_000_000);
+        // The old range [100, 200) no longer holds the tick; [-600, -400) does.
+        apply(&cache, &mint(100, 200, 5, 10, 1));
+        assert_eq!(liq(&cache), 2_000_000);
+        apply(&cache, &mint(-600, -400, 5, 10, 2));
+        assert_eq!(liq(&cache), 2_000_005);
     }
 
     #[test]
