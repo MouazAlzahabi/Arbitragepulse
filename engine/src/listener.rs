@@ -139,7 +139,10 @@ pub fn apply_log_to_cache(
     if topic0 == IUniswapV3Pool::Mint::SIGNATURE_HASH {
         if !repeat {
             let d = IUniswapV3Pool::Mint::decode_log(log.as_ref()).ok()?;
-            cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, true);
+            if cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, true) {
+                debug!("V3 Mint in range | pool={} | amount={} | liquidity={}", pool, d.amount,
+                       cache.v3_by_address.get(&pool).map(|e| e.liquidity).unwrap_or(0));
+            }
         }
         return None;
     }
@@ -147,7 +150,10 @@ pub fn apply_log_to_cache(
     if topic0 == IUniswapV3Pool::Burn::SIGNATURE_HASH {
         if !repeat {
             let d = IUniswapV3Pool::Burn::decode_log(log.as_ref()).ok()?;
-            cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, false);
+            if cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, false) {
+                debug!("V3 Burn in range | pool={} | amount={} | liquidity={}", pool, d.amount,
+                       cache.v3_by_address.get(&pool).map(|e| e.liquidity).unwrap_or(0));
+            }
         }
         return None;
     }
