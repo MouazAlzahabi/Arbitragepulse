@@ -10,12 +10,14 @@ use super::*;
 ///   2. factory.getPair() per (router × pair)
 ///   3. pair.token0() + pair.getReserves() per discovered pool
 ///      (+ factory.getFee(pool, stable) per Aerodrome pool — its fee can differ per pool)
+///
+/// Returns how many discovery calls were lost to RPC failure after retries (0 = complete).
 pub(crate) async fn discover_pools<P: Provider>(
     routers: &[RouterConfig],
     pairs: &[PairConfig],
     provider: &P,
     pool_cache: &PoolCache,
-) {
+) -> usize {
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
 
@@ -34,7 +36,7 @@ pub(crate) async fn discover_pools<P: Provider>(
         })
         .collect();
 
-    if target_routers.is_empty() { return; }
+    if target_routers.is_empty() { return 0; }
 
     // ── Round 1: factory address per router ───────────────────────────────────
     // Routers with factory_address in config skip the on-chain call entirely.
@@ -43,7 +45,7 @@ pub(crate) async fn discover_pools<P: Provider>(
         .filter(|r| r.configured_factory.is_none())
         .map(|r| (r.addr, IRouterWithFactory::factoryCall {}.abi_encode()))
         .collect();
-    let factory_raw = discover_mc(factory_calls, provider).await;
+    let (factory_raw, mut lost) = discover_mc(factory_calls, provider).await;
     let mut factory_raw_iter = factory_raw.into_iter();
     let factories: Vec<Option<Address>> = target_routers
         .iter()
@@ -62,7 +64,7 @@ pub(crate) async fn discover_pools<P: Provider>(
     // ── Round 2: getPair per (router × pair) ─────────────────────────────────
     // Aerodrome routers produce TWO calls per pair: volatile (stable:false) and
     // stable (stable:true). Both pools are discovered and cached independently.
-    struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, factory: Address, ta: Address, tb: Address, is_stable: bool }
+    struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, factory: Address, ta: Address, tb: Address, dec_ta: u8, dec_tb: u8, is_stable: bool }
     let mut pair_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pair_metas: Vec<PairMeta> = Vec::new();
 
@@ -71,35 +73,38 @@ pub(crate) async fn discover_pools<P: Provider>(
         for pair in pairs {
             let ta: Address = match pair.token_in.parse() { Ok(a) => a, Err(_) => continue };
             let tb: Address = match pair.token_out.parse() { Ok(a) => a, Err(_) => continue };
+            // Decimals from the pair config (what trade sizing uses too) — no decimals() round.
+            let (dec_ta, dec_tb) = (pair.token_in_decimals, pair.token_out_decimals);
             match rm.rtype {
                 RouterType::V2 => {
                     let cd = IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode();
                     pair_calls.push((factory, cd));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, factory, ta, tb, is_stable: false });
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, factory, ta, tb, dec_ta, dec_tb, is_stable: false });
                 }
                 RouterType::Aerodrome => {
                     // Aerodrome uses getPool() not getPair() — different 4-byte selector
                     let cd_vol = IAerodromeFactory::getPoolCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
                     pair_calls.push((factory, cd_vol));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, factory, ta, tb, is_stable: false });
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, factory, ta, tb, dec_ta, dec_tb, is_stable: false });
                     let cd_sta = IAerodromeFactory::getPoolCall { tokenA: ta, tokenB: tb, stable: true }.abi_encode();
                     pair_calls.push((factory, cd_sta));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, factory, ta, tb, is_stable: true });
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, factory, ta, tb, dec_ta, dec_tb, is_stable: true });
                 }
                 _ => continue,
             }
         }
     }
 
-    if pair_calls.is_empty() { return; }
-    let pair_raw = discover_mc(pair_calls, provider).await;
+    if pair_calls.is_empty() { return lost; }
+    let (pair_raw, l) = discover_mc(pair_calls, provider).await;
+    lost += l;
 
-    // ── Round 3: token0 + getReserves per pool; decimals fetched once per token ─
+    // ── Round 3: token0 + getReserves per pool (decimals come from the pair config) ─
     // The pool address from the stable=true call is a different
     // contract from stable=false, so `seen` naturally allows both.
     // rv_idx: index of this pool's token0 call in rv_calls; getReserves follows, then getFee
     // for Aerodrome pools (so the per-pool fee costs no extra round trip).
-    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool, rv_idx: usize }
+    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, dec_ta: u8, dec_tb: u8, is_stable: bool, rv_idx: usize }
     let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pool_metas: Vec<PoolMeta> = Vec::new();
     let mut seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
@@ -120,40 +125,16 @@ pub(crate) async fn discover_pools<P: Provider>(
             fee_bps: pm.fee_bps,
             ta: pm.ta,
             tb: pm.tb,
+            dec_ta: pm.dec_ta,
+            dec_tb: pm.dec_tb,
             is_stable: pm.is_stable,
             rv_idx,
         });
     }
 
-    if pool_metas.is_empty() { return; }
-    let rv_raw = discover_mc(rv_calls, provider).await;
-
-    // Decimals once per unique token (USDC/WETH shared across many pools).
-    let mut unique_tokens: Vec<Address> = Vec::new();
-    let mut token_seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
-    for pm in &pool_metas {
-        for token in [pm.ta, pm.tb] {
-            if token_seen.insert(token) {
-                unique_tokens.push(token);
-            }
-        }
-    }
-    let dec_calls: Vec<(Address, Vec<u8>)> = unique_tokens
-        .iter()
-        .map(|t| (*t, IERC20::decimalsCall {}.abi_encode()))
-        .collect();
-    let dec_raw = discover_mc(dec_calls, provider).await;
-    let decimals_by_token: std::collections::HashMap<Address, u8> = unique_tokens
-        .into_iter()
-        .zip(dec_raw.into_iter())
-        .map(|(token, raw_opt)| {
-            let dec = raw_opt
-                .as_ref()
-                .and_then(|r| IERC20::decimalsCall::abi_decode_returns(r).ok())
-                .unwrap_or(18);
-            (token, dec)
-        })
-        .collect();
+    if pool_metas.is_empty() { return lost; }
+    let (rv_raw, l) = discover_mc(rv_calls, provider).await;
+    lost += l;
 
     // ── Insert into pool_cache ────────────────────────────────────────────────
     for pm in pool_metas.iter() {
@@ -164,8 +145,6 @@ pub(crate) async fn discover_pools<P: Provider>(
         } else {
             pm.fee_bps
         };
-        let dec_ta = decimals_by_token.get(&pm.ta).copied().unwrap_or(18);
-        let dec_tb = decimals_by_token.get(&pm.tb).copied().unwrap_or(18);
 
         let token0   = match IUniswapV2Pair::token0Call::abi_decode_returns(t0_raw).ok()    { Some(t) => t, None => continue };
         let reserves = match IUniswapV2Pair::getReservesCall::abi_decode_returns(res_raw).ok() { Some(r) => r, None => continue };
@@ -174,7 +153,7 @@ pub(crate) async fn discover_pools<P: Provider>(
         let token1 = if pm.ta == token0 { pm.tb } else { pm.ta };
 
         // Map ta/tb decimals to token0/token1 order
-        let (decimals0, decimals1) = if pm.ta == token0 { (dec_ta, dec_tb) } else { (dec_tb, dec_ta) };
+        let (decimals0, decimals1) = if pm.ta == token0 { (pm.dec_ta, pm.dec_tb) } else { (pm.dec_tb, pm.dec_ta) };
 
         // Key suffix: Aerodrome volatile → "::volatile", stable → "::stable", V2 → unchanged
         let effective_id = match pm.rtype {
@@ -203,6 +182,7 @@ pub(crate) async fn discover_pools<P: Provider>(
             fee_num: U256::ZERO, // overwritten by PoolCache::insert()
         });
     }
+    lost
 }
 
 /// Per-pool Aerodrome fee from a factory.getFee(pool, stable) return, else the configured
@@ -235,12 +215,14 @@ fn decode_addr(raw: &[u8]) -> Option<Address> {
 /// Two multicall rounds:
 ///   1. factory.getPool(A, B, fee)  per (V3 router × pair × fee_tier)
 ///   2. pool.slot0() + pool.liquidity() per discovered pool
+///
+/// Returns how many discovery calls were lost to RPC failure after retries (0 = complete).
 pub(crate) async fn discover_v3_pools<P: Provider>(
     routers: &[RouterConfig],
     pairs: &[PairConfig],
     provider: &P,
     pool_cache: &PoolCache,
-) {
+) -> usize {
     use alloy::primitives::U256;
     use alloy::sol_types::SolCall;
     use std::collections::HashSet;
@@ -259,7 +241,7 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
         .collect();
 
     if v3_routers.is_empty() {
-        return;
+        return 0;
     }
 
     // ── Round 1: getPool(A, B, fee) per (router × pair × fee_tier) ───────────
@@ -285,9 +267,9 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     }
 
     if pool_calls.is_empty() {
-        return;
+        return 0;
     }
-    let pool_raw = discover_mc(pool_calls, provider).await;
+    let (pool_raw, mut lost) = discover_mc(pool_calls, provider).await;
 
     // A factory whose every getPool(A, B, uint24 fee) call fails gets no pools, so its
     // router is silently inactive — say so once at startup. A failure is None whether the
@@ -345,9 +327,10 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     }
 
     if state_queries.is_empty() {
-        return;
+        return lost;
     }
-    let state_raw = discover_mc(state_calls, provider).await;
+    let (state_raw, l) = discover_mc(state_calls, provider).await;
+    lost += l;
 
     // ── Insert into pool_cache ────────────────────────────────────────────────
     // Also need token0 to know direction. We derive it: token0 = min(ta, tb) by address.
@@ -390,6 +373,7 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
             fee_num_v3: U256::ZERO,
         });
     }
+    lost
 }
 
 // ─── Chunked multicall for pool discovery ─────────────────────────────────────
@@ -406,15 +390,21 @@ fn discover_chunk() -> usize { crate::config::tuning().discover_chunk_size }
 /// batches are bigger and a cold node may need to load state first.
 fn discover_call_timeout() -> std::time::Duration { crate::config::tuning().discover_call_timeout() }
 
+/// Attempts per multicall chunk when the RPC fails (error or timeout). A sub-call that
+/// reverts inside a successful multicall (pool doesn't exist) is an answer, not retried.
+const DISCOVER_ATTEMPTS: u32 = 3;
+
+/// Returns one result per call (None = reverted or lost) and how many calls were lost to RPC
+/// failure after retries — the caller warns, since those pools are then silently missing.
 pub(crate) async fn discover_mc<P: Provider>(
     calls: Vec<(Address, Vec<u8>)>,
     provider: &P,
-) -> Vec<Option<Vec<u8>>> {
+) -> (Vec<Option<Vec<u8>>>, usize) {
     use alloy::rpc::types::TransactionRequest;
     use alloy::sol_types::SolCall;
 
     if calls.is_empty() {
-        return vec![];
+        return (vec![], 0);
     }
 
     let mc3: Address = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -422,6 +412,10 @@ pub(crate) async fn discover_mc<P: Provider>(
         .expect("hardcoded Multicall3");
 
     let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
+    let mut rpc_failed = 0usize;
+    // Once a chunk has exhausted its retries the RPC is likely down: later chunks get one
+    // attempt each, so a dead RPC can't stretch startup to chunks × attempts × timeout.
+    let mut attempts = DISCOVER_ATTEMPTS;
 
     for chunk in calls.chunks(discover_chunk()) {
         let mc_calls: Vec<crate::abi::IMulticall3::Call3> = chunk
@@ -435,16 +429,33 @@ pub(crate) async fn discover_mc<P: Provider>(
         let calldata = crate::abi::IMulticall3::aggregate3Call { calls: mc_calls }.abi_encode();
         let tx = TransactionRequest::default().to(mc3).input(calldata.into());
 
-        // Bounded: a hung RPC otherwise blocks startup forever (seen on a cold fork).
-        let Ok(call_result) = tokio::time::timeout(discover_call_timeout(), provider.call(tx)).await else {
-            // Timed out: the RPC is stuck, so skip the sequential fallback (more calls would
-            // only stall longer) and count the chunk as failed — discovery warns per router.
-            tracing::warn!("Pool discovery multicall timed out after {:?} — {} call(s) counted as failed",
-                           discover_call_timeout(), chunk.len());
+        // Some(raw): answered. None after the loop: every attempt hit a transport error or
+        // timeout. An error *response* (node rejected the multicall) skips the retries and
+        // goes to the sequential fallback below.
+        let mut answered: Option<Result<alloy::primitives::Bytes, ()>> = None;
+        for attempt in 1..=attempts {
+            // Bounded: a hung RPC otherwise blocks startup forever (seen on a cold fork).
+            match tokio::time::timeout(discover_call_timeout(), provider.call(tx.clone())).await {
+                Ok(Ok(raw)) => { answered = Some(Ok(raw)); break; }
+                Ok(Err(alloy::transports::RpcError::ErrorResp(_))) => { answered = Some(Err(())); break; }
+                Ok(Err(e)) => tracing::warn!("Pool discovery multicall failed (attempt {attempt}/{attempts}): {e}"),
+                Err(_) => tracing::warn!("Pool discovery multicall timed out after {:?} (attempt {attempt}/{attempts})",
+                                         discover_call_timeout()),
+            }
+            if attempt < attempts {
+                tokio::time::sleep(std::time::Duration::from_millis(250 * 3u64.pow(attempt - 1))).await;
+            }
+        }
+        let Some(answered) = answered else {
+            // RPC stuck/failing: skip the sequential fallback (more calls would only stall
+            // longer) and count the chunk as failed.
+            tracing::warn!("Pool discovery: {} call(s) lost to RPC failure", chunk.len());
             results.extend(std::iter::repeat_n(None, chunk.len()));
+            rpc_failed += chunk.len();
+            attempts = 1;
             continue;
         };
-        if let Ok(raw) = call_result {
+        if let Ok(raw) = answered {
             if let Ok(ret) = crate::abi::IMulticall3::aggregate3Call::abi_decode_returns(&raw) {
                 results.extend(
                     ret.into_iter()
@@ -453,17 +464,21 @@ pub(crate) async fn discover_mc<P: Provider>(
                 continue;
             }
         }
-        // Fallback: sequential calls for this chunk
+        // Fallback: sequential calls for this chunk. An error response is a revert (no pool);
+        // a transport error or timeout is a lost call.
         for (target, data) in chunk {
             let tx2 = TransactionRequest::default()
                 .to(*target)
                 .input(data.clone().into());
-            let r = tokio::time::timeout(crate::util::rpc_read_timeout(), provider.call(tx2)).await;
-            results.push(r.ok().and_then(|r| r.ok()).map(|b| b.to_vec()));
+            match tokio::time::timeout(crate::util::rpc_read_timeout(), provider.call(tx2)).await {
+                Ok(Ok(b)) => results.push(Some(b.to_vec())),
+                Ok(Err(alloy::transports::RpcError::ErrorResp(_))) => results.push(None),
+                _ => { results.push(None); rpc_failed += 1; }
+            }
         }
     }
 
-    results
+    (results, rpc_failed)
 }
 
 #[cfg(test)]

@@ -146,13 +146,24 @@ pub async fn run_chain(
     // Eliminates per-block eth_calls for xy=k routers — reserves stay fresh via
     // on-chain Sync events (listener.rs subscribes and updates the cache live).
     let pool_cache = Arc::new(PoolCache::new());
-    discover::discover_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
+    let lost_v2 = discover::discover_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
     info!("[{}] Pool cache: {} V2/Aerodrome pools discovered", cfg.name, pool_cache.by_address.len());
 
     // ── V3 pool discovery: seed sqrtPriceX96 + liquidity from slot0() ─────────
     // Subscribes to V3 Swap events after startup to keep state fresh with zero RPC cost.
-    discover::discover_v3_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
+    let lost_v3 = discover::discover_v3_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
     info!("[{}] V3 pool cache: {} pools seeded", cfg.name, pool_cache.v3_by_address.len());
+    // Discovery calls lost to RPC failure (after retries) leave pools silently untracked
+    // until the next restart — say so where the operator looks, but keep running.
+    if lost_v2 + lost_v3 > 0 {
+        let msg = format!(
+            "[{}] Pool discovery INCOMPLETE: {} call(s) lost to RPC failure after retries \
+             ({} V2/Aerodrome + {} V3 pools tracked). Missing pools are not watched until a \
+             restart — check RPC health and restart the engine.",
+            cfg.name, lost_v2 + lost_v3, pool_cache.by_address.len(), pool_cache.v3_by_address.len());
+        warn!("{}", msg);
+        broadcast_log(&log_tx, "warn", &msg, None);
+    }
 
     // Dedicated HTTP provider for QuoterV2 reads — HTTP/2 connection pooling is
     // faster than WS for single request-response calls (~20-40ms improvement).
