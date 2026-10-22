@@ -599,7 +599,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                                 let submit_at = Instant::now();
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
-                                let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
+                                let tip_w = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 info!(
                                     "[{}] exec_send | route=2hop | scan_to_submit_ms={} | detect_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
                                     cfg.name, scan_to_submit_ms, detect_ms, exec_ms, elapsed_send, trigger, tip_w,
@@ -642,7 +642,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let contract_balances_bg = prep.contract_balances.clone();
                                 let detected_profit_bg = prep.profit_usd;
                                 let trigger_bg = trigger;
-                                let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
+                                let tip_bg = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 let exec_start_bg = exec_start;
                                 let send_rpc_bg = elapsed_send;
                                 let scan_to_submit_bg = scan_to_submit_ms;
@@ -1059,7 +1059,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
                                 let submit_at = Instant::now();
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
-                                let tip_w = tip_override.unwrap_or(cfg.priority_fee_wei);
+                                let tip_w = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 info!(
                                     "[{}] exec_send | route=triangular | scan_to_submit_ms={} | detect_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
                                     cfg.name, scan_to_submit_ms, detect_ms, exec_ms, elapsed_send, trigger, tip_w,
@@ -1104,7 +1104,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let contract_balances_bg = prep.contract_balances.clone();
                                 let detected_profit_bg = prep.profit_usd;
                                 let trigger_bg = trigger;
-                                let tip_bg = tip_override.unwrap_or(cfg.priority_fee_wei);
+                                let tip_bg = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 let exec_start_bg = exec_start;
                                 let send_rpc_bg = elapsed_send;
                                 let scan_to_submit_bg = scan_to_submit_ms;
