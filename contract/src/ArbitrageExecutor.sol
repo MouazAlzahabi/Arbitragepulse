@@ -32,6 +32,23 @@ interface ISwapRouterV3 {
         external payable returns (uint256 amountOut);
 }
 
+/// @dev Aerodrome Slipstream (concentrated liquidity) — pools are keyed by int24 tickSpacing
+///      instead of a fee tier, and the struct carries a deadline (8 fields).
+interface ISlipstreamRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        int24 tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external payable returns (uint256 amountOut);
+}
+
 /// @dev Aerodrome V2 (Base) — 4-field Route; factory=address(0) → router's default factory.
 interface IAerodromeRouter {
     struct Route {
@@ -74,9 +91,9 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     // ─── Router Types ─────────────────────────────────────────
     /// @dev Ordinals are part of the off-chain interface (setRouter takes a uint8):
-    ///      0 = V2, 1 = V3, 4 = Aerodrome. 2 and 3 (Solidly v1, SyncSwap) are retired —
-    ///      no Base deployment — and rejected; they keep their slots so 4 stays Aerodrome.
-    enum RouterType { V2, V3, RetiredSolidly, RetiredSyncSwap, Aerodrome }
+    ///      0 = V2, 1 = V3, 4 = Aerodrome, 5 = Slipstream. 2 and 3 (Solidly v1, SyncSwap) are
+    ///      retired — no Base deployment — and rejected; they keep their slots so 4 stays Aerodrome.
+    enum RouterType { V2, V3, RetiredSolidly, RetiredSyncSwap, Aerodrome, Slipstream }
 
     // ─── State ────────────────────────────────────────────────
 
@@ -139,6 +156,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice A V3 leg's fee is not a pool fee tier (hundredths of a bip, 100..999999 —
     ///         e.g. 30 passed as bps instead of 3000).
     error InvalidV3Fee(uint8 leg, address router, uint24 fee);
+    /// @notice A Slipstream leg's `fee` (its tick spacing) is 0 or above the int24 tick range.
+    error InvalidTickSpacing(uint8 leg, address router, uint24 tickSpacing);
     /// @notice A router call reverted. `reason` is the router's own revert data.
     error LegFailed(uint8 leg, address router, RouterType rtype, bytes reason);
     /// @notice A leg succeeded but the contract received none of its output token.
@@ -166,8 +185,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     // ─── Router configuration ─────────────────────────────────
 
-    /// @notice Allow a router with its type: 0 = V2, 1 = V3 (SwapRouter02), 4 = Aerodrome
-    ///         (2 and 3 are retired). The only way to allow a router, so none is ever
+    /// @notice Allow a router with its type: 0 = V2, 1 = V3 (SwapRouter02), 4 = Aerodrome,
+    ///         5 = Aerodrome Slipstream (2 and 3 are retired). The only way to allow a router, so none is ever
     ///         allowed with a forgotten type. Call again to change the type.
     function setRouter(address router, RouterType rtype) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
@@ -186,7 +205,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     function _isSupported(RouterType rtype) internal pure returns (bool) {
-        return rtype == RouterType.V2 || rtype == RouterType.V3 || rtype == RouterType.Aerodrome;
+        return rtype == RouterType.V2 || rtype == RouterType.V3 || rtype == RouterType.Aerodrome
+            || rtype == RouterType.Slipstream;
     }
 
     // ─── Receive ETH ──────────────────────────────────────────
@@ -324,6 +344,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         // Range check, not a tier list: tiers differ per DEX (Pancake 2500) and can be
         // added by governance; this catches 0 and bps-style values like 30.
         if (rtype == RouterType.V3 && (fee < 100 || fee >= 1_000_000)) revert InvalidV3Fee(leg, router, fee);
+        // Slipstream: `fee` carries the pool's tick spacing (1, 50, 100, 200, 2000, …).
+        if (rtype == RouterType.Slipstream && (fee == 0 || fee > 16_384)) revert InvalidTickSpacing(leg, router, fee);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
         IERC20(tokenIn).forceApprove(router, amountIn);
@@ -338,6 +360,17 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
                 tokenOut: tokenOut,
                 fee: fee,
                 recipient: address(this),
+                amountIn: amountIn,
+                amountOutMinimum: 0,
+                sqrtPriceLimitX96: 0
+            })));
+        } else if (rtype == RouterType.Slipstream) {
+            data = abi.encodeCall(ISlipstreamRouter.exactInputSingle, (ISlipstreamRouter.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                tickSpacing: int24(uint24(fee)),
+                recipient: address(this),
+                deadline: deadline,
                 amountIn: amountIn,
                 amountOutMinimum: 0,
                 sqrtPriceLimitX96: 0

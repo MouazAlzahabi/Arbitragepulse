@@ -21,6 +21,7 @@ Each router must be whitelisted with a type. Ordinals are part of the engine int
 | V3 | 1 | SwapRouter02 7-field `exactInputSingle` (Uniswap V3, PancakeSwap V3) | pool fee tier in hundredths of a bip, 100..999999 (e.g. 500 / 3000) — not bps |
 | — | 2, 3 | retired (Solidly 3-field, SyncSwap) — rejected | |
 | Aerodrome | 4 | 4-field `Route{from,to,stable,factory}` | `0` volatile pool, non-zero stable pool |
+| Slipstream | 5 | Aerodrome Slipstream 8-field `exactInputSingle` (`int24 tickSpacing`, deadline) | the pool's tick spacing, 1..16384 (1, 10, 50, 100, 200, 2000) — not a fee |
 
 ```bash
 cast send $EXECUTOR "setRouter(address,uint8)" $ROUTER $TYPE --private-key $PRIVATE_KEY --rpc-url $RPC
@@ -47,6 +48,7 @@ the capital exactly like a router-level minimum.
 | `InsufficientBalance(token, balance, needed)` | the contract does not hold `amountIn` of the start token |
 | `NoOutput(leg, router)` | a router returned without paying anything out (or the output balance shrank) |
 | `InvalidV3Fee(leg, router, fee)` | V3 fee outside 100..999999 — 0, or a bps value like 30 instead of 3000 |
+| `InvalidTickSpacing(leg, router, tickSpacing)` | Slipstream leg's `fee` (tick spacing) is 0 or above 16384 |
 | `RouterNotAllowed(router)` / `UnsupportedRouterType(router, rtype)` | not whitelisted / retired type |
 | `InvalidPath()` | repeated token in the route |
 | `DeadlineExpired(deadline, now)`, `ZeroAmount()`, `ZeroAddress()` | input checks |
@@ -108,7 +110,7 @@ The Rust lab (`cargo run -p lab -- setup`) deploys from the compiled artifact
 ```
 src/
   ArbitrageExecutor.sol      main contract
-  mocks/                     MockERC20, MockRouter (V2), MockV3Router, MockAerodromeRouter,
+  mocks/                     MockERC20, MockRouter (V2), MockV3Router, MockSlipstreamRouter, MockAerodromeRouter,
                              MockOddTokens (odd tokens and misbehaving routers: fee-on-transfer, approve
                              quirks, slashing, lying/no-op/silent/partial/gas-burning routers)
 script/

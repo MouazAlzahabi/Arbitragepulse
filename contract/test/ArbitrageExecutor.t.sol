@@ -6,6 +6,7 @@ import "../src/ArbitrageExecutor.sol";
 import "../src/mocks/MockERC20.sol";
 import "../src/mocks/MockRouter.sol";
 import "../src/mocks/MockV3Router.sol";
+import "../src/mocks/MockSlipstreamRouter.sol";
 import "../src/mocks/MockAerodromeRouter.sol";
 import "../src/mocks/MockOddTokens.sol";
 
@@ -764,6 +765,56 @@ contract ArbitrageExecutorTest is Test {
         assertEq(p, 20 ether);
         assertEq(n, 1);
         assertEq(bal, 1_020 ether);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Aerodrome Slipstream (type 5): `fee` carries the tick spacing
+    // ════════════════════════════════════════════════════════════
+
+    function _slip(uint256 num, uint256 den) internal returns (MockSlipstreamRouter r) {
+        r = new MockSlipstreamRouter(num, den);
+        _fund(address(r));
+        executor.setRouter(address(r), ArbitrageExecutor.RouterType.Slipstream);
+    }
+
+    function test_Slipstream_TwoHopAgainstV3_PassesTickSpacingAndDeadline() public {
+        MockSlipstreamRouter slip = _slip(2, 1);
+        uint256 before = tokenA.balanceOf(address(executor));
+        // 100 A → 200 B on Slipstream (tick spacing 100) → 120 A on V3
+        _arb(address(slip), address(v3B), 100, FEE, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
+        assertEq(slip.lastTickSpacing(), int24(100), "tick spacing reaches the router");
+        assertEq(slip.lastDeadline(), deadline, "deadline reaches the router");
+    }
+
+    function test_Slipstream_TriangularLeg() public {
+        MockSlipstreamRouter slip = _slip(1, 1);
+        uint256 before = tokenA.balanceOf(address(executor));
+        // 100 A → 200 B (v3A) → 200 C (Slipstream, tick spacing 1) → 120 A (v3B)
+        _tri(address(v3A), address(slip), address(v3B), FEE, 1, FEE, 1 ether);
+        assertEq(tokenA.balanceOf(address(executor)), before + 20 ether);
+        assertEq(slip.lastTickSpacing(), int24(1));
+    }
+
+    function test_Slipstream_TickSpacingZeroOrTooLarge_IsRejected() public {
+        MockSlipstreamRouter slip = _slip(2, 1);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.InvalidTickSpacing.selector, uint8(1), address(slip), uint24(0)));
+        _arb(address(slip), address(v3B), 0, FEE, 1 ether);
+        vm.expectRevert(abi.encodeWithSelector(ArbitrageExecutor.InvalidTickSpacing.selector, uint8(1), address(slip), uint24(20000)));
+        _arb(address(slip), address(v3B), 20000, FEE, 1 ether);
+    }
+
+    function test_Slipstream_LossReportsNotProfitable() public {
+        MockSlipstreamRouter slip = _slip(1, 1);
+        // 100 A → 100 B → 60 A
+        vm.expectRevert(_notProfitable(960 ether, 1 ether));
+        _arb(address(slip), address(v3B), 100, FEE, 1 ether);
+    }
+
+    function test_Slipstream_IsAnAllowedType() public {
+        MockSlipstreamRouter slip = _slip(1, 1);
+        assertTrue(executor.allowedRouters(address(slip)));
+        assertEq(uint8(executor.routerType(address(slip))), 5);
     }
 
     receive() external payable {}
