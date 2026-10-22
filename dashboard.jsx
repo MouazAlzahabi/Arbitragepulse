@@ -1269,6 +1269,8 @@ export default function Dashboard() {
   const handleConnect = (engineUrl) => {
     claimLogsFor(engineUrl);
     setStatsAuthFailed(false); setLoggedOut(false); setAuthenticated(true);
+    // Retry the socket now: same URL + key re-runs no effect, so authError would stick.
+    ws.reconnect();
   };
   const handleLogout = () => {
     setLoggedOut(true); setStatsAuthFailed(false); setAuthenticated(false);
