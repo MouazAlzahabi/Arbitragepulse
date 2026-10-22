@@ -724,6 +724,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                // Pause first: race analysis costs several RPC round-trips, and other pairs
+                                                // would keep sending certain-to-revert txs meanwhile.
+                                                if pause {
+                                                    pause_chain_for_revert(&shared_state_bg, chain_id_bg, &chain_name_bg, &log_tx_bg, revert_class_str.unwrap_or("unknown"), revert_detail.as_deref()).await;
+                                                }
                                                 let race = match (receipt.block_hash(), receipt.transaction_index()) {
                                                     (Some(bh), Some(idx)) => crate::race::analyze(
                                                         provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg,
@@ -760,9 +765,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "router_b_type":       rb_type_bg,
                                                     })),
                                                 );
-                                                if pause {
-                                                    pause_chain_for_revert(&shared_state_bg, chain_id_bg, &chain_name_bg, &log_tx_bg, revert_class_str.unwrap_or("unknown"), revert_detail.as_deref()).await;
-                                                }
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
@@ -1182,6 +1184,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                // Pause first: race analysis costs several RPC round-trips, and other pairs
+                                                // would keep sending certain-to-revert txs meanwhile.
+                                                if pause {
+                                                    pause_chain_for_revert(&shared_state_bg, chain_id_bg, &chain_name_bg, &log_tx_bg, revert_class_str.unwrap_or("unknown"), revert_detail.as_deref()).await;
+                                                }
                                                 let race = match (receipt.block_hash(), receipt.transaction_index()) {
                                                     (Some(bh), Some(idx)) => crate::race::analyze(
                                                         provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg,
@@ -1218,9 +1225,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "router_b_type":       rb_type_bg,
                                                     })),
                                                 );
-                                                if pause {
-                                                    pause_chain_for_revert(&shared_state_bg, chain_id_bg, &chain_name_bg, &log_tx_bg, revert_class_str.unwrap_or("unknown"), revert_detail.as_deref()).await;
-                                                }
                                             }
                                             if let Some(db) = db_bg {
                                                 let success = receipt.status();
