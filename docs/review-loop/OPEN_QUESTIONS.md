@@ -121,3 +121,14 @@ options, recommendation. Newest at the bottom.
   3. Engine: run the router-allowlist check inside `engine_dry_run` before accepting enabled:false (reject with an error the dashboard now displays). Keeps the button safe everywhere; needs an RPC call in the handler and a test.
   4. Remove the button. Simplest; loses the testnet convenience.
 - Recommendation: 3 if the button stays long-term, else 2.
+
+### [engine] Flashblocks HTTP `pending` lagging the pendingLogs feed (QuoteCache staleness)
+- Where: engine/src/strategy/mod.rs `QuoteCache` (keyed on the pool's cached sqrtP + liquidity); chain.preconf_http_rpc = https://mainnet.base.org at `pending`; scripts/preconf-lag.mjs
+- What / why unsure: Review R1-HOT-3. A scan triggered by a pre-confirmed log quotes QuoterV2 at `pending` on preconf_http_rpc. If that backend hasn't applied the flashblock yet, the quote reflects the old state but is cached under the new (sqrtP, liquidity) key and served for up to the cache age. Measured from a laptop (RTT ~130 ms): 0 lag in 297 samples, 7–8 % already "ahead". A co-located engine (RTT ~5 ms) reaches the backend ~60 ms sooner, so a short lag there can't be ruled out from here.
+- Procedure: on the production host run `node scripts/preconf-lag.mjs 120` (read-only, keyless; Node ≥ 22). It reports sync / lag / ahead counts and RTT.
+- Options + trade-offs:
+  1. Do nothing if lag = 0 there.
+  2. If lag > 0: skip `QuoteCache::insert` for scans triggered by pre-confirmed logs. Cheapest; costs ~1 extra quoter RTT on the next scan of that pool.
+  3. Precise: add slot0() to the same Multicall3 batch and key the entry by the returned state. Small extra calldata per batch.
+- Note: never point eth_getLogs at preconf_http_rpc / https://mainnet.base.org (or the preconf HTTP endpoint): they answer -32011 "request limit reached" even for 1-block ranges. eth_call / eth_blockNumber are fine. Today get_logs uses the primary provider only.
+- Recommendation: run the probe from the production host before going live; 2 if it shows lag.
