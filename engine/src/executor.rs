@@ -39,6 +39,28 @@ fn gas_limit_triangular() -> u64 { crate::config::tuning().gas_limit_triangular 
 /// check remains the economic guard.
 fn onchain_min_profit_bps() -> u64 { crate::config::tuning().onchain_min_profit_bps }
 
+/// Priority fee (wei per gas) for a trade: `base` (the fixed `chain.priority_fee_wei`, or
+/// the pending-path override), raised to `share_bps` of the expected gross profit spread
+/// over the gas limit, capped at `cap`. `share_bps == 0` → `base`. Spreading over the gas
+/// LIMIT (actual use is lower) keeps the tip paid at or under the share.
+pub(crate) fn profit_share_tip(
+    base: u128, profit_usd: f64, native_price_usd: f64, gas_limit: u64, share_bps: u64, cap: u128,
+) -> u128 {
+    if share_bps == 0 || !(profit_usd > 0.0) || !(native_price_usd > 0.0) || gas_limit == 0 {
+        return base;
+    }
+    let profit_wei = profit_usd / native_price_usd * 1e18;
+    let per_gas = profit_wei * share_bps as f64 / 10_000.0 / gas_limit as f64;
+    let dynamic = if per_gas.is_finite() { (per_gas as u128).min(cap) } else { cap };
+    base.max(dynamic)
+}
+
+/// [`profit_share_tip`] with the installed tuning.
+fn trade_tip(base: u128, profit_usd: f64, native_price_usd: f64, gas_limit: u64) -> u128 {
+    let t = crate::config::tuning();
+    profit_share_tip(base, profit_usd, native_price_usd, gas_limit, t.tip_profit_share_bps, t.tip_max_wei)
+}
+
 // ─── TxPrep ───────────────────────────────────────────────────────────────────
 
 /// Prepared transaction data returned by `prepare_2hop()` / `prepare_triangular()`
@@ -344,9 +366,12 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.gas_price_for_prepare(provider).await?;
-        // priority_fee (tip): use override from pending TX monitor when provided,
-        // otherwise use chain config value.
-        let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
+        // priority_fee (tip): pending-monitor override or the chain value, raised to the
+        // profit share when enabled. Part of gas_cost_usd, so the net-profit gate and the
+        // on-chain minProfit floor both account for it.
+        let priority_fee = trade_tip(
+            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, gas_limit_2hop(),
+        );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * gas_limit_2hop() as u128;
@@ -422,7 +447,9 @@ impl Executor {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.gas_price_for_prepare(provider).await?;
-        let priority_fee = tip_override.unwrap_or(self.priority_fee_wei);
+        let priority_fee = trade_tip(
+            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, gas_limit_triangular(),
+        );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
             let cost_wei = effective_gas_price * gas_limit_triangular() as u128;
@@ -546,7 +573,8 @@ impl Executor {
 
         // ── Gas profitability check (300k hardcoded — no eth_estimateGas) ─────
         let gas_cost_usd = {
-            let cost_wei = (gas_price + self.priority_fee_wei) * gas_limit_2hop() as u128;
+            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, gas_limit_2hop());
+            let cost_wei = (gas_price + tip) * gas_limit_2hop() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -753,7 +781,8 @@ impl Executor {
         let gas_price = self.get_gas_price(provider).await?;
 
         let gas_cost_usd = {
-            let cost_wei = (gas_price + self.priority_fee_wei) * gas_limit_triangular() as u128;
+            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, gas_limit_triangular());
+            let cost_wei = (gas_price + tip) * gas_limit_triangular() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -1075,5 +1104,29 @@ impl Executor {
                 tracing::warn!("DB write failed: {}", e);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profit_share_tip_rules() {
+        let (base, eth, limit) = (10_000_000u128, 2_500.0, 700_000u64);
+        // Off: the fixed tip.
+        assert_eq!(profit_share_tip(base, 5.0, eth, limit, 0, 2_000_000_000), base);
+        // 25% of $5 at $2500/ETH over 700k gas = 0.0005 ETH / 700k ≈ 714 285 714 wei/gas.
+        let t = profit_share_tip(base, 5.0, eth, limit, 2_500, 2_000_000_000);
+        assert!((714_285_000..=714_286_000).contains(&t), "{t}");
+        // The tip paid at the full limit is the share of the profit — never more.
+        let tip_usd = t as f64 * limit as f64 / 1e18 * eth;
+        assert!(tip_usd <= 1.25 + 1e-9 && tip_usd > 1.24, "{tip_usd}");
+        // Capped.
+        assert_eq!(profit_share_tip(base, 5.0, eth, limit, 2_500, 100_000_000), 100_000_000);
+        // Never below the fixed tip (tiny profit), and no tip from nonsense inputs.
+        assert_eq!(profit_share_tip(base, 0.0001, eth, limit, 2_500, 2_000_000_000), base);
+        assert_eq!(profit_share_tip(base, f64::NAN, eth, limit, 2_500, 2_000_000_000), base);
+        assert_eq!(profit_share_tip(base, 5.0, 0.0, limit, 2_500, 2_000_000_000), base);
     }
 }

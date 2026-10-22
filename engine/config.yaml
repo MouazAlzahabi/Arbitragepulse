@@ -297,6 +297,12 @@ tuning:
                                          #  (10000 − slack) × mul / 10000; old 200 / 6200 → 6076)
   gas_fallback_margin_bps: 2500          # last known gas price +25% if a fetch fails
   gas_fallback_max_age_ms: 120000        # …only if it is at most this old
+  # Profit-based tip (off at 0): tip per gas = max(priority_fee_wei, share × gross profit
+  # ÷ gas limit), capped at tip_max_wei. The tip is paid on reverts too, so a share raises
+  # the cost of every lost race; set it from arb_lost_race_total{cause="tip"}. The tip is
+  # counted in the gas cost, so the net-profit gate and on-chain floor still cover it.
+  tip_profit_share_bps: 0                # e.g. 1000 = up to 10% of gross profit (max 9000)
+  tip_max_wei: 2000000000                # 2 gwei per gas cap
   # ── Detection ──
   quoter_haircut_bps: 15
   p15_gate_spread: 0.00005               # local spread that triggers QuoterV2 verification

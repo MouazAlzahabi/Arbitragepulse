@@ -7,6 +7,7 @@ mod executor;
 mod listener;
 mod metrics;
 mod pool_cache;
+mod race;
 mod revert;
 mod strategy;
 mod types;

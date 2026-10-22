@@ -397,6 +397,13 @@ pub struct Tuning {
     pub gas_fallback_margin_bps: u64,
     /// Max age of the last known gas price to reuse it (ms).
     pub gas_fallback_max_age_ms: u64,
+    /// Priority fee as a share of each trade's expected gross profit (bps; 0 = off — the
+    /// fixed `chain.priority_fee_wei` is used). Inside a 200 ms flashblock txs are ordered
+    /// by priority fee, so a higher tip wins position — but it is paid even when the tx
+    /// reverts, so every lost race costs more. Tune from `arb_lost_race_total`. Max 9000.
+    pub tip_profit_share_bps: u64,
+    /// Cap on the profit-based priority fee (wei per gas).
+    pub tip_max_wei: u128,
 
     // ── Detection ──
     /// Haircut (bps) on quoted output before profit checks.
@@ -492,6 +499,8 @@ impl Default for Tuning {
             onchain_min_profit_bps: 6076, // = the former 98% slack × 62% multiplier
             gas_fallback_margin_bps: 2_500,
             gas_fallback_max_age_ms: 120_000,
+            tip_profit_share_bps: 0,
+            tip_max_wei: 2_000_000_000, // 2 gwei — ~1000× Base's typical base fee
             quoter_haircut_bps: 15,
             p15_gate_spread: 0.00005,
             min_v3_liquidity: 1_000_000_000,
@@ -574,6 +583,12 @@ impl Tuning {
         }
         if self.health_hold_max_ms < self.health_hold_base_ms {
             return Err(anyhow!("tuning.health_hold_max_ms must be >= health_hold_base_ms"));
+        }
+        if self.tip_profit_share_bps > 9_000 {
+            return Err(anyhow!("tuning.tip_profit_share_bps must be <= 9000 (a tip of the whole profit leaves nothing)"));
+        }
+        if self.tip_profit_share_bps > 0 && self.tip_max_wei == 0 {
+            return Err(anyhow!("tuning.tip_max_wei must be > 0 when tip_profit_share_bps is set"));
         }
         if self.onchain_min_profit_bps > 10_000 {
             return Err(anyhow!("tuning.onchain_min_profit_bps must be <= 10000"));

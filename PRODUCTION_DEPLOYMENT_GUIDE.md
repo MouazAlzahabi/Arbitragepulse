@@ -147,6 +147,13 @@ curl -s -H "Authorization: Bearer $API_KEY" localhost:3000/health | python3 -m j
   estimated L2 gas at the live ETH price. Gas actually paid by mined txs, including
   reverts, is `arb_gas_spent_usd_total{outcome="success"|"reverted"}` on `/metrics`
   (L2 execution gas only — the L1 data fee isn't included).
+- Each mined revert is classed in `arb_lost_race_total{cause}` and on the feed
+  (`lost_race=` plus a `race` object with the earlier txs on our pools and their tips):
+  `tip` — a tx ahead of us in the same block paid a higher tip; `ordering` — one ahead
+  paid an equal or lower tip (it reached the sequencer first); `timing` — nobody ahead in
+  our block, the price moved earlier (we were late); `unknown` — the lookup failed. Many
+  `tip` losses are the case for `tuning.tip_profit_share_bps` (off by default; the tip is
+  paid on reverts too, so raise it in small steps and watch `reverted` gas spend).
   Dry-run rows (`dry_run=1` in the trade DB, "DRY-RUN ok" in the feed) store the gross simulated profit; judge go-live by the `net=` figure in the DRY-RUN log line, which subtracts the estimated gas.
 - The dashboard (`dist/`, served by your web server or `npm run dashboard` locally,
   e.g. through an SSH tunnel to port 3000) shows the live feed, stats and backoff state.

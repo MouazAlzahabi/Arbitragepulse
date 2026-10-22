@@ -17,6 +17,8 @@ pub struct Metrics {
     pub profit_usd: GaugeVec,
     /// L2 execution gas paid by mined txs (USD), labelled by chain + outcome.
     pub gas_spent_usd: CounterVec,
+    /// Mined reverts by lost-race cause (tip / ordering / timing / unknown).
+    pub lost_races: CounterVec,
     /// 1 = RPC is reachable for this chain, 0 = down/unknown.
     pub rpc_connected: GaugeVec,
     /// Last block number seen from the block subscription, labelled by chain.
@@ -65,6 +67,12 @@ impl Metrics {
         )?;
         registry.register(Box::new(gas_spent_usd.clone()))?;
 
+        let lost_races = CounterVec::new(
+            Opts::new("arb_lost_race_total", "Mined reverts by cause: tip (outbid in the same block), ordering (same block, reached the sequencer first), timing (price moved in an earlier block), unknown"),
+            &["chain", "cause"],
+        )?;
+        registry.register(Box::new(lost_races.clone()))?;
+
         let rpc_connected = GaugeVec::new(
             Opts::new("arb_rpc_connected", "RPC health: 1=ok, 0=down"),
             &["chain"],
@@ -84,6 +92,7 @@ impl Metrics {
             reverts_on_chain,
             profit_usd,
             gas_spent_usd,
+            lost_races,
             rpc_connected,
             last_block,
             registry,

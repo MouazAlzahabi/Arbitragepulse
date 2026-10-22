@@ -588,6 +588,16 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let gas_limit_bg = prep.tx.gas.unwrap_or_default();
                                 let tx_hash_b256 = pending.tx_hash().clone();
                                 let provider_bg = provider.clone();
+                                // Lost-race telemetry inputs (read after the send returned).
+                                let race_pools_bg = {
+                                    let strat = strategy.read().await;
+                                    crate::race::route_pools(&strat.pool_cache, &[
+                                        (&optimized.router_a_id, optimized.router_a_type, optimized.fee_a, optimized.token_in, optimized.token_out),
+                                        (&optimized.router_b_id, optimized.router_b_type, optimized.fee_b, optimized.token_out, optimized.token_in),
+                                    ])
+                                };
+                                let our_tip_bg = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
+                                let our_sender_bg = prep.tx.from.unwrap_or_default();
                                 let ra_type_bg = crate::revert::router_type_label(&optimized.router_a_type);
                                 let rb_type_bg = crate::revert::router_type_label(&optimized.router_b_type);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -710,16 +720,25 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                let race = match (receipt.block_hash(), receipt.transaction_index()) {
+                                                    (Some(bh), Some(idx)) => crate::race::analyze(
+                                                        provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg,
+                                                    ).await,
+                                                    _ => None,
+                                                };
+                                                let race_cause = race.as_ref().map(|r| r.cause).unwrap_or("unknown");
+                                                metrics_bg.lost_races.with_label_values(&[&chain_name_bg, race_cause]).inc();
                                                 broadcast_log(
                                                     &log_tx_bg,
                                                     "warn",
                                                     &format!(
-                                                        "[{}] tx reverted on-chain | revert_class={} | pair={} | profit=${:.4} | scan_to_submit_ms={} | tx={}",
+                                                        "[{}] tx reverted on-chain | revert_class={} | pair={} | profit=${:.4} | scan_to_submit_ms={} | lost_race={} | tx={}",
                                                         chain_name_bg,
                                                         revert_class_str.unwrap_or("unknown"),
                                                         opp_id_bg,
                                                         profit_bg,
                                                         scan_to_submit_bg,
+                                                        race_cause,
                                                         tx_hash_bg,
                                                     ),
                                                     Some(serde_json::json!({
@@ -731,6 +750,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "success":             false,
                                                         "revert_class":        revert_class_str,
                                                         "revert_detail":       revert_detail.clone(),
+                                                        "race":                race,
                                                         "scan_to_submit_ms":   scan_to_submit_bg,
                                                         "router_a_type":       ra_type_bg,
                                                         "router_b_type":       rb_type_bg,
@@ -1025,6 +1045,17 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let gas_limit_bg = prep.tx.gas.unwrap_or_default();
                                 let tx_hash_b256 = pending.tx_hash().clone();
                                 let provider_bg = provider.clone();
+                                // Lost-race telemetry inputs (read after the send returned).
+                                let race_pools_bg = {
+                                    let strat = strategy.read().await;
+                                    crate::race::route_pools(&strat.pool_cache, &[
+                                        (&opp.router_ab_id, opp.router_ab_type, opp.fee_ab, opp.token_a, opp.token_b),
+                                        (&opp.router_bc_id, opp.router_bc_type, opp.fee_bc, opp.token_b, opp.token_c),
+                                        (&opp.router_ca_id, opp.router_ca_type, opp.fee_ca, opp.token_c, opp.token_a),
+                                    ])
+                                };
+                                let our_tip_bg = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
+                                let our_sender_bg = prep.tx.from.unwrap_or_default();
                                 let ra_type_bg = crate::revert::router_type_label(&opp.router_ab_type);
                                 let rb_type_bg = crate::revert::router_type_label(&opp.router_ca_type);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -1147,16 +1178,25 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                             } else {
                                                 confirmed_failed_bg.fetch_add(1, Ordering::Relaxed);
+                                                let race = match (receipt.block_hash(), receipt.transaction_index()) {
+                                                    (Some(bh), Some(idx)) => crate::race::analyze(
+                                                        provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg,
+                                                    ).await,
+                                                    _ => None,
+                                                };
+                                                let race_cause = race.as_ref().map(|r| r.cause).unwrap_or("unknown");
+                                                metrics_bg.lost_races.with_label_values(&[&chain_name_bg, race_cause]).inc();
                                                 broadcast_log(
                                                     &log_tx_bg,
                                                     "warn",
                                                     &format!(
-                                                        "[{}] triangular tx reverted on-chain | revert_class={} | pair={} | profit=${:.4} | scan_to_submit_ms={} | tx={}",
+                                                        "[{}] triangular tx reverted on-chain | revert_class={} | pair={} | profit=${:.4} | scan_to_submit_ms={} | lost_race={} | tx={}",
                                                         chain_name_bg,
                                                         revert_class_str.unwrap_or("unknown"),
                                                         opp_id_bg,
                                                         profit_bg,
                                                         scan_to_submit_bg,
+                                                        race_cause,
                                                         tx_hash_bg,
                                                     ),
                                                     Some(serde_json::json!({
@@ -1168,6 +1208,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                         "success":             false,
                                                         "revert_class":        revert_class_str,
                                                         "revert_detail":       revert_detail.clone(),
+                                                        "race":                race,
                                                         "scan_to_submit_ms":   scan_to_submit_bg,
                                                         "router_a_type":       ra_type_bg,
                                                         "router_b_type":       rb_type_bg,
