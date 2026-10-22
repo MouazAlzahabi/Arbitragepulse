@@ -348,19 +348,8 @@ pub async fn run_chain(
         };
         spawn_log_subscription((*provider).clone(), log_filter.clone(), feed.clone(), None, None);
         if let Some(url) = cfg.preconf_ws_rpc.clone() {
-            let shown = crate::util::redact_url(&url);
-            match ProviderBuilder::new()
-                .connect_ws(WsConnect::new(url).with_max_retries(u32::MAX))
-                .await
-            {
-                Ok(preconf) => {
-                    info!("[{}] Flashblocks pre-confirmed logs: subscribing on {}", cfg.name, shown);
-                    spawn_log_subscription(preconf, log_filter, feed, Some("pendingLogs"), Some(preconf_logs.clone()));
-                }
-                // Detection still works on sealed blocks — just ~1.2 s later.
-                Err(e) => warn!("[{}] Flashblocks endpoint {} unreachable ({}) — sealed-block logs only",
-                                cfg.name, shown, e),
-            }
+            // Connected in the background: an optional feed must never hold up startup.
+            spawn_preconf_subscription(url, log_filter, feed, preconf_logs.clone());
         }
     }
 
@@ -970,51 +959,97 @@ fn spawn_log_subscription<P: Provider + Clone + 'static>(
     method: Option<&'static str>,
     counter: Option<Arc<AtomicU64>>,
 ) {
+    tokio::spawn(run_log_subscription(provider, filter, feed, method, counter));
+}
+
+/// Bound on one WebSocket handshake. alloy's `connect_ws` has none, so a stalled
+/// endpoint (accepts TCP, never answers) would otherwise hang the caller forever.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Flashblocks `pendingLogs` feed: connect to `url` in a background task, retrying
+/// with backoff (each attempt bounded by [`WS_CONNECT_TIMEOUT`]), then run the
+/// subscription. Until it connects, detection runs on sealed-block logs (~1.2 s later).
+fn spawn_preconf_subscription(
+    url: String,
+    filter: alloy::rpc::types::Filter,
+    feed: LogFeed,
+    counter: Arc<AtomicU64>,
+) {
     tokio::spawn(async move {
-        let label = method.unwrap_or("logs");
+        let shown = crate::util::redact_url(&url);
         let mut backoff = Duration::from_secs(1);
-        let mut last_err = String::new();
-        loop {
-            let sub = match method {
-                None => provider.subscribe_logs(&filter).await,
-                Some(m) => provider.subscribe::<_, alloy::rpc::types::Log>((m, filter.clone())).await,
-            };
-            match sub {
-                Ok(sub) => {
-                    backoff = Duration::from_secs(1);
-                    last_err.clear();
-                    let mut stream = sub.into_stream();
-                    while let Some(log) = stream.next().await {
-                        if let Some(c) = &counter {
-                            c.fetch_add(1, Ordering::Relaxed);
-                        }
-                        if let Some(magnitude) = crate::listener::apply_log_to_cache(
-                            &log, &feed.cache, feed.solidly_sync_hash, feed.large_swap_bps, feed.large_v3_bps,
-                        ) {
-                            let _ = feed.swap_tx.try_send(SwapEvent {
-                                chain_id: feed.chain_id,
-                                pool: log.address(),
-                                block_number: log.block_number.unwrap_or(0),
-                                magnitude,
-                            });
-                        }
-                    }
-                    debug!("[{}] {} subscription ended, reconnecting...", feed.chain_name, label);
-                }
+        let mut warned = false;
+        let preconf = loop {
+            let conn = ProviderBuilder::new()
+                .connect_ws(WsConnect::new(url.clone()).with_max_retries(u32::MAX));
+            match rpc_timeout(WS_CONNECT_TIMEOUT, conn).await {
+                Ok(p) => break p,
                 Err(e) => {
-                    // Once per distinct error: an endpoint without the method would
-                    // otherwise log every backoff step.
-                    let msg = e.to_string();
-                    if msg != last_err {
-                        warn!("[{}] {} subscription failed: {} — retrying with backoff", feed.chain_name, label, msg);
-                        last_err = msg;
+                    if !warned {
+                        warn!("[{}] Flashblocks endpoint {} unreachable ({}) — sealed-block logs only, retrying in background",
+                              feed.chain_name, shown, e);
+                        warned = true;
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
                 }
             }
-        }
+        };
+        info!("[{}] Flashblocks pre-confirmed logs: subscribing on {}", feed.chain_name, shown);
+        run_log_subscription(preconf, filter, feed, Some("pendingLogs"), Some(counter)).await;
     });
+}
+
+async fn run_log_subscription<P: Provider + Clone + 'static>(
+    provider: P,
+    filter: alloy::rpc::types::Filter,
+    feed: LogFeed,
+    method: Option<&'static str>,
+    counter: Option<Arc<AtomicU64>>,
+) {
+    let label = method.unwrap_or("logs");
+    let mut backoff = Duration::from_secs(1);
+    let mut last_err = String::new();
+    loop {
+        let sub = match method {
+            None => provider.subscribe_logs(&filter).await,
+            Some(m) => provider.subscribe::<_, alloy::rpc::types::Log>((m, filter.clone())).await,
+        };
+        match sub {
+            Ok(sub) => {
+                backoff = Duration::from_secs(1);
+                last_err.clear();
+                let mut stream = sub.into_stream();
+                while let Some(log) = stream.next().await {
+                    if let Some(c) = &counter {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(magnitude) = crate::listener::apply_log_to_cache(
+                        &log, &feed.cache, feed.solidly_sync_hash, feed.large_swap_bps, feed.large_v3_bps,
+                    ) {
+                        let _ = feed.swap_tx.try_send(SwapEvent {
+                            chain_id: feed.chain_id,
+                            pool: log.address(),
+                            block_number: log.block_number.unwrap_or(0),
+                            magnitude,
+                        });
+                    }
+                }
+                debug!("[{}] {} subscription ended, reconnecting...", feed.chain_name, label);
+            }
+            Err(e) => {
+                // Once per distinct error: an endpoint without the method would
+                // otherwise log every backoff step.
+                let msg = e.to_string();
+                if msg != last_err {
+                    warn!("[{}] {} subscription failed: {} — retrying with backoff", feed.chain_name, label, msg);
+                    last_err = msg;
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
+            }
+        }
+    }
 }
 
 // ─── RPC connection with fallback ─────────────────────────────────────────────
@@ -1096,23 +1131,32 @@ async fn connect_with_fallback(
     let urls: Vec<&str> = std::iter::once(cfg.ws_rpc.as_str())
         .chain(cfg.ws_rpc_fallbacks.iter().map(String::as_str))
         .collect();
+    connect_first(&cfg.name, &urls, wallet, WS_CONNECT_TIMEOUT).await
+}
 
+/// First URL whose WS handshake completes within `limit` (a stalled endpoint falls
+/// through to the next one instead of hanging startup).
+async fn connect_first(
+    name: &str,
+    urls: &[&str],
+    wallet: EthereumWallet,
+    limit: Duration,
+) -> Result<impl Provider + Clone + 'static> {
     let mut last_err = String::new();
     for (i, url) in urls.iter().enumerate() {
-        match ProviderBuilder::<_, _, Ethereum>::new()
+        let conn = ProviderBuilder::<_, _, Ethereum>::new()
             .wallet(wallet.clone())
-            .connect_ws(WsConnect::new(*url).with_max_retries(u32::MAX))
-            .await
-        {
+            .connect_ws(WsConnect::new(*url).with_max_retries(u32::MAX));
+        match rpc_timeout(limit, conn).await {
             Ok(p) => {
                 if i > 0 {
-                    info!("[{}] Connected via fallback RPC #{}: {}", cfg.name, i, crate::util::redact_url(url));
+                    info!("[{}] Connected via fallback RPC #{}: {}", name, i, crate::util::redact_url(url));
                 }
                 return Ok(p);
             }
             Err(e) => {
-                warn!("[{}] RPC endpoint {} failed: {}", cfg.name, crate::util::redact_url(url), e);
-                last_err = e.to_string();
+                warn!("[{}] RPC endpoint {} failed: {}", name, crate::util::redact_url(url), e);
+                last_err = e;
             }
         }
     }
@@ -1127,6 +1171,27 @@ async fn connect_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A WS endpoint that accepts TCP but never answers the handshake must not hang
+    /// startup: each attempt times out and the next URL is tried.
+    #[tokio::test]
+    async fn stalled_ws_handshake_times_out_and_falls_through() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // keep open, never reply
+            }
+        });
+        let url = format!("ws://{}", addr);
+        let wallet = EthereumWallet::from(PrivateKeySigner::random());
+        let t0 = Instant::now();
+        let res = connect_first("test", &[url.as_str(), url.as_str()], wallet, Duration::from_millis(300)).await;
+        let err = match res { Ok(_) => panic!("stalled endpoint connected"), Err(e) => e.to_string() };
+        assert!(err.contains("timed out"), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "took {:?}", t0.elapsed());
+    }
 
     #[test]
     fn reset_breaker_on_resume_cases() {
