@@ -450,6 +450,9 @@ pub async fn run_chain(
     // Native-price and balance refreshes run as background tasks so their RPC calls never
     // delay a scan. Each flag stops a slow refresh from overlapping with the next tick.
     let price_refresh_busy   = Arc::new(AtomicBool::new(false));
+    // Last eth_blockNumber round trip (ms, f64 bits; 0 = failed / not yet measured). Measured
+    // in the price-refresh task so the ping never holds up the select loop.
+    let rpc_latency_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
     let balance_refresh_busy = Arc::new(AtomicBool::new(false));
     // When the last block header arrived: a long gap means the WS backend is dead (E1-3).
     let mut last_block_seen = Instant::now();
@@ -474,8 +477,15 @@ pub async fn run_chain(
                 if !price_refresh_busy.swap(true, Ordering::AcqRel) {
                     let (strategy, executor, provider) = (strategy.clone(), executor.clone(), provider.clone());
                     let (routers, pairs, cfg) = (chain_routers.clone(), chain_pairs.clone(), cfg.clone());
-                    let busy = price_refresh_busy.clone();
+                    let (busy, latency) = (price_refresh_busy.clone(), rpc_latency_bits.clone());
                     tokio::spawn(async move {
+                        // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
+                        let rpc_ping_start = Instant::now();
+                        let rpc_latency_ms = match rpc_timeout(rpc_read_timeout(), provider.get_block_number()).await {
+                            Ok(_) => rpc_ping_start.elapsed().as_millis() as f64,
+                            Err(_) => 0.0,
+                        };
+                        latency.store(rpc_latency_ms.to_bits(), Ordering::Relaxed);
                         state::update_native_price(&strategy, &executor, &provider, &routers, &pairs, &cfg).await;
                         busy.store(false, Ordering::Release);
                     });
@@ -487,12 +497,8 @@ pub async fn run_chain(
                 let now = Instant::now();
                 cooldowns.retain(|_, expire_at| *expire_at > now);
 
-                // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
-                let rpc_ping_start = Instant::now();
-                let rpc_latency_ms = match rpc_timeout(rpc_read_timeout(), provider.get_block_number()).await {
-                    Ok(_) => rpc_ping_start.elapsed().as_millis() as f64,
-                    Err(_) => 0.0,
-                };
+                // Latest ping from the price-refresh task (the previous tick's on this one).
+                let rpc_latency_ms = f64::from_bits(rpc_latency_bits.load(Ordering::Relaxed));
 
                 // Broadcast a heartbeat log so the Live Feed shows the engine is active
                 // even when no opportunities are detected. Fires every ~60 seconds.
