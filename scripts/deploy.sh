@@ -80,7 +80,13 @@ if [ "$DO_BUILD" = true ]; then
         set -e
         cd $REMOTE_PATH
         export PATH=\$PATH:\$HOME/.cargo/bin
-        cargo build --release -p engine 2>&1 | tail -5
+        # No pipe into tail: its exit status would hide a failed build (and pipefail is not POSIX sh).
+        if ! cargo build --release -p engine > /tmp/arbitragepulse-build.log 2>&1; then
+            tail -40 /tmp/arbitragepulse-build.log
+            echo 'Build FAILED, service not restarted'
+            exit 1
+        fi
+        tail -5 /tmp/arbitragepulse-build.log
         echo 'Build OK'
     "
     echo ""
