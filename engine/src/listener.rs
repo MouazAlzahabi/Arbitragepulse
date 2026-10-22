@@ -30,8 +30,10 @@ fn sqrtp_delta_bps(old: U256, new: U256, threshold_bps: u32) -> bool {
 }
 
 /// Decode a single Swap/Sync log, apply it to the pool cache, and classify magnitude.
-/// Returns `Some(magnitude)` when the log was recognized and applied.
-/// Idempotent — calling twice with the same log is safe.
+/// Returns `Some(magnitude)` when the log was recognized, applied, and is new — the caller
+/// should trigger a scan. A log older than the pool's last applied one is skipped; the
+/// same log seen again (pre-confirmed, then sealed) is re-applied but returns `None` so it
+/// doesn't trigger a second scan. Removed (reorged) logs are ignored.
 pub fn apply_log_to_cache(
     log: &alloy::rpc::types::Log,
     cache: &PoolCache,
@@ -41,6 +43,17 @@ pub fn apply_log_to_cache(
 ) -> Option<SwapMagnitude> {
     let pool = log.address();
     let topic0 = log.topics().first().copied()?;
+    if log.removed {
+        return None;
+    }
+    let repeat = match log.block_number.zip(log.log_index) {
+        Some(pos) => match cache.advance_log_position(pool, pos) {
+            std::cmp::Ordering::Less => return None,
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Greater => false,
+        },
+        None => false,
+    };
     let mut magnitude = SwapMagnitude::Normal;
 
     if topic0 == Sync::SIGNATURE_HASH {
@@ -55,7 +68,7 @@ pub fn apply_log_to_cache(
             }
         }
         cache.update_reserves(pool, r0, r1);
-        return Some(magnitude);
+        return (!repeat).then_some(magnitude);
     }
 
     if topic0 == solidly_sync_hash {
@@ -77,7 +90,7 @@ pub fn apply_log_to_cache(
             }
         }
         cache.update_reserves(pool, r0, r1);
-        return Some(magnitude);
+        return (!repeat).then_some(magnitude);
     }
 
     if topic0 == Swap::SIGNATURE_HASH {
@@ -90,7 +103,7 @@ pub fn apply_log_to_cache(
             }
         }
         cache.update_v3_state(pool, sqrtp, liq);
-        return Some(magnitude);
+        return (!repeat).then_some(magnitude);
     }
 
     if topic0 == IPancakeV3Pool::Swap::SIGNATURE_HASH {
@@ -103,7 +116,7 @@ pub fn apply_log_to_cache(
             }
         }
         cache.update_v3_state(pool, sqrtp, liq);
-        return Some(magnitude);
+        return (!repeat).then_some(magnitude);
     }
 
     None
@@ -318,5 +331,82 @@ impl Listener {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool_cache::PoolInfo;
+    use alloy::primitives::{address, keccak256};
+
+    const POOL: Address = address!("00000000000000000000000000000000000000aa");
+
+    fn cache_with_pool() -> PoolCache {
+        let cache = PoolCache::new();
+        cache.insert(POOL, PoolInfo {
+            token0: address!("0000000000000000000000000000000000000001"),
+            token1: address!("0000000000000000000000000000000000000002"),
+            reserve0: U256::from(1_000u64),
+            reserve1: U256::from(1_000u64),
+            fee_bps: 30,
+            router_id: "r".into(),
+            is_stable: false,
+            decimals0: 18,
+            decimals1: 18,
+            last_sync: std::time::Instant::now(),
+            fee_num: U256::ZERO,
+        });
+        cache
+    }
+
+    /// A V2 Sync log for POOL at (block, index).
+    fn sync_log(block: u64, index: u64, r0: u64, removed: bool) -> alloy::rpc::types::Log {
+        let data = Sync { reserve0: alloy::primitives::Uint::from(r0), reserve1: alloy::primitives::Uint::from(1_000u64) }
+            .encode_log_data();
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address: POOL, data },
+            block_number: Some(block),
+            log_index: Some(index),
+            removed,
+            ..Default::default()
+        }
+    }
+
+    fn apply(cache: &PoolCache, log: &alloy::rpc::types::Log) -> Option<SwapMagnitude> {
+        apply_log_to_cache(log, cache, keccak256(b"Sync(uint256,uint256)"), 200, 50)
+    }
+
+    fn reserve0(cache: &PoolCache) -> U256 {
+        cache.by_address.get(&POOL).unwrap().reserve0
+    }
+
+    #[test]
+    fn preconfirmed_then_sealed_logs_stay_ordered_and_trigger_once() {
+        let cache = cache_with_pool();
+        // Pre-confirmed log of block 11 arrives first and triggers a scan.
+        assert!(apply(&cache, &sync_log(11, 3, 2_000, false)).is_some());
+        assert_eq!(reserve0(&cache), U256::from(2_000u64));
+        // Its sealed copy: re-applied (same data), but no second scan.
+        assert!(apply(&cache, &sync_log(11, 3, 2_000, false)).is_none());
+        // A late sealed log of block 10 must not overwrite the newer state.
+        assert!(apply(&cache, &sync_log(10, 9, 1_500, false)).is_none());
+        assert_eq!(reserve0(&cache), U256::from(2_000u64));
+        // A newer log applies and triggers.
+        assert!(apply(&cache, &sync_log(11, 4, 2_100, false)).is_some());
+        assert_eq!(reserve0(&cache), U256::from(2_100u64));
+        // Removed (reorged) logs are ignored.
+        assert!(apply(&cache, &sync_log(12, 0, 9_999, true)).is_none());
+        assert_eq!(reserve0(&cache), U256::from(2_100u64));
+    }
+
+    #[test]
+    fn logs_without_position_still_apply() {
+        let cache = cache_with_pool();
+        let mut log = sync_log(0, 0, 3_000, false);
+        log.block_number = None;
+        log.log_index = None;
+        assert!(apply(&cache, &log).is_some());
+        assert_eq!(reserve0(&cache), U256::from(3_000u64));
     }
 }

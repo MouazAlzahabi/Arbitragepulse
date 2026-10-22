@@ -219,6 +219,10 @@ pub struct PoolCache {
     v3_metrics_dirty: Arc<AtomicBool>,
     cached_v3_fresh: Arc<AtomicUsize>,
     cached_v3_total: Arc<AtomicUsize>,
+    /// Last applied (block number, log index) per pool. Two log feeds update the cache —
+    /// pre-confirmed (flashblocks, ~1.2 s earlier) and sealed — so a late sealed log must
+    /// never overwrite newer pre-confirmed state.
+    log_pos: Arc<DashMap<Address, (u64, u64)>>,
 }
 
 impl Default for PoolCache {
@@ -233,6 +237,7 @@ impl Default for PoolCache {
             v3_metrics_dirty: Arc::new(AtomicBool::new(true)),
             cached_v3_fresh: Arc::new(AtomicUsize::new(0)),
             cached_v3_total: Arc::new(AtomicUsize::new(0)),
+            log_pos: Arc::new(DashMap::new()),
         }
     }
 }
@@ -269,6 +274,19 @@ impl PoolCache {
             .read()
             .map(|v| v.clone())
             .unwrap_or_default()
+    }
+
+    /// Record that the log at `pos` (block number, log index) is being applied to `pool`.
+    /// `Less`: older than what was applied — skip it. `Equal`: the same log again (e.g.
+    /// its sealed copy after the pre-confirmed one) — safe to re-apply, no new event.
+    /// `Greater`: new — recorded.
+    pub fn advance_log_position(&self, pool: Address, pos: (u64, u64)) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let mut entry = self.log_pos.entry(pool).or_insert((0, 0));
+        match pos.cmp(&*entry) {
+            Ordering::Greater => { *entry = pos; Ordering::Greater }
+            other => other,
+        }
     }
 
     /// Insert a pool and register both directional keys.

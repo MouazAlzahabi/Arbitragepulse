@@ -21,6 +21,12 @@ pub struct ChainConfig {
     /// Optional QuoterV2 address for V3 quoting (chain-specific)
     #[serde(default)]
     pub quoter_v2_address: Option<String>,
+    /// Flashblocks-aware WS endpoint (Base: `wss://mainnet-preconf.base.org`). When set,
+    /// the engine also subscribes to `pendingLogs` there: pool events from 200 ms
+    /// pre-confirmed sub-blocks, ~1.2 s before the sealed block (measured). Read-only, no
+    /// key, no wallet. Unset = off.
+    #[serde(default)]
+    pub preconf_ws_rpc: Option<String>,
     /// Fallback WS endpoints tried in order if the primary ws_rpc fails.
     /// Leave empty to use only the primary.
     #[serde(default)]

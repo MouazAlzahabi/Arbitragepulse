@@ -16,6 +16,14 @@ The config expects Alchemy (`${ALCHEMY_KEY}` is substituted from the instance en
 
 Size `chain.rpc_concurrency` to your Alchemy plan (3 for the free tier, 10–12 for Growth).
 
+**Flashblocks** (`chain.preconf_ws_rpc: wss://mainnet-preconf.base.org`): Base builds each
+2 s block from 200 ms pre-confirmed sub-blocks. The engine subscribes to their pool logs
+(`pendingLogs`) and reacts ~1.2 s (p50; p90 ~1.9 s) before the sealed block. The sealed
+log subscription on `ws_rpc` stays on as the source of truth and fallback; a per-pool
+(block, log index) guard keeps the two feeds ordered and triggers one scan per event.
+The heartbeat shows `preconf_logs=N` per interval — 0 for minutes on mainnet means the
+endpoint is down (detection continues on sealed blocks, ~1.2 s later).
+
 ## 2. Server
 
 Any small Linux VPS (2 vCPU / 4 GB is plenty) close to the Base sequencer region (US).

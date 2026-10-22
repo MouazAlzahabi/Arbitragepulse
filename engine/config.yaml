@@ -31,6 +31,10 @@ chain:
   scan_interval_ms: 2000
   rpc_concurrency: 3
   # Extra HTTP endpoints to broadcast signed txs concurrently (FCFS sequencer — race to arrive first)
+  # Flashblocks: pool events from 200 ms pre-confirmed sub-blocks (eth_subscribe
+  # "pendingLogs"), measured ~1.2 s (p50) before the sealed block. Read-only, keyless.
+  # Sealed-block logs stay on as the source of truth. Remove the line to turn it off.
+  preconf_ws_rpc: "wss://mainnet-preconf.base.org"
   ws_rpc_fallbacks:
     - "wss://mainnet.base.org"                              # public fallback (no mempool, blocks only)
   submission_rpcs:

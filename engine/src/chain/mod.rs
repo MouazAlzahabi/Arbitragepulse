@@ -299,63 +299,48 @@ pub async fn run_chain(
         });
     }
 
-    // ── Real-time log subscription for instant pool state updates ──────────
-    // Logs arrive on the WS connection before the next newHeads event,
-    // so pool state is current when block_rx fires the scanner.
+    // ── Real-time log subscriptions for instant pool state updates ──────────
+    // Sealed-block logs (primary RPC) are the source of truth. With `preconf_ws_rpc`, the
+    // same filter is also subscribed as `pendingLogs` on a Flashblocks-aware endpoint:
+    // events from 200 ms pre-confirmed sub-blocks, ~1.2 s earlier. Both feed the same
+    // cache + scan trigger; PoolCache's log-position guard keeps them ordered and stops a
+    // log's sealed copy from triggering a second scan.
     let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
+    let preconf_logs = Arc::new(AtomicU64::new(0));
     {
-        let log_addrs = pool_cache.watch_addresses();
         let log_filter = alloy::rpc::types::Filter::new()
-            .address(log_addrs)
+            .address(pool_cache.watch_addresses())
             .event_signature(vec![
                 crate::abi::Sync::SIGNATURE_HASH,
                 solidly_sync_hash_sub,
                 crate::abi::Swap::SIGNATURE_HASH,
                 IPancakeV3Pool::Swap::SIGNATURE_HASH,
             ]);
-        let provider_logs = (*provider).clone();
-        let swap_tx_sub = swap_tx_for_sub;
-        let cache_for_sub = pool_cache.clone();
-        let chain_id_sub = cfg.id;
-        let cname = cfg.name.clone();
-        let large_swap_bps_sub = cfg.large_swap_threshold_bps;
-        let large_v3_bps_sub = cfg.large_v3_threshold_bps;
-        tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
-            loop {
-                match provider_logs.subscribe_logs(&log_filter).await {
-                    Ok(sub) => {
-                        backoff = Duration::from_secs(1);
-                        let mut stream = sub.into_stream();
-                        while let Some(log) = stream.next().await {
-                            // Apply to cache immediately so pool state is fresh
-                            if let Some(magnitude) = crate::listener::apply_log_to_cache(
-                                &log,
-                                &cache_for_sub,
-                                solidly_sync_hash_sub,
-                                large_swap_bps_sub,
-                                large_v3_bps_sub,
-                            ) {
-                                let pool = log.address();
-                                let block_number = log.block_number.unwrap_or(0);
-                                let _ = swap_tx_sub.try_send(crate::listener::SwapEvent {
-                                    chain_id: chain_id_sub,
-                                    pool,
-                                    block_number,
-                                    magnitude,
-                                });
-                            }
-                        }
-                        debug!("[{}] log subscription ended, reconnecting...", cname);
-                    }
-                    Err(e) => {
-                        debug!("[{}] log subscription failed: {} — retrying in {:?}", cname, e, backoff);
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
-                    }
+        let feed = LogFeed {
+            cache: pool_cache.clone(),
+            swap_tx: swap_tx_for_sub.clone(),
+            chain_id: cfg.id,
+            chain_name: cfg.name.clone(),
+            solidly_sync_hash: solidly_sync_hash_sub,
+            large_swap_bps: cfg.large_swap_threshold_bps,
+            large_v3_bps: cfg.large_v3_threshold_bps,
+        };
+        spawn_log_subscription((*provider).clone(), log_filter.clone(), feed.clone(), None, None);
+        if let Some(url) = cfg.preconf_ws_rpc.clone() {
+            let shown = crate::util::redact_url(&url);
+            match ProviderBuilder::new()
+                .connect_ws(WsConnect::new(url).with_max_retries(u32::MAX))
+                .await
+            {
+                Ok(preconf) => {
+                    info!("[{}] Flashblocks pre-confirmed logs: subscribing on {}", cfg.name, shown);
+                    spawn_log_subscription(preconf, log_filter, feed, Some("pendingLogs"), Some(preconf_logs.clone()));
                 }
+                // Detection still works on sealed blocks — just ~1.2 s later.
+                Err(e) => warn!("[{}] Flashblocks endpoint {} unreachable ({}) — sealed-block logs only",
+                                cfg.name, shown, e),
             }
-        });
+        }
     }
 
     // ── Pending TX monitor (optional, requires mempool-enabled WS endpoint) ──
@@ -565,9 +550,11 @@ pub async fn run_chain(
                 let opp_count = last_opp_count.load(Ordering::Relaxed);
                 let (v3_fresh, v3_total) =
                     pool_cache.count_fresh_v3_pools(crate::config::tuning().v3_fresh_window());
+                let preconf_n = preconf_logs.swap(0, Ordering::Relaxed);
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}",
+                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v3={}/{}{}",
                     cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, v3_fresh, v3_total,
+                    if cfg.preconf_ws_rpc.is_some() { format!(" | preconf_logs={}", preconf_n) } else { String::new() },
                 );
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 // A full scan normally runs every block (~2 s); a long gap means scanning has
@@ -927,6 +914,77 @@ pub async fn run_chain(
             }
         }
     }
+}
+
+// ─── Pool log subscriptions ───────────────────────────────────────────────────
+
+/// What a log subscription feeds: the pool cache and the scan trigger.
+#[derive(Clone)]
+struct LogFeed {
+    cache: Arc<PoolCache>,
+    swap_tx: mpsc::Sender<SwapEvent>,
+    chain_id: u64,
+    chain_name: String,
+    solidly_sync_hash: alloy::primitives::B256,
+    large_swap_bps: u32,
+    large_v3_bps: u32,
+}
+
+/// Subscribe to pool logs and keep re-subscribing. `method`: `None` = standard `logs`
+/// (sealed blocks), `Some("pendingLogs")` = Flashblocks pre-confirmed logs. Each new log
+/// updates the cache and triggers a targeted scan (see `apply_log_to_cache`).
+fn spawn_log_subscription<P: Provider + Clone + 'static>(
+    provider: P,
+    filter: alloy::rpc::types::Filter,
+    feed: LogFeed,
+    method: Option<&'static str>,
+    counter: Option<Arc<AtomicU64>>,
+) {
+    tokio::spawn(async move {
+        let label = method.unwrap_or("logs");
+        let mut backoff = Duration::from_secs(1);
+        let mut last_err = String::new();
+        loop {
+            let sub = match method {
+                None => provider.subscribe_logs(&filter).await,
+                Some(m) => provider.subscribe::<_, alloy::rpc::types::Log>((m, filter.clone())).await,
+            };
+            match sub {
+                Ok(sub) => {
+                    backoff = Duration::from_secs(1);
+                    last_err.clear();
+                    let mut stream = sub.into_stream();
+                    while let Some(log) = stream.next().await {
+                        if let Some(c) = &counter {
+                            c.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(magnitude) = crate::listener::apply_log_to_cache(
+                            &log, &feed.cache, feed.solidly_sync_hash, feed.large_swap_bps, feed.large_v3_bps,
+                        ) {
+                            let _ = feed.swap_tx.try_send(SwapEvent {
+                                chain_id: feed.chain_id,
+                                pool: log.address(),
+                                block_number: log.block_number.unwrap_or(0),
+                                magnitude,
+                            });
+                        }
+                    }
+                    debug!("[{}] {} subscription ended, reconnecting...", feed.chain_name, label);
+                }
+                Err(e) => {
+                    // Once per distinct error: an endpoint without the method would
+                    // otherwise log every backoff step.
+                    let msg = e.to_string();
+                    if msg != last_err {
+                        warn!("[{}] {} subscription failed: {} — retrying with backoff", feed.chain_name, label, msg);
+                        last_err = msg;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
+                }
+            }
+        }
+    });
 }
 
 // ─── RPC connection with fallback ─────────────────────────────────────────────
