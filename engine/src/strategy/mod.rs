@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, Uint, U256};
 use alloy::providers::{DynProvider, Provider};
+use alloy::eips::BlockId;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use dashmap::DashMap;
@@ -240,6 +241,9 @@ pub struct Strategy {
     /// HTTP/2 connection pooling is faster than WS for single request-response calls.
     /// Falls back to the WS provider passed to evaluate() when None.
     pub http_provider: Option<DynProvider>,
+    /// Block tag for quote reads: `pending` when `http_provider` is the preconf endpoint
+    /// (`chain.preconf_http_rpc`), else `latest`.
+    pub quote_block: BlockId,
     /// Pre-parsed router addresses keyed by router ID.
     /// Populated once at construction — avoids Address::from_str() O(pairs × routers)
     /// times per scan (e.g. 50 pairs × 6 routers = 300 parses per block).
@@ -339,6 +343,7 @@ impl Strategy {
             quote_cache: Arc::new(QuoteCache::default()),
             optimistic_submission,
             http_provider,
+            quote_block: BlockId::latest(),
             router_addr_map,
             quoter_by_router,
             solidly_pool_keys,
@@ -574,8 +579,8 @@ impl Strategy {
         }
 
         let raw = match self.http_provider {
-            Some(ref hp) => run_multicall(hp, mc, self.rpc_concurrency).await,
-            None => run_multicall(provider, mc, self.rpc_concurrency).await,
+            Some(ref hp) => run_multicall(hp, mc, self.rpc_concurrency, self.quote_block).await,
+            None => run_multicall(provider, mc, self.rpc_concurrency, self.quote_block).await,
         };
         let mut health = QuoterBatchHealth::default();
         for ((router_id, slots), r) in sent.into_iter().zip(raw) {
@@ -631,6 +636,12 @@ impl Strategy {
         }
     }
 
+    /// The preconf quote provider (`chain.preconf_http_rpc`), when set — for callers that
+    /// would otherwise quote on the WS provider (the optimizer).
+    pub fn preconf_quote_provider(&self) -> Option<DynProvider> {
+        if self.quote_block == BlockId::pending() { self.http_provider.clone() } else { None }
+    }
+
     pub fn update_native_price(&mut self, price: f64) {
         self.native_price_usd = price;
     }
@@ -648,6 +659,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
     provider: &P,
     calls: Vec<(Address, Vec<u8>)>,
     concurrency: usize,
+    block: BlockId,
 ) -> Vec<Option<Vec<u8>>> {
     if calls.is_empty() {
         return vec![];
@@ -681,7 +693,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
         let tx = TransactionRequest::default().to(mc3).input(agg_calldata.into());
         let p = provider.clone();
         async move {
-            tokio::time::timeout(multicall_chunk_timeout(), p.call(tx)).await
+            tokio::time::timeout(multicall_chunk_timeout(), p.call(tx).block(block)).await
                 .map(|r| r.ok())
                 .map_err(|_| ())
         }
@@ -716,7 +728,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
                     let tx = TransactionRequest::default()
                         .to(*target)
                         .input(data.clone().into());
-                    let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx)).await;
+                    let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx).block(block)).await;
                     out.push(r.ok().and_then(|r| r.ok()).map(|b| b.to_vec()));
                 }
             }

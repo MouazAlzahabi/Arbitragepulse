@@ -521,9 +521,9 @@ impl Strategy {
                 }
                 let p15_raw = if cache_misses > 0 {
                     if let Some(ref hp) = self.http_provider {
-                        run_multicall(hp, p15_mc, self.rpc_concurrency).await
+                        run_multicall(hp, p15_mc, self.rpc_concurrency, self.quote_block).await
                     } else {
-                        run_multicall(provider, p15_mc, self.rpc_concurrency).await
+                        run_multicall(provider, p15_mc, self.rpc_concurrency, self.quote_block).await
                     }
                 } else {
                     vec![]
@@ -757,13 +757,13 @@ impl Strategy {
 
         let (p15b_raw_mc, p15c_raw) = if let Some(ref hp) = self.http_provider {
             tokio::join!(
-                async { if p15b_cache_misses > 0 { run_multicall(hp, p15b_mc, self.rpc_concurrency).await } else { vec![] } },
-                async { if !p15c_mc.is_empty() { run_multicall(hp, p15c_mc, self.rpc_concurrency).await } else { vec![] } },
+                async { if p15b_cache_misses > 0 { run_multicall(hp, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
+                async { if !p15c_mc.is_empty() { run_multicall(hp, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
             )
         } else {
             tokio::join!(
-                async { if p15b_cache_misses > 0 { run_multicall(provider, p15b_mc, self.rpc_concurrency).await } else { vec![] } },
-                async { if !p15c_mc.is_empty() { run_multicall(provider, p15c_mc, self.rpc_concurrency).await } else { vec![] } },
+                async { if p15b_cache_misses > 0 { run_multicall(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
+                async { if !p15c_mc.is_empty() { run_multicall(provider, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
             )
         };
 

@@ -27,6 +27,12 @@ pub struct ChainConfig {
     /// key, no wallet. Unset = off.
     #[serde(default)]
     pub preconf_ws_rpc: Option<String>,
+    /// Flashblocks-aware HTTP endpoint. When set, QuoterV2/Multicall3 reads, the optimizer,
+    /// pre-flight and dry-run simulation call it at block tag `pending`, pricing the same
+    /// pre-confirmed state the `preconf_ws_rpc` logs moved the pool cache to. Unset =
+    /// `http_rpc` / the WS provider at `latest`.
+    #[serde(default)]
+    pub preconf_http_rpc: Option<String>,
     /// Fallback WS endpoints tried in order if the primary ws_rpc fails.
     /// Leave empty to use only the primary.
     #[serde(default)]
@@ -321,6 +327,10 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
                 r.id, f
             ));
         }
+    }
+    if let Some(u) = chain.preconf_http_rpc.as_deref() {
+        u.parse::<url::Url>()
+            .map_err(|e| anyhow!("chain.preconf_http_rpc is not a URL ({}): {}", crate::util::redact_url(u), e))?;
     }
     if !(10..=600).contains(&chain.deadline_seconds) {
         return Err(anyhow!("chain.deadline_seconds must be 10..=600 (got {})", chain.deadline_seconds));

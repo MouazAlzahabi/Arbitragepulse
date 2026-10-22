@@ -96,6 +96,7 @@ impl Strategy {
             min_amount,
             max_amount,
             coarse,
+            self.quote_block,
         )
         .await;
 
@@ -118,6 +119,7 @@ impl Strategy {
             fine_min,
             fine_max,
             fine,
+            self.quote_block,
         )
         .await;
 
@@ -178,6 +180,7 @@ async fn probe_range<P: Provider + Clone + 'static>(
     min_amount: U256,
     max_amount: U256,
     steps: usize,
+    block: alloy::eips::BlockId,
 ) -> Option<(U256, U256)> {
     if steps == 0 || min_amount >= max_amount {
         return None;
@@ -221,7 +224,7 @@ async fn probe_range<P: Provider + Clone + 'static>(
                     Some(volatile_max_age()),
                 ),
                 RouterType::V3 => match quoter_a {
-                    Some(q) => quote_v3(&p, q, probe_amount, token_in, token_out, fa).await,
+                    Some(q) => quote_v3(&p, block, q, probe_amount, token_in, token_out, fa).await,
                     None => None,
                 },
                 RouterType::Aerodrome => {
@@ -231,8 +234,8 @@ async fn probe_range<P: Provider + Clone + 'static>(
             let mid = match mid {
                 Some(m) if !m.is_zero() => Some(m),
                 _ => match ra_t {
-                    RouterType::V2 => quote_v2(&p, ra, probe_amount, token_in, token_out).await,
-                    RouterType::Aerodrome => quote_aerodrome(&p, ra, probe_amount, token_in, token_out, fa).await,
+                    RouterType::V2 => quote_v2(&p, block, ra, probe_amount, token_in, token_out).await,
+                    RouterType::Aerodrome => quote_aerodrome(&p, block, ra, probe_amount, token_in, token_out, fa).await,
                     _ => None,
                 },
             };
@@ -246,7 +249,7 @@ async fn probe_range<P: Provider + Clone + 'static>(
                     Some(volatile_max_age()),
                 ),
                 RouterType::V3 => match quoter_b {
-                    Some(q) => quote_v3(&p, q, mid, token_out, token_in, fb).await,
+                    Some(q) => quote_v3(&p, block, q, mid, token_out, token_in, fb).await,
                     None => None,
                 },
                 RouterType::Aerodrome => {
@@ -256,8 +259,8 @@ async fn probe_range<P: Provider + Clone + 'static>(
             let back = match back {
                 Some(b) if !b.is_zero() => Some(b),
                 _ => match rb_t {
-                    RouterType::V2 => quote_v2(&p, rb, mid, token_out, token_in).await,
-                    RouterType::Aerodrome => quote_aerodrome(&p, rb, mid, token_out, token_in, fb).await,
+                    RouterType::V2 => quote_v2(&p, block, rb, mid, token_out, token_in).await,
+                    RouterType::Aerodrome => quote_aerodrome(&p, block, rb, mid, token_out, token_in, fb).await,
                     _ => None,
                 },
             };
@@ -303,6 +306,7 @@ fn local_solidly(
 
 async fn quote_v2<P: Provider>(
     provider: &P,
+    block: alloy::eips::BlockId,
     router: Address,
     amount_in: U256,
     token_in: Address,
@@ -312,6 +316,7 @@ async fn quote_v2<P: Provider>(
     match IUniswapV2Router02::new(router, provider)
         .getAmountsOut(amount_in, path)
         .call()
+        .block(block)
         .await
     {
         Ok(amounts) => amounts.last().copied(),
@@ -324,6 +329,7 @@ async fn quote_v2<P: Provider>(
 
 async fn quote_v3<P: Provider>(
     provider: &P,
+    block: alloy::eips::BlockId,
     quoter: Address,
     amount_in: U256,
     token_in: Address,
@@ -342,6 +348,7 @@ async fn quote_v3<P: Provider>(
             sqrtPriceLimitX96: sqrt_zero,
         })
         .call()
+        .block(block)
         .await
     {
         Ok(r) => Some(r.amountOut),
@@ -354,6 +361,7 @@ async fn quote_v3<P: Provider>(
 
 async fn quote_aerodrome<P: Provider>(
     provider: &P,
+    block: alloy::eips::BlockId,
     router: Address,
     amount_in: U256,
     token_in: Address,
@@ -373,6 +381,7 @@ async fn quote_aerodrome<P: Provider>(
             }],
         )
         .call()
+        .block(block)
         .await
     {
         Ok(amounts) => amounts.last().copied(),

@@ -24,6 +24,19 @@ log subscription on `ws_rpc` stays on as the source of truth and fallback; a per
 The heartbeat shows `preconf_logs=N` per interval — 0 for minutes on mainnet means the
 endpoint is down (detection continues on sealed blocks, ~1.2 s later).
 
+`chain.preconf_http_rpc` (default `https://mainnet.base.org`, the same endpoint as
+`http_rpc`) makes QuoterV2/Multicall3 reads, the optimizer, pre-flight and dry-run
+simulation use block tag `pending` there — the state the pre-confirmed logs showed. A
+check at `latest` would price the block *before* the move. `pending` costs ~25 ms more
+per call than `latest`. Remove the key to quote at `latest`.
+
+**Choosing endpoints:** latency from the server is what counts. On the server run
+`ALCHEMY_KEY=… scripts/rpc-latency.sh` (read-only; URLs printed with the key redacted).
+It reports p50/p95 of a QuoterV2 call at `latest` and `pending` for Base public, Base
+preconf and Alchemy, and whether each serves Flashblocks `pending` state. Use the fastest
+error-free endpoint for `http_rpc`, and the fastest Flashblocks one for `preconf_http_rpc`
+(add others as arguments: `scripts/rpc-latency.sh https://… https://…`).
+
 ## 2. Server
 
 Any small Linux VPS (2 vCPU / 4 GB is plenty) close to the Base sequencer region (US).

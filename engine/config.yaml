@@ -35,6 +35,12 @@ chain:
   # "pendingLogs"), measured ~1.2 s (p50) before the sealed block. Read-only, keyless.
   # Sealed-block logs stay on as the source of truth. Remove the line to turn it off.
   preconf_ws_rpc: "wss://mainnet-preconf.base.org"
+  # Quotes (QuoterV2/Multicall3), optimizer and simulation at block tag `pending` here, so
+  # they price the same pre-confirmed state the logs above moved the pool cache to. The
+  # public http_rpc serves Flashblocks `pending` (checked 2026-10-22): same endpoint and
+  # rate limits as today, ~+25 ms per call. Check others with scripts/rpc-latency.sh.
+  # Remove the line to quote at `latest` on http_rpc.
+  preconf_http_rpc: "https://mainnet.base.org"
   ws_rpc_fallbacks:
     - "wss://mainnet.base.org"                              # public fallback (no mempool, blocks only)
   submission_rpcs:

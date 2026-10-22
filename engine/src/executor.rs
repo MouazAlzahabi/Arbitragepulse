@@ -1,7 +1,7 @@
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Uint, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{anyhow, Result};
@@ -111,6 +111,21 @@ pub struct TxPrep {
     /// True when secondary broadcast is needed and signing hasn't happened yet.
     /// Set by prepare_*(); cleared (and raw_tx filled) by sign_if_needed().
     pub needs_sign: bool,
+    /// Preconf endpoint for pre-flight simulation at `pending` (see [`simulate_call`]).
+    pub sim_provider: Option<DynProvider>,
+}
+
+/// eth_call a trade: on the preconf endpoint at `pending` when set (the state the quotes
+/// priced), else on `provider` at `latest`.
+pub(crate) async fn simulate_call<P: Provider>(
+    provider: &P,
+    preconf: Option<&DynProvider>,
+    tx: TransactionRequest,
+) -> alloy::transports::TransportResult<alloy::primitives::Bytes> {
+    match preconf {
+        Some(pc) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending())).await,
+        None => transport_timeout(rpc_simulate_timeout(), provider.call(tx)).await,
+    }
 }
 
 impl TxPrep {
@@ -198,6 +213,9 @@ pub struct Executor {
     deadline_secs: u64,
     /// Cached unix second + deadline (now + deadline_secs) — avoids syscall per prepare.
     deadline_cache: StdMutex<(u64, U256)>,
+    /// `chain.preconf_http_rpc` provider: simulations run on it at `pending`. Set by
+    /// chain/mod.rs after construction; None = the caller's provider at `latest`.
+    pub sim_provider: Option<DynProvider>,
 }
 
 impl Executor {
@@ -242,6 +260,7 @@ impl Executor {
             priority_fee_wei,
             deadline_secs,
             deadline_cache: StdMutex::new((0, U256::ZERO)),
+            sim_provider: None,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .pool_max_idle_per_host(4)
@@ -433,6 +452,7 @@ impl Executor {
             raw_tx: None,
             needs_sign,
             http_client: self.http_client.clone(),
+            sim_provider: self.sim_provider.clone(),
         })
     }
 
@@ -508,6 +528,7 @@ impl Executor {
             raw_tx: None,
             needs_sign,
             http_client: self.http_client.clone(),
+            sim_provider: self.sim_provider.clone(),
         })
     }
 
@@ -598,7 +619,7 @@ impl Executor {
 
         // ── Dry-run: simulate only ─────────────────────────────────────────────
         if self.dry_run {
-            match transport_timeout(rpc_simulate_timeout(), provider.call(tx_base)).await {
+            match simulate_call(provider, self.sim_provider.as_ref(), tx_base).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =
@@ -805,7 +826,7 @@ impl Executor {
         self.stats.total_attempts += 1;
 
         if self.dry_run {
-            match transport_timeout(rpc_simulate_timeout(), provider.call(tx_base)).await {
+            match simulate_call(provider, self.sim_provider.as_ref(), tx_base).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =

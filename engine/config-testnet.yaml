@@ -29,7 +29,8 @@ chain:
   quoter_v2_address: "0xC5290058841028F1614F3A6F0F5816cAd0df5E27"  # Uniswap V3 QuoterV2 (Base Sepolia)
   scan_interval_ms: 2000
   rpc_concurrency: 3
-  # preconf_ws_rpc: no public Base Sepolia Flashblocks endpoint found (2026-10-22) — off.
+  # preconf_ws_rpc / preconf_http_rpc: no public Base Sepolia Flashblocks log endpoint
+  # found (2026-10-22) — off.
   ws_rpc_fallbacks:
     - "wss://base-sepolia-rpc.publicnode.com"
   submission_rpcs: []

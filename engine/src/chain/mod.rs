@@ -156,12 +156,19 @@ pub async fn run_chain(
 
     // Dedicated HTTP provider for QuoterV2 reads — HTTP/2 connection pooling is
     // faster than WS for single request-response calls (~20-40ms improvement).
-    // Dedicated HTTP provider for QuoterV2 reads — HTTP/2 connection pooling is
-    // faster than WS for single request-response calls (~20-40ms improvement).
-    let http_provider: Option<alloy::providers::DynProvider> = cfg.http_rpc
+    // With `preconf_http_rpc` it is the Flashblocks endpoint instead, read at `pending`.
+    // (URL validated at config load.)
+    let preconf_http: Option<alloy::providers::DynProvider> = cfg.preconf_http_rpc.as_deref()
+        .and_then(|raw| {
+            let url = raw.parse::<url::Url>().ok()?;
+            info!("[{}] Quotes and simulations at `pending` on {}", cfg.name, crate::util::redact_url(raw));
+            Some(ProviderBuilder::new().connect_http(url).erased())
+        });
+    let http_provider: Option<alloy::providers::DynProvider> = preconf_http.clone().or_else(|| cfg.http_rpc
         .parse::<url::Url>()
         .ok()
-        .map(|url| ProviderBuilder::new().connect_http(url).erased());
+        .map(|url| ProviderBuilder::new().connect_http(url).erased()));
+    executor.lock().await.sim_provider = preconf_http.clone();
 
     let min_triangular_profit_usd = cfg
         .min_triangular_profit_usd
@@ -179,6 +186,9 @@ pub async fn run_chain(
         cfg.optimistic_submission,
         http_provider,
     )));
+    if preconf_http.is_some() {
+        strategy.write().await.quote_block = alloy::eips::BlockId::pending();
+    }
 
     // ── Contract balance cache ─────────────────────────────────────────────────
     // Caches the ArbitrageExecutor's token_in balances. Refreshed every 30s and

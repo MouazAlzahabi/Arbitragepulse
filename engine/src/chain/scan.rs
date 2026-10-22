@@ -1,7 +1,7 @@
 use super::*;
 use alloy::network::ReceiptResponse;
 use alloy::primitives::B256;
-use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout, rpc_simulate_timeout};
+use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -390,7 +390,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             let optimized = if optimistic_submission || !cfg.optimize_size || skip_execution {
                 opp.clone()
             } else {
-                strategy.read().await.optimize(opp, provider.as_ref(), max_bal).await
+                let strat = strategy.read().await;
+                match strat.preconf_quote_provider() {
+                    Some(pc) => strat.optimize(opp, &pc, max_bal).await,
+                    None => strat.optimize(opp, provider.as_ref(), max_bal).await,
+                }
             };
 
             // Log the opportunity first so detection is always visible.
@@ -484,7 +488,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match transport_timeout(rpc_simulate_timeout(), provider.call(prep.tx.clone())).await {
+                            match crate::executor::simulate_call(provider.as_ref(), prep.sim_provider.as_ref(), prep.tx.clone()).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
@@ -953,7 +957,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match transport_timeout(rpc_simulate_timeout(), provider.call(prep.tx.clone())).await {
+                            match crate::executor::simulate_call(provider.as_ref(), prep.sim_provider.as_ref(), prep.tx.clone()).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
