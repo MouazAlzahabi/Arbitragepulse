@@ -257,8 +257,9 @@ impl Strategy {
             fee: u32,
             /// Pre-computed A→B amount from local xy=k cache. None = needs multicall result.
             local_result: Option<U256>,
-            /// Actual capital deployed for leg A→B.
-            /// May be < trip.amount_in when V3 capacity cap is applied.
+            /// Capital deployed for leg A→B: always the full trip.amount_in. (A V3 spot
+            /// quote caps its input, so its output can understate a full-size leg — the
+            /// route is scored conservatively, never inflated; QuoterV2 verifies V3 legs.)
             effective_amount_in: U256,
         }
 
@@ -286,6 +287,8 @@ impl Strategy {
                             trip.amount_in,
                             tiers,
                         );
+                        // `out` may be for a capped input (see quote_v3_spot_key); the route
+                        // still trades the full amount_in, so this only under-scores it.
                         match result {
                             Some((out, f)) => (f, trip.amount_in, Some(out)),
                             None => continue,
