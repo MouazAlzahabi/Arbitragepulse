@@ -826,7 +826,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }).await;
                                             }
                                         }
-                                        Err(e) => warn_receipt_unknown(&log_tx_bg, &chain_name_bg, &tx_hash_bg, &e),
+                                        Err(e) => {
+                                            // Outcome unknown, as on the 300 s timeout: re-fetch the nonce.
+                                            executor_bg.lock().await.forget_nonce();
+                                            warn_receipt_unknown(&log_tx_bg, &chain_name_bg, &tx_hash_bg, &e);
+                                        }
                                     }
                                     drop(provider_bg);
                                 });
@@ -1294,7 +1298,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }).await;
                                             }
                                         }
-                                        Err(e) => warn_receipt_unknown(&log_tx_bg, &chain_name_bg, &tx_hash_bg, &e),
+                                        Err(e) => {
+                                            // Outcome unknown, as on the 300 s timeout: re-fetch the nonce.
+                                            executor_bg.lock().await.forget_nonce();
+                                            warn_receipt_unknown(&log_tx_bg, &chain_name_bg, &tx_hash_bg, &e);
+                                        }
                                     }
                                     drop(provider_bg);
                                 });
