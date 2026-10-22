@@ -9,6 +9,7 @@ use super::*;
 ///   1. router.factory()  per V2/Solidly router
 ///   2. factory.getPair() per (router × pair)
 ///   3. pair.token0() + pair.getReserves() per discovered pool
+///      (+ factory.getFee(pool, stable) per Aerodrome pool — its fee can differ per pool)
 pub(crate) async fn discover_pools<P: Provider>(
     routers: &[RouterConfig],
     pairs: &[PairConfig],
@@ -61,7 +62,7 @@ pub(crate) async fn discover_pools<P: Provider>(
     // ── Round 2: getPair per (router × pair) ─────────────────────────────────
     // Aerodrome routers produce TWO calls per pair: volatile (stable:false) and
     // stable (stable:true). Both pools are discovered and cached independently.
-    struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool }
+    struct PairMeta { router_id: String, rtype: RouterType, fee_bps: u32, factory: Address, ta: Address, tb: Address, is_stable: bool }
     let mut pair_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pair_metas: Vec<PairMeta> = Vec::new();
 
@@ -74,16 +75,16 @@ pub(crate) async fn discover_pools<P: Provider>(
                 RouterType::V2 => {
                     let cd = IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode();
                     pair_calls.push((factory, cd));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, factory, ta, tb, is_stable: false });
                 }
                 RouterType::Aerodrome => {
                     // Aerodrome uses getPool() not getPair() — different 4-byte selector
                     let cd_vol = IAerodromeFactory::getPoolCall { tokenA: ta, tokenB: tb, stable: false }.abi_encode();
                     pair_calls.push((factory, cd_vol));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, ta, tb, is_stable: false });
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, factory, ta, tb, is_stable: false });
                     let cd_sta = IAerodromeFactory::getPoolCall { tokenA: ta, tokenB: tb, stable: true }.abi_encode();
                     pair_calls.push((factory, cd_sta));
-                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, ta, tb, is_stable: true });
+                    pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.stable_fee_bps, factory, ta, tb, is_stable: true });
                 }
                 _ => continue,
             }
@@ -96,7 +97,9 @@ pub(crate) async fn discover_pools<P: Provider>(
     // ── Round 3: token0 + getReserves per pool; decimals fetched once per token ─
     // The pool address from the stable=true call is a different
     // contract from stable=false, so `seen` naturally allows both.
-    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool }
+    // rv_idx: index of this pool's token0 call in rv_calls; getReserves follows, then getFee
+    // for Aerodrome pools (so the per-pool fee costs no extra round trip).
+    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, is_stable: bool, rv_idx: usize }
     let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pool_metas: Vec<PoolMeta> = Vec::new();
     let mut seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
@@ -104,8 +107,12 @@ pub(crate) async fn discover_pools<P: Provider>(
     for (pm, raw_opt) in pair_metas.iter().zip(pair_raw.iter()) {
         let pool = match raw_opt.as_ref().and_then(|r| decode_addr(r)) { Some(a) => a, None => continue };
         if !seen.insert(pool) { continue; }
+        let rv_idx = rv_calls.len();
         rv_calls.push((pool, IUniswapV2Pair::token0Call {}.abi_encode()));
         rv_calls.push((pool, IUniswapV2Pair::getReservesCall {}.abi_encode()));
+        if pm.rtype == RouterType::Aerodrome {
+            rv_calls.push((pm.factory, IAerodromeFactory::getFeeCall { pool, _stable: pm.is_stable }.abi_encode()));
+        }
         pool_metas.push(PoolMeta {
             pool,
             router_id: pm.router_id.clone(),
@@ -114,6 +121,7 @@ pub(crate) async fn discover_pools<P: Provider>(
             ta: pm.ta,
             tb: pm.tb,
             is_stable: pm.is_stable,
+            rv_idx,
         });
     }
 
@@ -148,9 +156,14 @@ pub(crate) async fn discover_pools<P: Provider>(
         .collect();
 
     // ── Insert into pool_cache ────────────────────────────────────────────────
-    for (i, pm) in pool_metas.iter().enumerate() {
-        let t0_raw  = match rv_raw.get(2 * i)     { Some(Some(r)) => r, _ => continue };
-        let res_raw = match rv_raw.get(2 * i + 1) { Some(Some(r)) => r, _ => continue };
+    for pm in pool_metas.iter() {
+        let t0_raw  = match rv_raw.get(pm.rv_idx)     { Some(Some(r)) => r, _ => continue };
+        let res_raw = match rv_raw.get(pm.rv_idx + 1) { Some(Some(r)) => r, _ => continue };
+        let fee_bps = if pm.rtype == RouterType::Aerodrome {
+            aerodrome_fee_bps(rv_raw.get(pm.rv_idx + 2).and_then(|r| r.as_deref()), pm.fee_bps)
+        } else {
+            pm.fee_bps
+        };
         let dec_ta = decimals_by_token.get(&pm.ta).copied().unwrap_or(18);
         let dec_tb = decimals_by_token.get(&pm.tb).copied().unwrap_or(18);
 
@@ -181,7 +194,7 @@ pub(crate) async fn discover_pools<P: Provider>(
             token1,
             reserve0: U256::from(reserves.reserve0),
             reserve1: U256::from(reserves.reserve1),
-            fee_bps: pm.fee_bps,
+            fee_bps,
             router_id: effective_id,
             is_stable: pm.is_stable,
             decimals0,
@@ -190,6 +203,16 @@ pub(crate) async fn discover_pools<P: Provider>(
             fee_num: U256::ZERO, // overwritten by PoolCache::insert()
         });
     }
+}
+
+/// Per-pool Aerodrome fee from a factory.getFee(pool, stable) return, else the configured
+/// fallback (call failed / undecodable / not a sane bps value).
+fn aerodrome_fee_bps(raw: Option<&[u8]>, fallback_bps: u32) -> u32 {
+    use alloy::sol_types::SolCall;
+    raw.and_then(|r| IAerodromeFactory::getFeeCall::abi_decode_returns(r).ok())
+        .and_then(|f| u32::try_from(f).ok())
+        .filter(|&f| f < 10_000)
+        .unwrap_or(fallback_bps)
 }
 
 fn decode_addr(raw: &[u8]) -> Option<Address> {
@@ -441,4 +464,49 @@ pub(crate) async fn discover_mc<P: Provider>(
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::U256;
+    use alloy::sol_types::SolValue;
+
+    #[test]
+    fn aerodrome_fee_uses_per_pool_getfee_with_config_fallback() {
+        let enc = |f: u64| U256::from(f).abi_encode();
+        // USDC/AERO stable carries a custom 200 bps fee; the factory default stable fee is 5.
+        assert_eq!(aerodrome_fee_bps(Some(&enc(200)), 5), 200);
+        assert_eq!(aerodrome_fee_bps(Some(&enc(5)), 1), 5);
+        assert_eq!(aerodrome_fee_bps(Some(&enc(0)), 5), 0); // zero-fee pool
+        // Failed call, garbage return, or an insane value → configured fallback.
+        assert_eq!(aerodrome_fee_bps(None, 5), 5);
+        assert_eq!(aerodrome_fee_bps(Some(&[1, 2, 3]), 5), 5);
+        assert_eq!(aerodrome_fee_bps(Some(&enc(10_000)), 30), 30);
+    }
+
+    #[test]
+    fn stable_quote_uses_per_pool_fee() {
+        // Same reserves, two stable pools that differ only in fee: the local quote must follow
+        // each pool's fee_bps (PoolCache::insert derives fee_num from it).
+        let cache = PoolCache::new();
+        let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().unwrap();
+        let usdt: Address = "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2".parse().unwrap();
+        let (p5, p200) = (Address::with_last_byte(5), Address::with_last_byte(200));
+        for (pool, fee_bps) in [(p5, 5u32), (p200, 200)] {
+            cache.insert(pool, PoolInfo {
+                token0: usdc, token1: usdt,
+                reserve0: U256::from(5_000_000_000_000u64), reserve1: U256::from(5_000_000_000_000u64),
+                fee_bps, router_id: format!("aero{fee_bps}::stable"), is_stable: true,
+                decimals0: 6, decimals1: 6, last_sync: Instant::now(), fee_num: U256::ZERO,
+            });
+        }
+        let amt = U256::from(100_000_000u64); // 100 USDC
+        let r = U256::from(5_000_000_000_000u64);
+        let q5 = cache.get_amount_out(p5, usdc, amt).unwrap();
+        let q200 = cache.get_amount_out(p200, usdc, amt).unwrap();
+        assert_eq!(Some(q5), crate::pool_cache::amount_out_stable(amt, r, r, 6, 6, U256::from(9_995u64)));
+        assert_eq!(Some(q200), crate::pool_cache::amount_out_stable(amt, r, r, 6, 6, U256::from(9_800u64)));
+        assert!(q200 < q5);
+    }
 }

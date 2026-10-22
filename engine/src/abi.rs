@@ -190,6 +190,8 @@ sol! {
     interface IAerodromeFactory {
         /// Aerodrome V2 factory uses getPool() not getPair()
         function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
+        /// Effective fee of `pool` in bps (/10_000): custom per-pool fee, else stableFee/volatileFee.
+        function getFee(address pool, bool _stable) external view returns (uint256);
     }
 
     #[sol(rpc)]

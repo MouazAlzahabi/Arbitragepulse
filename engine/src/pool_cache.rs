@@ -603,7 +603,7 @@ pub fn amount_out_v2(
 /// Aerodrome-stable pools use this curve.
 /// Reserves are normalised to 18 decimals before solving, then de-normalised.
 ///
-/// fee_bps: 1 (0.01%) for Aerodrome stable pools on Base.
+/// fee_bps: per pool from factory.getFee() — Aerodrome's default stable fee is 5 (0.05%).
 pub fn amount_out_stable(
     amount_in: U256,
     reserve_in: U256,

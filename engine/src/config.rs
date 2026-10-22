@@ -180,7 +180,9 @@ pub struct RouterConfig {
     #[serde(default)]
     pub factory_address: Option<String>,
     /// Fee (basis points) for Solidly stable pools (x³y+xy³=k).
-    /// If not set, falls back to fee_bps. Aerodrome stable pools use ~1 bps (0.01%).
+    /// If not set, falls back to fee_bps. Aerodrome's default stable fee is 5 bps (0.05%).
+    /// For Aerodrome this (and fee_bps) is only the fallback: discovery reads each pool's
+    /// fee from factory.getFee(pool, stable).
     #[serde(default)]
     pub stable_fee_bps: Option<u32>,
 }
