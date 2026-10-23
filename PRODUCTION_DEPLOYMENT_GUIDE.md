@@ -39,18 +39,17 @@ error-free endpoint for `http_rpc`, and the fastest Flashblocks one for `preconf
 
 ## 2. Server
 
-Any small Linux VPS (2 vCPU / 4 GB is plenty) close to the Base sequencer region (US).
+AWS EC2 `t4g.small` (2 vCPU / 2 GB Graviton, Ubuntu 24.04) in **us-east-1**, about $18/month.
+Step-by-step runbook, written so an agent can execute it with STOP checkpoints:
+**[docs/hosting/AWS_SETUP.md](docs/hosting/AWS_SETUP.md)**. `scripts/aws/provision.sh`
+creates the key pair, an SSH-only security group, the instance and an Elastic IP;
+`scripts/aws/teardown.sh` removes them.
 
-```bash
-sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev git curl
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-curl -L https://foundry.paradigm.xyz | bash && foundryup     # for cast/forge
-sudo adduser botadmin
-```
-
-The scripts assume the repo lives at `/home/botadmin/Arbitragepulse` and runs as
-`botadmin`; change `SCRIPTS_DIR`/`SERVICE_USER` in `scripts/server/setup.sh` and the
-paths in `scripts/server/arbitragepulse@.service` otherwise.
+The runbook also covers measuring RPC latency from the box, building, the env file, systemd,
+the SSH-tunnel dashboard and backups. The scripts assume the repo lives at
+`/home/botadmin/Arbitragepulse` and runs as `botadmin` (created by the provisioning
+cloud-init). `scripts/deploy.sh` takes the server from `ARB_SERVER=botadmin@<ip>` or an
+argument.
 
 ## 3. Executor contract
 
@@ -113,7 +112,7 @@ Keep `CONFIG_PATH=engine/config.yaml`, `PORT=3000`, `DB_PATH=trades-base.db`,
 From your machine (rsync + build on the server + restart + health check):
 
 ```bash
-./scripts/deploy.sh                    # default instance: base
+ARB_SERVER=botadmin@<ip> ./scripts/deploy.sh    # default instance: base
 ```
 
 deploy.sh waits up to 90 s for `/health` to report `ok` (or `paused`) and prints the last status either way.

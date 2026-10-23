@@ -2,8 +2,8 @@
 # ArbitragePulse — Local → Hetzner Deploy Script
 #
 # Usage:
-#   ./scripts/deploy.sh                       # deploys to default server
-#   ./scripts/deploy.sh botadmin@1.2.3.4      # override server
+#   ARB_SERVER=botadmin@1.2.3.4 ./scripts/deploy.sh   # server from env
+#   ./scripts/deploy.sh botadmin@1.2.3.4               # …or as an argument
 #   ./scripts/deploy.sh --code-only           # skip rebuild (config/script changes only)
 #   ./scripts/deploy.sh --build-only          # rebuild + restart, no rsync
 #   ./scripts/deploy.sh --instance=base-sepolia  # restart another instance (default: base)
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-SERVER="botadmin@5.161.193.123"
+SERVER="${ARB_SERVER:-}"   # no default: the server is set up per docs/hosting/AWS_SETUP.md
 REMOTE_PATH="/home/botadmin/Arbitragepulse"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -31,9 +31,14 @@ for arg in "$@"; do
         --code-only)  DO_BUILD=false ;;
         --build-only) DO_SYNC=false ;;
         --instance=*) INSTANCE="${arg#--instance=}" ;;
-        botadmin@*|root@*)  SERVER="$arg" ;;
+        *@*)          SERVER="$arg" ;;
     esac
 done
+
+if [ -z "$SERVER" ]; then
+    echo "No server: set ARB_SERVER=botadmin@<ip> or pass botadmin@<ip> as an argument" >&2
+    exit 1
+fi
 
 echo "================================================"
 echo " ArbitragePulse Deploy → ${SERVER}"
