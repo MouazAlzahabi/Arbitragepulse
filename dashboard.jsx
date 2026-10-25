@@ -389,8 +389,11 @@ function StatsRow({ logs, engineState, apiStats }) {
   // Dry-run: simulations that passed count as attempts but are never sent — not errors.
   const sims = sum("total_dry_run_ok");
   const attempts = sum("total_attempts");
-  // opportunities = every execution attempt that passed the gas-profit check
-  const opps   = allChains.length > 0 ? attempts
+  // opportunities = every opportunity the engine logged (the Opportunities list), including
+  // ones then skipped (unfunded, cooldown); older engines without the counter fall back to
+  // execution attempts.
+  const opps   = allChains.length > 0
+                  ? (allChains.some((c) => c.total_opportunities != null) ? sum("total_opportunities") : attempts)
                   : logs.filter((l) => l.type === "opportunity").length;
   // errors = counted by the engine, not derived: a tx still awaiting its receipt is
   // neither a success nor an error yet.
@@ -404,7 +407,7 @@ function StatsRow({ logs, engineState, apiStats }) {
   const items = [
     { l: "UPTIME", v: uptime, c: "#94a3b8" },
     { l: "CHAIN", v: allChains[0]?.chain_name ?? "—", c: "#a78bfa" },
-    { l: "OPPORTUNITIES", v: opps, c: "#818cf8" },
+    { l: "OPPORTUNITIES", v: opps, c: "#818cf8", title: `Found by the engine, including ones skipped before execution (e.g. executor not funded). Reached execution: ${attempts}` },
     { l: "TRADES", v: sims > 0 ? `${trades} (+${sims} sim)` : trades, c: "#34d399", title: "Confirmed on-chain (+ dry-run simulations that passed)" },
     { l: "ERRORS", v: errors, c: errors > 0 ? "#f87171" : "#334155" },
     { l: "GHOST PROFIT", v: `$${ghostProfit.toFixed(2)}`, c: "#64748b", title: "Sum of gross profit from trades rejected due to gas cost" },
@@ -465,6 +468,7 @@ function ChainCards({ apiStats }) {
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 11 }}>
               <div><span style={{ color: "#475569" }}>Scans </span><span style={{ color: "#94a3b8" }}>{c.total_scans || 0}</span></div>
+              <div><span style={{ color: "#475569" }}>Opps </span><span style={{ color: "#818cf8" }}>{c.total_opportunities || 0}</span></div>
               <div><span style={{ color: "#475569" }}>Executions </span><span style={{ color: "#94a3b8" }}>{c.total_attempts}</span></div>
               <div><span style={{ color: "#475569" }}>Success </span><span style={{ color: "#34d399" }}>{c.total_success}</span></div>
               <div><span style={{ color: "#475569" }}>Net profit (est.) </span><span style={{ color: "#a78bfa" }}>${(c.total_profit_usd || 0).toFixed(2)}</span></div>
