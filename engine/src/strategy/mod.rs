@@ -98,6 +98,10 @@ pub(crate) fn quote_cache_max_age() -> std::time::Duration { crate::config::tuni
 /// Pool cap for [`QuoteCache`]; cleared wholesale when exceeded.
 fn quote_cache_max_pools() -> usize { crate::config::tuning().quote_cache_max_pools }
 
+/// Minimum age of a pool's local state before a quote for it is cached — see
+/// [`QuoteCache::insert`].
+fn quote_cache_settle() -> std::time::Duration { crate::config::tuning().quote_cache_settle() }
+
 /// Timeout for one Multicall3 chunk in [`run_multicall`]. Without it a hung RPC request
 /// blocks the chain's scan loop forever (seen on a cold Anvil fork). QuoterV2 batches
 /// normally take ~80–160 ms; on timeout the chunk's calls count as failed.
@@ -144,7 +148,19 @@ impl QuoteCache {
     /// re-sent). `state_at_send` is the pool's (sqrtPriceX96, liquidity) read when the
     /// request was built: if the pool moves while the call is in flight, the entry no
     /// longer matches and is never served.
-    pub(crate) fn insert(&self, key: V3PoolKey, amount_in: U256, state_at_send: (U256, u128), amount_out: U256) {
+    ///
+    /// Skipped while the pool's local state is younger than [`quote_cache_settle()`]: a
+    /// quote sent right after a pre-confirmed log can price the state before it (the
+    /// quote RPC's `pending` lags the pendingLogs feed), and caching it under the new
+    /// state would keep serving that stale result. The quote itself is still used.
+    pub(crate) fn insert(&self, pools: &PoolCache, key: V3PoolKey, amount_in: U256, state_at_send: (U256, u128), amount_out: U256) {
+        self.insert_settled(pools, key, amount_in, state_at_send, amount_out, quote_cache_settle());
+    }
+
+    fn insert_settled(&self, pools: &PoolCache, key: V3PoolKey, amount_in: U256, state_at_send: (U256, u128), amount_out: U256, settle: std::time::Duration) {
+        if pools.v3_state_age(&key).is_none_or(|age| age < settle) {
+            return;
+        }
         if self.pools.len() > quote_cache_max_pools() {
             self.pools.clear();
         }
@@ -850,5 +866,60 @@ mod quote_encoding_tests {
         // Both quoters return (uint256 amountOut, uint160, uint32, uint256).
         let ret = (U256::from(42u64), U256::ZERO, U256::ZERO, U256::ZERO).abi_encode_params();
         assert_eq!(decode_v3_quote(Some(&ret)), Some(U256::from(42u64)));
+    }
+}
+
+#[cfg(test)]
+mod quote_cache_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const POOL: Address = Address::repeat_byte(0xbb);
+
+    fn pools_updated_ago(ago: Duration) -> (PoolCache, V3PoolKey) {
+        let (t0, t1) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let pools = PoolCache::new();
+        pools.insert_v3(POOL, crate::pool_cache::V3PoolState {
+            token0: t0,
+            token1: t1,
+            fee: 500,
+            swap_fee: 500,
+            sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1_000_000,
+            tick: 0,
+            router_id: "r".into(),
+            last_updated: Instant::now() - ago,
+            vr0: U256::ZERO,
+            vr1: U256::ZERO,
+            fee_num_v3: U256::ZERO,
+        });
+        (pools, V3PoolKey::new("r", t0, t1, 500))
+    }
+
+    #[test]
+    fn quote_for_a_just_moved_pool_is_not_cached() {
+        let settle = Duration::from_millis(500);
+        let amount = U256::from(1_000u64);
+        let out = U256::from(990u64);
+
+        // Pool moved 50 ms ago (pre-confirmed log): `pending` may still be the old state.
+        let (pools, key) = pools_updated_ago(Duration::from_millis(50));
+        let state = pools.v3_price_state(&key).unwrap();
+        let cache = QuoteCache::default();
+        cache.insert_settled(&pools, key.clone(), amount, state, out, settle);
+        assert_eq!(cache.get(&pools, &key, amount), None);
+
+        // Settled pool: cached and served as before.
+        let (pools, key) = pools_updated_ago(Duration::from_secs(1));
+        let state = pools.v3_price_state(&key).unwrap();
+        cache.insert_settled(&pools, key.clone(), amount, state, out, settle);
+        assert_eq!(cache.get(&pools, &key, amount), Some(out));
+
+        // settle = 0 keeps the old always-cache behaviour.
+        let (pools, key) = pools_updated_ago(Duration::ZERO);
+        let state = pools.v3_price_state(&key).unwrap();
+        let cache = QuoteCache::default();
+        cache.insert_settled(&pools, key.clone(), amount, state, out, Duration::ZERO);
+        assert_eq!(cache.get(&pools, &key, amount), Some(out));
     }
 }

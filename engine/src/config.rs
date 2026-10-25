@@ -480,6 +480,12 @@ pub struct Tuning {
     /// Max age of a cached 2-hop QuoterV2 result (ms). Block-relative: 3 blocks.
     pub quote_cache_max_age_ms: Option<u64>,
     pub quote_cache_max_pools: usize,
+    /// Don't cache a QuoterV2 result while the pool's local state is younger than this
+    /// (ms). Right after a pre-confirmed log moves the pool, `pending` on the quote RPC can
+    /// still price the previous state (measured on mainnet.base.org from us-east-1: 19% of
+    /// calls, all caught up within 100 ms); cached under the new state, that stale quote
+    /// would be served for up to quote_cache_max_age. 0 = always cache.
+    pub quote_cache_settle_ms: u64,
     /// RPC health: hold after an outage, cap for repeated relapses, relapse window (ms).
     pub health_hold_base_ms: u64,
     pub health_hold_max_ms: u64,
@@ -554,6 +560,7 @@ impl Default for Tuning {
             discover_call_timeout_ms: 15_000,
             quote_cache_max_age_ms: None,
             quote_cache_max_pools: 1024,
+            quote_cache_settle_ms: 500,
             health_hold_base_ms: 10_000,
             health_hold_max_ms: 80_000,
             health_relapse_window_ms: 60_000,
@@ -640,6 +647,7 @@ impl Tuning {
         ms(self.health_monitor_every_ms.unwrap_or(self.block_time_ms))
     }
     pub fn rpc_read_timeout(&self) -> std::time::Duration { ms(self.rpc_read_timeout_ms) }
+    pub fn quote_cache_settle(&self) -> std::time::Duration { ms(self.quote_cache_settle_ms) }
     pub fn rpc_send_timeout(&self) -> std::time::Duration { ms(self.rpc_send_timeout_ms) }
     pub fn multicall_chunk_timeout(&self) -> std::time::Duration { ms(self.multicall_chunk_timeout_ms) }
     pub fn discover_call_timeout(&self) -> std::time::Duration { ms(self.discover_call_timeout_ms) }
