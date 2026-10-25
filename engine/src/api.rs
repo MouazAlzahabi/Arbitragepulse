@@ -50,7 +50,10 @@ pub struct ChainStats {
     pub chain_name: String,
     /// Number of times the engine evaluated prices (scanned for opportunities).
     pub total_scans: u64,
-    /// Number of times an execution was attempted (opportunity found + profitable).
+    /// Opportunities found (one per OPP line in the feed), including ones then skipped for
+    /// balance, cooldown or gas — the dashboard's OPPORTUNITIES tile.
+    pub total_opportunities: u64,
+    /// Number of times an execution was attempted (reached the executor: prepare + send/simulate).
     pub total_attempts: u64,
     pub total_success: u64,
     pub total_failed: u64,
@@ -400,6 +403,7 @@ async fn stats_reset(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 for chain in &mut engine.chains {
                     chain.total_attempts = 0;
                     chain.total_scans = 0;
+                    chain.total_opportunities = 0;
                     chain.total_success = 0;
                     chain.total_failed = 0;
                     chain.total_dry_run_ok = 0;
@@ -749,6 +753,7 @@ mod tests {
             chain_id: 8453,
             chain_name: String::new(),
             total_scans: 0,
+            total_opportunities: 0,
             total_attempts: 0,
             total_success: 0,
             total_failed: 0,

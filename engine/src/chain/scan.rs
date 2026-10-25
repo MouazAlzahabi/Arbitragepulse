@@ -170,7 +170,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     last_fwd_count: &Arc<AtomicU64>,
     last_multi_count: &Arc<AtomicU64>,
     last_active_count: &Arc<AtomicU64>,
-    last_opp_count: &Arc<AtomicU64>,
+    opps_found: &Arc<AtomicU64>,
     contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
     // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
     targeted: Option<(HashSet<usize>, Vec<Address>)>,
@@ -283,8 +283,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     };
     let detect_ms = detect_start.elapsed().as_millis() as u64;
 
-    // Track opp count for heartbeat display
-    last_opp_count.store(all_opportunities.len() as u64, Ordering::Relaxed);
 
     // Log all opportunities found this scan so it's visible which pairs are generating them.
     // This is key for diagnosing "single pair always" — it shows whether other pairs have
@@ -383,6 +381,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // so detection is visible, but don't submit (they land at position 500+ on Base).
     // Pending-monitor triggered calls carry Some(tip_override) and always proceed.
     if cfg.pending_only_submission && tip_override.is_none() {
+        opps_found.fetch_add(1, Ordering::Relaxed);
         broadcast_log(
             log_tx,
             "opportunity",
@@ -434,6 +433,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
                 );
             } else {
+                opps_found.fetch_add(1, Ordering::Relaxed);
                 broadcast_log(
                     log_tx,
                     "opportunity",
@@ -908,6 +908,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
                 );
             } else {
+                opps_found.fetch_add(1, Ordering::Relaxed);
                 broadcast_log(
                     log_tx,
                     "opportunity",

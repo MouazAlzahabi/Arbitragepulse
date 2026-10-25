@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
                         chain_id,
                         chain_name: seed.chain_name,
                         total_scans: 0,
+                        total_opportunities: 0,
                         total_attempts: seed.attempts,
                         total_success: seed.successes,
                         total_failed: seed.reverted,

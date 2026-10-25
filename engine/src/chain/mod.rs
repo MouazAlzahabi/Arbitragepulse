@@ -245,6 +245,7 @@ pub async fn run_chain(
                 chain_id: cfg.id,
                 chain_name: cfg.name.clone(),
                 total_scans: 0,
+                total_opportunities: 0,
                 total_attempts: 0,
                 total_success: 0,
                 total_failed: 0,
@@ -406,13 +407,16 @@ pub async fn run_chain(
     let last_fwd_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     let last_multi_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     let last_active_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
-    // last_opp_count: how many profitable opportunities were found in the last scan
-    let last_opp_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
+    // opps_found: opportunities logged to the feed (one per candidate that reached execution,
+    // whether it then traded, was skipped for balance or failed). Cumulative; the heartbeat
+    // shows the per-beat delta and /stats the total — the dashboard's OPPORTUNITIES tile.
+    let opps_found: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     // Count of consecutive heartbeats with zero forward quotes.
     // Warning only fires at 3+ to suppress startup false-positives and transient RPC blips.
     let mut consecutive_zero_fwd: u32 = 0;
     // Scans at the previous heartbeat — used to show per-beat delta instead of cumulative.
     let mut last_hb_scans: u64 = 0;
+    let mut last_hb_opps: u64 = 0;
     // Lock-free scan counter — incremented by poll_tick and swap handlers (no write lock needed).
     // Synced to shared_state.total_scans during heartbeat's existing write() acquisition.
     let scan_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -501,6 +505,9 @@ pub async fn run_chain(
                             exec.confirmed_failed.store(0, Ordering::Relaxed);
                             exec.confirmed_profit_usd_bits.store(0, Ordering::Relaxed);
                             exec.ghost_profit_usd_bits.store(0, Ordering::Relaxed);
+                            scan_count.store(0, Ordering::Relaxed);
+                            opps_found.store(0, Ordering::Relaxed);
+                            (last_hb_scans, last_hb_opps) = (0, 0);
                             state.stats_reset_requested = false;
                         }
                     }
@@ -518,6 +525,7 @@ pub async fn run_chain(
                         chain.rpc_latency_ms = rpc_latency_ms;
                         chain.ghost_profit_usd = ghost;
                         chain.total_scans = scan_count.load(Ordering::Relaxed);
+                        chain.total_opportunities = opps_found.load(Ordering::Relaxed);
                     }
                     base_success + ok
                 };
@@ -557,7 +565,9 @@ pub async fn run_chain(
                 let multi_dex = last_multi_count.load(Ordering::Relaxed);
                 let active_pairs = last_active_count.load(Ordering::Relaxed);
                 let total_pairs = chain_pairs.len() as u64;
-                let opp_count = last_opp_count.load(Ordering::Relaxed);
+                let total_opps = opps_found.load(Ordering::Relaxed);
+                let opp_count = total_opps.saturating_sub(last_hb_opps);
+                last_hb_opps = total_opps;
                 let (v3_fresh, v3_total) =
                     pool_cache.count_fresh_v3_pools(crate::config::tuning().v3_fresh_window());
                 let preconf_n = preconf_logs.swap(0, Ordering::Relaxed);
@@ -746,7 +756,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None, disabled_set, None,
+                    &opps_found, &contract_balances, None, disabled_set, None,
                     "block",
                 ).await;
                 last_scan_at = Instant::now();
@@ -780,7 +790,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, None, disabled_set, None,
+                    &opps_found, &contract_balances, None, disabled_set, None,
                     "poll",
                 ).await;
                 last_scan_at = Instant::now();
@@ -869,7 +879,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    &opps_found, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     None,
                     "swap",
                 ).await;
@@ -914,7 +924,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &last_opp_count, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    &opps_found, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     Some(tip_override),
                     "pending",
                 ).await;
