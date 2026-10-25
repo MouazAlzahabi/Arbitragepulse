@@ -552,7 +552,7 @@ impl Strategy {
                             let result = quote.unwrap_or(U256::ZERO);
                             if let Some(state) = state.filter(|_| quote.is_some() || p15_batch_ok) {
                                 let key = V3PoolKey::new(router_a_id, *token_in, *token_out, *fee_a);
-                                self.quote_cache.insert(key, *full_amount, state, result);
+                                self.quote_cache.insert(&self.pool_cache, key, *full_amount, state, result);
                             }
                             result
                         }
@@ -791,7 +791,7 @@ impl Strategy {
                             .rev_v3_key
                             .clone()
                             .unwrap_or_else(|| V3PoolKey::new(&q_b.router_id, token_out, token_in, q_b.fee));
-                        self.quote_cache.insert(p15b_key, quoter_out, state, result);
+                        self.quote_cache.insert(&self.pool_cache, p15b_key, quoter_out, state, result);
                     }
                     if result.is_zero() { continue; }
                     result

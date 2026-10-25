@@ -583,6 +583,12 @@ impl PoolCache {
         self.v3_by_address.get(&pool_addr).map(|s| (s.sqrt_price_x96, s.liquidity))
     }
 
+    /// Time since the pool's local state last changed (Swap, Mint/Burn or seed).
+    pub fn v3_state_age(&self, key: &V3PoolKey) -> Option<Duration> {
+        let pool_addr = *self.v3_by_key.get(key)?;
+        self.v3_by_address.get(&pool_addr).map(|s| s.last_updated.elapsed())
+    }
+
 }
 
 // ─── AMM math ─────────────────────────────────────────────────────────────────
