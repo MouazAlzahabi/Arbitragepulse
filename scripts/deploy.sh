@@ -65,7 +65,6 @@ if [ "$DO_SYNC" = true ]; then
         --exclude 'target/' \
         --exclude '.git/' \
         --exclude 'contract/lib/' \
-        --exclude 'lab/' \
         --exclude '*.log' \
         --exclude '*.db' \
         --exclude '*.db-*' \
