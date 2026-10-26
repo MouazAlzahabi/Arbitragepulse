@@ -20,7 +20,7 @@ chain:
   native_currency: "ETH"
   wrapped_native: "0x4200000000000000000000000000000000000006"
   block_time_ms: 2000
-  contract_address: "0xF8aa9d575CEccdFed211383Cd3979241d9C6E0c2"
+  contract_address: "0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2"
   min_native_balance: 0.005
   # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
   # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
