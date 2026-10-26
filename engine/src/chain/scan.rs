@@ -451,13 +451,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Pending-monitor triggered calls carry Some(tip_override) and always proceed.
     if cfg.pending_only_submission && tip_override.is_none() {
         opps_found.fetch_add(1, Ordering::Relaxed);
+        let msg = format!(
+            "[{}] OPP! (pending-only mode, no submit) {} | profit=${:.4}",
+            cfg.name, display_id, best_opp.profit_usd(),
+        );
+        info!("{}", msg);
         broadcast_log(
             log_tx,
             "opportunity",
-            &format!(
-                "[{}] OPP! (pending-only mode, no submit) {} | profit=${:.4}",
-                cfg.name, display_id, best_opp.profit_usd(),
-            ),
+            &msg,
             Some(serde_json::json!({
                 "chain":      cfg.name,
                 "pair_id":    display_id,
@@ -503,13 +505,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 );
             } else {
                 opps_found.fetch_add(1, Ordering::Relaxed);
+                let msg = format!(
+                    "[{}] 2-hop {} | profit=${:.4} | {}/{}",
+                    cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
+                );
+                info!("{}", msg);
                 broadcast_log(
                     log_tx,
                     "opportunity",
-                    &format!(
-                        "[{}] 2-hop {} | profit=${:.4} | {}/{}",
-                        cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
-                    ),
+                    &msg,
                     Some(serde_json::json!({
                         "chain":      cfg.name,
                         "pair_id":    optimized.pair_id,
@@ -978,13 +982,15 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 );
             } else {
                 opps_found.fetch_add(1, Ordering::Relaxed);
+                let msg = format!(
+                    "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
+                    cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
+                );
+                info!("{}", msg);
                 broadcast_log(
                     log_tx,
                     "opportunity",
-                    &format!(
-                        "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
-                        cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
-                    ),
+                    &msg,
                     Some(serde_json::json!({
                         "chain":        cfg.name,
                         "pair_id":      opp.triplet_id,
