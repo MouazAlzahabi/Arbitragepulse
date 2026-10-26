@@ -8,6 +8,7 @@ mod listener;
 mod metrics;
 mod pool_cache;
 mod race;
+mod rpc_count;
 mod revert;
 mod strategy;
 mod types;

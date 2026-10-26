@@ -64,7 +64,8 @@ pub async fn run_chain(
     let signer_address = signer.address();
     let wallet = EthereumWallet::from(signer);
 
-    let provider = connect_with_fallback(&cfg, wallet.clone()).await
+    let rpc_counter = crate::rpc_count::RpcCounter::default();
+    let provider = connect_with_fallback(&cfg, wallet.clone(), rpc_counter.clone()).await
         .map_err(|e| anyhow::anyhow!("[{}] All RPC endpoints failed: {}", cfg.name, e))?;
 
     let provider = Arc::new(provider);
@@ -179,6 +180,12 @@ pub async fn run_chain(
         .ok()
         .map(|url| ProviderBuilder::new().connect_http(url).erased()));
     executor.lock().await.sim_provider = preconf_http.clone();
+    // Background reads (contract/signer balances, ETH price) don't need the main provider's
+    // speed or subscriptions: they go to the HTTP endpoint, keeping the main (paid) RPC for
+    // subscriptions, sends, receipts and nonces. Falls back to the main provider without one.
+    let reads: Arc<alloy::providers::DynProvider> = Arc::new(
+        http_provider.clone().unwrap_or_else(|| provider.as_ref().clone().erased()),
+    );
 
     let min_triangular_profit_usd = cfg
         .min_triangular_profit_usd
@@ -217,10 +224,10 @@ pub async fn run_chain(
         Arc::new(RwLock::new(initial))
     };
     // Fetch initial balances so the optimizer has data from the first scan.
-    state::refresh_contract_balances(provider.as_ref(), contract_addr, &contract_balances).await;
+    state::refresh_contract_balances(reads.as_ref(), contract_addr, &contract_balances).await;
     // Signer gas check (chain.min_native_balance): warn once per low period.
     let gas_low_warned = Arc::new(AtomicBool::new(false));
-    state::check_signer_gas(provider.as_ref(), signer_address, cfg.min_native_balance, &gas_low_warned, &log_tx, &cfg.name).await;
+    state::check_signer_gas(reads.as_ref(), signer_address, cfg.min_native_balance, &gas_low_warned, &log_tx, &cfg.name).await;
     // Startup funding check: warn for any underfunded pair.
     state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances, &log_tx).await;
     // Wire balances into executor for post-trade immediate refresh.
@@ -462,7 +469,7 @@ pub async fn run_chain(
                     std::process::exit(1);
                 }
                 if !price_refresh_busy.swap(true, Ordering::AcqRel) {
-                    let (strategy, executor, provider) = (strategy.clone(), executor.clone(), provider.clone());
+                    let (strategy, executor, provider, reads) = (strategy.clone(), executor.clone(), provider.clone(), reads.clone());
                     let (routers, pairs, cfg) = (chain_routers.clone(), chain_pairs.clone(), cfg.clone());
                     let (busy, latency) = (price_refresh_busy.clone(), rpc_latency_bits.clone());
                     tokio::spawn(async move {
@@ -473,7 +480,7 @@ pub async fn run_chain(
                             Err(_) => 0.0,
                         };
                         latency.store(rpc_latency_ms.to_bits(), Ordering::Relaxed);
-                        state::update_native_price(&strategy, &executor, &provider, &routers, &pairs, &cfg).await;
+                        state::update_native_price(&strategy, &executor, &reads, &routers, &pairs, &cfg).await;
                         busy.store(false, Ordering::Release);
                     });
                 }
@@ -579,6 +586,8 @@ pub async fn run_chain(
                     if cfg.preconf_ws_rpc.is_some() { format!(" | preconf_logs={}", preconf_n) } else { String::new() },
                     if unfunded > 0 { format!(" | unfunded={}/{}", unfunded, total_pairs) } else { String::new() },
                 );
+                // Requests on the main provider since the last beat, by method.
+                let heartbeat_msg = format!("{} | rpc={}", heartbeat_msg, rpc_counter.take_summary());
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 // A full scan normally runs every block (~2 s); a long gap means scanning has
                 // stalled (e.g. RPC outage), which the counters alone don't show.
@@ -642,13 +651,13 @@ pub async fn run_chain(
             // ── Periodic contract balance refresh ─────────────────────────────
             _ = balance_tick.tick() => {
                 if !balance_refresh_busy.swap(true, Ordering::AcqRel) {
-                    let (provider, balances) = (provider.clone(), contract_balances.clone());
+                    let (reads, balances) = (reads.clone(), contract_balances.clone());
                     let busy = balance_refresh_busy.clone();
                     let (log_tx, chain_name, min_eth, warned) =
                         (log_tx.clone(), cfg.name.clone(), cfg.min_native_balance, gas_low_warned.clone());
                     tokio::spawn(async move {
-                        state::refresh_contract_balances(provider.as_ref(), contract_addr, &balances).await;
-                        state::check_signer_gas(provider.as_ref(), signer_address, min_eth, &warned, &log_tx, &chain_name).await;
+                        state::refresh_contract_balances(reads.as_ref(), contract_addr, &balances).await;
+                        state::check_signer_gas(reads.as_ref(), signer_address, min_eth, &warned, &log_tx, &chain_name).await;
                         busy.store(false, Ordering::Release);
                     });
                 }
@@ -1131,11 +1140,12 @@ fn on_paused(last_scan_at: &mut Instant, rpc_health: &crate::util::RpcHealth) {
 async fn connect_with_fallback(
     cfg: &ChainConfig,
     wallet: EthereumWallet,
+    counter: crate::rpc_count::RpcCounter,
 ) -> Result<impl Provider + Clone + 'static> {
     let urls: Vec<&str> = std::iter::once(cfg.ws_rpc.as_str())
         .chain(cfg.ws_rpc_fallbacks.iter().map(String::as_str))
         .collect();
-    connect_first(&cfg.name, &urls, wallet, WS_CONNECT_TIMEOUT).await
+    connect_first(&cfg.name, &urls, wallet, WS_CONNECT_TIMEOUT, counter).await
 }
 
 /// First URL whose WS handshake completes within `limit` (a stalled endpoint falls
@@ -1145,14 +1155,19 @@ async fn connect_first(
     urls: &[&str],
     wallet: EthereumWallet,
     limit: Duration,
+    counter: crate::rpc_count::RpcCounter,
 ) -> Result<impl Provider + Clone + 'static> {
     let mut last_err = String::new();
     for (i, url) in urls.iter().enumerate() {
-        let conn = ProviderBuilder::<_, _, Ethereum>::new()
-            .wallet(wallet.clone())
-            .connect_ws(WsConnect::new(*url).with_max_retries(u32::MAX));
-        match rpc_timeout(limit, conn).await {
-            Ok(p) => {
+        // Every request on this provider is counted per method (heartbeat `rpc=`).
+        let client = alloy::rpc::client::ClientBuilder::default()
+            .layer(crate::rpc_count::CountLayer(counter.clone()))
+            .ws(WsConnect::new(*url).with_max_retries(u32::MAX));
+        match rpc_timeout(limit, client).await {
+            Ok(client) => {
+                let p = ProviderBuilder::<_, _, Ethereum>::new()
+                    .wallet(wallet.clone())
+                    .connect_client(client);
                 if i > 0 {
                     info!("[{}] Connected via fallback RPC #{}: {}", name, i, crate::util::redact_url(url));
                 }
@@ -1191,7 +1206,7 @@ mod tests {
         let url = format!("ws://{}", addr);
         let wallet = EthereumWallet::from(PrivateKeySigner::random());
         let t0 = Instant::now();
-        let res = connect_first("test", &[url.as_str(), url.as_str()], wallet, Duration::from_millis(300)).await;
+        let res = connect_first("test", &[url.as_str(), url.as_str()], wallet, Duration::from_millis(300), Default::default()).await;
         let err = match res { Ok(_) => panic!("stalled endpoint connected"), Err(e) => e.to_string() };
         assert!(err.contains("timed out"), "{err}");
         assert!(t0.elapsed() < Duration::from_secs(3), "took {:?}", t0.elapsed());
