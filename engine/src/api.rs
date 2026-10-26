@@ -75,8 +75,11 @@ pub struct ChainStats {
     pub last_block: u64,
     /// Unix seconds when `last_block` last advanced (0 = no block yet).
     pub last_block_at: u64,
-    /// Latest eth_blockNumber round-trip latency in ms (measured once per heartbeat interval). 0 = not yet measured.
+    /// Main-RPC eth_blockNumber round trip in ms: median of the last minute (sampled every
+    /// 10 s). 0 = not yet measured.
     pub rpc_latency_ms: f64,
+    /// Slowest of those samples (ms) — a brief spike shows here, not in the median.
+    pub rpc_latency_max_ms: f64,
 }
 
 #[derive(Debug, Default)]
@@ -768,6 +771,7 @@ mod tests {
             last_block: 0,
             last_block_at,
             rpc_latency_ms: 0.0,
+            rpc_latency_max_ms: 0.0,
         }
     }
 

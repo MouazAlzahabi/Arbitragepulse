@@ -281,6 +281,7 @@ pub async fn run_chain(
                 last_block: 0,
                 last_block_at: 0,
                 rpc_latency_ms: 0.0,
+                rpc_latency_max_ms: 0.0,
             });
         } else if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
             chain.rpc_ok = true;
@@ -458,9 +459,30 @@ pub async fn run_chain(
     // Native-price and balance refreshes run as background tasks so their RPC calls never
     // delay a scan. Each flag stops a slow refresh from overlapping with the next tick.
     let price_refresh_busy   = Arc::new(AtomicBool::new(false));
-    // Last eth_blockNumber round trip (ms, f64 bits; 0 = failed / not yet measured). Measured
-    // in the price-refresh task so the ping never holds up the select loop.
+    // Main-RPC round trip (ms, f64 bits; 0 = not yet measured): median and worst of the last
+    // minute's eth_blockNumber pings, taken every 10 s by a background task (never on the
+    // select loop). One sample a minute swung with whatever shared the WS socket at that moment.
     let rpc_latency_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
+    let rpc_latency_max_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
+    {
+        let (provider, median, worst) = (Arc::downgrade(&provider), rpc_latency_bits.clone(), rpc_latency_max_bits.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            let mut samples: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(6);
+            loop {
+                tick.tick().await;
+                let Some(provider) = provider.upgrade() else { return };
+                let t = Instant::now();
+                if rpc_timeout(rpc_read_timeout(), provider.get_block_number()).await.is_ok() {
+                    if samples.len() == 6 { samples.pop_front(); }
+                    samples.push_back(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                let (m, w) = latency_median_max(&samples);
+                median.store(m.to_bits(), Ordering::Relaxed);
+                worst.store(w.to_bits(), Ordering::Relaxed);
+            }
+        });
+    }
     let balance_refresh_busy = Arc::new(AtomicBool::new(false));
     // When the last block header arrived: a long gap means the WS backend is dead (E1-3).
     let mut last_block_seen = Instant::now();
@@ -483,17 +505,10 @@ pub async fn run_chain(
                     std::process::exit(1);
                 }
                 if !price_refresh_busy.swap(true, Ordering::AcqRel) {
-                    let (strategy, executor, provider, reads) = (strategy.clone(), executor.clone(), provider.clone(), reads.clone());
+                    let (strategy, executor, reads) = (strategy.clone(), executor.clone(), reads.clone());
                     let (routers, pairs, cfg) = (chain_routers.clone(), chain_pairs.clone(), cfg.clone());
-                    let (busy, latency) = (price_refresh_busy.clone(), rpc_latency_bits.clone());
+                    let busy = price_refresh_busy.clone();
                     tokio::spawn(async move {
-                        // Measure RPC round-trip latency via a lightweight eth_blockNumber call.
-                        let rpc_ping_start = Instant::now();
-                        let rpc_latency_ms = match rpc_timeout(rpc_read_timeout(), provider.get_block_number()).await {
-                            Ok(_) => rpc_ping_start.elapsed().as_millis() as f64,
-                            Err(_) => 0.0,
-                        };
-                        latency.store(rpc_latency_ms.to_bits(), Ordering::Relaxed);
                         state::update_native_price(&strategy, &executor, &reads, &routers, &pairs, &cfg).await;
                         busy.store(false, Ordering::Release);
                     });
@@ -544,6 +559,7 @@ pub async fn run_chain(
                         chain.total_failed = base_failed + fail;
                         chain.total_profit_usd = base_profit + profit;
                         chain.rpc_latency_ms = rpc_latency_ms;
+                        chain.rpc_latency_max_ms = f64::from_bits(rpc_latency_max_bits.load(Ordering::Relaxed));
                         chain.ghost_profit_usd = ghost;
                         chain.total_scans = scan_count.load(Ordering::Relaxed);
                         chain.total_opportunities = opps_found.load(Ordering::Relaxed);
@@ -1128,6 +1144,18 @@ fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
     });
 }
 
+/// Median and maximum of the latency samples (ms); (0, 0) when empty.
+fn latency_median_max(samples: &std::collections::VecDeque<f64>) -> (f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut v: Vec<f64> = samples.iter().copied().collect();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let mid = v.len() / 2;
+    let median = if v.len() % 2 == 0 { (v[mid - 1] + v[mid]) / 2.0 } else { v[mid] };
+    (median, v[v.len() - 1])
+}
+
 /// A breaker pause that was just cleared by /engine/resume left the failure count at the
 /// threshold; reset it so the next single failure doesn't re-trip at once.
 fn reset_breaker_on_resume(chain_paused: bool, consecutive_failures: &mut u32) -> bool {
@@ -1204,6 +1232,17 @@ async fn connect_first(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_median_max_cases() {
+        use std::collections::VecDeque;
+        assert_eq!(latency_median_max(&VecDeque::new()), (0.0, 0.0));
+        // One 21 ms spike among 6–9 ms samples moves the max, not the median.
+        let v: VecDeque<f64> = [6.0, 9.0, 21.0, 7.0, 8.0, 6.0].into_iter().collect();
+        assert_eq!(latency_median_max(&v), (7.5, 21.0));
+        let v: VecDeque<f64> = [5.0, 30.0, 6.0].into_iter().collect();
+        assert_eq!(latency_median_max(&v), (6.0, 30.0));
+    }
 
     /// A WS endpoint that accepts TCP but never answers the handshake must not hang
     /// startup: each attempt times out and the next URL is tried.

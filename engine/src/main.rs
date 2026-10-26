@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
                         last_block: 0,
                         last_block_at: 0,
                         rpc_latency_ms: 0.0,
+                        rpc_latency_max_ms: 0.0,
                     });
                     info!("Seeded chain stats from DB: chain_id={}", chain_id);
                 }

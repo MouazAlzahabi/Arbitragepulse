@@ -506,8 +506,10 @@ function GasLatencyBar({ apiStats, apiLatency, statsPollError }) {
       {rpcChains.map((c) => {
         const ms = Math.round(c.rpc_latency_ms);
         const col = ms < 100 ? "#34d399" : ms < 300 ? "#fbbf24" : "#f87171";
+        const max = c.rpc_latency_max_ms != null ? Math.round(c.rpc_latency_max_ms) : null;
         return (
-          <span key={c.chain_id} style={{ color: "#475569" }}>
+          <span key={c.chain_id} style={{ color: "#475569" }}
+            title={max != null ? `Engine's main RPC (eth_blockNumber): median of the last minute, sampled every 10 s. Slowest sample: ${max}ms. Quotes and sends use other endpoints.` : undefined}>
             📡 RPC ({c.chain_name}): <span style={{ color: col }}>{ms}ms</span>
           </span>
         );
