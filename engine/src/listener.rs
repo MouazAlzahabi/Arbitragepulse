@@ -63,6 +63,7 @@ pub fn apply_log_to_cache(
     if log.removed {
         return None;
     }
+    cache.note_log();
     let repeat = match log.block_number.zip(log.log_index) {
         Some(pos) => match cache.advance_log_position(pool, pos) {
             std::cmp::Ordering::Less => return None,
@@ -413,6 +414,31 @@ mod tests {
 
     fn reserve0(cache: &PoolCache) -> U256 {
         cache.by_address.get(&POOL).unwrap().reserve0
+    }
+
+    #[test]
+    fn quiet_pool_is_quoted_only_while_the_feed_is_live() {
+        let cache = cache_with_pool();
+        // No Sync for 200 s — past the 120 s volatile max age.
+        cache.by_address.get_mut(&POOL).unwrap().last_sync =
+            std::time::Instant::now() - std::time::Duration::from_secs(200);
+        let key = crate::pool_cache::V2PoolKey::new(
+            "r", address!("0000000000000000000000000000000000000001"), address!("0000000000000000000000000000000000000002"));
+        let quote = |c: &PoolCache| c.get_amount_out_by_v2_key(
+            &key, address!("0000000000000000000000000000000000000001"), U256::from(10u64),
+            Some(std::time::Duration::from_secs(120)));
+        assert!(cache.is_quiet(POOL));
+        // No log seen yet: the feed isn't live, so the max age still excludes the pool.
+        assert!(!cache.feed_live());
+        assert!(quote(&cache).is_none());
+        // Any pool log (here: another pool's) makes the feed live — the quiet pool's reserves
+        // are current, so it is quoted again (and re-checked on-chain before a trade).
+        let mut other = sync_log(20, 0, 5_000, false);
+        other.inner.address = address!("00000000000000000000000000000000000000cc");
+        apply(&cache, &other);
+        assert!(cache.feed_live());
+        assert!(quote(&cache).is_some());
+        assert!(cache.is_quiet(POOL), "still quiet: it gets the on-chain recheck");
     }
 
     #[test]

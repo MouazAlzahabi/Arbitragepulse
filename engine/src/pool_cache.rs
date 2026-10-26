@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, U256};
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -230,6 +230,10 @@ pub struct PoolCache {
     /// pre-confirmed (flashblocks, ~1.2 s earlier) and sealed — so a late sealed log must
     /// never overwrite newer pre-confirmed state.
     log_pos: Arc<DashMap<Address, (u64, u64)>>,
+    /// When any pool log was last applied (ms since `created`). While recent, the feed is
+    /// live and a quiet pool's reserves are current — see [`PoolCache::feed_live`].
+    last_log_ms: Arc<AtomicU64>,
+    created: Instant,
 }
 
 impl Default for PoolCache {
@@ -245,6 +249,8 @@ impl Default for PoolCache {
             cached_v3_fresh: Arc::new(AtomicUsize::new(0)),
             cached_v3_total: Arc::new(AtomicUsize::new(0)),
             log_pos: Arc::new(DashMap::new()),
+            last_log_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            created: Instant::now(),
         }
     }
 }
@@ -252,6 +258,30 @@ impl Default for PoolCache {
 impl PoolCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A pool log was applied (either feed): the feed is live.
+    pub fn note_log(&self) {
+        self.last_log_ms.store(self.created.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// True while a pool log arrived within `tuning.feed_silence_ms`. Every Sync/Swap is
+    /// applied, so a pool without events then is quiet, not stale: its price is unchanged.
+    pub fn feed_live(&self) -> bool {
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        last != u64::MAX
+            && (self.created.elapsed().as_millis() as u64).saturating_sub(last)
+                <= crate::config::tuning().feed_silence_ms
+    }
+
+    /// The pool's max age is exceeded (no Sync for `volatile/stable_pool_max_age`). While the
+    /// feed is live such a pool is still quoted, but its reserves are re-read on-chain before
+    /// a trade uses it (`scan::recheck_quiet_pools`).
+    pub fn is_quiet(&self, pool: Address) -> bool {
+        self.by_address.get(&pool).is_some_and(|i| {
+            let max = if i.is_stable { stable_max_age() } else { volatile_max_age() };
+            i.last_sync.elapsed() > max
+        })
     }
 
     fn mark_watch_addrs_dirty(&self) {
@@ -344,7 +374,7 @@ impl PoolCache {
         let pool = *self.by_key.get(&key)?;
         if let Some(age) = max_age {
             let info = self.by_address.get(&pool)?;
-            if info.last_sync.elapsed() > age {
+            if info.last_sync.elapsed() > age && !self.feed_live() {
                 return None; // stale — caller skips this DEX for this scan
             }
             compute_amount_out(&info, token_in, amount_in)
@@ -368,7 +398,7 @@ impl PoolCache {
         let pool = *self.by_key.get(key)?;
         if let Some(age) = max_age {
             let info = self.by_address.get(&pool)?;
-            if info.last_sync.elapsed() > age {
+            if info.last_sync.elapsed() > age && !self.feed_live() {
                 return None;
             }
             compute_amount_out(&info, token_in, amount_in)

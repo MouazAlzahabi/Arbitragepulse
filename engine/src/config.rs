@@ -461,6 +461,11 @@ pub struct Tuning {
     /// fresh without a Sync event (ms).
     pub volatile_pool_max_age_ms: u64,
     pub stable_pool_max_age_ms: u64,
+    /// The pool log feed counts as live while any pool log arrived within this window. Then
+    /// a quiet V2/Aerodrome pool is still quoted (its reserves are current: every Sync is
+    /// applied) and re-checked on-chain before trading; the per-pool max ages above apply
+    /// only when the feed is silent.
+    pub feed_silence_ms: u64,
     /// V3 pools with no Swap event for this long count as stale in the heartbeat (ms).
     pub v3_fresh_window_ms: u64,
 
@@ -550,6 +555,7 @@ impl Default for Tuning {
             optimizer_large_spread: 0.05,
             volatile_pool_max_age_ms: 120_000,
             stable_pool_max_age_ms: 30_000,
+            feed_silence_ms: 30_000,
             v3_fresh_window_ms: 30_000,
             rpc_read_timeout_ms: 5_000,
             rpc_simulate_timeout_ms: None,
@@ -594,10 +600,11 @@ impl Tuning {
         if block_time_ms == 0 {
             return Err(anyhow!("chain.block_time_ms must be > 0"));
         }
-        let positive: [(&str, u64); 18] = [
+        let positive: [(&str, u64); 19] = [
             ("balance_refresh_ms", self.balance_refresh_ms),
             ("volatile_pool_max_age_ms", self.volatile_pool_max_age_ms),
             ("stable_pool_max_age_ms", self.stable_pool_max_age_ms),
+            ("feed_silence_ms", self.feed_silence_ms),
             ("price_refresh_ms", self.price_refresh_ms),
             ("config_reload_ms", self.config_reload_ms),
             ("gas_limit_2hop", self.gas_limit_2hop),

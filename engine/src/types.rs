@@ -92,6 +92,21 @@ impl Opportunity {
         }
     }
 
+    /// The pools this opportunity trades through (V2/Aerodrome/V3), from the local cache.
+    pub fn pools(&self, cache: &crate::pool_cache::PoolCache) -> Vec<alloy::primitives::Address> {
+        match self {
+            Opportunity::TwoHop(o) => crate::race::route_pools(cache, &[
+                (&o.router_a_id, o.router_a_type, o.fee_a, o.token_in, o.token_out),
+                (&o.router_b_id, o.router_b_type, o.fee_b, o.token_out, o.token_in),
+            ]),
+            Opportunity::Triangular(o) => crate::race::route_pools(cache, &[
+                (&o.router_ab_id, o.router_ab_type, o.fee_ab, o.token_a, o.token_b),
+                (&o.router_bc_id, o.router_bc_type, o.fee_bc, o.token_b, o.token_c),
+                (&o.router_ca_id, o.router_ca_type, o.fee_ca, o.token_c, o.token_a),
+            ]),
+        }
+    }
+
     /// Cooldown-map key that throttles the opportunity log and ghost-profit accounting for a
     /// route whose last attempt was rejected as unprofitable after gas. It never gates
     /// execution: the route is re-evaluated on every scan.

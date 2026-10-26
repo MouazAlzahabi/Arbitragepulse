@@ -5,6 +5,66 @@ use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// While the log feed is live, a quiet V2/Aerodrome pool (no Sync for its max age) is still
+/// quoted from local reserves. Before any candidate trades through one, re-read those pools'
+/// reserves on-chain (one Multicall3 on the quote endpoint, only when such a candidate
+/// exists): unchanged reserves mean the local quote was exact and the candidate stands; a
+/// pool whose reserves moved (a missed Sync) is corrected in the cache and its candidates
+/// are dropped for this scan, and a failed read drops them too.
+async fn recheck_quiet_pools<P: Provider + Clone>(
+    strategy: &Arc<RwLock<Strategy>>,
+    provider: &P,
+    opps: Vec<Opportunity>,
+    chain_name: &str,
+) -> Vec<Opportunity> {
+    use alloy::sol_types::SolCall;
+    let (cache, quote_rpc, block, concurrency) = {
+        let s = strategy.read().await;
+        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.rpc_concurrency)
+    };
+    if !cache.feed_live() {
+        return opps; // feed silent: per-pool max ages already kept quiet pools out
+    }
+    let quiet_of: Vec<Vec<Address>> = opps.iter()
+        .map(|o| o.pools(&cache).into_iter().filter(|p| cache.is_quiet(*p)).collect())
+        .collect();
+    let mut quiet: Vec<Address> = quiet_of.iter().flatten().copied().collect();
+    quiet.sort();
+    quiet.dedup();
+    if quiet.is_empty() {
+        return opps;
+    }
+    let calls: Vec<(Address, Vec<u8>)> = quiet.iter()
+        .map(|p| (*p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()))
+        .collect();
+    let raw = match &quote_rpc {
+        Some(q) => crate::strategy::run_multicall(q, calls, concurrency, block).await,
+        None => crate::strategy::run_multicall(provider, calls, concurrency, block).await,
+    };
+    let mut bad: HashSet<Address> = HashSet::new();
+    for (pool, r) in quiet.iter().zip(raw) {
+        let decoded = r.and_then(|r| crate::abi::IUniswapV2Pair::getReservesCall::abi_decode_returns(&r).ok());
+        let Some(d) = decoded else { bad.insert(*pool); continue };
+        let (r0, r1) = (U256::from(d.reserve0), U256::from(d.reserve1));
+        let same = cache.by_address.get(pool).is_some_and(|i| i.reserve0 == r0 && i.reserve1 == r1);
+        // Either way the pool is now confirmed current: stamp it so it isn't re-read every scan.
+        cache.update_reserves(*pool, r0, r1);
+        if !same {
+            bad.insert(*pool);
+        }
+    }
+    let before = opps.len();
+    let kept: Vec<Opportunity> = opps.into_iter().zip(quiet_of)
+        .filter(|(_, q)| !q.iter().any(|p| bad.contains(p)))
+        .map(|(o, _)| o)
+        .collect();
+    debug!(
+        "[{}] quiet-pool recheck: {} pool(s) read, {} changed/unreadable, {} of {} candidate(s) kept",
+        chain_name, quiet.len(), bad.len(), kept.len(), before
+    );
+    kept
+}
+
 /// A mined revert of a class that repeats on every send (`RevertClass::pauses_chain`): pause
 /// the chain until the operator fixes it and calls POST /engine/resume.
 async fn pause_chain_for_revert(
@@ -283,6 +343,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     };
     let detect_ms = detect_start.elapsed().as_millis() as u64;
 
+
+    let all_opportunities = if all_opportunities.is_empty() {
+        all_opportunities
+    } else {
+        recheck_quiet_pools(strategy, provider.as_ref(), all_opportunities, &cfg.name).await
+    };
 
     // Log all opportunities found this scan so it's visible which pairs are generating them.
     // This is key for diagnosing "single pair always" — it shows whether other pairs have

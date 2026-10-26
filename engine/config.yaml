@@ -254,8 +254,12 @@ tuning:
   optimizer_coarse_steps: 5
   optimizer_fine_steps: 5
   optimizer_large_spread: 0.05
+  # While the pool log feed is live (any pool log within feed_silence_ms), a V2/Aerodrome
+  # pool with no Sync is quiet, not stale: it's still quoted, and its reserves are re-read
+  # on-chain before a trade uses it. These max ages apply only when the feed is silent.
   volatile_pool_max_age_ms: 120000
   stable_pool_max_age_ms: 30000
+  feed_silence_ms: 30000
   v3_fresh_window_ms: 30000
   # ── RPC ──
   rpc_read_timeout_ms: 5000
