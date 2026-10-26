@@ -303,13 +303,16 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     metrics.opportunities.with_label_values(&[&cfg.name]).inc();
 
     // Only lock executor when we have candidates — avoids mutex on empty scans.
-    let (ghost_profit_bits, rpc_health) = {
+    let (ghost_profit_bits, rpc_health, balance_slots) = {
         let exec = executor.lock().await;
-        (exec.ghost_profit_usd_bits.clone(), exec.rpc_health.clone())
+        (exec.ghost_profit_usd_bits.clone(), exec.rpc_health.clone(), exec.balance_slots.clone())
     };
 
     // Read once before the loop — dry_run doesn't change mid-scan.
     let dry_run = shared_state.read().await.dry_run;
+    // Dry-run with a known balance slot: an unfunded trade is simulated with an assumed
+    // balance (executor::balance_override) instead of skipped. Never in live mode.
+    let assume_balance = |token: &Address| dry_run && balance_slots.contains_key(token);
 
     // Try each opportunity in priority order (profit descending). On gas-rejection or
     // pre-flight failure, fall through to the next candidate. On a successful send or
@@ -453,7 +456,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
             // Guard: cached balance (refreshed every 30s) must cover amount_in.
             // Prevents sending txs that will STF when contract has no token_in.
-            if let Some(bal) = max_bal {
+            if let Some(bal) = max_bal.filter(|_| !assume_balance(&optimized.token_in)) {
                 if bal < optimized.amount_in {
                     let msg = format!(
                         "[{}] Skipping {} — insufficient token_in balance (have {}, need {}) → cd={}s",
@@ -525,7 +528,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match crate::executor::simulate_call(provider.as_ref(), prep.sim_provider.as_ref(), prep.tx.clone()).await {
+                            match crate::executor::simulate_call(provider.as_ref(), prep.sim_provider.as_ref(), prep.tx.clone(), None).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
@@ -936,7 +939,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     // Missing (token added by a config reload) = unfunded, as for 2-hop.
                     Some(bals.get(&opp.token_a).copied().unwrap_or(U256::ZERO))
                 };
-                if let Some(b) = bal {
+                if let Some(b) = bal.filter(|_| !assume_balance(&opp.token_a)) {
                     if b < opp.amount_in {
                         let msg = format!(
                             "[{}] Skipping triangular {} — insufficient token_a balance (have {}, need {}) → cd={}s",
@@ -1010,7 +1013,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Ok(prep) => {
                         if cfg.preflight_eth_call {
-                            match crate::executor::simulate_call(provider.as_ref(), prep.sim_provider.as_ref(), prep.tx.clone()).await {
+                            match crate::executor::simulate_call(provider.as_ref(), prep.sim_provider.as_ref(), prep.tx.clone(), None).await {
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);

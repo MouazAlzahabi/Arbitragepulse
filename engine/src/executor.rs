@@ -2,6 +2,7 @@ use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Uint, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::state::StateOverride;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use anyhow::{anyhow, Result};
@@ -116,16 +117,36 @@ pub struct TxPrep {
 }
 
 /// eth_call a trade: on the preconf endpoint at `pending` when set (the state the quotes
-/// priced), else on `provider` at `latest`.
+/// priced), else on `provider` at `latest`. `overrides` (dry-run only) patches state for
+/// this call, e.g. an assumed start-token balance — see [`balance_override`].
 pub(crate) async fn simulate_call<P: Provider>(
     provider: &P,
     preconf: Option<&DynProvider>,
     tx: TransactionRequest,
+    overrides: Option<StateOverride>,
 ) -> alloy::transports::TransportResult<alloy::primitives::Bytes> {
-    match preconf {
-        Some(pc) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending())).await,
-        None => transport_timeout(rpc_simulate_timeout(), provider.call(tx)).await,
+    match (preconf, overrides) {
+        (Some(pc), Some(o)) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending()).overrides(o)).await,
+        (Some(pc), None) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending())).await,
+        (None, Some(o)) => transport_timeout(rpc_simulate_timeout(), provider.call(tx).overrides(o)).await,
+        (None, None) => transport_timeout(rpc_simulate_timeout(), provider.call(tx)).await,
     }
+}
+
+/// Storage key of `holder`'s entry in a Solidity `mapping(address => uint256)` at `slot`.
+pub(crate) fn balance_key(holder: Address, slot: U256) -> alloy::primitives::B256 {
+    use alloy::sol_types::SolValue;
+    alloy::primitives::keccak256((holder, slot).abi_encode())
+}
+
+/// State override giving `holder` a balance of `amount` of `token`, whose balances live in
+/// the mapping at `slot`. Dry-run simulations of unfunded trades use it ("assumed balance").
+pub(crate) fn balance_override(token: Address, slot: U256, holder: Address, amount: U256) -> StateOverride {
+    use alloy::rpc::types::state::{AccountOverride, StateOverridesBuilder};
+    let value = alloy::primitives::B256::from(amount);
+    StateOverridesBuilder::default()
+        .append(token, AccountOverride::default().with_state_diff([(balance_key(holder, slot), value)]))
+        .build()
 }
 
 impl TxPrep {
@@ -216,6 +237,10 @@ pub struct Executor {
     /// `chain.preconf_http_rpc` provider: simulations run on it at `pending`. Set by
     /// chain/mod.rs after construction; None = the caller's provider at `latest`.
     pub sim_provider: Option<DynProvider>,
+    /// Dry-run only: balance-mapping slot per start token (found at startup by
+    /// `state::discover_balance_slots`). An unfunded trade is then simulated with an assumed
+    /// balance of `amount_in` instead of being skipped. Empty in live mode.
+    pub balance_slots: Arc<HashMap<Address, U256>>,
 }
 
 impl Executor {
@@ -261,6 +286,7 @@ impl Executor {
             deadline_secs,
             deadline_cache: StdMutex::new((0, U256::ZERO)),
             sim_provider: None,
+            balance_slots: Arc::new(HashMap::new()),
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .pool_max_idle_per_host(4)
@@ -584,6 +610,18 @@ impl Executor {
     /// Live path: releases the executor mutex after send_transaction (before
     /// receipt) by spawning receipt-waiting as a background task. A nonce
     /// counter prevents collisions when back-to-back opportunities fire.
+    /// Dry-run: a state override giving the executor `amount_in` of `token` when its cached
+    /// balance is short and the token's balance slot is known; None otherwise (live mode
+    /// never has slots, so it always simulates and sends against the real balance).
+    async fn assumed_balance(&self, token: Address, amount_in: U256) -> Option<StateOverride> {
+        let slot = *self.balance_slots.get(&token)?;
+        let have = match &self.contract_balances {
+            Some(b) => b.read().await.get(&token).copied().unwrap_or(U256::ZERO),
+            None => U256::ZERO,
+        };
+        (have < amount_in).then(|| balance_override(token, slot, self.contract_address, amount_in))
+    }
+
     pub async fn execute<P: Provider + Clone + 'static>(&mut self, provider: &P, opp: &ArbOpportunity) -> Result<String> {
         if self.paused {
             return Err(anyhow!("Executor paused"));
@@ -619,15 +657,17 @@ impl Executor {
 
         // ── Dry-run: simulate only ─────────────────────────────────────────────
         if self.dry_run {
-            match simulate_call(provider, self.sim_provider.as_ref(), tx_base).await {
+            let assumed = self.assumed_balance(opp.token_in, opp.amount_in).await;
+            match simulate_call(provider, self.sim_provider.as_ref(), tx_base, assumed.clone()).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =
                         "0x0000000000000000000000000000000000000000000000000000000000000000"
                             .to_string();
                     info!(
-                        "[{}] DRY-RUN ok | gross=${:.4} gas≈${:.4} net=${:.4}",
-                        self.chain_name, opp.profit_usd, gas_cost_usd, net_profit_usd
+                        "[{}] DRY-RUN ok | gross=${:.4} gas≈${:.4} net=${:.4}{}",
+                        self.chain_name, opp.profit_usd, gas_cost_usd, net_profit_usd,
+                        if assumed.is_some() { " | assumed balance" } else { "" },
                     );
                     self.persist_trade(opp, &tx_hash, true);
                     return Ok(tx_hash);
@@ -826,15 +866,17 @@ impl Executor {
         self.stats.total_attempts += 1;
 
         if self.dry_run {
-            match simulate_call(provider, self.sim_provider.as_ref(), tx_base).await {
+            let assumed = self.assumed_balance(opp.token_a, opp.amount_in).await;
+            match simulate_call(provider, self.sim_provider.as_ref(), tx_base, assumed.clone()).await {
                 Ok(_) => {
                     self.stats.total_simulated += 1;
                     let tx_hash =
                         "0x0000000000000000000000000000000000000000000000000000000000000000"
                             .to_string();
                     info!(
-                        "[{}] DRY-RUN triangular ok | gross=${:.4} gas≈${:.4} net=${:.4}",
-                        self.chain_name, opp.profit_usd, gas_cost_usd, net_profit_usd
+                        "[{}] DRY-RUN triangular ok | gross=${:.4} gas≈${:.4} net=${:.4}{}",
+                        self.chain_name, opp.profit_usd, gas_cost_usd, net_profit_usd,
+                        if assumed.is_some() { " | assumed balance" } else { "" },
                     );
                     self.persist_triangular(opp, &tx_hash, true);
                     return Ok(tx_hash);
@@ -1131,6 +1173,22 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_override_targets_the_holders_mapping_entry() {
+        use alloy::primitives::{address, b256};
+        let holder = address!("F8aa9d575CEccdFed211383Cd3979241d9C6E0c2");
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        // `cast index address <holder> 9`
+        let key = b256!("f541f5bf5a8aef1086a09fd1e4e475ae3b6302dcc71bc70502c35fa99479b7a4");
+        assert_eq!(balance_key(holder, U256::from(9)), key);
+
+        let amount = U256::from(1_000_000_000u64);
+        let o = balance_override(usdc, U256::from(9), holder, amount);
+        let diff = o.get(&usdc).and_then(|a| a.state_diff.as_ref()).expect("state diff on the token");
+        assert_eq!(diff.get(&key), Some(&alloy::primitives::B256::from(amount)));
+        assert_eq!(o.len(), 1, "only the token account is overridden");
+    }
 
     #[test]
     fn profit_share_tip_rules() {

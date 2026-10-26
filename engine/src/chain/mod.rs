@@ -230,6 +230,20 @@ pub async fn run_chain(
     state::check_signer_gas(reads.as_ref(), signer_address, cfg.min_native_balance, &gas_low_warned, &log_tx, &cfg.name).await;
     // Startup funding check: warn for any underfunded pair.
     state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances, &log_tx).await;
+    // Balance slots for dry-run's assumed balance (simulate unfunded trades instead of
+    // skipping them). On the simulation endpoint, which must accept eth_call state overrides.
+    {
+        let sim: &alloy::providers::DynProvider = preconf_http.as_ref().unwrap_or(reads.as_ref());
+        let tokens: Vec<Address> = contract_balances.read().await.keys().copied().collect();
+        let slots = state::discover_balance_slots(sim, &tokens, contract_addr).await;
+        let found: Vec<String> = chain_pairs.iter()
+            .filter_map(|p| p.token_in.parse::<Address>().ok().map(|a| (a, &p.token_in_symbol)))
+            .filter_map(|(a, sym)| slots.get(&a).map(|s| format!("{sym} slot {s}")))
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        info!("[{}] Dry-run assumed balance: {}", cfg.name,
+              if found.is_empty() { "unavailable (no balance slot found) — unfunded trades are skipped".to_string() } else { found.join(", ") });
+        executor.lock().await.balance_slots = Arc::new(slots);
+    }
     // Wire balances into executor for post-trade immediate refresh.
     { executor.lock().await.contract_balances = Some(contract_balances.clone()); }
     // Pre-fetch nonce at startup so first submission has zero RPC overhead.

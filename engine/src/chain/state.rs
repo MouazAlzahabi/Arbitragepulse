@@ -190,6 +190,39 @@ pub(crate) fn signer_gas_low(balance_wei: U256, min_eth: f64) -> bool {
     crate::util::u256_to_f64(balance_wei) / 1e18 < min_eth
 }
 
+/// Balance-mapping slot (0..=20) of each token, for dry-run's assumed balance: for each slot,
+/// `balanceOf(holder)` is called with a marker written at the holder's key; the slot whose
+/// read returns the marker is the one. Tokens with no match (proxy layouts beyond slot 20,
+/// rebasing tokens, RPC without state overrides) are left out — those keep being skipped
+/// when unfunded. Read-only; at most 21 calls per token, at startup.
+pub(crate) async fn discover_balance_slots<P: Provider>(
+    provider: &P,
+    tokens: &[Address],
+    holder: Address,
+) -> HashMap<Address, U256> {
+    let marker = U256::from(0x0bad_cafe_dead_beef_u64) << 64;
+    let mut out = HashMap::new();
+    for &token in tokens {
+        for slot in 0u64..=20 {
+            let slot = U256::from(slot);
+            let erc20 = IERC20::new(token, provider);
+            let call = erc20
+                .balanceOf(holder)
+                .state(crate::executor::balance_override(token, slot, holder, marker));
+            match rpc_timeout(rpc_read_timeout(), call.call()).await {
+                Ok(v) if v == marker => {
+                    out.insert(token, slot);
+                    break;
+                }
+                Ok(_) => {}
+                // No override support (or RPC down): don't probe the rest of the slots.
+                Err(_) => break,
+            }
+        }
+    }
+    out
+}
+
 /// Warn once per low period when the signer's ETH is below chain.min_native_balance.
 pub(crate) async fn check_signer_gas<P: Provider>(
     provider: &P,

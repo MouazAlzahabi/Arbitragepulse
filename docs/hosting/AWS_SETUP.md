@@ -159,6 +159,16 @@ ARB_SERVER=botadmin@$IP scripts/deploy.sh
 
 ## Phase 4 — Verify in dry-run (≈ 1 day)
 
+**Dry-run tests trades even while the executor is unfunded.** When the contract holds less
+than a trade's `amount_in`, the simulation runs with an *assumed balance*: an `eth_call`
+state override that sets the contract's USDC/USDT balance to `amount_in` for that one call
+only. The engine finds each token's balance slot at startup and logs it, e.g.
+`Dry-run assumed balance: USDC slot 9, USDT slot 0`. Results show as
+`DRY-RUN ok … | assumed balance` (or `Simulation failed`), so you can judge the routes
+before funding anything. Live mode never uses it: an unfunded trade is skipped, nothing is
+sent. Redeploy the executor (Phase 5, step 1–2) first, otherwise Slipstream routes fail
+their simulation.
+
 Service and health:
 ```bash
 ssh botadmin@$IP 'systemctl status arbitragepulse@base --no-pager | head -5'
