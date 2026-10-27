@@ -701,12 +701,26 @@ fn slipstream_quoters(routers: &[RouterConfig]) -> std::collections::HashSet<Add
 
 // ─── Multicall3 batch helper ───────────────────────────────────────────────────
 
+/// True when a failed Multicall3 `eth_call` was answered by the node with a revert or
+/// out-of-gas (the aggregate itself failed — per-call replay can still succeed). False for
+/// transport/RPC errors (rate limit, 5xx, reset): replaying 10× to the same endpoint would
+/// only amplify the load that caused them.
+fn multicall_error_is_revert(err: &alloy::transports::TransportError) -> bool {
+    match err {
+        alloy::transports::RpcError::ErrorResp(p) if !p.is_retry_err() => {
+            let msg = p.message.to_lowercase();
+            p.code == 3 || msg.contains("revert") || msg.contains("gas")
+        }
+        _ => false,
+    }
+}
+
 /// Batch all calls into a single `eth_call` to Multicall3.
 /// Returns `Some(Vec<u8>)` for each call that succeeded, `None` for failures.
-/// Falls back to parallel individual `eth_call`s if Multicall3 is unavailable.
 /// Batch calls via Multicall3, chunking into groups of multicall_chunk_size().
 /// All chunks are fired concurrently so total latency ≈ max(slowest chunk), not sum.
-/// Falls back to sequential individual eth_calls for any chunk that fails entirely.
+/// Falls back to sequential individual eth_calls only for a chunk whose aggregate reverted
+/// or returned undecodable bytes; a transport/RPC error or timeout marks the chunk failed.
 pub(crate) async fn run_multicall<P: Provider + Clone>(
     provider: &P,
     calls: Vec<(Address, Vec<u8>)>,
@@ -731,8 +745,9 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
     // Run at most `concurrency` chunks at a time (smooths the Alchemy CU burst that firing
     // everything with join_all caused). `buffered`, NOT `buffer_unordered`: callers zip the
     // flattened results against their input order, so chunks must come back in order.
-    // Per chunk: Ok(Some(raw)) = answered, Ok(None) = call error, Err(()) = timed out.
-    let chunk_raw: Vec<Result<Option<_>, ()>> = futures::stream::iter(owned_chunks.into_iter().map(|chunk| {
+    // Per chunk: Ok(Ok(raw)) = answered, Ok(Err(true)) = aggregate reverted,
+    // Ok(Err(false)) = transport/RPC error, Err(()) = timed out.
+    let chunk_raw: Vec<Result<Result<_, bool>, ()>> = futures::stream::iter(owned_chunks.into_iter().map(|chunk| {
         let mc_calls: Vec<IMulticall3::Call3> = chunk
             .iter()
             .map(|(target, data)| IMulticall3::Call3 {
@@ -746,7 +761,13 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
         let p = provider.clone();
         async move {
             tokio::time::timeout(multicall_chunk_timeout(), p.call(tx).block(block)).await
-                .map(|r| r.ok())
+                .map(|r| r.map_err(|e| {
+                    let revert = multicall_error_is_revert(&e);
+                    if !revert {
+                        warn!("Multicall3 chunk RPC error — calls counted as failed, no sequential fallback: {e}");
+                    }
+                    revert
+                }))
                 .map_err(|_| ())
         }
     }))
@@ -759,13 +780,24 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
     let mut call_offset = 0usize;
     for raw_res in chunk_raw {
         let chunk_len = multicall_chunk_size().min(calls.len() - call_offset);
-        let Ok(raw_opt) = raw_res else {
+        let Ok(raw_res) = raw_res else {
             // Timed out: count the chunk's calls as failed. No sequential fallback — the
             // RPC is evidently stuck, and more calls would stall the scan loop further.
             warn!("Multicall3 chunk timed out after {:?} — {} call(s) counted as failed", multicall_chunk_timeout(), chunk_len);
             out.extend(std::iter::repeat_n(None, chunk_len));
             call_offset += chunk_len;
             continue;
+        };
+        let raw_opt = match raw_res {
+            Ok(raw) => Some(raw),
+            Err(true) => None,
+            Err(false) => {
+                // Transport/RPC error (rate limit, 5xx): same as a timeout — replaying the
+                // chunk call by call would multiply load on an endpoint already refusing.
+                out.extend(std::iter::repeat_n(None, chunk_len));
+                call_offset += chunk_len;
+                continue;
+            }
         };
         match raw_opt.and_then(|raw| IMulticall3::aggregate3Call::abi_decode_returns(&raw).ok()) {
             Some(decoded) => {
@@ -774,7 +806,8 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
                 }));
             }
             None => {
-                // Chunk failed (Multicall3 unavailable or gas exceeded) — fall back sequentially.
+                // Aggregate reverted or returned undecodable bytes (Multicall3 unavailable or
+                // gas exceeded) — fall back sequentially.
                 warn!("Multicall3 chunk failed (gas limit exceeded?) — falling back to {} sequential eth_calls; reduce multicall_chunk_size() if this persists", chunk_len);
                 for (target, data) in calls[call_offset..call_offset + chunk_len].iter() {
                     let tx = TransactionRequest::default()
@@ -866,6 +899,50 @@ mod quote_encoding_tests {
         // Both quoters return (uint256 amountOut, uint160, uint32, uint256).
         let ret = (U256::from(42u64), U256::ZERO, U256::ZERO, U256::ZERO).abi_encode_params();
         assert_eq!(decode_v3_quote(Some(&ret)), Some(U256::from(42u64)));
+    }
+}
+
+#[cfg(test)]
+mod multicall_tests {
+    use super::*;
+    use alloy::transports::mock::Asserter;
+
+    // ErrorPayload (alloy's json-rpc feature isn't enabled, so build it from JSON).
+    fn err<T: serde::de::DeserializeOwned>(code: i64, msg: &str) -> T {
+        serde_json::from_value(serde_json::json!({ "code": code, "message": msg })).unwrap()
+    }
+
+    fn calls(n: u8) -> Vec<(Address, Vec<u8>)> {
+        (0..n).map(|i| (Address::repeat_byte(i + 1), vec![0u8; 4])).collect()
+    }
+
+    /// A rate-limited multicall is one request: the chunk is failed, not replayed per call.
+    #[tokio::test]
+    async fn rpc_error_does_not_replay_chunk() {
+        let asserter = Asserter::new();
+        asserter.push_failure(err(-32011, "request limit reached"));
+        // Sentinels: any sequential replay would consume these.
+        for _ in 0..3 {
+            asserter.push_failure(err(3, "execution reverted"));
+        }
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let out = run_multicall(&provider, calls(3), 1, BlockId::latest()).await;
+        assert_eq!(out, vec![None; 3]);
+        assert_eq!(asserter.read_q().len(), 3);
+    }
+
+    /// A reverted aggregate (e.g. out of gas) still falls back to per-call eth_calls.
+    #[tokio::test]
+    async fn reverted_aggregate_falls_back_per_call() {
+        let asserter = Asserter::new();
+        asserter.push_failure(err(3, "execution reverted"));
+        for _ in 0..3 {
+            asserter.push_failure(err(3, "execution reverted"));
+        }
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let out = run_multicall(&provider, calls(3), 1, BlockId::latest()).await;
+        assert_eq!(out, vec![None; 3]);
+        assert_eq!(asserter.read_q().len(), 0);
     }
 }
 
