@@ -72,6 +72,10 @@ pub fn apply_log_to_cache(
         },
         None => false,
     };
+    // Mint/Burn deltas are relative: a position-less copy (pendingLogs may omit
+    // blockNumber/logIndex) can't be de-duplicated against its sealed copy, so it would be
+    // applied twice. Apply them only from positioned logs; the sealed copy always has one.
+    let positioned = log.block_number.is_some() && log.log_index.is_some();
     let mut magnitude = SwapMagnitude::Normal;
 
     if topic0 == Sync::SIGNATURE_HASH {
@@ -138,7 +142,7 @@ pub fn apply_log_to_cache(
     }
 
     if topic0 == IUniswapV3Pool::Mint::SIGNATURE_HASH {
-        if !repeat {
+        if !repeat && positioned {
             let d = IUniswapV3Pool::Mint::decode_log(log.as_ref()).ok()?;
             if cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, true) {
                 debug!("V3 Mint in range | pool={} | amount={} | liquidity={}", pool, d.amount,
@@ -149,7 +153,7 @@ pub fn apply_log_to_cache(
     }
 
     if topic0 == IUniswapV3Pool::Burn::SIGNATURE_HASH {
-        if !repeat {
+        if !repeat && positioned {
             let d = IUniswapV3Pool::Burn::decode_log(log.as_ref()).ok()?;
             if cache.apply_v3_liquidity_delta(pool, d.tickLower.as_i32(), d.tickUpper.as_i32(), d.amount, false) {
                 debug!("V3 Burn in range | pool={} | amount={} | liquidity={}", pool, d.amount,
@@ -533,6 +537,17 @@ mod tests {
         // An older log (already covered by newer state) is skipped.
         apply(&cache, &mint(-50, 150, 999, 9, 0));
         assert_eq!(liq(&cache), 1_000_200);
+    }
+
+    #[test]
+    fn positionless_mint_is_applied_once_via_its_sealed_copy() {
+        let cache = cache_with_v3_pool();
+        let mut pending = mint(100, 200, 500, 10, 1);
+        pending.block_number = None;
+        pending.log_index = None;
+        apply(&cache, &pending);
+        apply(&cache, &mint(100, 200, 500, 10, 1));
+        assert_eq!(liq(&cache), 1_000_500);
     }
 
     #[test]
