@@ -218,6 +218,7 @@ Live wallet nonce check (safety rule 5) — still unchanged.
 
 | Task | Command |
 |---|---|
+| Update from GitHub (on the server, as botadmin) | `~/Arbitragepulse/scripts/server/update.sh`: pulls main, builds dashboard + engine, deletes `trades-base.db` and the log, restarts. `--keep-data` keeps them. A failed build leaves the running engine alone |
 | Logs | `ssh botadmin@$IP 'journalctl -fu arbitragepulse@base'` |
 | Restart | `ssh botadmin@$IP 'sudo systemctl restart arbitragepulse@base'` |
 | Your IP changed (SSH refused) | `aws ec2 authorize-security-group-ingress --group-id <sg> --protocol tcp --port 22 --cidr $(curl -s https://checkip.amazonaws.com)/32` — then remove the old rule |

@@ -138,7 +138,7 @@ routers:
 
 # ─── PAIRS ─────────────────────────────────────────────────
 # Chosen 2026-10-22 from GeckoTerminal 24h volume per venue (≥ $50k depth on ≥ 2 venues).
-# Sizes are a dry-run test (10K USDC/USDT, 4 WETH); set them back to the funded size before go-live.
+# Sizes are a dry-run test (5K USDC/USDT, 4 WETH); set them back to the funded size before go-live.
 # token_in is USDC or USDT only — the executor is funded with those two (each 2-hop trade
 # needs trade_amount of its token_in; triangles start from either). Pools are discovered
 # for EVERY pair of these tokens, so triangles also cover the WETH/cbBTC, WETH/AERO,
@@ -153,8 +153,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $38M/day: UniV3, Slipstream, PancakeV3
   - id: "base-usdc-cbbtc"
@@ -164,8 +164,8 @@ pairs:
     token_out_symbol: "CBBTC"
     token_in_decimals: 6
     token_out_decimals: 8
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $14M/day: Slipstream (deepest), UniV3, PancakeV3
   - id: "base-usdc-usdt"
@@ -175,8 +175,8 @@ pairs:
     token_out_symbol: "USDT"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $5.7M/day: Slipstream $2.9M deep vs UniV3
   - id: "base-usdt-weth"
@@ -186,8 +186,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $5.2M/day: AerodromeV2 $17.8M, Slipstream, UniV3
   - id: "base-usdc-aero"
@@ -197,8 +197,8 @@ pairs:
     token_out_symbol: "AERO"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $5.2M/day: Slipstream (deepest), PancakeV3, UniV3
   - id: "base-usdc-eurc"
@@ -208,8 +208,8 @@ pairs:
     token_out_symbol: "EURC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $0.5M/day: UniV3, PancakeV3, AerodromeV2
   - id: "base-usdc-virtual"
@@ -219,12 +219,12 @@ pairs:
     token_out_symbol: "VIRTUAL"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # ── WETH-start size test (dry-run only) ──
   # The executor holds no WETH: dry-run simulates these with an assumed balance; live, the
-  # balance guard skips them as unfunded. 4 WETH ≈ the 10K USDC size above.
+  # balance guard skips them as unfunded. Sized separately from the USDC/USDT pairs.
   - id: "base-weth-usdc"
     token_in: "0x4200000000000000000000000000000000000006"
     token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
