@@ -237,7 +237,10 @@ fn explain_router(data: &[u8]) -> Option<(&'static str, &'static str, RevertClas
         R::PoolDoesNotExist(_) => ("PoolDoesNotExist()", "no pool for this pair/stable flag", C::PoolNotFound),
         R::InsufficientLiquidity(_) =>
             ("InsufficientLiquidity()", "pool too thin for this trade size", C::InsufficientOutput),
-        R::K(_) => ("K()", "pool invariant check failed (fee-on-transfer token?)", C::Unknown),
+        // A router swap on a consistent pool can't fail K (its amountOut comes from the same
+        // reserves); seen when a pending-state simulation caught a pool mid-block, its
+        // balances and reserves out of step. AERO/USDC-style tokens have no transfer fee.
+        R::K(_) => ("K()", "pool reserves ≠ balances at the simulated state (pool changed mid-block)", C::InsufficientOutput),
         R::InsufficientInputAmount(_) => ("InsufficientInputAmount()", "pool received no input", C::TransferFailed),
         R::InvalidPath(_) => ("InvalidPath()", "router rejected the route", C::InvalidRoute),
         R::SameAddresses(_) => ("SameAddresses()", "router rejected the route", C::InvalidRoute),
@@ -599,6 +602,17 @@ mod tests {
             "leg 2 (Aerodrome router 0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43) reverted: \
              InsufficientOutputAmount() (output below the leg minimum — price moved)"
         );
+    }
+
+    #[test]
+    fn aerodrome_k_reads_as_a_moved_pool() {
+        let router = address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
+        let reason = Bytes::from(alloy::hex::decode("a932492f").unwrap()); // K()
+        let d = classify_revert_bytes(&LegFailed { leg: 3, router, rtype: 4, reason }.abi_encode());
+        assert_eq!(d.class, RevertClass::InsufficientOutput);
+        let detail = d.detail.unwrap();
+        assert!(detail.contains("K() (pool reserves ≠ balances"), "{detail}");
+        assert!(!detail.contains("fee-on-transfer"), "{detail}");
     }
 
     #[test]
