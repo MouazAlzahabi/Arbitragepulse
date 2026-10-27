@@ -37,7 +37,8 @@ pub struct ChainConfig {
     /// Leave empty to use only the primary.
     #[serde(default)]
     pub ws_rpc_fallbacks: Vec<String>,
-    /// Max number of Multicall3 chunks fired concurrently per scan.
+    /// Total Multicall3 chunks in flight on the quote endpoint per chain, shared by all
+    /// batches joined concurrently (Phase 1.5/1.5b/1.5c, prefetch, triangular verify).
     /// Free Alchemy plan (330 CU/s): use 3. Growth plan (3000 CU/s): use 10–12.
     /// Each chunk = 1 eth_call (26 CU). Default: 3.
     #[serde(default = "default_rpc_concurrency")]

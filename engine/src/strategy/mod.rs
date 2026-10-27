@@ -259,8 +259,9 @@ pub struct Strategy {
     pub min_triangular_profit_usd: f64,
     /// QuoterV2 contract address for V3 quotes (chain-specific, NOT the swap router)
     pub quoter_v2_address: Option<Address>,
-    /// Max concurrent Multicall3 chunks per scan (from config rpc_concurrency).
-    pub rpc_concurrency: usize,
+    /// Multicall3 chunks in flight on the quote endpoint, shared by every batch of this
+    /// chain (from config rpc_concurrency) — see [`QuoteGate`].
+    pub quote_gate: Arc<QuoteGate>,
     /// V2/Solidly-volatile pool reserve cache — updated live from on-chain Sync events.
     /// When populated, forward and reverse quotes for V2/Solidly-volatile routers are
     /// computed locally (zero eth_call) instead of via multicall.
@@ -389,7 +390,7 @@ impl Strategy {
             min_triangular_profit_usd,
             quoter_v2_address,
             pool_cache,
-            rpc_concurrency,
+            quote_gate: Arc::new(QuoteGate::new(rpc_concurrency)),
             pair_scan: Mutex::new(Vec::new()),
             tri_scan: Mutex::new(Vec::new()),
             opp_session_counts: Mutex::new(HashMap::new()),
@@ -443,8 +444,8 @@ impl Strategy {
             .map(|p| (*p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()))
             .collect();
         let raw = match &self.http_provider {
-            Some(hp) => run_multicall(hp, calls, self.rpc_concurrency, self.quote_block).await,
-            None => run_multicall(provider, calls, self.rpc_concurrency, self.quote_block).await,
+            Some(hp) => run_multicall(hp, calls, &self.quote_gate, self.quote_block).await,
+            None => run_multicall(provider, calls, &self.quote_gate, self.quote_block).await,
         };
         let mut have = self.recheck_prefetch.lock().unwrap();
         for (pool, r) in quiet.into_iter().zip(raw) {
@@ -683,8 +684,8 @@ impl Strategy {
         }
 
         let raw = match self.http_provider {
-            Some(ref hp) => run_multicall(hp, mc, self.rpc_concurrency, self.quote_block).await,
-            None => run_multicall(provider, mc, self.rpc_concurrency, self.quote_block).await,
+            Some(ref hp) => run_multicall(hp, mc, &self.quote_gate, self.quote_block).await,
+            None => run_multicall(provider, mc, &self.quote_gate, self.quote_block).await,
         };
         let mut health = QuoterBatchHealth::default();
         for ((router_id, slots), r) in sent.into_iter().zip(raw) {
@@ -809,6 +810,42 @@ impl ScanTimings {
     }
 }
 
+/// Multicall3 chunk budget on the quote endpoint, shared by every batch of one chain.
+/// Phase 1.5/1.5b/1.5c, the quiet-pool prefetch and triangular verification are joined
+/// concurrently; each used to get its own `rpc_concurrency` chunks, so several in flight
+/// at once overran the endpoint (chunk timeouts). Also counts chunk outcomes for the heartbeat.
+pub struct QuoteGate {
+    permits: tokio::sync::Semaphore,
+    /// Permits in total; also the per-batch `buffered` width (more would only queue).
+    pub width: usize,
+    ok: std::sync::atomic::AtomicU64,
+    timeout: std::sync::atomic::AtomicU64,
+    err: std::sync::atomic::AtomicU64,
+}
+
+impl QuoteGate {
+    pub fn new(n: usize) -> Self {
+        let width = n.max(1);
+        Self {
+            permits: tokio::sync::Semaphore::new(width),
+            width,
+            ok: Default::default(),
+            timeout: Default::default(),
+            err: Default::default(),
+        }
+    }
+
+    /// `ok/timeout/err` chunk counts since the last call (heartbeat `qmc=`), then reset.
+    /// ok = the node answered (incl. a reverted aggregate); err = transport/RPC error.
+    pub fn take_summary(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "{}/{}/{}",
+            self.ok.swap(0, Relaxed), self.timeout.swap(0, Relaxed), self.err.swap(0, Relaxed),
+        )
+    }
+}
+
 /// Batch all calls into a single `eth_call` to Multicall3.
 /// Returns `Some(Vec<u8>)` for each call that succeeded, `None` for failures.
 /// Batch calls via Multicall3, chunking into groups of multicall_chunk_size().
@@ -818,10 +855,10 @@ impl ScanTimings {
 pub(crate) async fn run_multicall<P: Provider + Clone>(
     provider: &P,
     calls: Vec<(Address, Vec<u8>)>,
-    concurrency: usize,
+    gate: &QuoteGate,
     block: BlockId,
 ) -> Vec<Option<Vec<u8>>> {
-    run_multicall_answered(provider, calls, concurrency, block).await
+    run_multicall_answered(provider, calls, gate, block).await
         .into_iter().map(|(r, _)| r).collect()
 }
 
@@ -833,7 +870,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
 pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
     provider: &P,
     calls: Vec<(Address, Vec<u8>)>,
-    concurrency: usize,
+    gate: &QuoteGate,
     block: BlockId,
 ) -> Vec<(Option<Vec<u8>>, bool)> {
     if calls.is_empty() {
@@ -851,8 +888,9 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
         .map(|c| c.to_vec())
         .collect();
 
-    // Run at most `concurrency` chunks at a time (smooths the Alchemy CU burst that firing
-    // everything with join_all caused). `buffered`, NOT `buffer_unordered`: callers zip the
+    // Run at most `gate.width` chunks at a time, and each only while holding a permit of the
+    // chain-wide gate, so concurrent batches share one budget (smooths the Alchemy CU burst
+    // that firing everything with join_all caused). `buffered`, NOT `buffer_unordered`: callers zip the
     // flattened results against their input order, so chunks must come back in order.
     // Per chunk: Ok(Ok(raw)) = answered, Ok(Err(true)) = aggregate reverted,
     // Ok(Err(false)) = transport/RPC error, Err(()) = timed out.
@@ -869,7 +907,10 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
         let tx = TransactionRequest::default().to(mc3).input(agg_calldata.into());
         let p = provider.clone();
         async move {
-            tokio::time::timeout(multicall_chunk_timeout(), p.call(tx).block(block)).await
+            use std::sync::atomic::Ordering::Relaxed;
+            // Permit first: queueing behind other batches must not eat the chunk's timeout.
+            let _permit = gate.permits.acquire().await;
+            let res = tokio::time::timeout(multicall_chunk_timeout(), p.call(tx).block(block)).await
                 .map(|r| r.map_err(|e| {
                     let revert = multicall_error_is_revert(&e);
                     if !revert {
@@ -877,10 +918,16 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
                     }
                     revert
                 }))
-                .map_err(|_| ())
+                .map_err(|_| ());
+            match &res {
+                Ok(Ok(_)) | Ok(Err(true)) => gate.ok.fetch_add(1, Relaxed),
+                Ok(Err(false)) => gate.err.fetch_add(1, Relaxed),
+                Err(()) => gate.timeout.fetch_add(1, Relaxed),
+            };
+            res
         }
     }))
-    .buffered(concurrency.max(1))
+    .buffered(gate.width)
     .collect()
     .await;
 
@@ -922,6 +969,7 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
                     let tx = TransactionRequest::default()
                         .to(*target)
                         .input(data.clone().into());
+                    let _permit = gate.permits.acquire().await;
                     let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx).block(block)).await;
                     out.push(match r {
                         Ok(Ok(b)) => (Some(b.to_vec()), true),
@@ -1039,9 +1087,12 @@ mod multicall_tests {
             asserter.push_failure(err(3, "execution reverted"));
         }
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        let out = run_multicall(&provider, calls(3), 1, BlockId::latest()).await;
+        let gate = QuoteGate::new(1);
+        let out = run_multicall(&provider, calls(3), &gate, BlockId::latest()).await;
         assert_eq!(out, vec![None; 3]);
         assert_eq!(asserter.read_q().len(), 3);
+        assert_eq!(gate.take_summary(), "0/0/1");
+        assert_eq!(gate.take_summary(), "0/0/0");
     }
 
     /// A reverted aggregate (e.g. out of gas) still falls back to per-call eth_calls.
@@ -1053,9 +1104,12 @@ mod multicall_tests {
             asserter.push_failure(err(3, "execution reverted"));
         }
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        let out = run_multicall(&provider, calls(3), 1, BlockId::latest()).await;
+        let gate = QuoteGate::new(1);
+        let out = run_multicall(&provider, calls(3), &gate, BlockId::latest()).await;
         assert_eq!(out, vec![None; 3]);
         assert_eq!(asserter.read_q().len(), 0);
+        // The node answered the aggregate (with a revert); fallback calls aren't chunks.
+        assert_eq!(gate.take_summary(), "1/0/0");
     }
 
     /// Two chunks, the second rate-limited: only the first chunk's calls are answered, so a
@@ -1071,7 +1125,8 @@ mod multicall_tests {
         asserter.push_success(&alloy::primitives::Bytes::from(ret));
         asserter.push_failure(err(-32011, "request limit reached"));
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        let out = run_multicall_answered(&provider, calls(n as u8), 1, BlockId::latest()).await;
+        let gate = QuoteGate::new(1);
+        let out = run_multicall_answered(&provider, calls(n as u8), &gate, BlockId::latest()).await;
         assert_eq!(out.len(), n);
         // Chunk 1: an inner revert is answered (cacheable as ZERO), the rest returned data.
         assert_eq!(out[0], (None, true));
@@ -1079,6 +1134,14 @@ mod multicall_tests {
         // Chunk 2: failed in transport — not answered.
         assert_eq!(out[n - 1], (None, false));
         assert!(asserter.read_q().is_empty());
+        assert_eq!(gate.take_summary(), "1/0/1");
+    }
+
+    #[test]
+    fn quote_gate_width_floor() {
+        let gate = QuoteGate::new(0);
+        assert_eq!(gate.width, 1);
+        assert_eq!(gate.permits.available_permits(), 1);
     }
 }
 

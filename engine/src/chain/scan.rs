@@ -14,9 +14,9 @@ use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout};
 /// separate quote endpoint.
 async fn spawn_k_state_check(strategy: &Arc<RwLock<Strategy>>, opp: &Opportunity, chain_name: &str) {
     use alloy::sol_types::SolCall;
-    let (cache, quote_rpc, block, concurrency) = {
+    let (cache, quote_rpc, block, gate) = {
         let s = strategy.read().await;
-        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.rpc_concurrency)
+        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.quote_gate.clone())
     };
     let Some(q) = quote_rpc else { return };
     let pools: Vec<(Address, Address, Address, (U256, U256))> = opp.pools(&cache).into_iter()
@@ -31,7 +31,7 @@ async fn spawn_k_state_check(strategy: &Arc<RwLock<Strategy>>, opp: &Opportunity
                 (p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()), bal(t0, p), bal(t1, p),
             ])
             .collect();
-        let raw = crate::strategy::run_multicall(&q, calls, concurrency, block).await;
+        let raw = crate::strategy::run_multicall(&q, calls, &gate, block).await;
         let word = |r: &Option<Vec<u8>>, i: usize| r.as_ref()
             .and_then(|b| b.get(i * 32..(i + 1) * 32)).map(U256::from_be_slice);
         let detail: Vec<String> = pools.iter().zip(raw.chunks(3)).map(|(&(p, _, _, cached), r)| {
@@ -72,10 +72,10 @@ async fn recheck_quiet_pools<P: Provider + Clone>(
     recheck_drops: &AtomicU64,
 ) -> Vec<Opportunity> {
     use alloy::sol_types::SolCall;
-    let (cache, quote_rpc, block, concurrency, prefetched) = {
+    let (cache, quote_rpc, block, gate, prefetched) = {
         let s = strategy.read().await;
         let prefetched: HashMap<Address, Option<(U256, U256)>> = s.recheck_prefetch.lock().unwrap().drain().collect();
-        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.rpc_concurrency, prefetched)
+        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.quote_gate.clone(), prefetched)
     };
     if !cache.feed_live() {
         return opps; // feed silent: per-pool max ages already kept quiet pools out
@@ -99,8 +99,8 @@ async fn recheck_quiet_pools<P: Provider + Clone>(
             .map(|p| (*p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()))
             .collect();
         let raw = match &quote_rpc {
-            Some(q) => crate::strategy::run_multicall(q, calls, concurrency, block).await,
-            None => crate::strategy::run_multicall(provider, calls, concurrency, block).await,
+            Some(q) => crate::strategy::run_multicall(q, calls, &gate, block).await,
+            None => crate::strategy::run_multicall(provider, calls, &gate, block).await,
         };
         for (pool, r) in missing.into_iter().zip(raw) {
             let reserves = r

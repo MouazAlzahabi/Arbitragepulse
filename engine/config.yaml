@@ -29,11 +29,11 @@ chain:
   deadline_seconds: 120
   quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
   scan_interval_ms: 2000
-  # Multicall3 chunks (tuning.multicall_chunk_size calls each) in flight at once PER batch on the
-  # quote endpoint. 6 × 10 = 60 calls per wave: a triangular verify round (up to ~60 quotes) goes
-  # out as ONE round trip instead of two sequential waves at 3. Joined batches (Phase 1.5 + 1.5c
-  # + prefetch, alongside the triangular verify) each get this many, so the peak is a few times
-  # higher — watch the heartbeat's rate-limit / lost-call counts after raising it.
+  # Multicall3 chunks (tuning.multicall_chunk_size calls each) in flight at once on the quote
+  # endpoint — ONE budget shared by every joined batch: Phase 1.5/1.5b/1.5c, the quiet-pool
+  # prefetch and the triangular verify. 6 = the peak of the build before those were joined; a
+  # lone verify round (≤50 calls, chunk 10) still goes out as one wave. Watch the heartbeat's
+  # `qmc=ok/timeout/err` chunk counts after changing it.
   rpc_concurrency: 6
   # Extra HTTP endpoints to broadcast signed txs concurrently (FCFS sequencer — race to arrive first)
   # Flashblocks: pool events from 200 ms pre-confirmed sub-blocks (eth_subscribe

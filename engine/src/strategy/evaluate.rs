@@ -592,9 +592,9 @@ impl Strategy {
             if p15c_mc.is_empty() {
                 vec![]
             } else if let Some(ref hp) = self.http_provider {
-                run_multicall_answered(hp, p15c_mc, self.rpc_concurrency, self.quote_block).await
+                run_multicall_answered(hp, p15c_mc, &self.quote_gate, self.quote_block).await
             } else {
-                run_multicall_answered(provider, p15c_mc, self.rpc_concurrency, self.quote_block).await
+                run_multicall_answered(provider, p15c_mc, &self.quote_gate, self.quote_block).await
             }
         });
         tokio::pin!(p15c_fut);
@@ -725,9 +725,9 @@ impl Strategy {
                     let t = std::time::Instant::now();
                     let p15 = async {
                         if let Some(ref hp) = self.http_provider {
-                            run_multicall_answered(hp, p15_mc, self.rpc_concurrency, self.quote_block).await
+                            run_multicall_answered(hp, p15_mc, &self.quote_gate, self.quote_block).await
                         } else {
-                            run_multicall_answered(provider, p15_mc, self.rpc_concurrency, self.quote_block).await
+                            run_multicall_answered(provider, p15_mc, &self.quote_gate, self.quote_block).await
                         }
                     };
                     let (raw, (), ()) = tokio::join!(p15, p15c_fut.as_mut(), prefetch_fut.as_mut());
@@ -959,9 +959,9 @@ impl Strategy {
             if p15b_cache_misses == 0 {
                 vec![]
             } else if let Some(ref hp) = self.http_provider {
-                run_multicall_answered(hp, p15b_mc, self.rpc_concurrency, self.quote_block).await
+                run_multicall_answered(hp, p15b_mc, &self.quote_gate, self.quote_block).await
             } else {
-                run_multicall_answered(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await
+                run_multicall_answered(provider, p15b_mc, &self.quote_gate, self.quote_block).await
             }
         };
         // The prefetch rides along only when this join is a round trip anyway (or Phase 1.5
