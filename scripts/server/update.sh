@@ -39,7 +39,8 @@ API_KEY="$(env_get API_KEY)"
 cd "$REPO"
 
 echo "[1/4] Pulling main..."
-git pull --ff-only
+git fetch origin main
+git merge --ff-only origin/main
 git log --oneline -1
 
 echo "[2/4] Building dashboard..."
