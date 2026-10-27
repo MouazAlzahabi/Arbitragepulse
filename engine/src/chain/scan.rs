@@ -5,6 +5,58 @@ use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// After a simulation reverted `K()` on a V2/Aerodrome leg: in the background, read each of
+/// the route's V2/Aerodrome pools at the quote state (`pending` on the preconf endpoint) —
+/// reserves plus both token balances, one Multicall3 — and log whether they agree. A router
+/// swap on a consistent pool can't fail K, so `reserves==balances:no` confirms the simulation
+/// caught a pool mid-block; `yes` everywhere means the state had settled by the read (or
+/// something else is wrong). Diagnostic only; never touches the scan. No-op without a
+/// separate quote endpoint.
+async fn spawn_k_state_check(strategy: &Arc<RwLock<Strategy>>, opp: &Opportunity, chain_name: &str) {
+    use alloy::sol_types::SolCall;
+    let (cache, quote_rpc, block, concurrency) = {
+        let s = strategy.read().await;
+        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.rpc_concurrency)
+    };
+    let Some(q) = quote_rpc else { return };
+    let pools: Vec<(Address, Address, Address, (U256, U256))> = opp.pools(&cache).into_iter()
+        .filter_map(|p| cache.by_address.get(&p).map(|i| (p, i.token0, i.token1, (i.reserve0, i.reserve1))))
+        .collect();
+    if pools.is_empty() { return; }
+    let (chain_name, route) = (chain_name.to_string(), opp.fingerprint());
+    tokio::spawn(async move {
+        let bal = |t: Address, p: Address| (t, crate::abi::IERC20::balanceOfCall { account: p }.abi_encode());
+        let calls: Vec<(Address, Vec<u8>)> = pools.iter()
+            .flat_map(|&(p, t0, t1, _)| [
+                (p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()), bal(t0, p), bal(t1, p),
+            ])
+            .collect();
+        let raw = crate::strategy::run_multicall(&q, calls, concurrency, block).await;
+        let word = |r: &Option<Vec<u8>>, i: usize| r.as_ref()
+            .and_then(|b| b.get(i * 32..(i + 1) * 32)).map(U256::from_be_slice);
+        let detail: Vec<String> = pools.iter().zip(raw.chunks(3)).map(|(&(p, _, _, cached), r)| {
+            match (word(&r[0], 0), word(&r[0], 1), word(&r[1], 0), word(&r[2], 0)) {
+                (Some(r0), Some(r1), Some(b0), Some(b1)) => {
+                    let ok = r0 == b0 && r1 == b1;
+                    format!(
+                        "{p} reserves==balances:{}{} cache_current:{}",
+                        if ok { "yes" } else { "no" },
+                        if ok { String::new() } else { format!(" (Δ0={} Δ1={})", diff(b0, r0), diff(b1, r1)) },
+                        cached == (r0, r1),
+                    )
+                }
+                _ => format!("{p} unreadable"),
+            }
+        }).collect();
+        info!("[{}] K() state-check {} | {}", chain_name, route, detail.join("; "));
+    });
+}
+
+/// `a - b` as a signed decimal string.
+fn diff(a: U256, b: U256) -> String {
+    if a >= b { format!("+{}", a - b) } else { format!("-{}", b - a) }
+}
+
 /// While the log feed is live, a quiet V2/Aerodrome pool (no Sync for its max age) is still
 /// quoted from local reserves. Before any candidate trades through one, re-read those pools'
 /// reserves on-chain (one Multicall3 on the quote endpoint, only when such a candidate
@@ -590,6 +642,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Err(e) => {
                         drop(exec);
+                        if e.to_string().contains("K()") {
+                            spawn_k_state_check(strategy, best_opp, &cfg.name).await;
+                        }
                         failure |= handle_execution_failure(&mut scan_rpc, 
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns, cooldown_secs(),
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
@@ -627,6 +682,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
+                                    if detail.contains("K()") {
+                                        spawn_k_state_check(strategy, best_opp, &cfg.name).await;
+                                    }
                                     warn!(
                                         "[{}] preflight_eth_call revert | pair={} | {}",
                                         cfg.name, optimized.pair_id, detail
@@ -1007,8 +1065,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 );
             } else {
                 let msg = format!(
-                    "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
-                    cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
+                    "[{}] triangular {} | profit=${:.4} | {}/{}/{} | fees={}/{}/{}",
+                    cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id,
+                    opp.fee_ab, opp.fee_bc, opp.fee_ca
                 );
                 info!("{}", msg);
                 broadcast_log(
@@ -1079,6 +1138,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     }
                     Err(e) => {
                         drop(exec);
+                        if e.to_string().contains("K()") {
+                            spawn_k_state_check(strategy, best_opp, &cfg.name).await;
+                        }
                         failure |= handle_execution_failure(&mut scan_rpc, 
                             e, &fingerprint, &router_ids, pending_pairs, cooldowns, cooldown_secs(),
                             consecutive_failures, cfg, shared_state, metrics, log_tx,
@@ -1113,6 +1175,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 Ok(_) => {}
                                 Err(e) => {
                                     let detail = crate::revert::format_eth_call_transport_error(&e);
+                                    if detail.contains("K()") {
+                                        spawn_k_state_check(strategy, best_opp, &cfg.name).await;
+                                    }
                                     warn!(
                                         "[{}] preflight_eth_call revert | triplet={} | {}",
                                         cfg.name, opp.triplet_id, detail
