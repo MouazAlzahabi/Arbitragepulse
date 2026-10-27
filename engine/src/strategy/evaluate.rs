@@ -8,6 +8,31 @@ use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
 use super::{ForwardTask, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, run_multicall, token_amount_to_usd, min_v3_liquidity};
 
+/// Phase 1.5 gate: true when a Phase 2 route should be QuoterV2-verified at full size.
+/// Requires a V3 forward leg, a local spread above the gate (`amount_back / capped_in >
+/// mul / den`, integer math) and an uncapped forward leg (`capped_in == full_in`): a leg
+/// tick-capped below the full size can't take the full size at spot.
+pub(super) fn p15_gate_eligible(
+    amount_back: U256,
+    capped_in: U256,
+    full_in: Option<U256>,
+    fwd: &RouterType,
+    mul: u64,
+    den: u64,
+) -> bool {
+    matches!(fwd, RouterType::V3)
+        && full_in == Some(capped_in)
+        && amount_back.saturating_mul(U256::from(den)) > capped_in.saturating_mul(U256::from(mul))
+}
+
+/// True when the local V3 spot quote of `amount_in` on `key` is not tick-capped
+/// (the pool's current tick can absorb the whole amount). Missing pool state = false.
+fn v3_spot_uncapped(cache: &crate::pool_cache::PoolCache, key: &V3PoolKey, token_in: Address, amount_in: U256) -> bool {
+    cache
+        .quote_v3_spot_key(key, token_in, amount_in)
+        .is_some_and(|(_, _, effective_in)| effective_in == amount_in)
+}
+
 impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
     /// All quotes run concurrently (two phases: forward then reverse).
@@ -332,7 +357,7 @@ impl Strategy {
         // Negative = below break-even; positive = profitable.
         let mut best_spread_pct: f64 = f64::NEG_INFINITY;
 
-        // Phase 1.5 gate: collect V3 tick-capped forward tasks that show real cross-DEX
+        // Phase 1.5 gate: collect uncapped V3 forward tasks that show real cross-DEX
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
         let p15_gate_spread = crate::config::tuning().p15_gate_spread;
         // Integer spread gate: amount_back/amount_in > 1.00005  (avoids float in hot loop)
@@ -372,14 +397,19 @@ impl Strategy {
                     best_spread_pct = spread;
                 }
 
-                // Phase 1.5 gate: local cross-DEX spread is promising AND forward router is V3.
-                // Fire for ALL V3 forwards with spread > threshold (tick-capped spot when pool is thin).
-                // QuoterV2 verifies the actual on-chain amount at full trade size. Without this,
-                // liquid pools (safe_cap >= trade_amount, task.amount_in == full) never trigger
-                // Phase 1.5 and V3×V3 spreads are permanently blocked from all_opportunities.
-                let p15_gate_hit = amount_back.saturating_mul(U256::from(p15_gate_den))
-                    > task.amount_in.saturating_mul(U256::from(p15_gate_mul));
-                if p15_gate_hit && matches!(task.router_a_type, RouterType::V3) {
+                // Phase 1.5 gate: local cross-DEX spread is promising AND forward router is V3
+                // AND its forward leg was not tick-capped. QuoterV2 verifies at full trade size;
+                // liquid pools (task.amount_in == full) must reach it, or V3×V3 spreads are
+                // permanently blocked. A capped forward can't take the full size at spot, so a
+                // full-size QuoterV2 call there is wasted RPC (and the bestV -99.99% artefact).
+                let full_in = self
+                    .pair_resolved
+                    .get(task.pair_idx)
+                    .and_then(|o| o.as_ref())
+                    .map(|r| r.amount_in);
+                if p15_gate_eligible(
+                    amount_back, task.amount_in, full_in, &task.router_a_type, p15_gate_mul, p15_gate_den,
+                ) {
                     p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
                 }
             }
@@ -454,7 +484,7 @@ impl Strategy {
 
         // ── Phase 1.5: Gated V3 QuoterV2 upgrade ─────────────────────────────────────
         // Fires only when Phase 2 local data showed cross-DEX spread > p15_gate_spread
-        // on a V3-tick-capped forward task. One batched multicall for all candidates.
+        // on an uncapped V3 forward task. One batched multicall for all candidates.
         let mut t_after_p15: u128 = 0;
         // p15b state declared here so it can be consumed by the parallel fire section
         // below, which runs outside the p15_gate block.
@@ -573,9 +603,15 @@ impl Strategy {
                     if quoter_out.is_zero() { continue; }
 
                     let pair = &self.pairs[pi];
+                    // V3 reverse pools whose spot quote for quoter_out is tick-capped can't
+                    // absorb it at spot — skip them rather than spend a 1.5b QuoterV2 call.
                     let q_b_list: Vec<ForwardTask> = match pair_quotes.get(&pi) {
                         Some(ts) => ts.iter()
                             .filter(|t| t.router_id != router_a_id)
+                            .filter(|t| !matches!(t.router_type, RouterType::V3)
+                                || t.rev_v3_key.as_ref().is_some_and(|k| {
+                                    v3_spot_uncapped(&self.pool_cache, k, token_out, quoter_out)
+                                }))
                             .cloned()
                             .collect(),
                         None => continue,
@@ -993,5 +1029,64 @@ impl Strategy {
         }
 
         (opportunities, best_raw_usd, best_verified_spread, total_fwd_ok, pairs_with_multi, best_spread_pct, pairs_with_any)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool_cache::{PoolCache, V3PoolState};
+    use std::time::Instant;
+
+    // Gate 0.005%: amount_back / amount_in > 1_000_050 / 1_000_000.
+    const MUL: u64 = 1_000_050;
+    const DEN: u64 = 1_000_000;
+
+    fn back(amount_in: u64, spread_ppm: u64) -> U256 {
+        U256::from(amount_in) * U256::from(1_000_000 + spread_ppm) / U256::from(1_000_000u64)
+    }
+
+    #[test]
+    fn p15_gate_skips_capped_forward_legs() {
+        let full = U256::from(10_000_000_000u64);
+        let capped = U256::from(5_000_000u64);
+        // (a) Tick-capped thin pool with a +0.5% spread on its capped input (WETH/AERO case).
+        assert!(!p15_gate_eligible(back(5_000_000, 5_000), capped, Some(full), &RouterType::V3, MUL, DEN));
+        // (b) Uncapped leg with +0.01% → gated.
+        assert!(p15_gate_eligible(back(10_000_000_000, 100), full, Some(full), &RouterType::V3, MUL, DEN));
+        // (c) Uncapped leg with +0.004% → below the 0.005% gate.
+        assert!(!p15_gate_eligible(back(10_000_000_000, 40), full, Some(full), &RouterType::V3, MUL, DEN));
+        // (d) V2 forward → never gated (handled by Phase 2 / 1.5c).
+        assert!(!p15_gate_eligible(back(10_000_000_000, 100), full, Some(full), &RouterType::V2, MUL, DEN));
+        // Unresolved pair → not gated.
+        assert!(!p15_gate_eligible(back(10_000_000_000, 100), full, None, &RouterType::V3, MUL, DEN));
+    }
+
+    #[test]
+    fn v3_spot_uncapped_detects_tick_capped_reverse_pools() {
+        let (t0, t1) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let pool = Address::repeat_byte(0xcc);
+        let cache = PoolCache::new();
+        // Price 1, L = 1e6 → vr0 = vr1 = 1e6; 2% cap = 20_000.
+        cache.insert_v3(pool, V3PoolState {
+            token0: t0,
+            token1: t1,
+            fee: 500,
+            swap_fee: 500,
+            sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1_000_000,
+            tick: 0,
+            router_id: "r".into(),
+            last_updated: Instant::now(),
+            vr0: U256::ZERO,
+            vr1: U256::ZERO,
+            fee_num_v3: U256::ZERO,
+        });
+        let key = V3PoolKey::new("r", t1, t0, 500);
+        assert!(v3_spot_uncapped(&cache, &key, t1, U256::from(10_000u64)));
+        assert!(!v3_spot_uncapped(&cache, &key, t1, U256::from(100_000u64)));
+        // Unknown pool → treated as not quotable at spot.
+        let missing = V3PoolKey::new("other", t1, t0, 500);
+        assert!(!v3_spot_uncapped(&cache, &missing, t1, U256::from(10_000u64)));
     }
 }
