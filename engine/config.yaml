@@ -296,9 +296,10 @@ tuning:
   tip_profit_share_bps: 0                # e.g. 1000 = up to 10% of gross profit (max 9000)
   tip_max_wei: 2000000000                # 2 gwei per gas cap
   # ── Detection ──
-  # 2 bps: quotes are exact (QuoterV2 / xy=k at the Flashblocks `pending` state) and every
-  # candidate is eth_call-simulated before send. 15 bps scaled with size ($15 at $10k) and
-  # removed every edge under 0.15%.
+  # 2 bps: quotes are exact (QuoterV2 / xy=k at the Flashblocks `pending` state), so this only
+  # covers price drift between quote and inclusion (~1 Flashblock). Live sends are NOT simulated
+  # first (preflight_eth_call off); a trade that drifts below minProfit reverts on-chain, costing
+  # only gas. 15 bps scaled with size ($15 at $10k) and removed every edge under 0.15%.
   quoter_haircut_bps: 2
   p15_gate_spread: 0.00005               # local spread that triggers QuoterV2 verification
   min_v3_liquidity: 1000000000
