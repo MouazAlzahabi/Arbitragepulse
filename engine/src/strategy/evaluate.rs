@@ -50,6 +50,9 @@ pub(super) fn route_legs_eligible(
 
 /// True when the local V3 spot quote of `amount_in` on `key` is not tick-capped
 /// (the pool's current tick can absorb the whole amount). Missing pool state = false.
+/// Speculative 1.5b request: (pair index, router A, fee A, reverse router, reverse fee, input).
+type SpecKey = (usize, String, u32, String, u32, U256);
+
 fn v3_spot_uncapped(cache: &crate::pool_cache::PoolCache, key: &V3PoolKey, token_in: Address, amount_in: U256) -> bool {
     cache
         .quote_v3_spot_key(key, token_in, amount_in)
@@ -626,6 +629,8 @@ impl Strategy {
         let mut p15b_pre: Vec<Option<U256>> = Vec::new();
         // Pool (sqrtPriceX96, liquidity) when each p15b_mc request was built — see QuoteCache::insert.
         let mut p15b_sent_state: Vec<Option<(U256, u128)>> = Vec::new();
+        // 1.5b reverse quotes answered by a speculative bracket instead of a second round trip.
+        let mut p15b_spec_hits: usize = 0;
         if !p15_gate.is_empty() && !self.optimistic_submission {
             let mut p15_list: Vec<(usize, String, u32, Address, Address, Address, U256)> = Vec::new();
             let mut p15_mc: Vec<(Address, Vec<u8>)> = Vec::new();
@@ -634,6 +639,12 @@ impl Strategy {
             // For each p15_list[i]: Some(v) = cache hit (v=ZERO means failed/skip),
             // None = cache miss → has a corresponding entry in p15_mc.
             let mut p15_pre: Vec<Option<U256>> = Vec::new();
+            // Speculative 1.5b: each V3 reverse leg quoted at the forward leg's upper-bound
+            // output and the bracket's lower point, in the Phase 1.5 batch. The real forward
+            // output then usually falls between the two points, and the chord gives a lower
+            // bound on the reverse output — no second round trip (see v3_leg_lower_bound).
+            let mut spec_routes: Vec<SpecKey> = Vec::new();
+            let mut spec_mc: Vec<(Address, Vec<u8>)> = Vec::new();
 
             for (pi, router_a_id, fee_a) in &p15_gate {
                 let resolved = match self.pair_resolved.get(*pi).and_then(|o| o.as_ref()) {
@@ -666,7 +677,33 @@ impl Strategy {
                     p15_sent_state.push(self.pool_cache.v3_price_state(&v3_cache_key));
                     p15_mc.push((quoter, self.encode_quote(quoter, fwd_task.token_in, fwd_task.token_out, *fee_a, full_amount)));
                 }
+
+                let Some(hi) = self.pool_cache.quote_v3_marginal(&v3_cache_key, fwd_task.token_in, full_amount)
+                    .filter(|a| !a.is_zero()) else { continue };
+                let lo = hi * U256::from(10_000 - super::triangular::verify_bracket_bps()) / U256::from(10_000u32);
+                for q_b in pair_quotes.get(pi).into_iter().flatten().filter(|t| {
+                    matches!(t.router_type, RouterType::V3)
+                        && route_legs_eligible(
+                            (router_a_id, fwd_task.router_addr, &RouterType::V3, *fee_a),
+                            (&t.router_id, t.router_addr, &t.router_type, t.fee),
+                            true,
+                        )
+                        && t.rev_v3_key.as_ref().is_some_and(|k| v3_spot_uncapped(&self.pool_cache, k, fwd_task.token_out, hi))
+                }) {
+                    let Some(quoter_b) = q_b.quoter_addr else { continue };
+                    for amt in [hi, lo] {
+                        spec_routes.push((*pi, router_a_id.clone(), *fee_a, q_b.router_id.clone(), q_b.fee, amt));
+                        spec_mc.push((quoter_b, self.encode_quote(quoter_b, fwd_task.token_out, fwd_task.token_in, q_b.fee, amt)));
+                    }
+                }
             }
+            // Only worth it when Phase 1.5 makes a round trip anyway.
+            if p15_mc.is_empty() {
+                spec_routes.clear();
+                spec_mc.clear();
+            }
+            let spec_n = spec_mc.len();
+            p15_mc.extend(spec_mc);
 
             let cache_hits  = p15_pre.iter().filter(|v| v.is_some()).count();
             let cache_misses = p15_mc.len();
@@ -698,6 +735,18 @@ impl Strategy {
                     vec![]
                 };
                 t_after_p15 = scan_start.elapsed().as_millis();
+                let mut p15_raw = p15_raw;
+                let spec_raw = p15_raw.split_off(p15_raw.len().saturating_sub(spec_n));
+                // (route, reverse router, fee) → reverse-leg QuoterV2 points (input, output), sorted.
+                let mut spec_points: std::collections::HashMap<(usize, String, u32, String, u32), Vec<(U256, U256)>> =
+                    std::collections::HashMap::new();
+                for ((pi, a_id, a_fee, b_id, b_fee, amt), (raw, _)) in spec_routes.into_iter().zip(spec_raw) {
+                    if let Some(out) = decode_v3_quote(raw.as_ref()) {
+                        let pts = spec_points.entry((pi, a_id, a_fee, b_id, b_fee)).or_default();
+                        pts.push((amt, out));
+                        pts.sort_by(|a, b| a.0.cmp(&b.0));
+                    }
+                }
 
                 // Merge cache hits + MC results into final quoter_outs.
                 // MC results are also stored in quote_cache so the next scan with unchanged
@@ -772,7 +821,15 @@ impl Strategy {
                                     .rev_v3_key
                                     .clone()
                                     .unwrap_or_else(|| V3PoolKey::new(&q_b.router_id, token_out, token_in, fee_b));
-                                let cached_b = self.quote_cache.get(&self.pool_cache, &p15b_key, quoter_out);
+                                let cached_b = self.quote_cache.get(&self.pool_cache, &p15b_key, quoter_out)
+                                    .or_else(|| spec_points
+                                        .get(&(pi, router_a_id.clone(), fee_a, q_b.router_id.clone(), fee_b))
+                                        .and_then(|pts| super::triangular::v3_leg_lower_bound(pts, quoter_out))
+                                        .filter(|&(bound, tight)| tight && !bound.is_zero())
+                                        .map(|(bound, _)| {
+                                            p15b_spec_hits += 1;
+                                            bound
+                                        }));
                                 p15b_candidates.push((pi, router_a_id.clone(), fee_a, router_a_addr,
                                                       token_in, token_out, full_amount, q_b.clone(), quoter_out));
                                 if cached_b.is_some() {
@@ -876,8 +933,8 @@ impl Strategy {
         let p15b_cache_misses = p15b_mc.len();
         if p15b_cache_hits > 0 || p15b_cache_misses > 0 {
             if p15b_cache_misses > 0 {
-                debug!("[chain={}] Phase 1.5b: {} V3×V3 reverse quote(s) + {} from cache",
-                       self.chain_id, p15b_cache_misses, p15b_cache_hits);
+                debug!("[chain={}] Phase 1.5b: {} V3×V3 reverse quote(s) + {} from cache ({} from speculative brackets)",
+                       self.chain_id, p15b_cache_misses, p15b_cache_hits, p15b_spec_hits);
             } else {
                 debug!("[chain={}] Phase 1.5b: all {} from p15b_cache — 0 HTTP calls",
                        self.chain_id, p15b_cache_hits);

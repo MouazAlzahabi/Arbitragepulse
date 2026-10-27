@@ -18,7 +18,7 @@ fn verify_max_rounds() -> usize { crate::config::tuning().tri_verify_max_rounds 
 /// upper-bound input `s` and `s × (1 − this)`. The real input normally falls between them
 /// (earlier legs' impact + tick crossings, ~30 bps on Base), where the chord between the
 /// two quotes is a tight lower bound — so one round trip usually suffices.
-fn verify_bracket_bps() -> u64 { crate::config::tuning().tri_verify_bracket_bps }
+pub(super) fn verify_bracket_bps() -> u64 { crate::config::tuning().tri_verify_bracket_bps }
 
 /// Outside its quoted points, a V3 leg's real input is bounded by the nearest point
 /// (chord through the origin below it, flat output above it). Accepted when within this
@@ -45,7 +45,7 @@ enum RouteWalk {
 /// by input, using that output is increasing and concave in input (zero at zero).
 /// Returns the bound and whether it is tight (exact, inside the points, or within
 /// [`verify_max_gap_bps()`] of the nearest point).
-fn v3_leg_lower_bound(points: &[(U256, U256)], amt: U256) -> Option<(U256, bool)> {
+pub(super) fn v3_leg_lower_bound(points: &[(U256, U256)], amt: U256) -> Option<(U256, bool)> {
     let gap_ok = |near: U256, far: U256| {
         near.abs_diff(far).saturating_mul(U256::from(10_000u32))
             <= near.saturating_mul(U256::from(verify_max_gap_bps()))
