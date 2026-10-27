@@ -29,7 +29,11 @@ chain:
   deadline_seconds: 120
   quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
   scan_interval_ms: 2000
-  rpc_concurrency: 3
+  # Multicall3 chunks (tuning.multicall_chunk_size calls each) in flight at once on the quote
+  # endpoint. 8 × 10 = 80 calls per wave: a triangular verify round (up to ~60 quotes) goes out
+  # as ONE round trip instead of two or three sequential waves at 3. Same calls, just at once —
+  # watch the heartbeat's rate-limit / lost-call counts after raising it.
+  rpc_concurrency: 8
   # Extra HTTP endpoints to broadcast signed txs concurrently (FCFS sequencer — race to arrive first)
   # Flashblocks: pool events from 200 ms pre-confirmed sub-blocks (eth_subscribe
   # "pendingLogs"), measured ~1.2 s (p50) before the sealed block. Read-only, keyless.
