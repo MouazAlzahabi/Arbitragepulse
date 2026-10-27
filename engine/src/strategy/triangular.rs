@@ -685,6 +685,7 @@ impl Strategy {
             }
         }
 
+        super::BeatSpreads::note(&self.beat.tri, best_tri_spread);
         if best_tri_spread.is_finite() && !p3_entries.is_empty() {
             debug!(
                 "[{}] triangular best spread: {:+.3}% ({} routes evaluated)",
@@ -828,6 +829,10 @@ impl Strategy {
                     self.chain_id, opp.triplet_id,
                 );
                 return None;
+            }
+            if !opp.amount_in.is_zero() {
+                let spread = crate::util::u256_to_f64(final_amt) / crate::util::u256_to_f64(opp.amount_in) - 1.0;
+                super::BeatSpreads::note(&self.beat.tri_v, spread);
             }
             let (sym_a, dec_a) = token_info.get(&addr_key(opp.token_a))?;
             let profit_usd = profit

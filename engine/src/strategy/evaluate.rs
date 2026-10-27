@@ -400,6 +400,9 @@ impl Strategy {
         // Best signed spread ratio: (reverse_out / amount_in) - 1.0
         // Negative = below break-even; positive = profitable.
         let mut best_spread_pct: f64 = f64::NEG_INFINITY;
+        // Same, but over every non-phantom route incl. unverified V3 spot ones (an upper
+        // bound): heartbeat `spot2=`, the market's distance from an edge while it's quiet.
+        let mut best_spot_spread: f64 = f64::NEG_INFINITY;
 
         // Phase 1.5 gate: collect uncapped V3 forward tasks that show real cross-DEX
         // divergence. QuoterV2 fires only for these (0 RPC when market is quiet).
@@ -457,6 +460,7 @@ impl Strategy {
             // their QuoterV2-verified results in 1.5/1.5b/1.5c.
             if !task.amount_in.is_zero() {
                 let spread = u256_to_f64(amount_back) / u256_to_f64(task.amount_in) - 1.0;
+                best_spot_spread = best_spot_spread.max(spread);
                 if v3_allowed && spread > best_spread_pct {
                     best_spread_pct = spread;
                 }
@@ -1207,6 +1211,8 @@ impl Strategy {
             self.chain_id, scan_start.elapsed().as_millis(), t_after_p15,
             opportunities.len()
         );
+
+        super::BeatSpreads::note(&self.beat.spot2, best_spot_spread);
 
         let min_floor = self.min_profit_usd;
         if opportunities.is_empty() && best_raw_usd > 0.0 && best_raw_usd >= min_floor {

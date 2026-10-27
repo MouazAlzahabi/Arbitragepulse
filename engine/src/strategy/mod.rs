@@ -323,6 +323,8 @@ pub struct Strategy {
     quoter_ever_ok: DashMap<String, ()>,
     /// Round-trip timings of the last scan, for the execution log: see [`ScanTimings`].
     pub timings: ScanTimings,
+    /// Best spreads since the last heartbeat, unverified ones included: see [`BeatSpreads`].
+    pub beat: BeatSpreads,
     /// Quiet-pool reserves read this scan alongside a QuoterV2 round (pool → reserves, None =
     /// unreadable), consumed by `scan::recheck_quiet_pools`. Cleared at each scan's start.
     pub recheck_prefetch: Mutex<HashMap<Address, Option<(U256, U256)>>>,
@@ -412,6 +414,7 @@ impl Strategy {
             quoter_fail_streak: DashMap::new(),
             quoter_ever_ok: DashMap::new(),
             timings: ScanTimings::default(),
+            beat: BeatSpreads::default(),
             recheck_prefetch: Mutex::new(HashMap::new()),
         };
         s.rebuild_scan_cache();
@@ -810,6 +813,44 @@ impl ScanTimings {
     }
 }
 
+/// Best signed spreads (ratio, e.g. -0.0012 = -0.12%) since the last heartbeat, as f64 bits
+/// (NEG_INFINITY = none). The heartbeat's `spread=`/`best=` skip unverified V3 spot routes,
+/// so in a quiet market they can't show how far the market is from an edge; these do.
+pub struct BeatSpreads {
+    /// 2-hop Phase 2, every non-phantom route incl. unverified V3 spot (an upper bound).
+    pub spot2: std::sync::atomic::AtomicU64,
+    /// Triangular Phase 3, every route on spot quotes (an upper bound for V3 legs).
+    pub tri: std::sync::atomic::AtomicU64,
+    /// Triangular routes after QuoterV2 verification (post-haircut).
+    pub tri_v: std::sync::atomic::AtomicU64,
+}
+
+impl Default for BeatSpreads {
+    fn default() -> Self {
+        let none = || std::sync::atomic::AtomicU64::new(f64::NEG_INFINITY.to_bits());
+        Self { spot2: none(), tri: none(), tri_v: none() }
+    }
+}
+
+impl BeatSpreads {
+    /// Raise `slot` to `v` if higher. Non-finite values are ignored.
+    pub fn note(slot: &std::sync::atomic::AtomicU64, v: f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !v.is_finite() { return; }
+        let _ = slot.fetch_update(Relaxed, Relaxed, |cur| (v > f64::from_bits(cur)).then_some(v.to_bits()));
+    }
+
+    /// Read and reset `slot` (NEG_INFINITY = nothing noted since the last take).
+    pub fn take(slot: &std::sync::atomic::AtomicU64) -> f64 {
+        f64::from_bits(slot.swap(f64::NEG_INFINITY.to_bits(), std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Signed spread ratio as a heartbeat percentage (`-0.123%`), or `n/a` when not finite.
+pub fn fmt_spread(v: f64) -> String {
+    if v.is_finite() { format!("{:+.3}%", v * 100.0) } else { "n/a".to_string() }
+}
+
 /// Multicall3 chunk budget on the quote endpoint, shared by every batch of one chain.
 /// Phase 1.5/1.5b/1.5c, the quiet-pool prefetch and triangular verification are joined
 /// concurrently; each used to get its own `rpc_concurrency` chunks, so several in flight
@@ -1142,6 +1183,32 @@ mod multicall_tests {
         let gate = QuoteGate::new(0);
         assert_eq!(gate.width, 1);
         assert_eq!(gate.permits.available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod beat_spreads_tests {
+    use super::*;
+
+    #[test]
+    fn note_keeps_max_ignores_non_finite_and_take_resets() {
+        let b = BeatSpreads::default();
+        BeatSpreads::note(&b.tri, -0.004);
+        BeatSpreads::note(&b.tri, -0.002);
+        BeatSpreads::note(&b.tri, -0.003);
+        BeatSpreads::note(&b.tri, f64::NAN);
+        BeatSpreads::note(&b.tri, f64::NEG_INFINITY);
+        assert_eq!(BeatSpreads::take(&b.tri), -0.002);
+        assert_eq!(BeatSpreads::take(&b.tri), f64::NEG_INFINITY);
+        // Slots are independent.
+        assert_eq!(BeatSpreads::take(&b.spot2), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn fmt_spread_formats_and_handles_none() {
+        assert_eq!(fmt_spread(f64::NEG_INFINITY), "n/a");
+        assert_eq!(fmt_spread(-0.00123), "-0.123%");
+        assert_eq!(fmt_spread(0.0005), "+0.050%");
     }
 }
 

@@ -587,19 +587,19 @@ pub async fn run_chain(
                     "$0".to_string()
                 };
                 // Read and reset the best signed spread % (shows market distance even when $0)
-                let spread_pct = f64::from_bits(best_spread_bits.swap(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed));
-                let spread_str = if spread_pct.is_finite() {
-                    format!("{:+.3}%", spread_pct * 100.0)
-                } else {
-                    "n/a".to_string()
-                };
+                let spread_str = crate::strategy::fmt_spread(f64::from_bits(
+                    best_spread_bits.swap(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed)));
                 // Read and reset Phase 1.5 verified spread (QuoterV2-confirmed, can be negative).
                 // bestV distinguishes real spread from V3 spot formula phantoms.
-                let verified_spread = f64::from_bits(best_verified_spread_bits.swap(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed));
-                let verified_str = if verified_spread.is_finite() {
-                    format!("{:+.3}%", verified_spread * 100.0)
-                } else {
-                    "n/a".to_string()
+                let verified_str = crate::strategy::fmt_spread(f64::from_bits(
+                    best_verified_spread_bits.swap(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed)));
+                // Best spreads incl. routes that best=/spread= skip. spot2 (2-hop) and tri
+                // (triangular) are unverified spot upper bounds; triV is QuoterV2-verified.
+                let (spot2_str, tri_str, tri_v_str) = {
+                    use crate::strategy::{fmt_spread, BeatSpreads};
+                    let s = strategy.read().await;
+                    (fmt_spread(BeatSpreads::take(&s.beat.spot2)), fmt_spread(BeatSpreads::take(&s.beat.tri)),
+                     fmt_spread(BeatSpreads::take(&s.beat.tri_v)))
                 };
                 // Read last-scan quote diagnostics
                 let fwd_ok = last_fwd_count.load(Ordering::Relaxed);
@@ -616,8 +616,8 @@ pub async fn run_chain(
                 // Pairs the executor can't fund (cached balances, no RPC): they detect but never trade.
                 let unfunded = state::underfunded_pairs(&chain_pairs, &*contract_balances.read().await).len();
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={}{} | v2={} v3={}/{}{}{}",
-                    cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
+                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} spot2={} tri={} triV={} | quotes={} active={}/{} cross={} | opps={}{} | v2={} v3={}/{}{}{}",
+                    cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, spot2_str, tri_str, tri_v_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
                     if recheck_drop_n > 0 { format!(" recheck_drop={}", recheck_drop_n) } else { String::new() },
                     pool_cache.by_address.len(), v3_fresh, v3_total,
                     if cfg.preconf_ws_rpc.is_some() { format!(" | preconf_logs={}", preconf_n) } else { String::new() },
