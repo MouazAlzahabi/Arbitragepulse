@@ -541,7 +541,7 @@ impl Default for Tuning {
             gas_fallback_max_age_ms: 120_000,
             tip_profit_share_bps: 0,
             tip_max_wei: 2_000_000_000, // 2 gwei — ~1000× Base's typical base fee
-            quoter_haircut_bps: 15,
+            quoter_haircut_bps: 2,
             p15_gate_spread: 0.00005,
             min_v3_liquidity: 1_000_000_000,
             v3_spot_max_vr_fraction_bps: 200,

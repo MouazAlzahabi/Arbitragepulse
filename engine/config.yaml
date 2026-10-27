@@ -59,7 +59,7 @@ chain:
   # Applies to EVERY triangular route. V3-leg routes are QuoterV2-verified first (revert plan 1.4),
   # so for them this is checked against verified profit and no longer absorbs the ~0.30% V3 spot
   # overestimate the old $0.80 covered. V2/Solidly/Aerodrome-only routes are NOT re-verified: they
-  # rely on event-sourced reserves (exact xy=k / stable curve) + 15 bps haircut + 5% sanity cap.
+  # rely on event-sourced reserves (exact xy=k / stable curve) + 2 bps haircut + 5% sanity cap.
   # If those routes start reverting, raise this floor — it is the only extra guard they have.
   # With optimistic_submission: true, V3-leg routes are submitted UNVERIFIED on spot quotes; the
   # engine then deducts the ~0.30% V3 overestimate (V3_SPOT_OVERESTIMATE_BPS) before this floor.
@@ -296,7 +296,10 @@ tuning:
   tip_profit_share_bps: 0                # e.g. 1000 = up to 10% of gross profit (max 9000)
   tip_max_wei: 2000000000                # 2 gwei per gas cap
   # ── Detection ──
-  quoter_haircut_bps: 15
+  # 2 bps: quotes are exact (QuoterV2 / xy=k at the Flashblocks `pending` state) and every
+  # candidate is eth_call-simulated before send. 15 bps scaled with size ($15 at $10k) and
+  # removed every edge under 0.15%.
+  quoter_haircut_bps: 2
   p15_gate_spread: 0.00005               # local spread that triggers QuoterV2 verification
   min_v3_liquidity: 1000000000
   v3_spot_max_vr_fraction_bps: 200

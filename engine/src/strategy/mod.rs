@@ -870,6 +870,22 @@ mod quote_encoding_tests {
 }
 
 #[cfg(test)]
+mod haircut_tests {
+    use super::*;
+
+    #[test]
+    fn default_haircut_keeps_a_ten_bps_exact_edge() {
+        // +0.10% exact quote on 10k USDC: 15 bps used to turn it into a loss.
+        let amount_in = U256::from(10_000_000_000u64);
+        let back = amount_in * U256::from(10_010u64) / U256::from(10_000u64);
+        let after = apply_exec_quote_haircut(back);
+        assert!(after > amount_in);
+        // 2 bps of 10.01k = $2.002 off a $10.00 edge.
+        assert_eq!(after - amount_in, U256::from(7_998_000u64));
+    }
+}
+
+#[cfg(test)]
 mod quote_cache_tests {
     use super::*;
     use std::time::{Duration, Instant};
