@@ -83,7 +83,9 @@ impl Strategy {
     /// Evaluate all pairs on all router combinations for arb opportunities.
     /// All quotes run concurrently (two phases: forward then reverse).
     /// Returns `(opportunities, best_raw_profit_usd, best_verified_spread, fwd_quotes_ok, pairs_with_multi, best_spread_pct, pairs_with_any)`:
-    /// - `best_raw_profit_usd`: highest profit even if below min_profit_usd (for status logging)
+    /// - `best_raw_profit_usd`: highest profit even if below min_profit_usd (for status logging).
+    ///   Like `best_spread_pct`, it skips unverified V3 spot routes (only their QuoterV2
+    ///   results count), so it never shows an edge that can't become an opportunity.
     /// - `best_verified_spread`: best signed spread confirmed by Phase 1.5 QuoterV2 (can be negative).
     ///   NEG_INFINITY = Phase 1.5 didn't run or reverse lookup always failed.
     ///   Negative = QuoterV2 confirmed loss after V3 fees (V3 phantom correctly deflated).
@@ -423,12 +425,32 @@ impl Strategy {
                 continue;
             }
 
+            // Any route with a V3 forward leg: the sqrtPriceX96 virtual-reserve
+            // approximation can overestimate by 0.01–0.1% (single-tick math vs
+            // actual multi-tick execution + fee). This creates phantom spreads on
+            // V3→V2 and V3→V3 routes that consistently fail pre-flight.
+            // Phase 1.5 handles ALL V3-forward routes via QuoterV2, which gives
+            // the exact on-chain output. Letting them through here creates a second
+            // unverified entry alongside the Phase 1.5 verified one — causing double
+            // pre-flight attempts and cooldown spam for the same conceptual route.
+            let router_a_is_v3 = matches!(task.router_a_type, RouterType::V3);
+            // V2→V3 routes need Phase 1.5c QuoterV2 verification for the V3 reverse leg.
+            // quote_v3_spot overestimates output in concentrated pools crossing multiple
+            // ticks — same problem Phase 1.5b solves for V3→V3.
+            let router_b_is_v3 = matches!(task.router_b_type, RouterType::V3);
+
+            // Optimistic mode: bypass QuoterV2 and submit immediately on Phase 1 spot quotes.
+            // Disable by setting optimistic_submission: false in config.yaml.
+            let v3_allowed = self.optimistic_submission || (!router_a_is_v3 && !router_b_is_v3);
+
             // Track signed spread % for all non-phantom quotes (even unprofitable ones).
             // Must be after the sanity cap to prevent V3 spot mismatch artifacts from
-            // corrupting the spread metric with astronomical values.
+            // corrupting the spread metric with astronomical values. Unverified V3 spot
+            // routes can never become opportunities here: they feed best=/spread= only via
+            // their QuoterV2-verified results in 1.5/1.5b/1.5c.
             if !task.amount_in.is_zero() {
                 let spread = u256_to_f64(amount_back) / u256_to_f64(task.amount_in) - 1.0;
-                if spread > best_spread_pct {
+                if v3_allowed && spread > best_spread_pct {
                     best_spread_pct = spread;
                 }
 
@@ -459,28 +481,12 @@ impl Strategy {
                     self.native_price_usd,
                 );
 
-                // Track best profit seen regardless of threshold (for status logging)
-                if profit_usd > best_raw_usd {
+                // Track best profit seen regardless of threshold (for status logging);
+                // unverified V3 spot routes excluded, as for the spread above.
+                if v3_allowed && profit_usd > best_raw_usd {
                     best_raw_usd = profit_usd;
                 }
 
-                // Any route with a V3 forward leg: the sqrtPriceX96 virtual-reserve
-                // approximation can overestimate by 0.01–0.1% (single-tick math vs
-                // actual multi-tick execution + fee). This creates phantom spreads on
-                // V3→V2 and V3→V3 routes that consistently fail pre-flight.
-                // Phase 1.5 handles ALL V3-forward routes via QuoterV2, which gives
-                // the exact on-chain output. Letting them through here creates a second
-                // unverified entry alongside the Phase 1.5 verified one — causing double
-                // pre-flight attempts and cooldown spam for the same conceptual route.
-                let router_a_is_v3 = matches!(task.router_a_type, RouterType::V3);
-                // V2→V3 routes need Phase 1.5c QuoterV2 verification for the V3 reverse leg.
-                // quote_v3_spot overestimates output in concentrated pools crossing multiple
-                // ticks — same problem Phase 1.5b solves for V3→V3.
-                let router_b_is_v3 = matches!(task.router_b_type, RouterType::V3);
-
-                // Optimistic mode: bypass QuoterV2 and submit immediately on Phase 1 spot quotes.
-                // Disable by setting optimistic_submission: false in config.yaml.
-                let v3_allowed = self.optimistic_submission || (!router_a_is_v3 && !router_b_is_v3);
                 let pair_min_profit = self
                     .pair_resolved
                     .get(task.pair_idx)
