@@ -448,10 +448,19 @@ impl Strategy {
         };
         let mut have = self.recheck_prefetch.lock().unwrap();
         for (pool, r) in quiet.into_iter().zip(raw) {
-            let reserves = r
+            // A failed read is left out, so the recheck reads that pool again itself.
+            let Some(reserves) = r
                 .and_then(|r| crate::abi::IUniswapV2Pair::getReservesCall::abi_decode_returns(&r).ok())
-                .map(|d| (U256::from(d.reserve0), U256::from(d.reserve1)));
-            have.insert(pool, reserves);
+                .map(|d| (U256::from(d.reserve0), U256::from(d.reserve1)))
+            else { continue };
+            // Unchanged reserves confirm the pool: stamp it, so it isn't re-read every scan
+            // while its routes keep failing the profit check. A changed pool stays quiet, and
+            // the recheck drops its candidates and corrects the cache.
+            let cached = self.pool_cache.by_address.get(&pool).map(|i| (i.reserve0, i.reserve1));
+            if cached == Some(reserves) {
+                self.pool_cache.update_reserves(pool, reserves.0, reserves.1);
+            }
+            have.insert(pool, Some(reserves));
         }
     }
 

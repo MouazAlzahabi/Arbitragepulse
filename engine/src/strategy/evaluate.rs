@@ -50,8 +50,9 @@ pub(super) fn route_legs_eligible(
 
 /// True when the local V3 spot quote of `amount_in` on `key` is not tick-capped
 /// (the pool's current tick can absorb the whole amount). Missing pool state = false.
-/// Speculative 1.5b request: (pair index, router A, fee A, reverse router, reverse fee, input).
-type SpecKey = (usize, String, u32, String, u32, U256);
+/// Speculative 1.5b request: (pair index, router A, fee A, reverse router, reverse fee, input,
+/// reverse pool state at request time).
+type SpecKey = (usize, String, u32, String, u32, U256, Option<(U256, u128)>);
 
 fn v3_spot_uncapped(cache: &crate::pool_cache::PoolCache, key: &V3PoolKey, token_in: Address, amount_in: U256) -> bool {
     cache
@@ -691,8 +692,9 @@ impl Strategy {
                         && t.rev_v3_key.as_ref().is_some_and(|k| v3_spot_uncapped(&self.pool_cache, k, fwd_task.token_out, hi))
                 }) {
                     let Some(quoter_b) = q_b.quoter_addr else { continue };
+                    let state = q_b.rev_v3_key.as_ref().and_then(|k| self.pool_cache.v3_price_state(k));
                     for amt in [hi, lo] {
-                        spec_routes.push((*pi, router_a_id.clone(), *fee_a, q_b.router_id.clone(), q_b.fee, amt));
+                        spec_routes.push((*pi, router_a_id.clone(), *fee_a, q_b.router_id.clone(), q_b.fee, amt, state));
                         spec_mc.push((quoter_b, self.encode_quote(quoter_b, fwd_task.token_out, fwd_task.token_in, q_b.fee, amt)));
                     }
                 }
@@ -738,13 +740,15 @@ impl Strategy {
                 let mut p15_raw = p15_raw;
                 let spec_raw = p15_raw.split_off(p15_raw.len().saturating_sub(spec_n));
                 // (route, reverse router, fee) → reverse-leg QuoterV2 points (input, output), sorted.
-                let mut spec_points: std::collections::HashMap<(usize, String, u32, String, u32), Vec<(U256, U256)>> =
+                // Plus the reverse pool's state when they were requested (for the quote cache).
+                let mut spec_points: std::collections::HashMap<(usize, String, u32, String, u32), (Vec<(U256, U256)>, Option<(U256, u128)>)> =
                     std::collections::HashMap::new();
-                for ((pi, a_id, a_fee, b_id, b_fee, amt), (raw, _)) in spec_routes.into_iter().zip(spec_raw) {
+                for ((pi, a_id, a_fee, b_id, b_fee, amt, state), (raw, _)) in spec_routes.into_iter().zip(spec_raw) {
                     if let Some(out) = decode_v3_quote(raw.as_ref()) {
-                        let pts = spec_points.entry((pi, a_id, a_fee, b_id, b_fee)).or_default();
+                        let (pts, st) = spec_points.entry((pi, a_id, a_fee, b_id, b_fee)).or_default();
                         pts.push((amt, out));
                         pts.sort_by(|a, b| a.0.cmp(&b.0));
+                        *st = state;
                     }
                 }
 
@@ -822,14 +826,18 @@ impl Strategy {
                                     .clone()
                                     .unwrap_or_else(|| V3PoolKey::new(&q_b.router_id, token_out, token_in, fee_b));
                                 let cached_b = self.quote_cache.get(&self.pool_cache, &p15b_key, quoter_out)
-                                    .or_else(|| spec_points
-                                        .get(&(pi, router_a_id.clone(), fee_a, q_b.router_id.clone(), fee_b))
-                                        .and_then(|pts| super::triangular::v3_leg_lower_bound(pts, quoter_out))
-                                        .filter(|&(bound, tight)| tight && !bound.is_zero())
-                                        .map(|(bound, _)| {
-                                            p15b_spec_hits += 1;
-                                            bound
-                                        }));
+                                    .or_else(|| {
+                                        let (pts, state) = spec_points
+                                            .get(&(pi, router_a_id.clone(), fee_a, q_b.router_id.clone(), fee_b))?;
+                                        let (bound, tight) = super::triangular::v3_leg_lower_bound(pts, quoter_out)?;
+                                        if !tight || bound.is_zero() { return None; }
+                                        p15b_spec_hits += 1;
+                                        // Conservative, so as good as a quote for the next scan's cache hit.
+                                        if let Some(state) = *state {
+                                            self.quote_cache.insert(&self.pool_cache, p15b_key.clone(), quoter_out, state, bound);
+                                        }
+                                        Some(bound)
+                                    });
                                 p15b_candidates.push((pi, router_a_id.clone(), fee_a, router_a_addr,
                                                       token_in, token_out, full_amount, q_b.clone(), quoter_out));
                                 if cached_b.is_some() {
@@ -956,7 +964,15 @@ impl Strategy {
                 run_multicall_answered(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await
             }
         };
-        let (p15b_raw_mc, (), ()) = tokio::join!(p15b, p15c_fut.as_mut(), prefetch_fut.as_mut());
+        // The prefetch rides along only when this join is a round trip anyway (or Phase 1.5
+        // already ran it); otherwise it's left unpolled and the recheck reads what it needs.
+        let rides = p15b_cache_misses > 0 || (p15c_queued > 0 && p15c_fut.as_mut().output_mut().is_none());
+        let prefetch = async {
+            if rides || prefetch_fut.as_mut().output_mut().is_some() {
+                prefetch_fut.as_mut().await;
+            }
+        };
+        let (p15b_raw_mc, (), ()) = tokio::join!(p15b, p15c_fut.as_mut(), prefetch);
         let p15c_raw = p15c_fut.as_mut().take_output().unwrap_or_default();
         if p15b_cache_misses > 0 || p15c_queued > 0 {
             self.timings.p15bc_ms.store(t.elapsed().as_millis() as u64, Relaxed);
