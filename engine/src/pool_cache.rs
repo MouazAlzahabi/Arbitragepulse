@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, U256};
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -222,10 +222,6 @@ pub struct PoolCache {
     /// Cached union of V2 + V3 pool addresses for log filters / listeners.
     watch_addrs: Arc<RwLock<Vec<Address>>>,
     watch_addrs_dirty: Arc<AtomicBool>,
-    /// Heartbeat v3 fresh/total — recomputed when `v3_metrics_dirty` is set.
-    v3_metrics_dirty: Arc<AtomicBool>,
-    cached_v3_fresh: Arc<AtomicUsize>,
-    cached_v3_total: Arc<AtomicUsize>,
     /// Last applied (block number, log index) per pool. Two log feeds update the cache —
     /// pre-confirmed (flashblocks, ~1.2 s earlier) and sealed — so a late sealed log must
     /// never overwrite newer pre-confirmed state.
@@ -245,9 +241,6 @@ impl Default for PoolCache {
             v3_by_key: Arc::new(DashMap::new()),
             watch_addrs: Arc::new(RwLock::new(Vec::new())),
             watch_addrs_dirty: Arc::new(AtomicBool::new(true)),
-            v3_metrics_dirty: Arc::new(AtomicBool::new(true)),
-            cached_v3_fresh: Arc::new(AtomicUsize::new(0)),
-            cached_v3_total: Arc::new(AtomicUsize::new(0)),
             log_pos: Arc::new(DashMap::new()),
             last_log_ms: Arc::new(AtomicU64::new(u64::MAX)),
             created: Instant::now(),
@@ -286,10 +279,6 @@ impl PoolCache {
 
     fn mark_watch_addrs_dirty(&self) {
         self.watch_addrs_dirty.store(true, Ordering::Release);
-    }
-
-    fn mark_v3_metrics_dirty(&self) {
-        self.v3_metrics_dirty.store(true, Ordering::Release);
     }
 
     fn rebuild_watch_addrs_if_dirty(&self) {
@@ -436,23 +425,15 @@ impl PoolCache {
 
     /// Count V3 pools updated within `window`. Returns (fresh, total).
     /// fresh = pools that received at least one Swap event within the window.
+    /// Recomputed on every call (heartbeat only, O(pools)) so pools that age out of the
+    /// window without a new event are reflected immediately.
     pub fn count_fresh_v3_pools(&self, window: Duration) -> (usize, usize) {
-        let total_live = self.v3_by_address.len();
-        let cached_total = self.cached_v3_total.load(Ordering::Relaxed);
-        if self.v3_metrics_dirty.swap(false, Ordering::AcqRel) || cached_total != total_live {
-            let fresh = self
-                .v3_by_address
-                .iter()
-                .filter(|e| e.last_updated.elapsed() <= window)
-                .count();
-            self.cached_v3_fresh.store(fresh, Ordering::Relaxed);
-            self.cached_v3_total.store(total_live, Ordering::Relaxed);
-            return (fresh, total_live);
-        }
-        (
-            self.cached_v3_fresh.load(Ordering::Relaxed),
-            self.cached_v3_total.load(Ordering::Relaxed),
-        )
+        let fresh = self
+            .v3_by_address
+            .iter()
+            .filter(|e| e.last_updated.elapsed() <= window)
+            .count();
+        (fresh, self.v3_by_address.len())
     }
 
     /// Returns (token0, token1) for any watched pool — V2/Aerodrome or V3.
@@ -482,7 +463,6 @@ impl PoolCache {
             .insert(V3PoolKey::new(rid, state.token1, state.token0, fee), pool);
         self.v3_by_address.insert(pool, state);
         self.mark_watch_addrs_dirty();
-        self.mark_v3_metrics_dirty();
     }
 
     /// Update sqrtPriceX96 and liquidity from a V3 Swap event.
@@ -495,7 +475,6 @@ impl PoolCache {
             e.tick = tick;
             e.last_updated = Instant::now();
             e.refresh_vr();
-            self.mark_v3_metrics_dirty();
         }
     }
 
@@ -511,7 +490,6 @@ impl PoolCache {
         e.liquidity = if add { e.liquidity.saturating_add(amount) } else { e.liquidity.saturating_sub(amount) };
         e.last_updated = Instant::now();
         e.refresh_vr();
-        self.mark_v3_metrics_dirty();
         true
     }
 
@@ -766,4 +744,33 @@ fn stable_get_y(x0: U256, xy: U256, y_init: U256, one: U256) -> U256 {
         }
     }
     y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_v3_count_reflects_pools_aging_out_without_updates() {
+        let cache = PoolCache::new();
+        cache.insert_v3(Address::repeat_byte(0xaa), V3PoolState {
+            token0: Address::repeat_byte(1),
+            token1: Address::repeat_byte(2),
+            fee: 500,
+            swap_fee: 500,
+            sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1_000_000,
+            tick: 0,
+            router_id: "r".into(),
+            last_updated: Instant::now(),
+            vr0: U256::ZERO,
+            vr1: U256::ZERO,
+            fee_num_v3: U256::ZERO,
+        });
+        assert_eq!(cache.count_fresh_v3_pools(Duration::from_secs(30)), (1, 1));
+        // The pool ages past the window with no new event.
+        cache.v3_by_address.get_mut(&Address::repeat_byte(0xaa)).unwrap().last_updated =
+            Instant::now() - Duration::from_secs(60);
+        assert_eq!(cache.count_fresh_v3_pools(Duration::from_secs(30)), (0, 1));
+    }
 }
