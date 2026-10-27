@@ -10,12 +10,14 @@ use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout};
 /// reserves on-chain (one Multicall3 on the quote endpoint, only when such a candidate
 /// exists): unchanged reserves mean the local quote was exact and the candidate stands; a
 /// pool whose reserves moved (a missed Sync) is corrected in the cache and its candidates
-/// are dropped for this scan, and a failed read drops them too.
+/// are dropped for this scan, and a failed read drops them too. Drops are logged at info
+/// (pool, cached vs on-chain reserves) and added to `recheck_drops` (heartbeat).
 async fn recheck_quiet_pools<P: Provider + Clone>(
     strategy: &Arc<RwLock<Strategy>>,
     provider: &P,
     opps: Vec<Opportunity>,
     chain_name: &str,
+    recheck_drops: &AtomicU64,
 ) -> Vec<Opportunity> {
     use alloy::sol_types::SolCall;
     let (cache, quote_rpc, block, concurrency) = {
@@ -42,15 +44,23 @@ async fn recheck_quiet_pools<P: Provider + Clone>(
         None => crate::strategy::run_multicall(provider, calls, concurrency, block).await,
     };
     let mut bad: HashSet<Address> = HashSet::new();
+    // One "pool cached=(r0,r1) on-chain=(r0,r1)|unreadable" entry per bad pool, for the drop log.
+    let mut bad_detail: Vec<String> = Vec::new();
     for (pool, r) in quiet.iter().zip(raw) {
+        let cached = cache.by_address.get(pool).map(|i| (i.reserve0, i.reserve1));
         let decoded = r.and_then(|r| crate::abi::IUniswapV2Pair::getReservesCall::abi_decode_returns(&r).ok());
-        let Some(d) = decoded else { bad.insert(*pool); continue };
+        let Some(d) = decoded else {
+            bad.insert(*pool);
+            bad_detail.push(format!("{} cached={:?} on-chain=unreadable", pool, cached));
+            continue;
+        };
         let (r0, r1) = (U256::from(d.reserve0), U256::from(d.reserve1));
-        let same = cache.by_address.get(pool).is_some_and(|i| i.reserve0 == r0 && i.reserve1 == r1);
+        let same = cached == Some((r0, r1));
         // Either way the pool is now confirmed current: stamp it so it isn't re-read every scan.
         cache.update_reserves(*pool, r0, r1);
         if !same {
             bad.insert(*pool);
+            bad_detail.push(format!("{} cached={:?} on-chain=({}, {})", pool, cached, r0, r1));
         }
     }
     let before = opps.len();
@@ -58,10 +68,19 @@ async fn recheck_quiet_pools<P: Provider + Clone>(
         .filter(|(_, q)| !q.iter().any(|p| bad.contains(p)))
         .map(|(o, _)| o)
         .collect();
-    debug!(
-        "[{}] quiet-pool recheck: {} pool(s) read, {} changed/unreadable, {} of {} candidate(s) kept",
-        chain_name, quiet.len(), bad.len(), kept.len(), before
-    );
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        recheck_drops.fetch_add(dropped as u64, Ordering::Relaxed);
+        info!(
+            "[{}] quiet-pool recheck dropped {} of {} candidate(s): {}",
+            chain_name, dropped, before, bad_detail.join("; ")
+        );
+    } else {
+        debug!(
+            "[{}] quiet-pool recheck: {} pool(s) read, {} changed/unreadable, {} of {} candidate(s) kept",
+            chain_name, quiet.len(), bad.len(), kept.len(), before
+        );
+    }
     kept
 }
 
@@ -231,6 +250,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     last_multi_count: &Arc<AtomicU64>,
     last_active_count: &Arc<AtomicU64>,
     opps_found: &Arc<AtomicU64>,
+    recheck_drops: &Arc<AtomicU64>,
     contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
     // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
     targeted: Option<(HashSet<usize>, Vec<Address>)>,
@@ -347,7 +367,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     let all_opportunities = if all_opportunities.is_empty() {
         all_opportunities
     } else {
-        recheck_quiet_pools(strategy, provider.as_ref(), all_opportunities, &cfg.name).await
+        recheck_quiet_pools(strategy, provider.as_ref(), all_opportunities, &cfg.name, recheck_drops).await
     };
 
     // Log all opportunities found this scan so it's visible which pairs are generating them.

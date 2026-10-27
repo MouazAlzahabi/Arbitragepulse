@@ -433,6 +433,9 @@ pub async fn run_chain(
     // whether it then traded, was skipped for balance or failed). Cumulative; the heartbeat
     // shows the per-beat delta and /stats the total — the dashboard's OPPORTUNITIES tile.
     let opps_found: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
+    // recheck_drops: candidates dropped by the quiet-pool on-chain recheck (cached reserves
+    // moved or unreadable). Cumulative; shown in the heartbeat only when > 0.
+    let recheck_drops: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     // Count of consecutive heartbeats with zero forward quotes.
     // Warning only fires at 3+ to suppress startup false-positives and transient RPC blips.
     let mut consecutive_zero_fwd: u32 = 0;
@@ -608,11 +611,14 @@ pub async fn run_chain(
                 let (v3_fresh, v3_total) =
                     pool_cache.count_fresh_v3_pools(crate::config::tuning().v3_fresh_window());
                 let preconf_n = preconf_logs.swap(0, Ordering::Relaxed);
+                let recheck_drop_n = recheck_drops.load(Ordering::Relaxed);
                 // Pairs the executor can't fund (cached balances, no RPC): they detect but never trade.
                 let unfunded = state::underfunded_pairs(&chain_pairs, &*contract_balances.read().await).len();
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={} | v2={} v3={}/{}{}{}",
-                    cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count, pool_cache.by_address.len(), v3_fresh, v3_total,
+                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} | quotes={} active={}/{} cross={} | opps={}{} | v2={} v3={}/{}{}{}",
+                    cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
+                    if recheck_drop_n > 0 { format!(" recheck_drop={}", recheck_drop_n) } else { String::new() },
+                    pool_cache.by_address.len(), v3_fresh, v3_total,
                     if cfg.preconf_ws_rpc.is_some() { format!(" | preconf_logs={}", preconf_n) } else { String::new() },
                     if unfunded > 0 { format!(" | unfunded={}/{}", unfunded, total_pairs) } else { String::new() },
                 );
@@ -795,7 +801,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &contract_balances, None, disabled_set, None,
+                    &opps_found, &recheck_drops, &contract_balances, None, disabled_set, None,
                     "block",
                 ).await;
                 last_scan_at = Instant::now();
@@ -829,7 +835,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &contract_balances, None, disabled_set, None,
+                    &opps_found, &recheck_drops, &contract_balances, None, disabled_set, None,
                     "poll",
                 ).await;
                 last_scan_at = Instant::now();
@@ -918,7 +924,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     None,
                     "swap",
                 ).await;
@@ -963,7 +969,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     Some(tip_override),
                     "pending",
                 ).await;
