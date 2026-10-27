@@ -623,8 +623,10 @@ pub async fn run_chain(
                     if cfg.preconf_ws_rpc.is_some() { format!(" | preconf_logs={}", preconf_n) } else { String::new() },
                     if unfunded > 0 { format!(" | unfunded={}/{}", unfunded, total_pairs) } else { String::new() },
                 );
-                // Requests on the main provider since the last beat, by method.
-                let heartbeat_msg = format!("{} | rpc={}", heartbeat_msg, rpc_counter.take_summary());
+                // Requests on the main provider since the last beat, by method; then Multicall3
+                // chunks on the quote endpoint (ok/timeout/err) since the last beat.
+                let qmc = strategy.read().await.quote_gate.take_summary();
+                let heartbeat_msg = format!("{} | rpc={} | qmc={}", heartbeat_msg, rpc_counter.take_summary(), qmc);
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 // A full scan normally runs every block (~2 s); a long gap means scanning has
                 // stalled (e.g. RPC outage), which the counters alone don't show.
