@@ -50,8 +50,9 @@ pub struct ChainStats {
     pub chain_name: String,
     /// Number of times the engine evaluated prices (scanned for opportunities).
     pub total_scans: u64,
-    /// Opportunities found (one per OPP line in the feed), including ones then skipped for
-    /// balance, cooldown or gas — the dashboard's OPPORTUNITIES tile.
+    /// Opportunities detected — each route counted at most once per cooldown window,
+    /// including ones then skipped for balance, cooldown or in-flight — the dashboard's
+    /// OPPORTUNITIES tile.
     pub total_opportunities: u64,
     /// Number of times an execution was attempted (reached the executor: prepare + send/simulate).
     pub total_attempts: u64,

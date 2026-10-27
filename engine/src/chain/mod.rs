@@ -429,9 +429,10 @@ pub async fn run_chain(
     let last_fwd_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     let last_multi_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     let last_active_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
-    // opps_found: opportunities logged to the feed (one per candidate that reached execution,
-    // whether it then traded, was skipped for balance or failed). Cumulative; the heartbeat
-    // shows the per-beat delta and /stats the total — the dashboard's OPPORTUNITIES tile.
+    // opps_found: detected opportunities — each route fingerprint counted at most once per
+    // cooldown_secs, whether or not it was then skipped (route/pair cooldown, in-flight),
+    // traded or failed; routes recently rejected after gas are not counted. Cumulative; the
+    // heartbeat shows the per-beat delta and /stats the total — the dashboard's OPPORTUNITIES tile.
     let opps_found: Arc<AtomicU64> = Arc::new(AtomicU64::new(0u64));
     // recheck_drops: candidates dropped by the quiet-pool on-chain recheck (cached reserves
     // moved or unreadable). Cumulative; shown in the heartbeat only when > 0.

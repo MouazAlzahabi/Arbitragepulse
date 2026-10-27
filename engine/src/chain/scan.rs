@@ -431,6 +431,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         .get(&Opportunity::gas_log_key(&fingerprint))
         .is_some_and(|t| *t > Instant::now());
 
+    // Count the detection before the cooldown / in-flight skips below, so `opps=` means
+    // "detected", not "attempted". Routes recently rejected after gas aren't net-profitable
+    // and aren't counted.
+    if !gas_log_throttled && first_detection_in_window(cooldowns, &fingerprint, Instant::now(), cooldown_secs()) {
+        opps_found.fetch_add(1, Ordering::Relaxed);
+    }
+
     // Cooldown check (deadline style)
     let expire_at_opt = cooldowns.get(&fingerprint).copied();
     if let Some(expire_at) = expire_at_opt {
@@ -470,7 +477,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // so detection is visible, but don't submit (they land at position 500+ on Base).
     // Pending-monitor triggered calls carry Some(tip_override) and always proceed.
     if cfg.pending_only_submission && tip_override.is_none() {
-        opps_found.fetch_add(1, Ordering::Relaxed);
         let msg = format!(
             "[{}] OPP! (pending-only mode, no submit) {} | profit=${:.4}",
             cfg.name, display_id, best_opp.profit_usd(),
@@ -524,7 +530,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
                 );
             } else {
-                opps_found.fetch_add(1, Ordering::Relaxed);
                 let msg = format!(
                     "[{}] 2-hop {} | profit=${:.4} | {}/{}",
                     cfg.name, optimized.pair_id, optimized.profit_usd, optimized.router_a_id, optimized.router_b_id
@@ -1001,7 +1006,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
                 );
             } else {
-                opps_found.fetch_add(1, Ordering::Relaxed);
                 let msg = format!(
                     "[{}] triangular {} | profit=${:.4} | {}/{}/{}",
                     cfg.name, opp.triplet_id, opp.profit_usd, opp.router_ab_id, opp.router_bc_id, opp.router_ca_id
@@ -1610,6 +1614,23 @@ fn gas_reject_log_due(
     true
 }
 
+/// Records a detection of `fingerprint` and says whether to count it in `opps_found`:
+/// true at most once per `window_secs` per route, so a standing edge re-detected on every
+/// scan isn't counted again and again. Never cools the route itself down.
+fn first_detection_in_window(
+    cooldowns: &mut HashMap<String, Instant>,
+    fingerprint: &str,
+    now: Instant,
+    window_secs: u64,
+) -> bool {
+    let key = Opportunity::opp_count_key(fingerprint);
+    if cooldowns.get(&key).is_some_and(|t| *t > now) {
+        return false;
+    }
+    cooldowns.insert(key, now + Duration::from_secs(window_secs));
+    true
+}
+
 /// Handle execution failure (both 2-hop and triangular).
 pub(crate) async fn handle_execution_failure(
     scan_rpc: &mut ScanRpc<'_>,
@@ -1773,5 +1794,19 @@ mod tests {
         assert!(gas_reject_log_due(&mut cooldowns, fp3000, t0 + Duration::from_secs(30), 60));
         // After the window: logged again.
         assert!(gas_reject_log_due(&mut cooldowns, fp, t0 + Duration::from_secs(61), 60));
+    }
+
+    #[test]
+    fn detections_count_once_per_window_without_cooling_the_route() {
+        let mut cooldowns: HashMap<String, Instant> = HashMap::new();
+        let fp = "base-usdc-weth|uniswap-v3-base:500|uniswap-v3-base:3000|1000000000";
+        let t0 = Instant::now();
+        assert!(first_detection_in_window(&mut cooldowns, fp, t0, 15));
+        assert!(!first_detection_in_window(&mut cooldowns, fp, t0 + Duration::from_secs(5), 15));
+        assert!(!cooldowns.contains_key(fp));
+        // Another fee tier is another route.
+        let fp100 = "base-usdc-weth|uniswap-v3-base:100|uniswap-v3-base:3000|1000000000";
+        assert!(first_detection_in_window(&mut cooldowns, fp100, t0 + Duration::from_secs(5), 15));
+        assert!(first_detection_in_window(&mut cooldowns, fp, t0 + Duration::from_secs(16), 15));
     }
 }

@@ -113,6 +113,13 @@ impl Opportunity {
     pub fn gas_log_key(fingerprint: &str) -> String {
         format!("{fingerprint}|gaslog")
     }
+
+    /// Cooldown-map key that dedupes the `opps_found` count: a standing edge re-detected
+    /// on every scan counts once per [`crate::chain::cooldown_secs()`] window. Never gates
+    /// execution.
+    pub fn opp_count_key(fingerprint: &str) -> String {
+        format!("{fingerprint}|counted")
+    }
 }
 
 // ─── Per-pair scan snapshot ───────────────────────────────────────────────────
