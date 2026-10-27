@@ -6,7 +6,7 @@ use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, V3PoolKey, volatile_max_age, stable_max_age};
 use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
-use super::{ForwardTask, QuoteCache, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, run_multicall, token_amount_to_usd, min_v3_liquidity};
+use super::{ForwardTask, QuoteCache, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, run_multicall_answered, token_amount_to_usd, min_v3_liquidity};
 
 /// Phase 1.5 gate: true when a Phase 2 route should be QuoterV2-verified at full size.
 /// Requires a V3 forward leg, a local spread above the gate (`amount_back / capped_in >
@@ -575,9 +575,9 @@ impl Strategy {
                 }
                 let p15_raw = if cache_misses > 0 {
                     if let Some(ref hp) = self.http_provider {
-                        run_multicall(hp, p15_mc, self.rpc_concurrency, self.quote_block).await
+                        run_multicall_answered(hp, p15_mc, self.rpc_concurrency, self.quote_block).await
                     } else {
-                        run_multicall(provider, p15_mc, self.rpc_concurrency, self.quote_block).await
+                        run_multicall_answered(provider, p15_mc, self.rpc_concurrency, self.quote_block).await
                     }
                 } else {
                     vec![]
@@ -587,9 +587,9 @@ impl Strategy {
                 // Merge cache hits + MC results into final quoter_outs.
                 // MC results are also stored in quote_cache so the next scan with unchanged
                 // pool state gets a free cache hit (within quote_cache_max_age()).
-                // Cache a failed quote (ZERO) only if the batch otherwise worked — then the
-                // failure is a real revert, not a transport error that would suppress the pool.
-                let p15_batch_ok = p15_raw.iter().any(Option::is_some);
+                // Cache a failed quote (ZERO) only if the node answered that call's chunk —
+                // then the failure is a real revert, not a transport error that would
+                // suppress the pool (chunks fail independently).
                 let mut mc_raw_iter = p15_raw.into_iter();
                 let mut sent_state_iter = p15_sent_state.into_iter();
                 let mut p15_health = QuoterBatchHealth::default();
@@ -599,12 +599,12 @@ impl Strategy {
                         if let Some(cached_val) = pre {
                             *cached_val  // served from cache — 0 HTTP
                         } else {
-                            let raw_opt = mc_raw_iter.next().unwrap_or(None);
+                            let (raw_opt, answered) = mc_raw_iter.next().unwrap_or((None, false));
                             let state = sent_state_iter.next().flatten();
                             let quote = decode_v3_quote(raw_opt.as_ref());
                             p15_health.record(router_a_id, quote.is_some());
                             let result = quote.unwrap_or(U256::ZERO);
-                            if let Some(state) = state.filter(|_| quote.is_some() || p15_batch_ok) {
+                            if let Some(state) = state.filter(|_| quote.is_some() || answered) {
                                 let key = V3PoolKey::new(router_a_id, *token_in, *token_out, *fee_a);
                                 self.quote_cache.insert(&self.pool_cache, key, *full_amount, state, result);
                             }
@@ -826,19 +826,18 @@ impl Strategy {
 
         let (p15b_raw_mc, p15c_raw) = if let Some(ref hp) = self.http_provider {
             tokio::join!(
-                async { if p15b_cache_misses > 0 { run_multicall(hp, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
-                async { if !p15c_mc.is_empty() { run_multicall(hp, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
+                async { if p15b_cache_misses > 0 { run_multicall_answered(hp, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
+                async { if !p15c_mc.is_empty() { run_multicall_answered(hp, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
             )
         } else {
             tokio::join!(
-                async { if p15b_cache_misses > 0 { run_multicall(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
-                async { if !p15c_mc.is_empty() { run_multicall(provider, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
+                async { if p15b_cache_misses > 0 { run_multicall_answered(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
+                async { if !p15c_mc.is_empty() { run_multicall_answered(provider, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
             )
         };
 
         // ── Process Phase 1.5b results ────────────────────────────────────────────────
         {
-            let p15b_batch_ok = p15b_raw_mc.iter().any(Option::is_some);
             let mut mc_iter = p15b_raw_mc.into_iter();
             let mut sent_state_iter = p15b_sent_state.into_iter();
             let mut p15b_health = QuoterBatchHealth::default();
@@ -849,13 +848,13 @@ impl Strategy {
                     if cached_val.is_zero() { continue; }
                     cached_val
                 } else {
-                    let raw_opt = mc_iter.next().unwrap_or(None);
+                    let (raw_opt, answered) = mc_iter.next().unwrap_or((None, false));
                     let state = sent_state_iter.next().flatten();
                     let quote = decode_v3_quote(raw_opt.as_ref());
                     p15b_health.record(&q_b.router_id, quote.is_some());
                     let result = quote.unwrap_or(U256::ZERO);
-                    // Cache ZERO only when the batch otherwise worked (real revert, see 1.5).
-                    if let Some(state) = state.filter(|_| quote.is_some() || p15b_batch_ok) {
+                    // Cache ZERO only when this call's chunk was answered (real revert, see 1.5).
+                    if let Some(state) = state.filter(|_| quote.is_some() || answered) {
                         let p15b_key = q_b
                             .rev_v3_key
                             .clone()
@@ -925,7 +924,6 @@ impl Strategy {
 
         // ── Process Phase 1.5c results ────────────────────────────────────────────────
         let mut p15c_health = QuoterBatchHealth::default();
-        let p15c_batch_ok = p15c_raw.iter().any(Option::is_some);
         let mut p15c_mc_iter = p15c_raw.into_iter();
         let mut p15c_state_iter = p15c_sent_state.into_iter();
         for ((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id, token_out_amount), pre)
@@ -935,13 +933,13 @@ impl Strategy {
                 if cached_val.is_zero() { continue; }
                 cached_val
             } else {
-                let raw_opt = p15c_mc_iter.next().unwrap_or(None);
+                let (raw_opt, answered) = p15c_mc_iter.next().unwrap_or((None, false));
                 let state = p15c_state_iter.next().flatten();
                 let quote = decode_v3_quote(raw_opt.as_ref());
                 p15c_health.record(&router_b_id, quote.is_some());
                 let result = quote.unwrap_or(U256::ZERO);
-                // Cache ZERO only when the batch otherwise worked (real revert, see 1.5).
-                if let Some(state) = state.filter(|_| quote.is_some() || p15c_batch_ok) {
+                // Cache ZERO only when this call's chunk was answered (real revert, see 1.5).
+                if let Some(state) = state.filter(|_| quote.is_some() || answered) {
                     let key = V3PoolKey::new(&router_b_id, token_out, token_in, fee_b);
                     self.quote_cache.insert(&self.pool_cache, key, token_out_amount, state, result);
                 }

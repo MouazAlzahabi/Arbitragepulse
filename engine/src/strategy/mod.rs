@@ -727,6 +727,21 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
     concurrency: usize,
     block: BlockId,
 ) -> Vec<Option<Vec<u8>>> {
+    run_multicall_answered(provider, calls, concurrency, block).await
+        .into_iter().map(|(r, _)| r).collect()
+}
+
+/// [`run_multicall`], plus per call whether the node actually answered it: true for a
+/// result or an on-chain failure (inner revert, reverted fallback call), false when its
+/// chunk (or its fallback call) hit a timeout or transport/RPC error. Only an answered
+/// `None` is a real revert — callers caching failures must check this per call, since
+/// chunks fail independently.
+pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
+    provider: &P,
+    calls: Vec<(Address, Vec<u8>)>,
+    concurrency: usize,
+    block: BlockId,
+) -> Vec<(Option<Vec<u8>>, bool)> {
     if calls.is_empty() {
         return vec![];
     }
@@ -776,7 +791,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
     .await;
 
     // Flatten results in order; fall back per-chunk if Multicall3 decode fails.
-    let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(calls.len());
+    let mut out: Vec<(Option<Vec<u8>>, bool)> = Vec::with_capacity(calls.len());
     let mut call_offset = 0usize;
     for raw_res in chunk_raw {
         let chunk_len = multicall_chunk_size().min(calls.len() - call_offset);
@@ -784,7 +799,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
             // Timed out: count the chunk's calls as failed. No sequential fallback — the
             // RPC is evidently stuck, and more calls would stall the scan loop further.
             warn!("Multicall3 chunk timed out after {:?} — {} call(s) counted as failed", multicall_chunk_timeout(), chunk_len);
-            out.extend(std::iter::repeat_n(None, chunk_len));
+            out.extend(std::iter::repeat_n((None, false), chunk_len));
             call_offset += chunk_len;
             continue;
         };
@@ -794,7 +809,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
             Err(false) => {
                 // Transport/RPC error (rate limit, 5xx): same as a timeout — replaying the
                 // chunk call by call would multiply load on an endpoint already refusing.
-                out.extend(std::iter::repeat_n(None, chunk_len));
+                out.extend(std::iter::repeat_n((None, false), chunk_len));
                 call_offset += chunk_len;
                 continue;
             }
@@ -802,7 +817,7 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
         match raw_opt.and_then(|raw| IMulticall3::aggregate3Call::abi_decode_returns(&raw).ok()) {
             Some(decoded) => {
                 out.extend(decoded.into_iter().map(|r| {
-                    if r.success { Some(r.returnData.to_vec()) } else { None }
+                    (r.success.then(|| r.returnData.to_vec()), true)
                 }));
             }
             None => {
@@ -814,7 +829,11 @@ pub(crate) async fn run_multicall<P: Provider + Clone>(
                         .to(*target)
                         .input(data.clone().into());
                     let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx).block(block)).await;
-                    out.push(r.ok().and_then(|r| r.ok()).map(|b| b.to_vec()));
+                    out.push(match r {
+                        Ok(Ok(b)) => (Some(b.to_vec()), true),
+                        Ok(Err(e)) => (None, multicall_error_is_revert(&e)),
+                        Err(_) => (None, false),
+                    });
                 }
             }
         }
@@ -943,6 +962,29 @@ mod multicall_tests {
         let out = run_multicall(&provider, calls(3), 1, BlockId::latest()).await;
         assert_eq!(out, vec![None; 3]);
         assert_eq!(asserter.read_q().len(), 0);
+    }
+
+    /// Two chunks, the second rate-limited: only the first chunk's calls are answered, so a
+    /// caller never caches the second chunk's `None`s as real reverts.
+    #[tokio::test]
+    async fn failed_chunk_calls_are_not_answered() {
+        let n = multicall_chunk_size() + 1;
+        let results: Vec<IMulticall3::McResult> = (0..multicall_chunk_size())
+            .map(|i| IMulticall3::McResult { success: i != 0, returnData: vec![7u8; 32].into() })
+            .collect();
+        let ret = IMulticall3::aggregate3Call::abi_encode_returns(&results);
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::primitives::Bytes::from(ret));
+        asserter.push_failure(err(-32011, "request limit reached"));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let out = run_multicall_answered(&provider, calls(n as u8), 1, BlockId::latest()).await;
+        assert_eq!(out.len(), n);
+        // Chunk 1: an inner revert is answered (cacheable as ZERO), the rest returned data.
+        assert_eq!(out[0], (None, true));
+        assert!(out[1..n - 1].iter().all(|(r, a)| r.is_some() && *a));
+        // Chunk 2: failed in transport — not answered.
+        assert_eq!(out[n - 1], (None, false));
+        assert!(asserter.read_q().is_empty());
     }
 }
 
