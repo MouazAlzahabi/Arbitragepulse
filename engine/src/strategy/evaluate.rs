@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use tracing::{debug, info, warn};
+use std::sync::atomic::Ordering::Relaxed;
 
 use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, V3PoolKey, volatile_max_age, stable_max_age};
@@ -109,6 +110,8 @@ impl Strategy {
         is_full_scan: bool,
     ) -> (Vec<ArbOpportunity>, f64, f64, usize, usize, f64, usize) {
         let scan_start = std::time::Instant::now();
+        self.timings.p15_ms.store(0, Relaxed);
+        self.timings.p15bc_ms.store(0, Relaxed);
 
         // ── Phase 1: Forward quotes ───────────────────────────────────────────────
         // V2 and Solidly-volatile pools use xy=k (constant-product AMM), so we compute
@@ -523,6 +526,76 @@ impl Strategy {
             }
         }
 
+        // ── Phase 1.5c candidate collection ──────────────────────────────────────────
+        // Collected before Phase 1.5: it needs only Phase 2 data, so its QuoterV2 batch runs
+        // concurrently with Phase 1.5's (and, if that made no call, with 1.5b's).
+        // Local-forward (V2/Solidly/Aerodrome) / V3-reverse routes: quote_v3_spot overestimates
+        // multi-tick output. QuoterV2 verifies the exact V3 reverse output before submission.
+        let mut p15c_mc: Vec<(Address, Vec<u8>)> = Vec::new();
+        let mut p15c_candidates: Vec<(usize, String, u32, Address, RouterType, Address, Address, U256, u32, Address, String, U256)> = Vec::new();
+        // Same QuoteCache rule as 1.5/1.5b: Some(v) = cache hit (ZERO = failed/skip), None = in p15c_mc.
+        let mut p15c_pre: Vec<Option<U256>> = Vec::new();
+        let mut p15c_sent_state: Vec<Option<(U256, u128)>> = Vec::new();
+        {
+            for task in &rev_tasks {
+                let router_a_is_local = matches!(task.router_a_type, RouterType::V2 | RouterType::Aerodrome);
+                if !router_a_is_local { continue; }
+                if !matches!(task.router_b_type, RouterType::V3) { continue; }
+
+                let local_back = match task.local_back { Some(v) => v, None => continue };
+                let p15_gate_hit = local_back.saturating_mul(U256::from(p15_gate_den))
+                    > task.amount_in.saturating_mul(U256::from(p15_gate_mul));
+                if !p15_gate_hit { continue; }
+
+                let full_amount = match self
+                    .pair_resolved
+                    .get(task.pair_idx)
+                    .and_then(|o| o.as_ref())
+                    .map(|r| r.amount_in)
+                {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                // Find quoter for the V3 reverse router from forward quotes of this pair
+                let quoter_b = match pair_quotes.get(&task.pair_idx)
+                    .and_then(|ts| ts.iter().find(|t| t.router_id == task.router_b_id && t.fee == task.fee_b))
+                    .and_then(|t| t.quoter_addr)
+                {
+                    Some(q) => q, None => continue,
+                };
+
+                let p15c_key = V3PoolKey::new(&task.router_b_id, task.token_out, task.token_in, task.fee_b);
+                if quote_cache_precheck(&self.quote_cache, &self.pool_cache, &p15c_key, task.token_out_amount,
+                                        &mut p15c_pre, &mut p15c_sent_state) {
+                    p15c_mc.push((quoter_b, self.encode_quote(quoter_b, task.token_out, task.token_in, task.fee_b, task.token_out_amount)));
+                }
+                p15c_candidates.push((
+                    task.pair_idx,
+                    task.router_a_id.clone(), task.fee_a, task.router_a_addr,
+                    task.router_a_type.clone(),
+                    task.token_in, task.token_out, full_amount,
+                    task.fee_b, task.router_b_addr, task.router_b_id.clone(),
+                    task.token_out_amount,
+                ));
+            }
+
+        }
+
+        // Not polled until joined with Phase 1.5 (or 1.5b below); MaybeDone keeps the output
+        // so the later join just collects it.
+        let p15c_fut = futures::future::maybe_done(async {
+            if p15c_mc.is_empty() {
+                vec![]
+            } else if let Some(ref hp) = self.http_provider {
+                run_multicall_answered(hp, p15c_mc, self.rpc_concurrency, self.quote_block).await
+            } else {
+                run_multicall_answered(provider, p15c_mc, self.rpc_concurrency, self.quote_block).await
+            }
+        });
+        tokio::pin!(p15c_fut);
+        let p15c_queued = p15c_candidates.len() - p15c_pre.iter().filter(|v| v.is_some()).count();
+
         // ── Phase 1.5: Gated V3 QuoterV2 upgrade ─────────────────────────────────────
         // Fires only when Phase 2 local data showed cross-DEX spread > p15_gate_spread
         // on an uncapped V3 forward task. One batched multicall for all candidates.
@@ -591,11 +664,17 @@ impl Strategy {
                     );
                 }
                 let p15_raw = if cache_misses > 0 {
-                    if let Some(ref hp) = self.http_provider {
-                        run_multicall_answered(hp, p15_mc, self.rpc_concurrency, self.quote_block).await
-                    } else {
-                        run_multicall_answered(provider, p15_mc, self.rpc_concurrency, self.quote_block).await
-                    }
+                    let t = std::time::Instant::now();
+                    let p15 = async {
+                        if let Some(ref hp) = self.http_provider {
+                            run_multicall_answered(hp, p15_mc, self.rpc_concurrency, self.quote_block).await
+                        } else {
+                            run_multicall_answered(provider, p15_mc, self.rpc_concurrency, self.quote_block).await
+                        }
+                    };
+                    let (raw, ()) = tokio::join!(p15, p15c_fut.as_mut());
+                    self.timings.p15_ms.store(t.elapsed().as_millis() as u64, Relaxed);
+                    raw
                 } else {
                     vec![]
                 };
@@ -770,61 +849,6 @@ impl Strategy {
             }
         }
 
-        // ── Phase 1.5c candidate collection ──────────────────────────────────────────
-        // Collected before firing so it can run concurrently with Phase 1.5b below.
-        // Local-forward (V2/Solidly/Aerodrome) / V3-reverse routes: quote_v3_spot overestimates
-        // multi-tick output. QuoterV2 verifies the exact V3 reverse output before submission.
-        let mut p15c_mc: Vec<(Address, Vec<u8>)> = Vec::new();
-        let mut p15c_candidates: Vec<(usize, String, u32, Address, RouterType, Address, Address, U256, u32, Address, String, U256)> = Vec::new();
-        // Same QuoteCache rule as 1.5/1.5b: Some(v) = cache hit (ZERO = failed/skip), None = in p15c_mc.
-        let mut p15c_pre: Vec<Option<U256>> = Vec::new();
-        let mut p15c_sent_state: Vec<Option<(U256, u128)>> = Vec::new();
-        {
-            for task in &rev_tasks {
-                let router_a_is_local = matches!(task.router_a_type, RouterType::V2 | RouterType::Aerodrome);
-                if !router_a_is_local { continue; }
-                if !matches!(task.router_b_type, RouterType::V3) { continue; }
-
-                let local_back = match task.local_back { Some(v) => v, None => continue };
-                let p15_gate_hit = local_back.saturating_mul(U256::from(p15_gate_den))
-                    > task.amount_in.saturating_mul(U256::from(p15_gate_mul));
-                if !p15_gate_hit { continue; }
-
-                let full_amount = match self
-                    .pair_resolved
-                    .get(task.pair_idx)
-                    .and_then(|o| o.as_ref())
-                    .map(|r| r.amount_in)
-                {
-                    Some(a) => a,
-                    None => continue,
-                };
-
-                // Find quoter for the V3 reverse router from forward quotes of this pair
-                let quoter_b = match pair_quotes.get(&task.pair_idx)
-                    .and_then(|ts| ts.iter().find(|t| t.router_id == task.router_b_id && t.fee == task.fee_b))
-                    .and_then(|t| t.quoter_addr)
-                {
-                    Some(q) => q, None => continue,
-                };
-
-                let p15c_key = V3PoolKey::new(&task.router_b_id, task.token_out, task.token_in, task.fee_b);
-                if quote_cache_precheck(&self.quote_cache, &self.pool_cache, &p15c_key, task.token_out_amount,
-                                        &mut p15c_pre, &mut p15c_sent_state) {
-                    p15c_mc.push((quoter_b, self.encode_quote(quoter_b, task.token_out, task.token_in, task.fee_b, task.token_out_amount)));
-                }
-                p15c_candidates.push((
-                    task.pair_idx,
-                    task.router_a_id.clone(), task.fee_a, task.router_a_addr,
-                    task.router_a_type.clone(),
-                    task.token_in, task.token_out, full_amount,
-                    task.fee_b, task.router_b_addr, task.router_b_id.clone(),
-                    task.token_out_amount,
-                ));
-            }
-
-        }
-
         // ── Fire Phase 1.5b and Phase 1.5c in parallel ───────────────────────────────
         // Both are independent: 1.5b needs Phase 1.5 output (already computed above);
         // 1.5c needs only rev_tasks (collected just above). Running them concurrently
@@ -842,20 +866,25 @@ impl Strategy {
         }
         if !p15c_candidates.is_empty() {
             debug!("[chain={}] Phase 1.5c: {} local→V3 reverse quote(s) + {} from cache", self.chain_id,
-                   p15c_mc.len(), p15c_candidates.len() - p15c_mc.len());
+                   p15c_queued, p15c_candidates.len() - p15c_queued);
         }
 
-        let (p15b_raw_mc, p15c_raw) = if let Some(ref hp) = self.http_provider {
-            tokio::join!(
-                async { if p15b_cache_misses > 0 { run_multicall_answered(hp, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
-                async { if !p15c_mc.is_empty() { run_multicall_answered(hp, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
-            )
-        } else {
-            tokio::join!(
-                async { if p15b_cache_misses > 0 { run_multicall_answered(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
-                async { if !p15c_mc.is_empty() { run_multicall_answered(provider, p15c_mc, self.rpc_concurrency, self.quote_block).await } else { vec![] } },
-            )
+        // 1.5c already finished if it was joined with Phase 1.5; polling a done MaybeDone is free.
+        let t = std::time::Instant::now();
+        let p15b = async {
+            if p15b_cache_misses == 0 {
+                vec![]
+            } else if let Some(ref hp) = self.http_provider {
+                run_multicall_answered(hp, p15b_mc, self.rpc_concurrency, self.quote_block).await
+            } else {
+                run_multicall_answered(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await
+            }
         };
+        let (p15b_raw_mc, ()) = tokio::join!(p15b, p15c_fut.as_mut());
+        let p15c_raw = p15c_fut.as_mut().take_output().unwrap_or_default();
+        if p15b_cache_misses > 0 || p15c_queued > 0 {
+            self.timings.p15bc_ms.store(t.elapsed().as_millis() as u64, Relaxed);
+        }
 
         // ── Process Phase 1.5b results ────────────────────────────────────────────────
         {

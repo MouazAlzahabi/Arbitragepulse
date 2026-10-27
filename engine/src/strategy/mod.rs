@@ -320,6 +320,8 @@ pub struct Strategy {
     quoter_fail_streak: DashMap<String, (u32, std::time::Instant, bool)>,
     /// Routers whose QuoterV2 has returned at least one quote since startup.
     quoter_ever_ok: DashMap<String, ()>,
+    /// Round-trip timings of the last scan, for the execution log: see [`ScanTimings`].
+    pub timings: ScanTimings,
 }
 
 impl Strategy {
@@ -405,6 +407,7 @@ impl Strategy {
             tri_disabled_legs_cache: Mutex::new(None),
             quoter_fail_streak: DashMap::new(),
             quoter_ever_ok: DashMap::new(),
+            timings: ScanTimings::default(),
         };
         s.rebuild_scan_cache();
         s
@@ -726,6 +729,32 @@ fn multicall_error_is_revert(err: &alloy::transports::TransportError) -> bool {
             p.code == 3 || msg.contains("revert") || msg.contains("gas")
         }
         _ => false,
+    }
+}
+
+/// Wall time of the last scan's quote round trips (ms; 0 = the phase made no RPC call).
+/// One scan runs at a time per chain; evaluate and detect_triangular write disjoint fields.
+#[derive(Default)]
+pub struct ScanTimings {
+    /// 2-hop Phase 1.5 (V3 forward QuoterV2), overlapped with 1.5c.
+    pub p15_ms: std::sync::atomic::AtomicU64,
+    /// 2-hop Phase 1.5b / remaining 1.5c (after Phase 1.5).
+    pub p15bc_ms: std::sync::atomic::AtomicU64,
+    /// Triangular QuoterV2 verification, all rounds.
+    pub tri_verify_ms: std::sync::atomic::AtomicU64,
+    /// Triangular verification rounds run.
+    pub tri_verify_rounds: std::sync::atomic::AtomicU64,
+}
+
+impl ScanTimings {
+    /// `p15=…ms p15bc=…ms tri_verify=…ms×N` for the execution log lines.
+    pub fn summary(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "p15={}ms p15bc={}ms tri_verify={}ms×{}",
+            self.p15_ms.load(Relaxed), self.p15bc_ms.load(Relaxed),
+            self.tri_verify_ms.load(Relaxed), self.tri_verify_rounds.load(Relaxed),
+        )
     }
 }
 

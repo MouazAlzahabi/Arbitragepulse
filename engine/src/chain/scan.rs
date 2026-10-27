@@ -415,11 +415,23 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     };
     let detect_ms = detect_start.elapsed().as_millis() as u64;
 
-
+    let recheck_start = Instant::now();
     let all_opportunities = if all_opportunities.is_empty() {
         all_opportunities
     } else {
         recheck_quiet_pools(strategy, provider.as_ref(), all_opportunities, &cfg.name, recheck_drops).await
+    };
+    let recheck_ms = recheck_start.elapsed().as_millis() as u64;
+    // Everything before the first candidate's execution starts.
+    let pre_exec_ms = detect_ms + recheck_ms;
+    // Where the pre-execution time went, for the execution log lines.
+    let timing = if all_opportunities.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "detect={}ms ({}) recheck={}ms",
+            detect_ms, strategy.read().await.timings.summary(), recheck_ms,
+        )
     };
 
     // Log all opportunities found this scan so it's visible which pairs are generating them.
@@ -628,14 +640,14 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 exec.dry_run = true;
                 match exec.execute(provider.as_ref(), &optimized).await {
                     Ok(tx_hash) => {
-                        let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
+                        let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         handle_execution_success(
                             &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                            shared_state, log_tx, metrics, scan_to_submit_ms,
+                            shared_state, log_tx, metrics, scan_to_submit_ms, &timing,
                             cooldown_secs(),
                         ).await;
                         break 'candidates;
@@ -766,13 +778,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
-                                let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
+                                let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                                 let submit_at = Instant::now();
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 info!(
-                                    "[{}] exec_send | route=2hop | scan_to_submit_ms={} | detect_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
-                                    cfg.name, scan_to_submit_ms, detect_ms, exec_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=2hop | scan_to_submit_ms={} | {} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, timing, exec_ms, elapsed_send, trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, optimized.pair_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
@@ -996,7 +1008,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 handle_execution_success(
                                     &tx_hash, &fingerprint, optimized.profit_usd, &optimized.pair_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                                    shared_state, log_tx, metrics, scan_to_submit_ms,
+                                    shared_state, log_tx, metrics, scan_to_submit_ms, &timing,
                                     send_cooldown_secs(),
                                 ).await;
                                 break 'candidates;
@@ -1124,14 +1136,14 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 exec.dry_run = true;
                 match exec.execute_triangular(provider.as_ref(), opp).await {
                     Ok(tx_hash) => {
-                        let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
+                        let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         handle_execution_success(
                             &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                             &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                            shared_state, log_tx, metrics, scan_to_submit_ms,
+                            shared_state, log_tx, metrics, scan_to_submit_ms, &timing,
                             cooldown_secs(),
                         ).await;
                         break 'candidates;
@@ -1247,13 +1259,13 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             Ok(pending) => {
                                 let tx_hash = format!("{:?}", pending.tx_hash());
                                 let elapsed_send = send_start.elapsed().as_millis() as u64;
-                                let scan_to_submit_ms = detect_ms + candidate_start.elapsed().as_millis() as u64;
+                                let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                                 let submit_at = Instant::now();
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 info!(
-                                    "[{}] exec_send | route=triangular | scan_to_submit_ms={} | detect_ms={} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
-                                    cfg.name, scan_to_submit_ms, detect_ms, exec_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=triangular | scan_to_submit_ms={} | {} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, timing, exec_ms, elapsed_send, trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, opp.triplet_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
@@ -1478,7 +1490,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 handle_execution_success(
                                     &tx_hash, &fingerprint, opp.profit_usd, &opp.triplet_id,
                                     &router_ids, pending_pairs, consecutive_failures, dry_run, cfg,
-                                    shared_state, log_tx, metrics, scan_to_submit_ms,
+                                    shared_state, log_tx, metrics, scan_to_submit_ms, &timing,
                                     send_cooldown_secs(),
                                 ).await;
                                 break 'candidates;
@@ -1605,6 +1617,7 @@ pub(crate) async fn handle_execution_success(
     log_tx: &LogBroadcaster,
     metrics: &Arc<Metrics>,
     scan_to_submit_ms: u64,
+    timing: &str,
     cooldown_secs: u64,
 ) {
     *consecutive_failures = 0;
@@ -1629,8 +1642,8 @@ pub(crate) async fn handle_execution_success(
             log_tx,
             "trade",
             &format!(
-                "[{}] DRY-RUN ok | simulated tx={} | pair={} | profit=${:.4} | scan→submit={}ms",
-                cfg.name, tx_hash, display_id, profit_usd, scan_to_submit_ms,
+                "[{}] DRY-RUN ok | simulated tx={} | pair={} | profit=${:.4} | scan→submit={}ms | {}",
+                cfg.name, tx_hash, display_id, profit_usd, scan_to_submit_ms, timing,
             ),
             Some(serde_json::json!({
                 "chain":              cfg.name,
@@ -1647,8 +1660,8 @@ pub(crate) async fn handle_execution_success(
             log_tx,
             "info",
             &format!(
-                "[{}] Submitted (pending) tx={} | pair={} | profit=${:.4} | scan→submit={}ms → cd={}s — awaiting receipt",
-                cfg.name, tx_hash, display_id, profit_usd, scan_to_submit_ms, cooldown_secs,
+                "[{}] Submitted (pending) tx={} | pair={} | profit=${:.4} | scan→submit={}ms ({}) → cd={}s — awaiting receipt",
+                cfg.name, tx_hash, display_id, profit_usd, scan_to_submit_ms, timing, cooldown_secs,
             ),
             Some(serde_json::json!({
                 "chain":                  cfg.name,

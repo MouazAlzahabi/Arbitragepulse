@@ -92,6 +92,8 @@ impl Strategy {
         token_filter: Option<&[Address]>,
         disabled_triplets: &std::collections::HashSet<String>,
     ) -> (Vec<TriangularOpportunity>, f64) {
+        self.timings.tri_verify_ms.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.timings.tri_verify_rounds.store(0, std::sync::atomic::Ordering::Relaxed);
         use std::collections::HashMap;
 
         // ── Build token info from all pairs on this chain ─────────────────────────
@@ -590,8 +592,10 @@ impl Strategy {
                 opportunities.into_iter().partition(has_v3_leg);
             // Bounded batch: ≤ 2 × max routes × 3 legs QuoterV2 calls in one multicall round.
             v3_routes.truncate(max_opportunities.saturating_mul(2));
+            let t = std::time::Instant::now();
             let (verified, best_verified_usd) =
                 self.verify_v3_triangular(provider, v3_routes, &token_info).await;
+            self.timings.tri_verify_ms.store(t.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
             best_raw_usd = best_raw_usd.max(best_verified_usd);
             rest.extend(verified);
             rest.sort_by(|a, b| b.profit_usd.total_cmp(&a.profit_usd));
@@ -762,6 +766,7 @@ impl Strategy {
         let mut points: Vec<[Vec<(U256, U256)>; 3]> = vec![Default::default(); opportunities.len()];
         let mut final_amounts: Vec<Option<U256>> = vec![None; opportunities.len()];
         for round in 0..verify_max_rounds() {
+            self.timings.tri_verify_rounds.store(round as u64 + 1, std::sync::atomic::Ordering::Relaxed);
             let legs: Vec<V3LegQuote> = requests.iter().map(|&(i, leg, amount_in)| V3LegQuote {
                 key: keys[i][leg].as_ref().expect("requests are V3 legs"),
                 amount_in,
