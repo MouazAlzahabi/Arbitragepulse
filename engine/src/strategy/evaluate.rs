@@ -6,7 +6,7 @@ use crate::config::RouterType;
 use crate::pool_cache::{V2PoolKey, V3PoolKey, volatile_max_age, stable_max_age};
 use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
-use super::{ForwardTask, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, run_multicall, token_amount_to_usd, min_v3_liquidity};
+use super::{ForwardTask, QuoteCache, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, run_multicall, token_amount_to_usd, min_v3_liquidity};
 
 /// Phase 1.5 gate: true when a Phase 2 route should be QuoterV2-verified at full size.
 /// Requires a V3 forward leg, a local spread above the gate (`amount_back / capped_in >
@@ -31,6 +31,30 @@ fn v3_spot_uncapped(cache: &crate::pool_cache::PoolCache, key: &V3PoolKey, token
     cache
         .quote_v3_spot_key(key, token_in, amount_in)
         .is_some_and(|(_, _, effective_in)| effective_in == amount_in)
+}
+
+/// Shared QuoteCache pre-check for one QuoterV2 request. Hit: pushes `Some(v)` to `pre`
+/// and returns false. Miss: pushes `None` to `pre` and the pool's current price state to
+/// `sent_state` (see [`QuoteCache::insert`]) and returns true — the caller queues the call.
+fn quote_cache_precheck(
+    quote_cache: &QuoteCache,
+    pools: &crate::pool_cache::PoolCache,
+    key: &V3PoolKey,
+    amount_in: U256,
+    pre: &mut Vec<Option<U256>>,
+    sent_state: &mut Vec<Option<(U256, u128)>>,
+) -> bool {
+    match quote_cache.get(pools, key, amount_in) {
+        Some(v) => {
+            pre.push(Some(v));
+            false
+        }
+        None => {
+            pre.push(None);
+            sent_state.push(pools.v3_price_state(key));
+            true
+        }
+    }
 }
 
 impl Strategy {
@@ -730,7 +754,10 @@ impl Strategy {
         // Local-forward (V2/Solidly/Aerodrome) / V3-reverse routes: quote_v3_spot overestimates
         // multi-tick output. QuoterV2 verifies the exact V3 reverse output before submission.
         let mut p15c_mc: Vec<(Address, Vec<u8>)> = Vec::new();
-        let mut p15c_candidates: Vec<(usize, String, u32, Address, RouterType, Address, Address, U256, u32, Address, String)> = Vec::new();
+        let mut p15c_candidates: Vec<(usize, String, u32, Address, RouterType, Address, Address, U256, u32, Address, String, U256)> = Vec::new();
+        // Same QuoteCache rule as 1.5/1.5b: Some(v) = cache hit (ZERO = failed/skip), None = in p15c_mc.
+        let mut p15c_pre: Vec<Option<U256>> = Vec::new();
+        let mut p15c_sent_state: Vec<Option<(U256, u128)>> = Vec::new();
         {
             for task in &rev_tasks {
                 let router_a_is_local = matches!(task.router_a_type, RouterType::V2 | RouterType::Aerodrome);
@@ -760,13 +787,18 @@ impl Strategy {
                     Some(q) => q, None => continue,
                 };
 
-                p15c_mc.push((quoter_b, self.encode_quote(quoter_b, task.token_out, task.token_in, task.fee_b, task.token_out_amount)));
+                let p15c_key = V3PoolKey::new(&task.router_b_id, task.token_out, task.token_in, task.fee_b);
+                if quote_cache_precheck(&self.quote_cache, &self.pool_cache, &p15c_key, task.token_out_amount,
+                                        &mut p15c_pre, &mut p15c_sent_state) {
+                    p15c_mc.push((quoter_b, self.encode_quote(quoter_b, task.token_out, task.token_in, task.fee_b, task.token_out_amount)));
+                }
                 p15c_candidates.push((
                     task.pair_idx,
                     task.router_a_id.clone(), task.fee_a, task.router_a_addr,
                     task.router_a_type.clone(),
                     task.token_in, task.token_out, full_amount,
                     task.fee_b, task.router_b_addr, task.router_b_id.clone(),
+                    task.token_out_amount,
                 ));
             }
 
@@ -787,8 +819,9 @@ impl Strategy {
                        self.chain_id, p15b_cache_hits);
             }
         }
-        if !p15c_mc.is_empty() {
-            debug!("[chain={}] Phase 1.5c: {} local→V3 reverse quote(s)", self.chain_id, p15c_mc.len());
+        if !p15c_candidates.is_empty() {
+            debug!("[chain={}] Phase 1.5c: {} local→V3 reverse quote(s) + {} from cache", self.chain_id,
+                   p15c_mc.len(), p15c_candidates.len() - p15c_mc.len());
         }
 
         let (p15b_raw_mc, p15c_raw) = if let Some(ref hp) = self.http_provider {
@@ -892,12 +925,29 @@ impl Strategy {
 
         // ── Process Phase 1.5c results ────────────────────────────────────────────────
         let mut p15c_health = QuoterBatchHealth::default();
-        for ((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id), raw_opt)
-            in p15c_candidates.into_iter().zip(p15c_raw.into_iter())
+        let p15c_batch_ok = p15c_raw.iter().any(Option::is_some);
+        let mut p15c_mc_iter = p15c_raw.into_iter();
+        let mut p15c_state_iter = p15c_sent_state.into_iter();
+        for ((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id, token_out_amount), pre)
+            in p15c_candidates.into_iter().zip(p15c_pre.into_iter())
         {
-            let quote = decode_v3_quote(raw_opt.as_ref());
-            p15c_health.record(&router_b_id, quote.is_some());
-            let Some(amount_back) = quote else { continue };
+            let amount_back = if let Some(cached_val) = pre {
+                if cached_val.is_zero() { continue; }
+                cached_val
+            } else {
+                let raw_opt = p15c_mc_iter.next().unwrap_or(None);
+                let state = p15c_state_iter.next().flatten();
+                let quote = decode_v3_quote(raw_opt.as_ref());
+                p15c_health.record(&router_b_id, quote.is_some());
+                let result = quote.unwrap_or(U256::ZERO);
+                // Cache ZERO only when the batch otherwise worked (real revert, see 1.5).
+                if let Some(state) = state.filter(|_| quote.is_some() || p15c_batch_ok) {
+                    let key = V3PoolKey::new(&router_b_id, token_out, token_in, fee_b);
+                    self.quote_cache.insert(&self.pool_cache, key, token_out_amount, state, result);
+                }
+                if result.is_zero() { continue; }
+                result
+            };
 
             // Phantom check first (>5% positive spread = physically impossible)
             if amount_back > full_amount
@@ -1036,7 +1086,7 @@ impl Strategy {
 mod tests {
     use super::*;
     use crate::pool_cache::{PoolCache, V3PoolState};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     // Gate 0.005%: amount_back / amount_in > 1_000_050 / 1_000_000.
     const MUL: u64 = 1_000_050;
@@ -1062,13 +1112,10 @@ mod tests {
         assert!(!p15_gate_eligible(back(10_000_000_000, 100), full, None, &RouterType::V3, MUL, DEN));
     }
 
-    #[test]
-    fn v3_spot_uncapped_detects_tick_capped_reverse_pools() {
-        let (t0, t1) = (Address::repeat_byte(1), Address::repeat_byte(2));
-        let pool = Address::repeat_byte(0xcc);
+    /// Price 1, L = 1e6 → vr0 = vr1 = 1e6; 2% cap = 20_000. Last moved `ago`.
+    fn pools_with_v3(t0: Address, t1: Address, ago: Duration) -> PoolCache {
         let cache = PoolCache::new();
-        // Price 1, L = 1e6 → vr0 = vr1 = 1e6; 2% cap = 20_000.
-        cache.insert_v3(pool, V3PoolState {
+        cache.insert_v3(Address::repeat_byte(0xcc), V3PoolState {
             token0: t0,
             token1: t1,
             fee: 500,
@@ -1077,16 +1124,44 @@ mod tests {
             liquidity: 1_000_000,
             tick: 0,
             router_id: "r".into(),
-            last_updated: Instant::now(),
+            last_updated: Instant::now() - ago,
             vr0: U256::ZERO,
             vr1: U256::ZERO,
             fee_num_v3: U256::ZERO,
         });
+        cache
+    }
+
+    #[test]
+    fn v3_spot_uncapped_detects_tick_capped_reverse_pools() {
+        let (t0, t1) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let cache = pools_with_v3(t0, t1, Duration::ZERO);
         let key = V3PoolKey::new("r", t1, t0, 500);
         assert!(v3_spot_uncapped(&cache, &key, t1, U256::from(10_000u64)));
         assert!(!v3_spot_uncapped(&cache, &key, t1, U256::from(100_000u64)));
         // Unknown pool → treated as not quotable at spot.
         let missing = V3PoolKey::new("other", t1, t0, 500);
         assert!(!v3_spot_uncapped(&cache, &missing, t1, U256::from(10_000u64)));
+    }
+
+    /// Phase 1.5c: a second scan on unchanged pool state is served from QuoteCache.
+    #[test]
+    fn p15c_second_scan_on_unchanged_state_hits_quote_cache() {
+        let (t0, t1) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let pools = pools_with_v3(t0, t1, Duration::from_secs(5));
+        let qc = QuoteCache::default();
+        let key = V3PoolKey::new("r", t1, t0, 500);
+        let amount = U256::from(10_000u64);
+        let (mut pre, mut sent) = (Vec::new(), Vec::new());
+
+        // Scan 1: miss → queued, state captured; result stored as the 1.5c loop does.
+        assert!(quote_cache_precheck(&qc, &pools, &key, amount, &mut pre, &mut sent));
+        assert_eq!(pre, vec![None]);
+        qc.insert(&pools, key.clone(), amount, sent[0].unwrap(), U256::from(9_990u64));
+
+        // Scan 2: hit → no QuoterV2 call.
+        assert!(!quote_cache_precheck(&qc, &pools, &key, amount, &mut pre, &mut sent));
+        assert_eq!(pre, vec![None, Some(U256::from(9_990u64))]);
+        assert_eq!(sent.len(), 1);
     }
 }
