@@ -322,6 +322,9 @@ pub struct Strategy {
     quoter_ever_ok: DashMap<String, ()>,
     /// Round-trip timings of the last scan, for the execution log: see [`ScanTimings`].
     pub timings: ScanTimings,
+    /// Quiet-pool reserves read this scan alongside a QuoterV2 round (pool → reserves, None =
+    /// unreadable), consumed by `scan::recheck_quiet_pools`. Cleared at each scan's start.
+    pub recheck_prefetch: Mutex<HashMap<Address, Option<(U256, U256)>>>,
 }
 
 impl Strategy {
@@ -408,9 +411,48 @@ impl Strategy {
             quoter_fail_streak: DashMap::new(),
             quoter_ever_ok: DashMap::new(),
             timings: ScanTimings::default(),
+            recheck_prefetch: Mutex::new(HashMap::new()),
         };
         s.rebuild_scan_cache();
         s
+    }
+
+    /// Read the reserves of the quiet V2/Aerodrome pools among `pools` into
+    /// `recheck_prefetch` (one Multicall3 on the quote endpoint). Joined with a QuoterV2 round,
+    /// so the scan's quiet-pool recheck finds its answer without a round trip of its own.
+    /// No-op while the feed is silent (the recheck reads nothing then) or no pool is quiet.
+    pub(crate) async fn prefetch_quiet_reserves<P: Provider + Clone>(
+        &self,
+        provider: &P,
+        pools: impl IntoIterator<Item = Address>,
+    ) {
+        if !self.pool_cache.feed_live() {
+            return;
+        }
+        let mut quiet: Vec<Address> = pools.into_iter().filter(|p| self.pool_cache.is_quiet(*p)).collect();
+        quiet.sort();
+        quiet.dedup();
+        {
+            let have = self.recheck_prefetch.lock().unwrap();
+            quiet.retain(|p| !have.contains_key(p));
+        }
+        if quiet.is_empty() {
+            return;
+        }
+        let calls: Vec<(Address, Vec<u8>)> = quiet.iter()
+            .map(|p| (*p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()))
+            .collect();
+        let raw = match &self.http_provider {
+            Some(hp) => run_multicall(hp, calls, self.rpc_concurrency, self.quote_block).await,
+            None => run_multicall(provider, calls, self.rpc_concurrency, self.quote_block).await,
+        };
+        let mut have = self.recheck_prefetch.lock().unwrap();
+        for (pool, r) in quiet.into_iter().zip(raw) {
+            let reserves = r
+                .and_then(|r| crate::abi::IUniswapV2Pair::getReservesCall::abi_decode_returns(&r).ok())
+                .map(|d| (U256::from(d.reserve0), U256::from(d.reserve1)));
+            have.insert(pool, reserves);
+        }
     }
 
     fn disabled_triplets_fingerprint(disabled: &std::collections::HashSet<String>) -> u64 {

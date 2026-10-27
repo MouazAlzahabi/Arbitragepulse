@@ -594,6 +594,25 @@ impl Strategy {
             }
         });
         tokio::pin!(p15c_fut);
+        // Quiet V2/Aerodrome pools of the routes Phase 1.5 / 1.5c may verify: their reserves are
+        // read alongside the QuoterV2 round (see Strategy::prefetch_quiet_reserves).
+        let mut prefetch_pools: Vec<Address> = Vec::new();
+        if !p15_gate.is_empty() && !self.optimistic_submission {
+            for (pi, ..) in &p15_gate {
+                for t in pair_quotes.get(pi).into_iter().flatten()
+                    .filter(|t| matches!(t.router_type, RouterType::V2 | RouterType::Aerodrome))
+                {
+                    prefetch_pools.extend(crate::race::route_pools(&self.pool_cache, &[
+                        (&t.router_id, t.router_type, t.fee, t.token_in, t.token_out),
+                    ]));
+                }
+            }
+        }
+        for c in &p15c_candidates {
+            prefetch_pools.extend(crate::race::route_pools(&self.pool_cache, &[(&c.1, c.4, c.2, c.5, c.6)]));
+        }
+        let prefetch_fut = futures::future::maybe_done(self.prefetch_quiet_reserves(provider, prefetch_pools));
+        tokio::pin!(prefetch_fut);
         let p15c_queued = p15c_candidates.len() - p15c_pre.iter().filter(|v| v.is_some()).count();
 
         // ── Phase 1.5: Gated V3 QuoterV2 upgrade ─────────────────────────────────────
@@ -672,7 +691,7 @@ impl Strategy {
                             run_multicall_answered(provider, p15_mc, self.rpc_concurrency, self.quote_block).await
                         }
                     };
-                    let (raw, ()) = tokio::join!(p15, p15c_fut.as_mut());
+                    let (raw, (), ()) = tokio::join!(p15, p15c_fut.as_mut(), prefetch_fut.as_mut());
                     self.timings.p15_ms.store(t.elapsed().as_millis() as u64, Relaxed);
                     raw
                 } else {
@@ -880,7 +899,7 @@ impl Strategy {
                 run_multicall_answered(provider, p15b_mc, self.rpc_concurrency, self.quote_block).await
             }
         };
-        let (p15b_raw_mc, ()) = tokio::join!(p15b, p15c_fut.as_mut());
+        let (p15b_raw_mc, (), ()) = tokio::join!(p15b, p15c_fut.as_mut(), prefetch_fut.as_mut());
         let p15c_raw = p15c_fut.as_mut().take_output().unwrap_or_default();
         if p15b_cache_misses > 0 || p15c_queued > 0 {
             self.timings.p15bc_ms.store(t.elapsed().as_millis() as u64, Relaxed);

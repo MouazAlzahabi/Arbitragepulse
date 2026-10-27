@@ -592,9 +592,20 @@ impl Strategy {
                 opportunities.into_iter().partition(has_v3_leg);
             // Bounded batch: ≤ 2 × max routes × 3 legs QuoterV2 calls in one multicall round.
             v3_routes.truncate(max_opportunities.saturating_mul(2));
+            // The candidates' quiet V2/Aerodrome pools are read alongside the QuoterV2 round,
+            // so the scan's quiet-pool recheck needs no round trip of its own.
+            let pools: Vec<Address> = v3_routes.iter().chain(rest.iter().take(max_opportunities))
+                .flat_map(|o| crate::race::route_pools(&self.pool_cache, &[
+                    (&o.router_ab_id, o.router_ab_type, o.fee_ab, o.token_a, o.token_b),
+                    (&o.router_bc_id, o.router_bc_type, o.fee_bc, o.token_b, o.token_c),
+                    (&o.router_ca_id, o.router_ca_type, o.fee_ca, o.token_c, o.token_a),
+                ]))
+                .collect();
             let t = std::time::Instant::now();
-            let (verified, best_verified_usd) =
-                self.verify_v3_triangular(provider, v3_routes, &token_info).await;
+            let ((verified, best_verified_usd), ()) = tokio::join!(
+                self.verify_v3_triangular(provider, v3_routes, &token_info),
+                self.prefetch_quiet_reserves(provider, pools),
+            );
             self.timings.tri_verify_ms.store(t.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
             best_raw_usd = best_raw_usd.max(best_verified_usd);
             rest.extend(verified);

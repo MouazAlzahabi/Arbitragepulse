@@ -72,9 +72,10 @@ async fn recheck_quiet_pools<P: Provider + Clone>(
     recheck_drops: &AtomicU64,
 ) -> Vec<Opportunity> {
     use alloy::sol_types::SolCall;
-    let (cache, quote_rpc, block, concurrency) = {
+    let (cache, quote_rpc, block, concurrency, prefetched) = {
         let s = strategy.read().await;
-        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.rpc_concurrency)
+        let prefetched: HashMap<Address, Option<(U256, U256)>> = s.recheck_prefetch.lock().unwrap().drain().collect();
+        (s.pool_cache.clone(), s.http_provider.clone(), s.quote_block, s.rpc_concurrency, prefetched)
     };
     if !cache.feed_live() {
         return opps; // feed silent: per-pool max ages already kept quiet pools out
@@ -88,25 +89,36 @@ async fn recheck_quiet_pools<P: Provider + Clone>(
     if quiet.is_empty() {
         return opps;
     }
-    let calls: Vec<(Address, Vec<u8>)> = quiet.iter()
-        .map(|p| (*p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()))
-        .collect();
-    let raw = match &quote_rpc {
-        Some(q) => crate::strategy::run_multicall(q, calls, concurrency, block).await,
-        None => crate::strategy::run_multicall(provider, calls, concurrency, block).await,
-    };
+    // Pools the strategy already read alongside its QuoterV2 round cost nothing here; only
+    // the rest (e.g. routes with no V3 leg, which had no round to ride on) are read now.
+    let missing: Vec<Address> = quiet.iter().copied().filter(|p| !prefetched.contains_key(p)).collect();
+    let fetched_n = quiet.len() - missing.len();
+    let mut read: HashMap<Address, Option<(U256, U256)>> = prefetched;
+    if !missing.is_empty() {
+        let calls: Vec<(Address, Vec<u8>)> = missing.iter()
+            .map(|p| (*p, crate::abi::IUniswapV2Pair::getReservesCall {}.abi_encode()))
+            .collect();
+        let raw = match &quote_rpc {
+            Some(q) => crate::strategy::run_multicall(q, calls, concurrency, block).await,
+            None => crate::strategy::run_multicall(provider, calls, concurrency, block).await,
+        };
+        for (pool, r) in missing.into_iter().zip(raw) {
+            let reserves = r
+                .and_then(|r| crate::abi::IUniswapV2Pair::getReservesCall::abi_decode_returns(&r).ok())
+                .map(|d| (U256::from(d.reserve0), U256::from(d.reserve1)));
+            read.insert(pool, reserves);
+        }
+    }
     let mut bad: HashSet<Address> = HashSet::new();
     // One "pool cached=(r0,r1) on-chain=(r0,r1)|unreadable" entry per bad pool, for the drop log.
     let mut bad_detail: Vec<String> = Vec::new();
-    for (pool, r) in quiet.iter().zip(raw) {
+    for pool in quiet.iter() {
         let cached = cache.by_address.get(pool).map(|i| (i.reserve0, i.reserve1));
-        let decoded = r.and_then(|r| crate::abi::IUniswapV2Pair::getReservesCall::abi_decode_returns(&r).ok());
-        let Some(d) = decoded else {
+        let Some((r0, r1)) = read.get(pool).copied().flatten() else {
             bad.insert(*pool);
             bad_detail.push(format!("{} cached={:?} on-chain=unreadable", pool, cached));
             continue;
         };
-        let (r0, r1) = (U256::from(d.reserve0), U256::from(d.reserve1));
         let same = cached == Some((r0, r1));
         // Either way the pool is now confirmed current: stamp it so it isn't re-read every scan.
         cache.update_reserves(*pool, r0, r1);
@@ -129,8 +141,8 @@ async fn recheck_quiet_pools<P: Provider + Clone>(
         );
     } else {
         debug!(
-            "[{}] quiet-pool recheck: {} pool(s) read, {} changed/unreadable, {} of {} candidate(s) kept",
-            chain_name, quiet.len(), bad.len(), kept.len(), before
+            "[{}] quiet-pool recheck: {} pool(s) read ({} prefetched), {} changed/unreadable, {} of {} candidate(s) kept",
+            chain_name, quiet.len(), fetched_n, bad.len(), kept.len(), before
         );
     }
     kept
@@ -323,6 +335,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
     let (all_opportunities, optimistic_submission) = {
         let strat = strategy.read().await;
+        strat.recheck_prefetch.lock().unwrap().clear();
         let optimistic_submission = strat.optimistic_submission;
 
         // Merge targeted mask with disabled-pairs exclusion mask.
