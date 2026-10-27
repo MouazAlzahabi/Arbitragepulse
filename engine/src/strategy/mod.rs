@@ -98,6 +98,10 @@ pub(crate) fn quote_cache_max_age() -> std::time::Duration { crate::config::tuni
 /// Pool cap for [`QuoteCache`]; cleared wholesale when exceeded.
 fn quote_cache_max_pools() -> usize { crate::config::tuning().quote_cache_max_pools }
 
+/// Per-pool amount cap for [`QuoteCache`]: the oldest entries go first when exceeded.
+/// 1.5b/1.5c key on amounts that change with every reserve move.
+const QUOTE_CACHE_MAX_AMOUNTS: usize = 64;
+
 /// Minimum age of a pool's local state before a quote for it is cached — see
 /// [`QuoteCache::insert`].
 fn quote_cache_settle() -> std::time::Duration { crate::config::tuning().quote_cache_settle() }
@@ -164,8 +168,18 @@ impl QuoteCache {
         if self.pools.len() > quote_cache_max_pools() {
             self.pools.clear();
         }
-        self.pools.entry(key).or_default()
-            .insert(amount_in, (state_at_send.0, state_at_send.1, amount_out, std::time::Instant::now()));
+        // Entries for a state other than the pool's current one (or past max age) can never
+        // be served again ([`Self::get`]). Compared to the current state, not state_at_send,
+        // so a late result from an older state doesn't evict valid entries.
+        let current = pools.v3_price_state(&key);
+        let max_age = quote_cache_max_age();
+        let mut by_amount = self.pools.entry(key).or_default();
+        by_amount.retain(|_, e| Some((e.0, e.1)) == current && e.3.elapsed() <= max_age);
+        by_amount.insert(amount_in, (state_at_send.0, state_at_send.1, amount_out, std::time::Instant::now()));
+        while by_amount.len() > QUOTE_CACHE_MAX_AMOUNTS {
+            let Some(oldest) = by_amount.iter().min_by_key(|(_, e)| e.3).map(|(a, _)| *a) else { break };
+            by_amount.remove(&oldest);
+        }
     }
 }
 
@@ -1056,5 +1070,29 @@ mod quote_cache_tests {
         let cache = QuoteCache::default();
         cache.insert_settled(&pools, key.clone(), amount, state, out, Duration::ZERO);
         assert_eq!(cache.get(&pools, &key, amount), Some(out));
+    }
+
+    #[test]
+    fn insert_evicts_other_states_and_caps_amounts_per_pool() {
+        let (pools, key) = pools_updated_ago(Duration::from_secs(1));
+        let state = pools.v3_price_state(&key).unwrap();
+        let cache = QuoteCache::default();
+        let len = || cache.pools.get(&key).unwrap().len();
+
+        // An entry stored under an older pool state is dropped by the next insert.
+        let old_state = (state.0 + U256::from(1u64), state.1);
+        cache.insert_settled(&pools, key.clone(), U256::from(1u64), old_state, U256::from(1u64), Duration::ZERO);
+        cache.insert_settled(&pools, key.clone(), U256::from(2u64), state, U256::from(2u64), Duration::ZERO);
+        assert_eq!(len(), 1);
+        assert_eq!(cache.get(&pools, &key, U256::from(2u64)), Some(U256::from(2u64)));
+
+        // Same state, ever-changing amounts: bounded, newest kept.
+        let n = QUOTE_CACHE_MAX_AMOUNTS as u64 + 10;
+        for a in 100..100 + n {
+            cache.insert_settled(&pools, key.clone(), U256::from(a), state, U256::from(a), Duration::ZERO);
+        }
+        assert_eq!(len(), QUOTE_CACHE_MAX_AMOUNTS);
+        let last = U256::from(100 + n - 1);
+        assert_eq!(cache.get(&pools, &key, last), Some(last));
     }
 }
