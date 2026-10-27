@@ -25,6 +25,28 @@ pub(super) fn p15_gate_eligible(
         && amount_back.saturating_mul(U256::from(den)) > capped_in.saturating_mul(U256::from(mul))
 }
 
+/// True when a 2-hop route may pair leg A with leg B. Legs on different router contracts
+/// always may. On the same router contract only two different V3 fee tiers (or Slipstream
+/// tick spacings) of one router may: both legs are QuoterV2-verified at full size (1.5 →
+/// 1.5b), so same-router spot phantoms never become opportunities — hence `verified`
+/// (false under `optimistic_submission`, where spot V3 routes are submitted directly).
+/// Still excluded: the identical pool (same router and fee), and Aerodrome volatile ×
+/// stable, which share one router_addr and fail on-chain (InsufficientOutputAmount).
+pub(super) fn route_legs_eligible(
+    (a_id, a_addr, a_type, a_fee): (&str, Address, &RouterType, u32),
+    (b_id, b_addr, b_type, b_fee): (&str, Address, &RouterType, u32),
+    verified: bool,
+) -> bool {
+    if a_addr != b_addr {
+        return true;
+    }
+    verified
+        && a_id == b_id
+        && a_fee != b_fee
+        && matches!(a_type, RouterType::V3)
+        && matches!(b_type, RouterType::V3)
+}
+
 /// True when the local V3 spot quote of `amount_in` on `key` is not tick-capped
 /// (the pool's current tick can absorb the whole amount). Missing pool state = false.
 fn v3_spot_uncapped(cache: &crate::pool_cache::PoolCache, key: &V3PoolKey, token_in: Address, amount_in: U256) -> bool {
@@ -293,24 +315,13 @@ impl Strategy {
                         continue;
                     }
 
-                    // Skip same-router V3 combinations entirely.
-                    // The single-tick sqrtPriceX96 approximation is only reliable for
-                    // cross-DEX comparisons. Within the same router, fee-tier pools share
-                    // the same overall market price — spot divergences between fee=500 and
-                    // fee=3000 (or even same fee with integer rounding) produce phantom arbs
-                    // that consistently fail on-chain. Real arbs always cross DEX/router
-                    // boundaries; same-router V3 × V3 is never reliably detectable with
-                    // local spot math.
-                    // Never route both legs through the same router contract.
-                    // Aerodrome volatile and stable share one router_addr but have different
-                    // router_ids — without this guard, vol×sta creates a same-DEX "arb" that
-                    // always fails on-chain (InsufficientOutputAmount from the stable pool).
-                    if q_a.router_addr == q_b.router_addr {
-                        continue;
-                    }
-                    if q_a.router_id == q_b.router_id
-                        && matches!(q_a.router_type, RouterType::V3)
-                    {
+                    // Same router contract: only cross-fee-tier V3 routes, which 1.5/1.5b
+                    // verify with QuoterV2 (local spot math alone phantoms between tiers).
+                    if !route_legs_eligible(
+                        (&q_a.router_id, q_a.router_addr, &q_a.router_type, q_a.fee),
+                        (&q_b.router_id, q_b.router_addr, &q_b.router_type, q_b.fee),
+                        !self.optimistic_submission,
+                    ) {
                         continue;
                     }
 
@@ -631,7 +642,11 @@ impl Strategy {
                     // absorb it at spot — skip them rather than spend a 1.5b QuoterV2 call.
                     let q_b_list: Vec<ForwardTask> = match pair_quotes.get(&pi) {
                         Some(ts) => ts.iter()
-                            .filter(|t| t.router_id != router_a_id)
+                            .filter(|t| route_legs_eligible(
+                                (&router_a_id, router_a_addr, &RouterType::V3, fee_a),
+                                (&t.router_id, t.router_addr, &t.router_type, t.fee),
+                                true,
+                            ))
                             .filter(|t| !matches!(t.router_type, RouterType::V3)
                                 || t.rev_v3_key.as_ref().is_some_and(|k| {
                                     v3_spot_uncapped(&self.pool_cache, k, token_out, quoter_out)
@@ -1092,6 +1107,22 @@ mod tests {
 
     fn back(amount_in: u64, spread_ppm: u64) -> U256 {
         U256::from(amount_in) * U256::from(1_000_000 + spread_ppm) / U256::from(1_000_000u64)
+    }
+
+    #[test]
+    fn same_router_routes_only_across_v3_fee_tiers() {
+        let (uni, aero, pancake) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
+        let (v3, aer) = (RouterType::V3, RouterType::Aerodrome);
+        // Cross-DEX: always eligible, verified or not.
+        assert!(route_legs_eligible(("uni", uni, &v3, 500), ("pancake", pancake, &v3, 500), false));
+        // Same V3 router, different fee tiers: eligible only when QuoterV2-verified.
+        assert!(route_legs_eligible(("uni", uni, &v3, 500), ("uni", uni, &v3, 3000), true));
+        assert!(!route_legs_eligible(("uni", uni, &v3, 500), ("uni", uni, &v3, 3000), false));
+        // Identical pool: never.
+        assert!(!route_legs_eligible(("uni", uni, &v3, 500), ("uni", uni, &v3, 500), true));
+        // Aerodrome volatile × stable (one router contract, two ids): never.
+        assert!(!route_legs_eligible(("aero_vol", aero, &aer, 0), ("aero_sta", aero, &aer, 1), true));
+        assert!(!route_legs_eligible(("aero", aero, &aer, 0), ("aero", aero, &aer, 1), true));
     }
 
     #[test]
