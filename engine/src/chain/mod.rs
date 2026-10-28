@@ -399,12 +399,10 @@ pub async fn run_chain(
     // before it confirms — enables same-block execution on FCFS chains like Base.
     let (pending_tx_chan, mut pending_rx) = mpsc::channel::<pending::PendingSwapEvent>(256);
     if cfg.pending_tx_monitoring {
-        // Build the pending-monitor URL list: primary ws_rpc first (Alchemy — has mempool access),
-        // then fallbacks. Public nodes (wss://mainnet.base.org) don't expose the mempool on OP
-        // Stack and will always fail with 405; they sit in fallbacks as a last resort for block
-        // subscriptions only.
-        let mut pending_ws_urls: Vec<String> = vec![cfg.ws_rpc.clone()];
-        pending_ws_urls.extend_from_slice(&cfg.ws_rpc_fallbacks);
+        // Primary ws_rpc only (Alchemy — has mempool access). The ws_rpc_fallbacks are public
+        // endpoints that don't expose the mempool on OP Stack: cycling onto them only failed
+        // every 30 s. With one URL a dropped connection reconnects to it with backoff.
+        let pending_ws_urls: Vec<String> = vec![cfg.ws_rpc.clone()];
         pending::spawn_pending_monitor(
             cfg.name.clone(),
             pending_ws_urls,
