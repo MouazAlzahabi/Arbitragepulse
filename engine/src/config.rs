@@ -37,6 +37,12 @@ pub struct ChainConfig {
     /// Leave empty to use only the primary.
     #[serde(default)]
     pub ws_rpc_fallbacks: Vec<String>,
+    /// Token addresses whose pools are watched only on the keyless `preconf_ws_rpc` feed,
+    /// not on the primary (metered) ws_rpc log subscription: any pool with one of these on
+    /// either side. Keeps added tokens off the paid event budget. Ignored (all pools on the
+    /// primary feed, with a warning) when `preconf_ws_rpc` is unset.
+    #[serde(default)]
+    pub preconf_only_tokens: Vec<String>,
     /// Total Multicall3 chunks in flight on the quote endpoint per chain, shared by all
     /// batches joined concurrently (Phase 1.5/1.5b/1.5c, prefetch, triangular verify).
     /// Free Alchemy plan (330 CU/s): use 3. Growth plan (3000 CU/s): use 10–12.
