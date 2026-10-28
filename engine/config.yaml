@@ -50,6 +50,13 @@ chain:
   # the preconf endpoint serves eth_subscribe newHeads + filtered logs (checked 2026-10-28). No mempool.
   ws_rpc_fallbacks:
     - "wss://mainnet-preconf.base.org"
+  # Pools with one of these tokens on either side are watched on preconf_ws_rpc only (keyless),
+  # never on ws_rpc (Alchemy bills each log event). Core-token pools stay on both feeds.
+  preconf_only_tokens:
+    - "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf"  # VVV
+    - "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee"  # AERO (new)
+    - "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b"  # tBTC
+    - "0xcb585250f852C6c6bf90434AB21A00f02833a4af"  # cbXRP
   submission_rpcs:
     - "https://mainnet-sequencer.base.org"                     # Direct OP Stack sequencer (bypasses CDN)
     - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
@@ -229,6 +236,56 @@ pairs:
     trade_amount: "5000"
     max_trade: "5000"
 
+  # ── Added 2026-10-28 (Halal screen + scripts/token-scout.py). Pools of these tokens are
+  # watched on the keyless preconf feed only (chain.preconf_only_tokens), not on Alchemy.
+  # All four passed a fork transfer test (received == sent: no transfer fee).
+  # VVV (Venice AI): Aerodrome V2 $8.3M, Slipstream $2.5M, UniV3 USDC $1.0M, UniV3 WETH 1% $1.0M.
+  - id: "base-usdc-vvv"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf"
+    token_in_symbol: "USDC"
+    token_out_symbol: "VVV"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+
+  # New AERO (post Aero merger 2026-10-21; the old AERO pair above stays while it holds $3M+).
+  # Its USDC/WETH pools are on the Aero factories (not covered yet): no routes until those
+  # are added; today only UniV3 AERO/cbBTC is discovered.
+  - id: "base-usdc-aero2"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee"
+    token_in_symbol: "USDC"
+    token_out_symbol: "AERO2"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+
+  # tBTC: only UniV3 tBTC/cbBTC is on a covered venue (its USDC pool is on Uniswap V4) — no
+  # routes until a second tBTC venue is covered.
+  - id: "base-usdc-tbtc"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b"
+    token_in_symbol: "USDC"
+    token_out_symbol: "TBTC"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+
+  # cbXRP: pools only on the Aero factories today — no routes until those are covered.
+  - id: "base-usdc-cbxrp"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0xcb585250f852C6c6bf90434AB21A00f02833a4af"
+    token_in_symbol: "USDC"
+    token_out_symbol: "CBXRP"
+    token_in_decimals: 6
+    token_out_decimals: 6
+    trade_amount: "5000"
+    max_trade: "5000"
+
   # ── WETH-start size test (dry-run only) ──
   # The executor holds no WETH: dry-run simulates these with an assumed balance; live, the
   # balance guard skips them as unfunded. Sized separately from the USDC/USDT pairs.
@@ -281,6 +338,7 @@ pairs:
     token_out_decimals: 18
     trade_amount: "4"
     max_trade: "4"
+
 
 
 # ─── TUNING ────────────────────────────────────────────────

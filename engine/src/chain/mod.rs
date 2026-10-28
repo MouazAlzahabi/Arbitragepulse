@@ -372,12 +372,36 @@ pub async fn run_chain(
     // events from 200 ms pre-confirmed sub-blocks, ~1.2 s earlier. Both feed the same
     // cache + scan trigger; PoolCache's log-position guard keeps them ordered and stops a
     // log's sealed copy from triggering a second scan.
+    // Pools of `preconf_only_tokens` are left out of the sealed filter and watched on the
+    // preconf feed only. A missed preconf log can't cause a bad trade: quiet V2 pools are
+    // re-read before trading (recheck_quiet_pools) and V3 legs are QuoterV2-verified.
     let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
     let preconf_logs = Arc::new(AtomicU64::new(0));
     {
+        let preconf_only: HashSet<Address> = if cfg.preconf_ws_rpc.is_some() {
+            cfg.preconf_only_tokens.iter().filter_map(|t| match t.parse::<Address>() {
+                Ok(a) => Some(a),
+                Err(_) => { warn!("[{}] preconf_only_tokens: invalid address {}", cfg.name, t); None }
+            }).collect()
+        } else {
+            if !cfg.preconf_only_tokens.is_empty() {
+                warn!("[{}] preconf_only_tokens set without preconf_ws_rpc — watching those pools on ws_rpc", cfg.name);
+            }
+            HashSet::new()
+        };
+        let all_addrs = pool_cache.watch_addresses();
+        let (sealed_addrs, preconf_only_n) = split_preconf_only(&all_addrs, &preconf_only, |p| pool_cache.get_pool_tokens(p));
+        if preconf_only_n > 0 {
+            info!("[{}] {} of {} pools watched on the preconf feed only (preconf_only_tokens)",
+                  cfg.name, preconf_only_n, all_addrs.len());
+        }
+        let topics = crate::listener::pool_log_topics(solidly_sync_hash_sub);
+        let sealed_filter = alloy::rpc::types::Filter::new()
+            .address(sealed_addrs.clone())
+            .event_signature(topics.clone());
         let log_filter = alloy::rpc::types::Filter::new()
-            .address(pool_cache.watch_addresses())
-            .event_signature(crate::listener::pool_log_topics(solidly_sync_hash_sub));
+            .address(all_addrs)
+            .event_signature(topics);
         let feed = LogFeed {
             cache: pool_cache.clone(),
             swap_tx: swap_tx_for_sub.clone(),
@@ -387,7 +411,10 @@ pub async fn run_chain(
             large_swap_bps: cfg.large_swap_threshold_bps,
             large_v3_bps: cfg.large_v3_threshold_bps,
         };
-        spawn_log_subscription((*provider).clone(), log_filter.clone(), feed.clone(), None, None);
+        // An address-less filter would match every log on the chain: skip it instead.
+        if !sealed_addrs.is_empty() {
+            spawn_log_subscription((*provider).clone(), sealed_filter, feed.clone(), None, None);
+        }
         if let Some(url) = cfg.preconf_ws_rpc.clone() {
             // Connected in the background: an optional feed must never hold up startup.
             spawn_preconf_subscription(url, log_filter, feed, preconf_logs.clone());
@@ -1261,9 +1288,44 @@ async fn connect_first(
     ))
 }
 
+/// Pools for the sealed (primary ws_rpc) log filter: every address except pools with a
+/// `preconf_only` token on either side. Returns those addresses and how many were left out.
+/// Pools with unknown tokens stay on the sealed filter.
+fn split_preconf_only(
+    addrs: &[Address],
+    preconf_only: &HashSet<Address>,
+    tokens_of: impl Fn(Address) -> Option<(Address, Address)>,
+) -> (Vec<Address>, usize) {
+    if preconf_only.is_empty() {
+        return (addrs.to_vec(), 0);
+    }
+    let sealed: Vec<Address> = addrs.iter().copied()
+        .filter(|&p| !matches!(tokens_of(p), Some((a, b)) if preconf_only.contains(&a) || preconf_only.contains(&b)))
+        .collect();
+    let left_out = addrs.len() - sealed.len();
+    (sealed, left_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_preconf_only_keeps_core_pools_sealed() {
+        let (usdc, weth, vvv) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
+        let (core, vvv_weth, vvv_usdc, unknown) =
+            (Address::repeat_byte(10), Address::repeat_byte(11), Address::repeat_byte(12), Address::repeat_byte(13));
+        let tokens = |p: Address| match p {
+            p if p == core => Some((usdc, weth)),
+            p if p == vvv_weth => Some((weth, vvv)),
+            p if p == vvv_usdc => Some((vvv, usdc)),
+            _ => None,
+        };
+        let all = vec![core, vvv_weth, vvv_usdc, unknown];
+        let only: HashSet<Address> = [vvv].into_iter().collect();
+        assert_eq!(split_preconf_only(&all, &only, tokens), (vec![core, unknown], 2));
+        assert_eq!(split_preconf_only(&all, &HashSet::new(), tokens), (all.clone(), 0));
+    }
 
     #[test]
     fn latency_median_max_cases() {

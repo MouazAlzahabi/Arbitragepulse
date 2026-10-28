@@ -1,0 +1,29 @@
+# token-scout denylist: one entry per line, "<address or SYMBOL>  <category>  # note".
+# Categories: lending, yield, staking, stock, derivative, hook, fot (fee-on-transfer), meme, other.
+# deny: excluded from the shortlist. flag: listed with a FLAG note for a manual decision.
+# Matching is by address (case-insensitive) or by exact symbol (case-insensitive).
+MORPHO   deny lending
+WELL     deny lending      # Moonwell
+AAVE     deny lending
+COMP     deny lending
+SEAM     deny lending      # Seamless
+FLUID    deny lending
+USDS     flag lending      # Sky CDP system issuer
+sUSDS    deny yield
+sDAI     deny yield
+sUSDe    deny yield
+USDe     flag yield
+cbETH    flag staking
+wstETH   flag staking
+weETH    flag staking
+ezETH    flag staking
+rETH     flag staking
+LBTC     flag staking
+JitoSOL  flag staking
+DIEM     flag staking      # Venice derived staking/compute token
+DRV      deny derivative   # Derive options/perps
+BRETT    deny hook         # swap-back hook
+XDP      deny other        # memecoin launch platform (owner decision 2026-10-28)
+DEGEN    deny meme
+TOSHI    deny meme
+SPX      deny meme
