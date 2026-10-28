@@ -89,12 +89,31 @@ pub async fn run_chain(
         return Err(anyhow::anyhow!("[{}] contract_address is zero — check config", cfg.name));
     }
 
+    // ── Startup reads: public http_rpc first, main (paid) WS provider as fallback ──
+    // The setup check and pool discovery are ~70 eth_calls per (re)start; on http_rpc they
+    // cost the main RPC nothing. A step that fails or loses calls there is redone once on
+    // the main provider. The chain-id guard above and the nonce stay on the main provider.
+    let http_rpc_provider: Option<alloy::providers::DynProvider> = cfg.http_rpc
+        .parse::<url::Url>()
+        .ok()
+        .map(|url| ProviderBuilder::new().connect_http(url).erased());
+    let main_reads = provider.as_ref().clone().erased();
+    let startup_reads = http_rpc_provider.as_ref().unwrap_or(&main_reads);
+    let has_startup_fallback = http_rpc_provider.is_some();
+
     // ── Executor setup check: owner = signer (exit 2), router allowlist (exit 2 live), paused ──
     // Runs before pool discovery so a wrong key fails within seconds. Startup only.
     let dry_run_at_start = shared_state.read().await.dry_run;
-    let start_paused = state::check_contract_setup(
-        provider.as_ref(), contract_addr, signer_address, &routers, &cfg.name, dry_run_at_start, &log_tx,
-    ).await?;
+    let setup = |p| state::check_contract_setup(
+        p, contract_addr, signer_address, &routers, &cfg.name, dry_run_at_start, &log_tx,
+    );
+    let start_paused = match setup(startup_reads).await {
+        Err(e) if has_startup_fallback => {
+            warn!("{} (http_rpc) — retrying the setup check on the main RPC", e);
+            setup(&main_reads).await?
+        }
+        r => r?,
+    };
 
     // ── Executor ──
     let submission_rpc_urls: Vec<url::Url> = cfg.submission_rpcs.iter()
@@ -146,12 +165,20 @@ pub async fn run_chain(
     // Eliminates per-block eth_calls for xy=k routers — reserves stay fresh via
     // on-chain Sync events (listener.rs subscribes and updates the cache live).
     let pool_cache = Arc::new(PoolCache::new());
-    let lost_v2 = discover::discover_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
+    let mut lost_v2 = discover::discover_pools(&chain_routers, &chain_pairs, startup_reads, &pool_cache).await;
+    if lost_v2 > 0 && has_startup_fallback {
+        warn!("[{}] V2/Aerodrome discovery lost {} call(s) on http_rpc — retrying on the main RPC", cfg.name, lost_v2);
+        lost_v2 = discover::discover_pools(&chain_routers, &chain_pairs, &main_reads, &pool_cache).await;
+    }
     info!("[{}] Pool cache: {} V2/Aerodrome pools discovered", cfg.name, pool_cache.by_address.len());
 
     // ── V3 pool discovery: seed sqrtPriceX96 + liquidity from slot0() ─────────
     // Subscribes to V3 Swap events after startup to keep state fresh with zero RPC cost.
-    let lost_v3 = discover::discover_v3_pools(&chain_routers, &chain_pairs, provider.as_ref(), &pool_cache).await;
+    let mut lost_v3 = discover::discover_v3_pools(&chain_routers, &chain_pairs, startup_reads, &pool_cache).await;
+    if lost_v3 > 0 && has_startup_fallback {
+        warn!("[{}] V3 discovery lost {} call(s) on http_rpc — retrying on the main RPC", cfg.name, lost_v3);
+        lost_v3 = discover::discover_v3_pools(&chain_routers, &chain_pairs, &main_reads, &pool_cache).await;
+    }
     info!("[{}] V3 pool cache: {} pools seeded", cfg.name, pool_cache.v3_by_address.len());
     // Discovery calls lost to RPC failure (after retries) leave pools silently untracked
     // until the next restart — say so where the operator looks, but keep running.
@@ -175,16 +202,13 @@ pub async fn run_chain(
             info!("[{}] Quotes and simulations at `pending` on {}", cfg.name, crate::util::redact_url(raw));
             Some(ProviderBuilder::new().connect_http(url).erased())
         });
-    let http_provider: Option<alloy::providers::DynProvider> = preconf_http.clone().or_else(|| cfg.http_rpc
-        .parse::<url::Url>()
-        .ok()
-        .map(|url| ProviderBuilder::new().connect_http(url).erased()));
+    let http_provider: Option<alloy::providers::DynProvider> = preconf_http.clone().or(http_rpc_provider);
     executor.lock().await.sim_provider = preconf_http.clone();
     // Background reads (contract/signer balances, ETH price) don't need the main provider's
     // speed or subscriptions: they go to the HTTP endpoint, keeping the main (paid) RPC for
     // subscriptions, sends, receipts and nonces. Falls back to the main provider without one.
     let reads: Arc<alloy::providers::DynProvider> = Arc::new(
-        http_provider.clone().unwrap_or_else(|| provider.as_ref().clone().erased()),
+        http_provider.clone().unwrap_or(main_reads),
     );
 
     let min_triangular_profit_usd = cfg
