@@ -19,6 +19,7 @@ if [ "$#" -gt 0 ]; then
   URLS=("$@")
 else
   URLS=("https://mainnet.base.org" "https://mainnet-preconf.base.org")
+  # Spends the production key's Alchemy quota (2N+ calls) when ALCHEMY_KEY is set.
   [ -n "${ALCHEMY_KEY:-}" ] && URLS+=("https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}")
 fi
 
