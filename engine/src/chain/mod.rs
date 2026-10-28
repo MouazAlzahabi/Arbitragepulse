@@ -464,14 +464,15 @@ pub async fn run_chain(
     // delay a scan. Each flag stops a slow refresh from overlapping with the next tick.
     let price_refresh_busy   = Arc::new(AtomicBool::new(false));
     // Main-RPC round trip (ms, f64 bits; 0 = not yet measured): median and worst of the last
-    // minute's eth_blockNumber pings, taken every 10 s by a background task (never on the
-    // select loop). One sample a minute swung with whatever shared the WS socket at that moment.
+    // 6 eth_blockNumber pings, taken every `tuning.rpc_latency_sample_ms` (60 s → a 6-minute
+    // window) by a background task (never on the select loop). Display only; each ping is a
+    // request on the WS provider's quota, so the window is wide rather than the ping frequent.
     let rpc_latency_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
     let rpc_latency_max_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
     {
         let (provider, median, worst) = (Arc::downgrade(&provider), rpc_latency_bits.clone(), rpc_latency_max_bits.clone());
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            let mut tick = tokio::time::interval(crate::config::tuning().rpc_latency_sample());
             let mut samples: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(6);
             loop {
                 tick.tick().await;

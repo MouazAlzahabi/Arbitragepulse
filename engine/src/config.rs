@@ -505,6 +505,10 @@ pub struct Tuning {
     pub quoter_warn_min_batches: u32,
     /// Minimum interval between rate-limit reports (ms).
     pub rate_limit_log_every_ms: u64,
+    /// Main-RPC latency ping interval (ms): one eth_blockNumber on the WS provider, feeding
+    /// only the dashboard's rpc_latency_ms / rpc_latency_max_ms. Every request counts
+    /// against the WS provider's quota (10 s was 8,640/day; 60 s is 1,440).
+    pub rpc_latency_sample_ms: u64,
 
     // ── Scan loop ──
     /// Cooldowns after a failed attempt and after a send (s); after a gas-unprofitable skip
@@ -576,6 +580,7 @@ impl Default for Tuning {
             quoter_broken_warn_after_ms: 300_000,
             quoter_warn_min_batches: 5,
             rate_limit_log_every_ms: 30_000,
+            rpc_latency_sample_ms: 60_000,
             cooldown_secs: 15,
             send_cooldown_secs: 15,
             gas_reject_cooldown_secs: 60,
@@ -601,7 +606,7 @@ impl Tuning {
         if block_time_ms == 0 {
             return Err(anyhow!("chain.block_time_ms must be > 0"));
         }
-        let positive: [(&str, u64); 19] = [
+        let positive: [(&str, u64); 20] = [
             ("balance_refresh_ms", self.balance_refresh_ms),
             ("volatile_pool_max_age_ms", self.volatile_pool_max_age_ms),
             ("stable_pool_max_age_ms", self.stable_pool_max_age_ms),
@@ -621,6 +626,7 @@ impl Tuning {
             ("tri_verify_max_rounds", self.tri_verify_max_rounds as u64),
             ("max_consecutive_failures", self.max_consecutive_failures as u64),
             ("block_stall_exit_ms", self.block_stall_exit_ms),
+            ("rpc_latency_sample_ms", self.rpc_latency_sample_ms),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(anyhow!("tuning.{} must be > 0", name));
@@ -666,6 +672,7 @@ impl Tuning {
     pub fn quoter_never_ok_warn_after(&self) -> std::time::Duration { ms(self.quoter_never_ok_warn_after_ms) }
     pub fn quoter_broken_warn_after(&self) -> std::time::Duration { ms(self.quoter_broken_warn_after_ms) }
     pub fn rate_limit_log_every(&self) -> std::time::Duration { ms(self.rate_limit_log_every_ms) }
+    pub fn rpc_latency_sample(&self) -> std::time::Duration { ms(self.rpc_latency_sample_ms) }
     pub fn slow_scan_warn(&self) -> std::time::Duration { ms(self.slow_scan_warn_ms) }
     pub fn heartbeat_stall_warn(&self) -> std::time::Duration { ms(self.heartbeat_stall_warn_ms) }
     pub fn block_stall_exit(&self) -> std::time::Duration { ms(self.block_stall_exit_ms) }
@@ -727,6 +734,7 @@ routers: []
         assert_eq!(t.health_monitor_every(), std::time::Duration::from_secs(2));
         assert_eq!(t.phantom_cap_bps, 500);
         assert_eq!(t.block_stall_exit_ms, 300_000);
+        assert_eq!(t.rpc_latency_sample(), std::time::Duration::from_secs(60));
     }
 
     #[test]
@@ -769,6 +777,8 @@ routers: []
         assert!(parse_config(&zero).is_err());
         let stall = format!("{}tuning:\n  block_stall_exit_ms: 0\n", MIN);
         assert!(parse_config(&stall).is_err());
+        let ping = format!("{}tuning:\n  rpc_latency_sample_ms: 0\n", MIN);
+        assert!(parse_config(&ping).is_err(), "interval(0) panics");
         let prune = format!("{}tuning:\n  pool_prune_after_ms: 1\n", MIN);
         assert!(parse_config(&prune).is_err(), "pool_prune_after_ms was removed");
     }

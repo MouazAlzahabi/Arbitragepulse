@@ -343,6 +343,7 @@ tuning:
   quoter_broken_warn_after_ms: 300000
   quoter_warn_min_batches: 5
   rate_limit_log_every_ms: 30000
+  rpc_latency_sample_ms: 60000          # dashboard latency ping on ws_rpc (eth_blockNumber); 1,440/day
   # ── Scan loop ──
   cooldown_secs: 15
   send_cooldown_secs: 15
