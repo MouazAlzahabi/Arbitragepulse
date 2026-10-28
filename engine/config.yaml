@@ -46,15 +46,17 @@ chain:
   # rate limits as today, ~+25 ms per call. Check others with scripts/rpc-latency.sh.
   # Remove the line to quote at `latest` on http_rpc.
   preconf_http_rpc: "https://mainnet.base.org"
+  # Used only if ws_rpc fails at (re)start. wss://mainnet.base.org refuses WebSocket (HTTP 405);
+  # the preconf endpoint serves eth_subscribe newHeads + filtered logs (checked 2026-10-28). No mempool.
   ws_rpc_fallbacks:
-    - "wss://mainnet.base.org"                              # public fallback (no mempool, blocks only)
+    - "wss://mainnet-preconf.base.org"
   submission_rpcs:
     - "https://mainnet-sequencer.base.org"                     # Direct OP Stack sequencer (bypasses CDN)
     - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
     - "https://base.llamarpc.com"                              # LlamaRPC parallel submit
   # Submit immediately after Phase 1 local quotes — skip QuoterV2 (~80-160ms saved).
-  # Re-enabled QuoterV2 verification: primary RPC is now wss://mainnet.base.org
-  # so we're at block position ~1-10 even with the extra ~80-160ms for V3 quotes.
+  # Re-enabled QuoterV2 verification: block position stays ~1-10 even with the extra
+  # ~80-160ms for V3 quotes.
   # Phantom V3 spreads (virtual reserves overestimate by ~0.17%) are caught here.
   # Traced mined reverts on Base often show Phase-1 phantom edges vs actual V3 liquidity (final balance <
   # starting balance + minProfit). QuoterV2 preflight trades latency for fewer guaranteed reverts until the
