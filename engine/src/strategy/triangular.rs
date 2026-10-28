@@ -583,7 +583,7 @@ impl Strategy {
 
         // ── Revert plan 1.4: verify routes with a V3 leg before submit ───────────
         // Cached sqrtPriceX96 ignores tick crossings, so V3 legs overstate output
-        // (~0.30% on a 270 USDT trade) by far more than the 2 bps haircut recovers.
+        // (~0.30% on a 270 USDT trade) by far more than the 0.5 bp haircut recovers.
         // Runs before the truncate so routes dropped here are backfilled by lower-ranked ones.
         // Optimistic mode skips QuoterV2 (like 2-hop): V3-leg routes go out on spot quotes,
         // warned once at Strategy construction.

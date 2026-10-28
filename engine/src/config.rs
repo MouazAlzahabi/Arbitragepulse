@@ -441,8 +441,8 @@ pub struct Tuning {
     pub tip_max_wei: u128,
 
     // ── Detection ──
-    /// Haircut (bps) on quoted output before profit checks.
-    pub quoter_haircut_bps: u64,
+    /// Haircut on quoted output before profit checks, in tenths of a bp (5 = 0.5 bp).
+    pub quoter_haircut_dbps: u64,
     /// Local spread above which Phase 1.5 QuoterV2 verification runs (fraction).
     pub p15_gate_spread: f64,
     /// Minimum active-tick liquidity for a V3 pool to be tradeable.
@@ -552,7 +552,7 @@ impl Default for Tuning {
             gas_fallback_max_age_ms: 120_000,
             tip_profit_share_bps: 0,
             tip_max_wei: 2_000_000_000, // 2 gwei — ~1000× Base's typical base fee
-            quoter_haircut_bps: 2,
+            quoter_haircut_dbps: 5,
             p15_gate_spread: 0.00005,
             min_v3_liquidity: 1_000_000_000,
             v3_spot_max_vr_fraction_bps: 200,
@@ -639,6 +639,9 @@ impl Tuning {
         }
         if self.health_hold_max_ms < self.health_hold_base_ms {
             return Err(anyhow!("tuning.health_hold_max_ms must be >= health_hold_base_ms"));
+        }
+        if self.quoter_haircut_dbps > 1_000 {
+            return Err(anyhow!("tuning.quoter_haircut_dbps is in tenths of a bp and must be <= 1000 (10 bp)"));
         }
         if self.tip_profit_share_bps > 9_000 {
             return Err(anyhow!("tuning.tip_profit_share_bps must be <= 9000 (a tip of the whole profit leaves nothing)"));

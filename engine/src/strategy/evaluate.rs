@@ -885,7 +885,7 @@ impl Strategy {
                             continue;
                         }
 
-                        // Apply quoter_haircut_bps() buffer (Phase 1.5: V3 forward + Aerodrome/V2 reverse).
+                        // Apply quoter_haircut_dbps() buffer (Phase 1.5: V3 forward + Aerodrome/V2 reverse).
                         // Aerodrome reverse uses local pool cache (volatile_max_age()=120s).
                         // Active pools get Sync events every few blocks; haircut covers quote→inclusion drift.
                         let amount_back = apply_exec_quote_haircut(amount_back);

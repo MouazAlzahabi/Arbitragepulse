@@ -31,13 +31,13 @@ pub(crate) fn min_v3_liquidity() -> u128 { crate::config::tuning().min_v3_liquid
 /// V3 quoteExactInputSingle calls that can reach 5M gas/call when tracing ticks.
 pub(crate) fn multicall_chunk_size() -> usize { crate::config::tuning().multicall_chunk_size }
 
-/// QuoterV2 post-buffer (bps): removed from `amount_back` before profit vs `min_profit_usd`.
-/// Used in Phase 1.5/1.5b/1.5c and optimize.rs — keep all paths on this single constant.
-pub(crate) fn quoter_haircut_bps() -> u64 { crate::config::tuning().quoter_haircut_bps }
+/// QuoterV2 post-buffer (tenths of a bp): removed from `amount_back` before profit vs
+/// `min_profit_usd`. Used in Phase 1.5/1.5b/1.5c and optimize.rs — keep all paths on this.
+pub(crate) fn quoter_haircut_dbps() -> u64 { crate::config::tuning().quoter_haircut_dbps }
 
 /// Detection / execution buffer applied to quoted output before profit checks (Phase 1.1).
 pub(crate) fn apply_exec_quote_haircut(amount_out: U256) -> U256 {
-    (amount_out * U256::from(10_000 - quoter_haircut_bps())) / U256::from(10_000u32)
+    (amount_out * U256::from(100_000 - quoter_haircut_dbps())) / U256::from(100_000u32)
 }
 
 /// QuoterV2 `quoteExactInputSingle` calldata (Uniswap V3 ABI, `uint24 fee`).
@@ -1223,8 +1223,8 @@ mod haircut_tests {
         let back = amount_in * U256::from(10_010u64) / U256::from(10_000u64);
         let after = apply_exec_quote_haircut(back);
         assert!(after > amount_in);
-        // 2 bps of 10.01k = $2.002 off a $10.00 edge.
-        assert_eq!(after - amount_in, U256::from(7_998_000u64));
+        // 0.5 bp of 10.01k = $0.5005 off a $10.00 edge.
+        assert_eq!(after - amount_in, U256::from(9_499_500u64));
     }
 }
 
