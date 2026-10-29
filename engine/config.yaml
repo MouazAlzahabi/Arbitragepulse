@@ -44,11 +44,13 @@ chain:
   # Sealed-block logs stay on as the source of truth. Remove the line to turn it off.
   preconf_ws_rpc: "wss://mainnet-preconf.base.org"
   # Quotes (QuoterV2/Multicall3), optimizer and simulation at block tag `pending` here, so
-  # they price the same pre-confirmed state the logs above moved the pool cache to. The
-  # public http_rpc serves Flashblocks `pending` (checked 2026-10-22): same endpoint and
-  # rate limits as today, ~+25 ms per call. Check others with scripts/rpc-latency.sh.
-  # Remove the line to quote at `latest` on http_rpc.
-  preconf_http_rpc: "https://mainnet.base.org"
+  # they price the same pre-confirmed state the logs above moved the pool cache to.
+  # Alchemy (paid) since 2026-10-29: the free endpoint rate-limited 25-28% of quote chunks
+  # in busy minutes. Alchemy serves Flashblocks `pending` (scripts/rpc-latency.sh on the
+  # server: pending grew 356 → 419 txs; quote @pending p50 79 ms / p95 90 ms vs free
+  # 72 / 108 ms). Background reads stay on http_rpc (free). Remove the line to quote at
+  # `latest` on http_rpc.
+  preconf_http_rpc: "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
   # Used only if ws_rpc fails at (re)start. wss://mainnet.base.org refuses WebSocket (HTTP 405);
   # the preconf endpoint serves eth_subscribe newHeads + filtered logs (checked 2026-10-28). No mempool.
   ws_rpc_fallbacks:
