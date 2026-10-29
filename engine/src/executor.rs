@@ -256,6 +256,9 @@ pub struct DirectVenues {
     /// router id → the `fee` its legs carry: None = DirectCL (unused, 0); Some(f) =
     /// DirectPair, 0 = the pool quotes itself (Aerodrome / Aero), else Uniswap V2 fee bps.
     pub venues: HashMap<String, Option<u32>>,
+    /// Router ids whose pools run a swap hook needing gas headroom (Aero CL: its hook
+    /// reverts "IG" unless 250k gas is left). Each leg on one adds `tuning.gas_per_hooked_leg`.
+    pub hooked: std::collections::HashSet<String>,
 }
 
 impl DirectVenues {
@@ -265,7 +268,15 @@ impl DirectVenues {
             crate::config::RouterType::Aerodrome => Some(0),
             crate::config::RouterType::V2 => Some(r.fee_bps),
         })).collect();
-        Self { cache: Some(cache), venues }
+        let hooked = routers.iter().filter(|r| r.metaquoter).map(|r| r.id.clone()).collect();
+        Self { cache: Some(cache), venues, hooked }
+    }
+
+    /// Legs of a route on hooked venues (router ids may carry a "::volatile/stable" suffix).
+    pub fn hooked_legs(&self, router_ids: &[&str]) -> u64 {
+        router_ids.iter()
+            .filter(|id| self.hooked.contains(id.split("::").next().unwrap_or(id)))
+            .count() as u64
     }
 
     /// The (router, fee) the executor gets for one leg: unchanged for router venues; the
@@ -457,11 +468,11 @@ impl Executor {
         // profit share when enabled. Part of gas_cost_usd, so the net-profit gate and the
         // on-chain minProfit floor both account for it.
         let priority_fee = trade_tip(
-            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_2hop(),
+            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_2hop(opp),
         );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = effective_gas_price * self.gas_2hop() as u128;
+            let cost_wei = effective_gas_price * self.gas_2hop(opp) as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -478,7 +489,7 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(self.gas_2hop());
+        tx_base.gas = Some(self.gas_2hop(opp));
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
@@ -536,11 +547,11 @@ impl Executor {
         }
         let gas_price = self.gas_price_for_prepare(provider).await?;
         let priority_fee = trade_tip(
-            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_triangular(),
+            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_triangular(opp),
         );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = effective_gas_price * self.gas_triangular() as u128;
+            let cost_wei = effective_gas_price * self.gas_triangular(opp) as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -557,7 +568,7 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(self.gas_triangular());
+        tx_base.gas = Some(self.gas_triangular(opp));
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
@@ -677,8 +688,8 @@ impl Executor {
 
         // ── Gas profitability check (300k hardcoded — no eth_estimateGas) ─────
         let gas_cost_usd = {
-            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_2hop());
-            let cost_wei = (gas_price + tip) * self.gas_2hop() as u128;
+            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_2hop(opp));
+            let cost_wei = (gas_price + tip) * self.gas_2hop(opp) as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -696,7 +707,7 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(self.gas_2hop());
+        tx_base.gas = Some(self.gas_2hop(opp));
 
         self.stats.total_attempts += 1;
 
@@ -887,8 +898,8 @@ impl Executor {
         let gas_price = self.get_gas_price(provider).await?;
 
         let gas_cost_usd = {
-            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_triangular());
-            let cost_wei = (gas_price + tip) * self.gas_triangular() as u128;
+            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_triangular(opp));
+            let cost_wei = (gas_price + tip) * self.gas_triangular(opp) as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -906,7 +917,7 @@ impl Executor {
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(self.gas_triangular());
+        tx_base.gas = Some(self.gas_triangular(opp));
 
         self.stats.total_attempts += 1;
 
@@ -1120,13 +1131,20 @@ impl Executor {
         out.max(U256::from(1u8))
     }
 
-    /// Gas limits: the configured ones, plus the V4 borrow overhead when borrowing.
-    fn gas_2hop(&self) -> u64 {
-        gas_limit_2hop() + if self.borrow { crate::config::tuning().gas_borrow_extra } else { 0 }
+    /// Gas limits: the configured ones, plus the V4 borrow overhead when borrowing, plus
+    /// `gas_per_hooked_leg` for each leg on a hooked venue (Aero CL).
+    fn gas_2hop(&self, opp: &ArbOpportunity) -> u64 {
+        let t = crate::config::tuning();
+        gas_limit_2hop()
+            + if self.borrow { t.gas_borrow_extra } else { 0 }
+            + self.direct.hooked_legs(&[&opp.router_a_id, &opp.router_b_id]) * t.gas_per_hooked_leg
     }
 
-    fn gas_triangular(&self) -> u64 {
-        gas_limit_triangular() + if self.borrow { crate::config::tuning().gas_borrow_extra } else { 0 }
+    fn gas_triangular(&self, opp: &TriangularOpportunity) -> u64 {
+        let t = crate::config::tuning();
+        gas_limit_triangular()
+            + if self.borrow { t.gas_borrow_extra } else { 0 }
+            + self.direct.hooked_legs(&[&opp.router_ab_id, &opp.router_bc_id, &opp.router_ca_id]) * t.gas_per_hooked_leg
     }
 
     fn build_calldata(&self, opp: &ArbOpportunity, deadline: U256, min_profit: U256) -> Result<Vec<u8>> {
@@ -1270,6 +1288,25 @@ mod tests {
         assert_eq!(d.leg(router, "uni-v3", RouterType::V3, 500, usdc, weth).unwrap(), (router, 500));
         assert!(d.leg(router, "uni-v2", RouterType::V2, 0, usdc, weth).is_err(), "uncached direct pool");
         assert_eq!(d.venues.get("uni-v2"), Some(&Some(30)));
+    }
+
+    /// Aero CL legs (metaquoter venues) add gas_per_hooked_leg each; other routes keep the
+    /// configured limits. Measured on mainnet: a borrowed 3-leg Aero CL triangle uses ~1.04M
+    /// inside unlock and runs out at 1.02M.
+    #[test]
+    fn hooked_legs_raise_the_gas_limit() {
+        let routers = vec![
+            router_cfg("{id: aero-cl, name: a, address: '0x0000000000000000000000000000000000000001', type: v3, slipstream: true, direct: true, metaquoter: true, factory_address: '0x0000000000000000000000000000000000000009', quoter_address: '0x0000000000000000000000000000000000000008'}"),
+            router_cfg("{id: aero-v2, name: b, address: '0x0000000000000000000000000000000000000002', type: aerodrome, direct: true}"),
+            router_cfg("{id: uni-v3, name: c, address: '0x0000000000000000000000000000000000000004', type: v3}"),
+        ];
+        let d = DirectVenues::from_routers(&routers, Arc::new(crate::pool_cache::PoolCache::new()));
+        assert_eq!(d.hooked_legs(&["aero-cl", "aero-cl", "aero-cl"]), 3);
+        assert_eq!(d.hooked_legs(&["uni-v3", "aero-v2::volatile"]), 0);
+        assert_eq!(d.hooked_legs(&["aero-cl", "uni-v3"]), 1);
+        let t = crate::config::Tuning::default();
+        let tri = t.gas_limit_triangular + t.gas_borrow_extra + 3 * t.gas_per_hooked_leg;
+        assert!(tri >= 2_000_000, "3 Aero CL legs, borrowed: {tri}");
     }
 
     #[test]

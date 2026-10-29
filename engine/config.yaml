@@ -420,6 +420,11 @@ tuning:
   # ── Execution ──
   gas_limit_2hop: 700000
   gas_limit_triangular: 900000
+  # Per Aero CL leg (metaquoter venues): their swap hook reverts "IG" unless 250k gas is left
+  # when it runs, and a hooked swap costs ~250-290k. A borrowed 3-leg Aero CL triangle used
+  # ~1.04M and ran out at 1.02M (mainnet replay 2026-10-29); with this it gets 2.07M.
+  # You pay for gas used, not the limit; only the profit gate's estimate grows (~$0.03).
+  gas_per_hooked_leg: 350000
   onchain_min_profit_bps: 6076           # on-chain minProfit = 60.76% of the gas-cost floor
                                          # (replaces router_min_out_slack_bps × sell_leg_minprofit_mul_bps:
                                          #  (10000 − slack) × mul / 10000; old 200 / 6200 → 6076)

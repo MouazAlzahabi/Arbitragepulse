@@ -458,6 +458,9 @@ pub struct Tuning {
     pub gas_limit_triangular: u64,
     /// Extra gas for a borrowed trade (V4 unlock / take / sync / settle + repay transfer).
     pub gas_borrow_extra: u64,
+    /// Extra gas per leg on a hooked venue (Aero CL, `metaquoter: true`): its swap costs
+    /// ~250-290k and its hook reverts "IG" unless 250k gas is left when it runs.
+    pub gas_per_hooked_leg: u64,
     /// On-chain `minProfit` as bps of the gas-cost floor (6076 = 60.76%). The contract
     /// reverts `NotProfitable` unless final balance ≥ starting balance + minProfit; < 10000 leaves room for
     /// same-block drift, with the off-chain net-profit check as the economic guard.
@@ -601,6 +604,7 @@ impl Default for Tuning {
             gas_limit_2hop: 700_000,
             gas_limit_triangular: 900_000,
             gas_borrow_extra: 120_000,
+            gas_per_hooked_leg: 350_000,
             onchain_min_profit_bps: 6076, // = the former 98% slack × 62% multiplier
             gas_fallback_margin_bps: 2_500,
             gas_fallback_max_age_ms: 120_000,
