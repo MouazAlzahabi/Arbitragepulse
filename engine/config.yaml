@@ -375,6 +375,9 @@ tuning:
   # with no priced token is never skipped. 0 = off. (Lowering it: GitHub issue.)
   min_pool_depth_usd: 20000
   pool_depth_refresh_ms: 5000
+  # Re-run pool discovery (on http_rpc, free) this often to pick up pools created after
+  # startup; new pools are added and both log feeds resubscribed. 0 = startup only.
+  pool_rediscover_ms: 21600000           # 6 h
   v3_spot_max_vr_fraction_bps: 200
   v3_spot_overestimate_bps: 30           # per V3 leg, optimistic mode only
   phantom_cap_bps: 500                   # profit > 5% of input = phantom quote

@@ -101,6 +101,8 @@ pub async fn run_chain(
     let main_reads = provider.as_ref().clone().erased();
     let startup_reads = http_rpc_provider.as_ref().unwrap_or(&main_reads);
     let has_startup_fallback = http_rpc_provider.is_some();
+    // Periodic pool rediscovery reads on the same endpoint as startup discovery.
+    let rediscover_reads = startup_reads.clone();
 
     // ── Executor setup check: owner = signer (exit 2), router allowlist (exit 2 live), paused ──
     // Runs before pool discovery so a wrong key fails within seconds. Startup only.
@@ -379,49 +381,64 @@ pub async fn run_chain(
     // re-read before trading (recheck_quiet_pools) and V3 legs are QuoterV2-verified.
     let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
     let preconf_logs = Arc::new(AtomicU64::new(0));
-    {
-        let preconf_only: HashSet<Address> = if cfg.preconf_ws_rpc.is_some() {
-            cfg.preconf_only_tokens.iter().filter_map(|t| match t.parse::<Address>() {
-                Ok(a) => Some(a),
-                Err(_) => { warn!("[{}] preconf_only_tokens: invalid address {}", cfg.name, t); None }
-            }).collect()
-        } else {
-            if !cfg.preconf_only_tokens.is_empty() {
-                warn!("[{}] preconf_only_tokens set without preconf_ws_rpc — watching those pools on ws_rpc", cfg.name);
+    let preconf_only: HashSet<Address> = if cfg.preconf_ws_rpc.is_some() {
+        cfg.preconf_only_tokens.iter().filter_map(|t| match t.parse::<Address>() {
+            Ok(a) => Some(a),
+            Err(_) => { warn!("[{}] preconf_only_tokens: invalid address {}", cfg.name, t); None }
+        }).collect()
+    } else {
+        if !cfg.preconf_only_tokens.is_empty() {
+            warn!("[{}] preconf_only_tokens set without preconf_ws_rpc — watching those pools on ws_rpc", cfg.name);
+        }
+        HashSet::new()
+    };
+    let log_feed = LogFeed {
+        cache: pool_cache.clone(),
+        swap_tx: swap_tx_for_sub.clone(),
+        chain_id: cfg.id,
+        chain_name: cfg.name.clone(),
+        solidly_sync_hash: solidly_sync_hash_sub,
+        large_swap_bps: cfg.large_swap_threshold_bps,
+        large_v3_bps: cfg.large_v3_threshold_bps,
+    };
+    // Starts both log feeds for the cache's current pools. Re-run by pool rediscovery
+    // (maintain.rs) when new pools appear: the new feeds start before the old ones are
+    // aborted, so no log is missed; the overlap's duplicates are dropped by the cache's
+    // log-position guard.
+    let start_log_feeds: Arc<dyn Fn() -> Vec<tokio::task::JoinHandle<()>> + Send + Sync> = {
+        let (cache, provider, preconf_url) = (pool_cache.clone(), provider.clone(), cfg.preconf_ws_rpc.clone());
+        let (feed, counter, chain_name) = (log_feed.clone(), preconf_logs.clone(), cfg.name.clone());
+        Arc::new(move || {
+            let all_addrs = cache.watch_addresses();
+            let (sealed_addrs, preconf_only_n) = split_preconf_only(&all_addrs, &preconf_only, |p| cache.get_pool_tokens(p));
+            if preconf_only_n > 0 {
+                info!("[{}] {} of {} pools watched on the preconf feed only (preconf_only_tokens)",
+                      chain_name, preconf_only_n, all_addrs.len());
             }
-            HashSet::new()
-        };
-        let all_addrs = pool_cache.watch_addresses();
-        let (sealed_addrs, preconf_only_n) = split_preconf_only(&all_addrs, &preconf_only, |p| pool_cache.get_pool_tokens(p));
-        if preconf_only_n > 0 {
-            info!("[{}] {} of {} pools watched on the preconf feed only (preconf_only_tokens)",
-                  cfg.name, preconf_only_n, all_addrs.len());
-        }
-        let topics = crate::listener::pool_log_topics(solidly_sync_hash_sub);
-        let sealed_filter = alloy::rpc::types::Filter::new()
-            .address(sealed_addrs.clone())
-            .event_signature(topics.clone());
-        let log_filter = alloy::rpc::types::Filter::new()
-            .address(all_addrs)
-            .event_signature(topics);
-        let feed = LogFeed {
-            cache: pool_cache.clone(),
-            swap_tx: swap_tx_for_sub.clone(),
-            chain_id: cfg.id,
-            chain_name: cfg.name.clone(),
-            solidly_sync_hash: solidly_sync_hash_sub,
-            large_swap_bps: cfg.large_swap_threshold_bps,
-            large_v3_bps: cfg.large_v3_threshold_bps,
-        };
-        // An address-less filter would match every log on the chain: skip it instead.
-        if !sealed_addrs.is_empty() {
-            spawn_log_subscription((*provider).clone(), sealed_filter, feed.clone(), None, None);
-        }
-        if let Some(url) = cfg.preconf_ws_rpc.clone() {
-            // Connected in the background: an optional feed must never hold up startup.
-            spawn_preconf_subscription(url, log_filter, feed, preconf_logs.clone());
-        }
-    }
+            let topics = crate::listener::pool_log_topics(solidly_sync_hash_sub);
+            let mut handles = Vec::new();
+            // An address-less filter would match every log on the chain: skip it instead.
+            if !sealed_addrs.is_empty() {
+                let sealed_filter = alloy::rpc::types::Filter::new()
+                    .address(sealed_addrs)
+                    .event_signature(topics.clone());
+                handles.push(spawn_log_subscription((*provider).clone(), sealed_filter, feed.clone(), None, None));
+            }
+            if let Some(url) = preconf_url.clone() {
+                // Connected in the background: an optional feed must never hold up startup.
+                let log_filter = alloy::rpc::types::Filter::new()
+                    .address(all_addrs)
+                    .event_signature(topics);
+                handles.push(spawn_preconf_subscription(url, log_filter, feed.clone(), counter.clone()));
+            }
+            handles
+        })
+    };
+    let log_feed_handles = start_log_feeds();
+    maintain::spawn_rediscovery(
+        rediscover_reads, chain_routers.clone(), chain_pairs.clone(), pool_cache.clone(),
+        start_log_feeds.clone(), log_feed_handles, cfg.name.clone(),
+    );
 
     // ── Pending TX monitor (optional, requires mempool-enabled WS endpoint) ──
     // Fires a targeted arb scan with matching tip when a large swap is detected
@@ -1062,8 +1079,8 @@ fn spawn_log_subscription<P: Provider + Clone + 'static>(
     feed: LogFeed,
     method: Option<&'static str>,
     counter: Option<Arc<AtomicU64>>,
-) {
-    tokio::spawn(run_log_subscription(provider, filter, feed, method, counter));
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_log_subscription(provider, filter, feed, method, counter))
 }
 
 /// Bound on one WebSocket handshake. alloy's `connect_ws` has none, so a stalled
@@ -1078,7 +1095,7 @@ fn spawn_preconf_subscription(
     filter: alloy::rpc::types::Filter,
     feed: LogFeed,
     counter: Arc<AtomicU64>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let shown = crate::util::redact_url(&url);
         let mut backoff = Duration::from_secs(1);
@@ -1101,7 +1118,7 @@ fn spawn_preconf_subscription(
         };
         info!("[{}] Flashblocks pre-confirmed logs: subscribing on {}", feed.chain_name, shown);
         run_log_subscription(preconf, filter, feed, Some("pendingLogs"), Some(counter)).await;
-    });
+    })
 }
 
 async fn run_log_subscription<P: Provider + Clone + 'static>(
