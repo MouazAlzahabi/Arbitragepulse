@@ -241,6 +241,46 @@ pub struct Executor {
     /// `state::discover_balance_slots`). An unfunded trade is then simulated with an assumed
     /// balance of `amount_in` instead of being skipped. Empty in live mode.
     pub balance_slots: Arc<HashMap<Address, U256>>,
+    /// Venues traded on their pools directly (`direct: true` routers): legs on them send
+    /// the pool as the "router". Set by chain/mod.rs after construction.
+    pub direct: Arc<DirectVenues>,
+    /// `chain.borrow`: every trade borrows its amountIn from the V4 PoolManager (contract
+    /// *Borrowed entry points) instead of using the contract's balance.
+    pub borrow: bool,
+}
+
+/// Venues traded on their pools directly (router config `direct: true`).
+#[derive(Default)]
+pub struct DirectVenues {
+    pub cache: Option<Arc<crate::pool_cache::PoolCache>>,
+    /// router id → the `fee` its legs carry: None = DirectCL (unused, 0); Some(f) =
+    /// DirectPair, 0 = the pool quotes itself (Aerodrome / Aero), else Uniswap V2 fee bps.
+    pub venues: HashMap<String, Option<u32>>,
+}
+
+impl DirectVenues {
+    pub fn from_routers(routers: &[crate::config::RouterConfig], cache: Arc<crate::pool_cache::PoolCache>) -> Self {
+        let venues = routers.iter().filter(|r| r.direct).map(|r| (r.id.clone(), match r.router_type {
+            crate::config::RouterType::V3 => None,
+            crate::config::RouterType::Aerodrome => Some(0),
+            crate::config::RouterType::V2 => Some(r.fee_bps),
+        })).collect();
+        Self { cache: Some(cache), venues }
+    }
+
+    /// The (router, fee) the executor gets for one leg: unchanged for router venues; the
+    /// leg's pool and its DirectCL / DirectPair fee for direct ones. Errs when a direct
+    /// leg's pool is not in the cache (the trade is then not sent).
+    pub fn leg(&self, router: Address, router_id: &str, rtype: crate::config::RouterType, fee: u32, tin: Address, tout: Address)
+        -> Result<(Address, u32)>
+    {
+        let venue = router_id.split("::").next().unwrap_or(router_id);
+        let Some(kind) = self.venues.get(venue) else { return Ok((router, fee)) };
+        let pool = self.cache.as_ref()
+            .and_then(|c| crate::race::leg_pool(c, (router_id, rtype, fee, tin, tout)))
+            .ok_or_else(|| anyhow!("direct venue {}: no cached pool for {:?}→{:?} (fee {})", venue, tin, tout, fee))?;
+        Ok((pool, kind.unwrap_or(0)))
+    }
 }
 
 impl Executor {
@@ -287,6 +327,8 @@ impl Executor {
             deadline_cache: StdMutex::new((0, U256::ZERO)),
             sim_provider: None,
             balance_slots: Arc::new(HashMap::new()),
+            direct: Arc::new(DirectVenues::default()),
+            borrow: false,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .pool_max_idle_per_host(4)
@@ -415,11 +457,11 @@ impl Executor {
         // profit share when enabled. Part of gas_cost_usd, so the net-profit gate and the
         // on-chain minProfit floor both account for it.
         let priority_fee = trade_tip(
-            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, gas_limit_2hop(),
+            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_2hop(),
         );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = effective_gas_price * gas_limit_2hop() as u128;
+            let cost_wei = effective_gas_price * self.gas_2hop() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -431,12 +473,12 @@ impl Executor {
         }
         let deadline = self.deadline();
         let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
-        let calldata = self.build_calldata(opp, deadline, min_profit);
+        let calldata = self.build_calldata(opp, deadline, min_profit)?;
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(gas_limit_2hop());
+        tx_base.gas = Some(self.gas_2hop());
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
@@ -494,11 +536,11 @@ impl Executor {
         }
         let gas_price = self.gas_price_for_prepare(provider).await?;
         let priority_fee = trade_tip(
-            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, gas_limit_triangular(),
+            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_triangular(),
         );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
-            let cost_wei = effective_gas_price * gas_limit_triangular() as u128;
+            let cost_wei = effective_gas_price * self.gas_triangular() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -510,12 +552,12 @@ impl Executor {
         }
         let deadline = self.deadline();
         let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
-        let calldata = self.build_triangular_calldata(opp, deadline, min_profit);
+        let calldata = self.build_triangular_calldata(opp, deadline, min_profit)?;
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(gas_limit_triangular());
+        tx_base.gas = Some(self.gas_triangular());
         self.stats.total_attempts += 1;
         let nonce = match self.nonce {
             Some(n) => n,
@@ -614,6 +656,9 @@ impl Executor {
     /// balance is short and the token's balance slot is known; None otherwise (live mode
     /// never has slots, so it always simulates and sends against the real balance).
     async fn assumed_balance(&self, token: Address, amount_in: U256) -> Option<StateOverride> {
+        if self.borrow {
+            return None; // borrowed trades need no balance
+        }
         let slot = *self.balance_slots.get(&token)?;
         let have = match &self.contract_balances {
             Some(b) => b.read().await.get(&token).copied().unwrap_or(U256::ZERO),
@@ -632,8 +677,8 @@ impl Executor {
 
         // ── Gas profitability check (300k hardcoded — no eth_estimateGas) ─────
         let gas_cost_usd = {
-            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, gas_limit_2hop());
-            let cost_wei = (gas_price + tip) * gas_limit_2hop() as u128;
+            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_2hop());
+            let cost_wei = (gas_price + tip) * self.gas_2hop() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -646,12 +691,12 @@ impl Executor {
 
         let deadline = self.deadline();
         let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
-        let calldata = self.build_calldata(opp, deadline, min_profit);
+        let calldata = self.build_calldata(opp, deadline, min_profit)?;
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(gas_limit_2hop());
+        tx_base.gas = Some(self.gas_2hop());
 
         self.stats.total_attempts += 1;
 
@@ -842,8 +887,8 @@ impl Executor {
         let gas_price = self.get_gas_price(provider).await?;
 
         let gas_cost_usd = {
-            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, gas_limit_triangular());
-            let cost_wei = (gas_price + tip) * gas_limit_triangular() as u128;
+            let tip = trade_tip(self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_triangular());
+            let cost_wei = (gas_price + tip) * self.gas_triangular() as u128;
             cost_wei as f64 / 1e18 * self.native_price_usd
         };
         let net_profit_usd = opp.profit_usd - gas_cost_usd;
@@ -856,12 +901,12 @@ impl Executor {
 
         let deadline = self.deadline();
         let min_profit = Self::gas_cost_to_token_floor(opp.expected_profit, opp.profit_usd, gas_cost_usd);
-        let calldata = self.build_triangular_calldata(opp, deadline, min_profit);
+        let calldata = self.build_triangular_calldata(opp, deadline, min_profit)?;
         let mut tx_base = TransactionRequest::default()
             .to(self.contract_address)
             .input(calldata.into())
             .from(self.signer_address);
-        tx_base.gas = Some(gas_limit_triangular());
+        tx_base.gas = Some(self.gas_triangular());
 
         self.stats.total_attempts += 1;
 
@@ -1075,37 +1120,52 @@ impl Executor {
         out.max(U256::from(1u8))
     }
 
-    fn build_calldata(&self, opp: &ArbOpportunity, deadline: U256, min_profit: U256) -> Vec<u8> {
-        ArbitrageExecutor::executeArbitrageCall {
-            tokenIn: opp.token_in,
-            tokenOut: opp.token_out,
-            amountIn: opp.amount_in,
-            routerA: opp.router_a,
-            routerB: opp.router_b,
-            feeA: Uint::<24, 1>::from(opp.fee_a),
-            feeB: Uint::<24, 1>::from(opp.fee_b),
-            minProfit: min_profit,
-            deadline,
-        }
-        .abi_encode()
+    /// Gas limits: the configured ones, plus the V4 borrow overhead when borrowing.
+    fn gas_2hop(&self) -> u64 {
+        gas_limit_2hop() + if self.borrow { crate::config::tuning().gas_borrow_extra } else { 0 }
     }
 
-    fn build_triangular_calldata(&self, opp: &TriangularOpportunity, deadline: U256, min_profit: U256) -> Vec<u8> {
-        ArbitrageExecutor::executeTriangularArbitrageCall {
-            tokenA: opp.token_a,
-            tokenB: opp.token_b,
-            tokenC: opp.token_c,
-            amountIn: opp.amount_in,
-            routerAB: opp.router_ab,
-            routerBC: opp.router_bc,
-            routerCA: opp.router_ca,
-            feeAB: Uint::<24, 1>::from(opp.fee_ab),
-            feeBC: Uint::<24, 1>::from(opp.fee_bc),
-            feeCA: Uint::<24, 1>::from(opp.fee_ca),
-            minProfit: min_profit,
-            deadline,
-        }
-        .abi_encode()
+    fn gas_triangular(&self) -> u64 {
+        gas_limit_triangular() + if self.borrow { crate::config::tuning().gas_borrow_extra } else { 0 }
+    }
+
+    fn build_calldata(&self, opp: &ArbOpportunity, deadline: U256, min_profit: U256) -> Result<Vec<u8>> {
+        let d = &self.direct;
+        let (router_a, fee_a) = d.leg(opp.router_a, &opp.router_a_id, opp.router_a_type, opp.fee_a, opp.token_in, opp.token_out)?;
+        let (router_b, fee_b) = d.leg(opp.router_b, &opp.router_b_id, opp.router_b_type, opp.fee_b, opp.token_out, opp.token_in)?;
+        let (fee_a, fee_b) = (Uint::<24, 1>::from(fee_a), Uint::<24, 1>::from(fee_b));
+        let (tokenIn, tokenOut, amountIn) = (opp.token_in, opp.token_out, opp.amount_in);
+        Ok(if self.borrow {
+            ArbitrageExecutor::executeArbitrageBorrowedCall {
+                tokenIn, tokenOut, amountIn, routerA: router_a, routerB: router_b, feeA: fee_a, feeB: fee_b,
+                minProfit: min_profit, deadline,
+            }.abi_encode()
+        } else {
+            ArbitrageExecutor::executeArbitrageCall {
+                tokenIn, tokenOut, amountIn, routerA: router_a, routerB: router_b, feeA: fee_a, feeB: fee_b,
+                minProfit: min_profit, deadline,
+            }.abi_encode()
+        })
+    }
+
+    fn build_triangular_calldata(&self, opp: &TriangularOpportunity, deadline: U256, min_profit: U256) -> Result<Vec<u8>> {
+        let d = &self.direct;
+        let (router_ab, fee_ab) = d.leg(opp.router_ab, &opp.router_ab_id, opp.router_ab_type, opp.fee_ab, opp.token_a, opp.token_b)?;
+        let (router_bc, fee_bc) = d.leg(opp.router_bc, &opp.router_bc_id, opp.router_bc_type, opp.fee_bc, opp.token_b, opp.token_c)?;
+        let (router_ca, fee_ca) = d.leg(opp.router_ca, &opp.router_ca_id, opp.router_ca_type, opp.fee_ca, opp.token_c, opp.token_a)?;
+        let fee = |f: u32| Uint::<24, 1>::from(f);
+        let (tokenA, tokenB, tokenC, amountIn) = (opp.token_a, opp.token_b, opp.token_c, opp.amount_in);
+        Ok(if self.borrow {
+            ArbitrageExecutor::executeTriangularArbitrageBorrowedCall {
+                tokenA, tokenB, tokenC, amountIn, routerAB: router_ab, routerBC: router_bc, routerCA: router_ca,
+                feeAB: fee(fee_ab), feeBC: fee(fee_bc), feeCA: fee(fee_ca), minProfit: min_profit, deadline,
+            }.abi_encode()
+        } else {
+            ArbitrageExecutor::executeTriangularArbitrageCall {
+                tokenA, tokenB, tokenC, amountIn, routerAB: router_ab, routerBC: router_bc, routerCA: router_ca,
+                feeAB: fee(fee_ab), feeBC: fee(fee_bc), feeCA: fee(fee_ca), minProfit: min_profit, deadline,
+            }.abi_encode()
+        })
     }
 
     /// Fire-and-forget: persist trade to SQLite off the async thread.
@@ -1173,6 +1233,44 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::RouterType;
+
+    fn router_cfg(yaml: &str) -> crate::config::RouterConfig { serde_yaml::from_str(yaml).unwrap() }
+
+    /// Legs on direct venues send the leg's pool as the router (fee 0 for DirectCL and
+    /// self-quoting pairs, fee bps for Uniswap V2); router venues are unchanged; a direct
+    /// leg whose pool isn't cached is refused. Borrowing picks the *Borrowed entry point.
+    #[test]
+    fn direct_legs_send_pools_and_borrow_picks_entry_point() {
+        use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
+        let (usdc, weth) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let (cl_pool, pair_pool, router) = (Address::repeat_byte(0xc1), Address::repeat_byte(0xa2), Address::repeat_byte(0x99));
+        let cache = Arc::new(PoolCache::new());
+        cache.insert_v3(cl_pool, V3PoolState {
+            token0: usdc, token1: weth, fee: 50, swap_fee: 300, sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1, tick: 0, router_id: "aero-cl".into(), last_updated: std::time::Instant::now(),
+            vr0: U256::ZERO, vr1: U256::ZERO, fee_num_v3: U256::ZERO,
+        });
+        cache.insert(pair_pool, PoolInfo {
+            token0: usdc, token1: weth, reserve0: U256::from(1u64), reserve1: U256::from(1u64), fee_bps: 30,
+            router_id: "aero-v2::volatile".into(), is_stable: false, decimals0: 6, decimals1: 18,
+            last_sync: std::time::Instant::now(), fee_num: U256::ZERO,
+        });
+        let routers = vec![
+            router_cfg("{id: aero-cl, name: a, address: '0x0000000000000000000000000000000000000001', type: v3, direct: true}"),
+            router_cfg("{id: aero-v2, name: b, address: '0x0000000000000000000000000000000000000002', type: aerodrome, direct: true}"),
+            router_cfg("{id: uni-v2, name: c, address: '0x0000000000000000000000000000000000000003', type: v2, fee_bps: 30, direct: true}"),
+            router_cfg("{id: uni-v3, name: d, address: '0x0000000000000000000000000000000000000004', type: v3}"),
+        ];
+        let d = DirectVenues::from_routers(&routers, cache);
+        assert_eq!(d.leg(router, "aero-cl", RouterType::V3, 50, usdc, weth).unwrap(), (cl_pool, 0));
+        assert_eq!(d.leg(router, "aero-v2::volatile", RouterType::Aerodrome, 0, weth, usdc).unwrap(), (pair_pool, 0));
+        assert_eq!(d.leg(router, "aero-v2", RouterType::Aerodrome, 0, usdc, weth).unwrap(), (pair_pool, 0));
+        assert_eq!(d.leg(router, "uni-v3", RouterType::V3, 500, usdc, weth).unwrap(), (router, 500));
+        assert!(d.leg(router, "uni-v2", RouterType::V2, 0, usdc, weth).is_err(), "uncached direct pool");
+        assert_eq!(d.venues.get("uni-v2"), Some(&Some(30)));
+    }
 
     #[test]
     fn balance_override_targets_the_holders_mapping_entry() {

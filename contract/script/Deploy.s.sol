@@ -31,7 +31,12 @@ contract DeployExecutor is Script {
 
         vm.startBroadcast(deployerKey);
 
-        ArbitrageExecutor executor = new ArbitrageExecutor();
+        // Uniswap V4 PoolManager for the *Borrowed entry points (Base mainnet). Elsewhere set
+        // POOL_MANAGER, or leave it unset to deploy without borrowing.
+        address poolManager = block.chainid == 8453
+            ? 0x498581fF718922c3f8e6A244956aF099B2652b2b
+            : vm.envOr("POOL_MANAGER", address(0));
+        ArbitrageExecutor executor = new ArbitrageExecutor(poolManager);
 
         vm.stopBroadcast();
 
@@ -41,6 +46,7 @@ contract DeployExecutor is Script {
         console.log("======================================");
         console.log("ArbitrageExecutor deployed to:", address(executor));
         console.log("Owner:", executor.owner());
+        console.log("V4 PoolManager (borrowing):", executor.poolManager());
         console.log("======================================");
         console.log("");
         console.log("Next steps:");
@@ -49,9 +55,13 @@ contract DeployExecutor is Script {
             "       forge verify-contract ", vm.toString(address(executor)),
             " src/ArbitrageExecutor.sol:ArbitrageExecutor --chain ", chain, " --watch"
         ));
-        console.log("  2. Whitelist each router with its type (0 = V2, 1 = V3 SwapRouter02, 4 = Aerodrome):");
+        console.log("  2. Whitelist each router with its type (0 = V2, 1 = V3 SwapRouter02, 4 = Aerodrome,");
+        console.log("     5 = Slipstream), and the pools the engine lists for 6 = DirectCL / 7 = DirectPair:");
         console.log(string.concat(
             "       cast send ", vm.toString(address(executor)), " 'setRouter(address,uint8)' <router> <type>"
+        ));
+        console.log(string.concat(
+            "       cast send ", vm.toString(address(executor)), " 'setRouters(address[],uint8)' '[<pool>,...]' 6"
         ));
         console.log("  3. Fund:    send the pair's start token (e.g. USDC) to", address(executor));
         console.log("  4. Engine:  chain.contract_address =", address(executor));

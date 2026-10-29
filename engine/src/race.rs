@@ -20,26 +20,30 @@ pub type Leg<'a> = (&'a str, RouterType, u32, Address, Address);
 /// Pool addresses a route trades through, from the local pool cache.
 pub fn route_pools(cache: &PoolCache, legs: &[Leg<'_>]) -> Vec<Address> {
     let mut out = Vec::new();
-    for &(router_id, rtype, fee, tin, tout) in legs {
-        let pool = match rtype {
-            RouterType::V3 => cache.v3_by_key.get(&V3PoolKey::new(router_id, tin, tout, fee)).map(|p| *p),
-            RouterType::V2 => cache.by_key.get(&V2PoolKey::new(router_id, tin, tout)).map(|p| *p),
-            RouterType::Aerodrome => {
-                // 2-hop routes carry the cache id ("<router>::volatile|stable"); triangular
-                // routes carry the router id and the stable flag in `fee`.
-                let id = if router_id.contains("::") {
-                    router_id.to_string()
-                } else {
-                    format!("{router_id}::{}", if fee != 0 { "stable" } else { "volatile" })
-                };
-                cache.by_key.get(&V2PoolKey::new(&id, tin, tout)).map(|p| *p)
-            }
-        };
-        if let Some(p) = pool.filter(|p| !out.contains(p)) {
+    for &leg in legs {
+        if let Some(p) = leg_pool(cache, leg).filter(|p| !out.contains(p)) {
             out.push(p);
         }
     }
     out
+}
+
+/// The pool one leg trades through, from the local pool cache.
+pub fn leg_pool(cache: &PoolCache, (router_id, rtype, fee, tin, tout): Leg<'_>) -> Option<Address> {
+    match rtype {
+        RouterType::V3 => cache.v3_by_key.get(&V3PoolKey::new(router_id, tin, tout, fee)).map(|p| *p),
+        RouterType::V2 => cache.by_key.get(&V2PoolKey::new(router_id, tin, tout)).map(|p| *p),
+        RouterType::Aerodrome => {
+            // 2-hop routes carry the cache id ("<router>::volatile|stable"); triangular
+            // routes carry the router id and the stable flag in `fee`.
+            let id = if router_id.contains("::") {
+                router_id.to_string()
+            } else {
+                format!("{router_id}::{}", if fee != 0 { "stable" } else { "volatile" })
+            };
+            cache.by_key.get(&V2PoolKey::new(&id, tin, tout)).map(|p| *p)
+        }
+    }
 }
 
 /// A tx that touched one of our pools earlier in the block.

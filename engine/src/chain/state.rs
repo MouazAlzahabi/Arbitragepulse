@@ -378,6 +378,7 @@ pub(crate) async fn check_contract_setup<P: Provider>(
     routers: &[RouterConfig],
     chain: &str,
     dry_run: bool,
+    borrow: bool,
     log_tx: &LogBroadcaster,
 ) -> Result<bool> {
     use crate::abi::ArbitrageExecutor;
@@ -395,7 +396,8 @@ pub(crate) async fn check_contract_setup<P: Provider>(
         .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: paused() failed: {e}"))?;
 
     let mut problems = Vec::new();
-    for r in routers {
+    // Direct venues are checked per pool after discovery (check_direct_pools).
+    for r in routers.iter().filter(|r| !r.direct) {
         let addr: Address = match r.address.parse() {
             Ok(a) => a,
             Err(_) => {
@@ -411,6 +413,13 @@ pub(crate) async fn check_contract_setup<P: Provider>(
             .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: routerType() failed: {e}"))?;
         if let Some(p) = router_problem(&r.id, addr, r.router_type, r.slipstream, allowed, onchain_type) {
             problems.push(p);
+        }
+    }
+    if borrow {
+        match rpc_timeout(rpc_read_timeout(), exec.poolManager().call()).await {
+            Ok(pm) if !pm.is_zero() => info!("[{chain}] Executor borrows from the V4 PoolManager {pm}"),
+            Ok(_) => problems.push("chain.borrow is on but the executor was deployed without a PoolManager — redeploy (contract v4) or set chain.borrow: false".to_string()),
+            Err(e) => problems.push(format!("chain.borrow is on but the executor has no poolManager() (not contract v4?): {e}")),
         }
     }
     for p in &problems {
@@ -431,10 +440,94 @@ pub(crate) async fn check_contract_setup<P: Provider>(
     }
     info!(
         "[{chain}] Executor {contract}: owner = signer, {} routers allowlisted{}",
-        routers.len() - problems.len(),
+        routers.iter().filter(|r| !r.direct).count().saturating_sub(problems.len()),
         if paused { ", PAUSED" } else { "" }
     );
     Ok(paused)
+}
+
+/// Direct venues trade on their pools, so every pool the engine may use must be allowlisted
+/// on the executor with type 6 (DirectCL) / 7 (DirectPair). Reads allowedRouters + routerType
+/// for each (one chunked Multicall3) and logs the missing ones with ready `setRouters`
+/// commands. Live mode disables them in the pool cache (never quoted); dry-run keeps them, so
+/// detection shows what allowlisting would add (their simulations revert RouterNotAllowed).
+/// Returns how many are missing.
+pub(crate) async fn check_direct_pools<P: Provider>(
+    provider: &P,
+    contract: Address,
+    routers: &[RouterConfig],
+    cache: &PoolCache,
+    dry_run: bool,
+    chain: &str,
+    log_tx: &LogBroadcaster,
+) -> usize {
+    use alloy::sol_types::SolCall;
+    use crate::abi::ArbitrageExecutor;
+    let want = direct_pools(routers, cache);
+    if want.is_empty() {
+        return 0;
+    }
+    let calls: Vec<(Address, Vec<u8>)> = want.iter()
+        .flat_map(|(p, _)| [
+            (contract, ArbitrageExecutor::allowedRoutersCall { router: *p }.abi_encode()),
+            (contract, ArbitrageExecutor::routerTypeCall { router: *p }.abi_encode()),
+        ])
+        .collect();
+    let (raw, lost) = super::discover::discover_mc(calls, provider).await;
+    let word = |r: &Option<Vec<u8>>| r.as_ref().and_then(|b| b.get(..32)).map(alloy::primitives::U256::from_be_slice);
+    let mut missing: HashMap<u8, Vec<Address>> = HashMap::new();
+    for ((pool, ty), r) in want.iter().zip(raw.chunks(2)) {
+        let ok = word(&r[0]).is_some_and(|w| w == alloy::primitives::U256::from(1u8))
+            && word(&r[1]).is_some_and(|w| w == alloy::primitives::U256::from(*ty));
+        if !ok {
+            missing.entry(*ty).or_default().push(*pool);
+        }
+    }
+    let n: usize = missing.values().map(Vec::len).sum();
+    if n == 0 {
+        info!("[{chain}] Direct venues: all {} pools allowlisted on the executor", want.len());
+        return 0;
+    }
+    let msg = format!(
+        "[{chain}] Direct venues: {n} of {} pools not allowlisted on the executor{} — {}",
+        want.len(),
+        if lost > 0 { format!(" ({lost} reads lost)") } else { String::new() },
+        if dry_run { "dry-run keeps them (their simulations revert RouterNotAllowed)" } else { "skipped until allowlisted" },
+    );
+    warn!("{msg}");
+    broadcast_log(log_tx, "warn", &msg, None);
+    for (ty, pools) in &missing {
+        for chunk in pools.chunks(40) {
+            let list: Vec<String> = chunk.iter().map(|p| p.to_string()).collect();
+            info!("[{chain}]   cast send {contract} 'setRouters(address[],uint8)' '[{}]' {ty}", list.join(","));
+        }
+        if !dry_run {
+            for p in pools {
+                cache.disable_pool(*p);
+            }
+        }
+    }
+    n
+}
+
+/// (pool, executor router type) for every cached pool of a `direct: true` venue:
+/// 6 DirectCL for V3-type venues, 7 DirectPair for V2 / Aerodrome-type ones.
+pub(crate) fn direct_pools(routers: &[RouterConfig], cache: &PoolCache) -> Vec<(Address, u8)> {
+    let direct: HashMap<&str, u8> = routers.iter().filter(|r| r.direct)
+        .map(|r| (r.id.as_str(), if r.router_type == RouterType::V3 { 6 } else { 7 }))
+        .collect();
+    if direct.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(Address, u8)> = cache.v3_by_address.iter()
+        .filter_map(|e| Some((*e.key(), *direct.get(e.router_id.as_str())?)))
+        .collect();
+    out.extend(cache.by_address.iter().filter_map(|e| {
+        let venue = e.router_id.split("::").next()?;
+        Some((*e.key(), *direct.get(venue)?))
+    }));
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -520,5 +613,30 @@ mod tests {
     fn signer_gas_low_threshold() {
         assert!(signer_gas_low(U256::from(4_000_000_000_000_000u64), 0.005));
         assert!(!signer_gas_low(U256::from(6_000_000_000_000_000u64), 0.005));
+    }
+
+    #[test]
+    fn direct_pools_lists_only_direct_venues_with_their_type() {
+        use crate::pool_cache::{PoolInfo, V3PoolState};
+        let cache = PoolCache::new();
+        let v3 = |rid: &str| V3PoolState {
+            token0: Address::repeat_byte(1), token1: Address::repeat_byte(2), fee: 50, swap_fee: 300,
+            sqrt_price_x96: U256::from(1u64) << 96, liquidity: 1, tick: 0, router_id: rid.into(),
+            last_updated: std::time::Instant::now(), vr0: U256::ZERO, vr1: U256::ZERO, fee_num_v3: U256::ZERO,
+        };
+        cache.insert_v3(Address::repeat_byte(0xa), v3("aero-cl"));
+        cache.insert_v3(Address::repeat_byte(0xb), v3("uni-v3"));
+        cache.insert(Address::repeat_byte(0xc), PoolInfo {
+            token0: Address::repeat_byte(1), token1: Address::repeat_byte(2), reserve0: U256::from(1u64),
+            reserve1: U256::from(1u64), fee_bps: 5, router_id: "aero-v2::stable".into(), is_stable: true,
+            decimals0: 6, decimals1: 6, last_sync: std::time::Instant::now(), fee_num: U256::ZERO,
+        });
+        let r = |y: &str| -> RouterConfig { serde_yaml::from_str(y).unwrap() };
+        let routers = vec![
+            r("{id: aero-cl, name: a, address: '0x0000000000000000000000000000000000000001', type: v3, direct: true}"),
+            r("{id: aero-v2, name: b, address: '0x0000000000000000000000000000000000000002', type: aerodrome, direct: true}"),
+            r("{id: uni-v3, name: c, address: '0x0000000000000000000000000000000000000003', type: v3}"),
+        ];
+        assert_eq!(direct_pools(&routers, &cache), vec![(Address::repeat_byte(0xa), 6), (Address::repeat_byte(0xc), 7)]);
     }
 }

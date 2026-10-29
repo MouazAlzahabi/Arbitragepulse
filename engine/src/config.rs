@@ -43,6 +43,13 @@ pub struct ChainConfig {
     /// primary feed, with a warning) when `preconf_ws_rpc` is unset.
     #[serde(default)]
     pub preconf_only_tokens: Vec<String>,
+    /// Trade with the start amount borrowed from the Uniswap V4 PoolManager and repaid in the
+    /// same transaction (executor *Borrowed entry points: no fee, no interest). Trades no
+    /// longer need the contract's own balance: the balance guards and "unfunded" warnings
+    /// are off and dry-run needs no assumed balance. Needs an executor deployed with the
+    /// PoolManager (contract v4).
+    #[serde(default)]
+    pub borrow: bool,
     /// Total Multicall3 chunks in flight on the quote endpoint per chain, shared by all
     /// batches joined concurrently (Phase 1.5/1.5b/1.5c, prefetch, triangular verify).
     /// Free Alchemy plan (330 CU/s): use 3. Growth plan (3000 CU/s): use 10–12.
@@ -199,6 +206,22 @@ pub struct RouterConfig {
     /// router as type 5.
     #[serde(default)]
     pub slipstream: bool,
+    /// Trade on this venue's pools directly instead of through `address` (executor router
+    /// types 6 DirectCL for `type: "v3"`, 7 DirectPair for `"v2"` / `"aerodrome"`). Every
+    /// pool the engine uses must then be allowlisted on the executor (setRouters); the
+    /// startup check lists the missing ones. `address` only identifies the venue.
+    #[serde(default)]
+    pub direct: bool,
+    /// Aero V2 (with `type: "aerodrome"` and `direct: true`): volatile pools come from
+    /// `factory_address` and stable pools from this factory, both via `getPool(a, b)`; each
+    /// pool's fee is its factory fee module's `customFee(pool)` (0 = the factory default,
+    /// `fee_bps` / `stable_fee_bps`).
+    #[serde(default)]
+    pub stable_factory_address: Option<String>,
+    /// `quoter_address` is Aero's Metaquoter — `quoteExactInput(address[] pools, tokenIn,
+    /// amountIn)` — instead of a QuoterV2 (needed for Aero CL pools, `slipstream: true`).
+    #[serde(default)]
+    pub metaquoter: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -346,6 +369,15 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
         if r.slipstream && r.fee_tiers.iter().any(|&t| t == 0 || t > 16_384) {
             return Err(anyhow!("router '{}': Slipstream fee_tiers are tick spacings, 1..=16384", r.id));
         }
+        if r.metaquoter && !(r.router_type == RouterType::V3 && r.quoter_address.is_some()) {
+            return Err(anyhow!("router '{}': metaquoter: true needs type \"v3\" and quoter_address (Aero Metaquoter)", r.id));
+        }
+        if r.stable_factory_address.is_some() && !(r.router_type == RouterType::Aerodrome && r.direct && r.factory_address.is_some()) {
+            return Err(anyhow!(
+                "router '{}': stable_factory_address (Aero V2) needs type \"aerodrome\", direct: true and factory_address (the volatile factory)",
+                r.id
+            ));
+        }
         if let Some(f) = r.fee_tiers.iter().find(|&&f| f == 0 || f >= 1_000_000) {
             return Err(anyhow!(
                 "router '{}': fee tier {} is out of range — V3 fee tiers are 1..=999999 (hundredths of a bip: 100, 500, 3000, 10000)",
@@ -424,6 +456,8 @@ pub struct Tuning {
     pub gas_limit_2hop: u64,
     /// Gas limit for a triangular (3-hop) arb tx.
     pub gas_limit_triangular: u64,
+    /// Extra gas for a borrowed trade (V4 unlock / take / sync / settle + repay transfer).
+    pub gas_borrow_extra: u64,
     /// On-chain `minProfit` as bps of the gas-cost floor (6076 = 60.76%). The contract
     /// reverts `NotProfitable` unless final balance ≥ starting balance + minProfit; < 10000 leaves room for
     /// same-block drift, with the off-chain net-profit check as the economic guard.
@@ -560,6 +594,7 @@ impl Default for Tuning {
         Self {
             gas_limit_2hop: 700_000,
             gas_limit_triangular: 900_000,
+            gas_borrow_extra: 120_000,
             onchain_min_profit_bps: 6076, // = the former 98% slack × 62% multiplier
             gas_fallback_margin_bps: 2_500,
             gas_fallback_max_age_ms: 120_000,

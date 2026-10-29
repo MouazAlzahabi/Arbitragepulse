@@ -134,8 +134,40 @@ sol! {
             uint256 deadline
         ) external;
 
-        /// Allow a router with its type (0 = V2, 1 = V3, 4 = Aerodrome); the only way to allow one.
+        /// Same trades with amountIn borrowed from the Uniswap V4 PoolManager and repaid in
+        /// the same tx (contract v4; no fee, no interest).
+        function executeArbitrageBorrowed(
+            address tokenIn,
+            address tokenOut,
+            uint256 amountIn,
+            address routerA,
+            address routerB,
+            uint24 feeA,
+            uint24 feeB,
+            uint256 minProfit,
+            uint256 deadline
+        ) external;
+
+        function executeTriangularArbitrageBorrowed(
+            address tokenA,
+            address tokenB,
+            address tokenC,
+            uint256 amountIn,
+            address routerAB,
+            address routerBC,
+            address routerCA,
+            uint24 feeAB,
+            uint24 feeBC,
+            uint24 feeCA,
+            uint256 minProfit,
+            uint256 deadline
+        ) external;
+
+        /// Allow a router with its type (0 = V2, 1 = V3, 4 = Aerodrome, 5 = Slipstream,
+        /// 6 = DirectCL pool, 7 = DirectPair pool); the only way to allow one.
         function setRouter(address router, uint8 rtype) external;
+        function setRouters(address[] routers, uint8 rtype) external;
+        function poolManager() external view returns (address);
         function revokeRouter(address router) external;
         function allowedRouters(address router) external view returns (bool);
         function routerType(address router) external view returns (uint8);
@@ -232,6 +264,25 @@ sol! {
         function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
         /// Effective fee of `pool` in bps (/10_000): custom per-pool fee, else stableFee/volatileFee.
         function getFee(address pool, bool _stable) external view returns (uint256);
+    }
+
+    /// Aero V2 (post Aerodrome+Velodrome merger): one factory per pool type.
+    #[sol(rpc)]
+    interface IAeroV2Factory {
+        function getPool(address tokenA, address tokenB) external view returns (address pool);
+        function feeModule() external view returns (address);
+    }
+
+    /// Aero V2 fee module: a pool's custom fee in bps; 0 = the factory default.
+    #[sol(rpc)]
+    interface IAeroFeeModule {
+        function customFee(address pool) external view returns (uint256);
+    }
+
+    /// Aero Metaquoter: quote a path of Aero pools. Returns amountOut first (then per-pool
+    /// price/tick data), like QuoterV2.
+    interface IAeroMetaquoter {
+        function quoteExactInput(address[] pools, address tokenIn, uint256 amountIn) external returns (uint256 amountOut);
     }
 
     #[sol(rpc)]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::abi::{IAeroV2Factory, IAeroFeeModule};
 
 // ─── Pool discovery (startup) ─────────────────────────────────────────────────
 
@@ -45,7 +46,8 @@ pub(crate) async fn discover_pools<P: Provider>(
     // ── Collect V2 and Aerodrome routers ──────────────────────────────────────
     // configured_factory: pre-parsed from config.factory_address — avoids the on-chain
     // factory() call for routers that don't expose it (e.g. Aerodrome uses defaultFactory()).
-    struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32, stable_fee_bps: u32, configured_factory: Option<Address> }
+    // aero_stable: Aero V2 — the stable-pool factory (volatile pools come from the main one).
+    struct RouterMeta { id: String, addr: Address, rtype: RouterType, fee_bps: u32, stable_fee_bps: u32, configured_factory: Option<Address>, aero_stable: Option<Address> }
     let target_routers: Vec<RouterMeta> = routers
         .iter()
         .filter(|r| r.router_type == RouterType::V2 || r.router_type == RouterType::Aerodrome)
@@ -53,7 +55,8 @@ pub(crate) async fn discover_pools<P: Provider>(
             let addr: Address = r.address.parse().ok()?;
             let stable_fee_bps = r.stable_fee_bps.unwrap_or(r.fee_bps);
             let configured_factory = r.factory_address.as_deref().and_then(|s| s.parse::<Address>().ok());
-            Some(RouterMeta { id: r.id.clone(), addr, rtype: r.router_type.clone(), fee_bps: r.fee_bps, stable_fee_bps, configured_factory })
+            let aero_stable = r.stable_factory_address.as_deref().and_then(|s| s.parse::<Address>().ok());
+            Some(RouterMeta { id: r.id.clone(), addr, rtype: r.router_type.clone(), fee_bps: r.fee_bps, stable_fee_bps, configured_factory, aero_stable })
         })
         .collect();
 
@@ -82,6 +85,20 @@ pub(crate) async fn discover_pools<P: Provider>(
         })
         .collect();
 
+    // Aero V2: each factory's fee module (per-pool custom fees live there).
+    let aero_factories: Vec<Address> = target_routers.iter().enumerate()
+        .filter_map(|(ri, r)| Some([factories[ri]?, r.aero_stable?]))
+        .flatten()
+        .collect();
+    let (module_raw, l) = discover_mc(
+        aero_factories.iter().map(|f| (*f, IAeroV2Factory::feeModuleCall {}.abi_encode())).collect(),
+        provider,
+    ).await;
+    lost += l;
+    let fee_modules: std::collections::HashMap<Address, Address> = aero_factories.iter().zip(module_raw)
+        .filter_map(|(f, r)| Some((*f, IAeroV2Factory::feeModuleCall::abi_decode_returns(&r?).ok()?)))
+        .collect();
+
     // ── Round 2: getPair per (router × pair) ─────────────────────────────────
     // Aerodrome routers produce TWO calls per pair: volatile (stable:false) and
     // stable (stable:true). Both pools are discovered and cached independently.
@@ -98,6 +115,14 @@ pub(crate) async fn discover_pools<P: Provider>(
                     let cd = IUniswapV2Factory::getPairCall { tokenA: ta, tokenB: tb }.abi_encode();
                     pair_calls.push((factory, cd));
                     pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps: rm.fee_bps, factory, ta, tb, dec_ta, dec_tb, is_stable: false });
+                }
+                RouterType::Aerodrome if rm.aero_stable.is_some() => {
+                    // Aero V2: getPool(a, b) on the volatile and on the stable factory.
+                    let stable_factory = rm.aero_stable.unwrap_or(factory);
+                    for (f, is_stable, fee_bps) in [(factory, false, rm.fee_bps), (stable_factory, true, rm.stable_fee_bps)] {
+                        pair_calls.push((f, IAeroV2Factory::getPoolCall { tokenA: ta, tokenB: tb }.abi_encode()));
+                        pair_metas.push(PairMeta { router_id: rm.id.clone(), rtype: rm.rtype.clone(), fee_bps, factory: f, ta, tb, dec_ta, dec_tb, is_stable });
+                    }
                 }
                 RouterType::Aerodrome => {
                     // Aerodrome uses getPool() not getPair() — different 4-byte selector
@@ -122,7 +147,7 @@ pub(crate) async fn discover_pools<P: Provider>(
     // contract from stable=false, so `seen` naturally allows both.
     // rv_idx: index of this pool's token0 call in rv_calls; getReserves follows, then getFee
     // for Aerodrome pools (so the per-pool fee costs no extra round trip).
-    struct PoolMeta { pool: Address, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, dec_ta: u8, dec_tb: u8, is_stable: bool, rv_idx: usize }
+    struct PoolMeta { pool: Address, aero_fee: bool, router_id: String, rtype: RouterType, fee_bps: u32, ta: Address, tb: Address, dec_ta: u8, dec_tb: u8, is_stable: bool, rv_idx: usize }
     let mut rv_calls: Vec<(Address, Vec<u8>)> = Vec::new();
     let mut pool_metas: Vec<PoolMeta> = Vec::new();
     let mut seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
@@ -133,11 +158,14 @@ pub(crate) async fn discover_pools<P: Provider>(
         let rv_idx = rv_calls.len();
         rv_calls.push((pool, IUniswapV2Pair::token0Call {}.abi_encode()));
         rv_calls.push((pool, IUniswapV2Pair::getReservesCall {}.abi_encode()));
-        if pm.rtype == RouterType::Aerodrome {
+        if let Some(module) = fee_modules.get(&pm.factory) {
+            rv_calls.push((*module, IAeroFeeModule::customFeeCall { pool }.abi_encode()));
+        } else if pm.rtype == RouterType::Aerodrome {
             rv_calls.push((pm.factory, IAerodromeFactory::getFeeCall { pool, _stable: pm.is_stable }.abi_encode()));
         }
         pool_metas.push(PoolMeta {
             pool,
+            aero_fee: fee_modules.contains_key(&pm.factory),
             router_id: pm.router_id.clone(),
             rtype: pm.rtype.clone(),
             fee_bps: pm.fee_bps,
@@ -158,7 +186,9 @@ pub(crate) async fn discover_pools<P: Provider>(
     for pm in pool_metas.iter() {
         let t0_raw  = match rv_raw.get(pm.rv_idx)     { Some(Some(r)) => r, _ => continue };
         let res_raw = match rv_raw.get(pm.rv_idx + 1) { Some(Some(r)) => r, _ => continue };
-        let fee_bps = if pm.rtype == RouterType::Aerodrome {
+        let fee_bps = if pm.aero_fee {
+            aero_custom_fee_bps(rv_raw.get(pm.rv_idx + 2).and_then(|r| r.as_deref()), pm.fee_bps)
+        } else if pm.rtype == RouterType::Aerodrome {
             aerodrome_fee_bps(rv_raw.get(pm.rv_idx + 2).and_then(|r| r.as_deref()), pm.fee_bps)
         } else {
             pm.fee_bps
@@ -205,6 +235,18 @@ pub(crate) async fn discover_pools<P: Provider>(
 
 /// Per-pool Aerodrome fee from a factory.getFee(pool, stable) return, else the configured
 /// fallback (call failed / undecodable / not a sane bps value).
+/// Aero V2 `customFee(pool)`: 0 = the factory default (`default_bps`), 420 = a zero fee
+/// (Velodrome's ZERO_FEE_INDICATOR), else bps. Unreadable → the default.
+pub(crate) fn aero_custom_fee_bps(raw: Option<&[u8]>, default_bps: u32) -> u32 {
+    use alloy::sol_types::SolCall;
+    match raw.and_then(|r| IAeroFeeModule::customFeeCall::abi_decode_returns(r).ok()).and_then(|f| u32::try_from(f).ok()) {
+        Some(0) | None => default_bps,
+        Some(420) => 0,
+        Some(f) if f < 10_000 => f,
+        Some(_) => default_bps,
+    }
+}
+
 pub(crate) fn aerodrome_fee_bps(raw: Option<&[u8]>, fallback_bps: u32) -> u32 {
     use alloy::sol_types::SolCall;
     raw.and_then(|r| IAerodromeFactory::getFeeCall::abi_decode_returns(r).ok())
@@ -539,6 +581,16 @@ mod tests {
     use super::*;
     use alloy::primitives::U256;
     use alloy::sol_types::SolValue;
+
+    #[test]
+    fn aero_custom_fee_falls_back_and_reads_zero_indicator() {
+        let w = |v: u64| U256::from(v).abi_encode();
+        assert_eq!(aero_custom_fee_bps(Some(&w(0)), 30), 30, "0 = factory default");
+        assert_eq!(aero_custom_fee_bps(Some(&w(420)), 30), 0, "ZERO_FEE_INDICATOR");
+        assert_eq!(aero_custom_fee_bps(Some(&w(100)), 30), 100);
+        assert_eq!(aero_custom_fee_bps(Some(&w(20_000)), 5), 5, "out of range");
+        assert_eq!(aero_custom_fee_bps(None, 5), 5, "unreadable");
+    }
 
     fn pair(tin: &str, tout: &str, dout: u8) -> PairConfig {
         PairConfig {

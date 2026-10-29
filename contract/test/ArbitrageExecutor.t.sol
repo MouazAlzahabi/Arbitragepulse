@@ -50,7 +50,7 @@ contract ArbitrageExecutorTest is Test {
         attacker = makeAddr("attacker");
         deadline = block.timestamp + 300;
 
-        executor = new ArbitrageExecutor();
+        executor = new ArbitrageExecutor(address(0));
         tokenA = new MockERC20("Token A", "TKA", 10_000_000 ether);
         tokenB = new MockERC20("Token B", "TKB", 10_000_000 ether);
         tokenC = new MockERC20("Token C", "TKC", 10_000_000 ether);

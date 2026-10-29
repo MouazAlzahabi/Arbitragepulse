@@ -266,6 +266,8 @@ pub struct PoolCache {
     /// Recomputed from cached state by [`PoolCache::recompute_shallow`]; they stay
     /// subscribed, so a pool that fills is quoted again after the next recompute.
     shallow: Arc<dashmap::DashSet<Address>>,
+    /// Pools of direct venues the executor does not allowlist (live mode): never quoted.
+    disabled: Arc<dashmap::DashSet<Address>>,
 }
 
 impl Default for PoolCache {
@@ -281,6 +283,7 @@ impl Default for PoolCache {
             last_log_ms: Arc::new(AtomicU64::new(u64::MAX)),
             created: Instant::now(),
             shallow: Arc::new(dashmap::DashSet::new()),
+            disabled: Arc::new(dashmap::DashSet::new()),
         }
     }
 }
@@ -333,9 +336,16 @@ impl PoolCache {
         true
     }
 
-    /// True when the pool is below `tuning.min_pool_depth_usd` (see `recompute_shallow`).
-    pub fn is_shallow(&self, pool: Address) -> bool {
-        !self.shallow.is_empty() && self.shallow.contains(&pool)
+    /// True when local quotes must skip the pool: below `tuning.min_pool_depth_usd` (see
+    /// `recompute_shallow`) or disabled (`disable_pool`).
+    pub fn is_skipped(&self, pool: Address) -> bool {
+        (!self.shallow.is_empty() && self.shallow.contains(&pool))
+            || (!self.disabled.is_empty() && self.disabled.contains(&pool))
+    }
+
+    /// Never quote this pool again (e.g. a direct-venue pool the executor doesn't allow).
+    pub fn disable_pool(&self, pool: Address) {
+        self.disabled.insert(pool);
     }
 
     /// Recompute the shallow-pool set from cached state. `known` holds USD per whole token
@@ -451,7 +461,7 @@ impl PoolCache {
     /// Routes to xy=k or x³y+xy³=k formula based on `PoolInfo.is_stable`.
     /// Returns None if pool not cached or reserves are zero.
     pub fn get_amount_out(&self, pool: Address, token_in: Address, amount_in: U256) -> Option<U256> {
-        if self.is_shallow(pool) { return None; }
+        if self.is_skipped(pool) { return None; }
         let info = self.by_address.get(&pool)?;
         compute_amount_out(&info, token_in, amount_in)
     }
@@ -473,7 +483,7 @@ impl PoolCache {
         let key = V2PoolKey::new(router_id, token_in, token_out);
         let pool = *self.by_key.get(&key)?;
         if let Some(age) = max_age {
-            if self.is_shallow(pool) { return None; }
+            if self.is_skipped(pool) { return None; }
             let info = self.by_address.get(&pool)?;
             if info.last_sync.elapsed() > age && !self.feed_live() {
                 return None; // stale — caller skips this DEX for this scan
@@ -498,7 +508,7 @@ impl PoolCache {
     ) -> Option<U256> {
         let pool = *self.by_key.get(key)?;
         if let Some(age) = max_age {
-            if self.is_shallow(pool) { return None; }
+            if self.is_skipped(pool) { return None; }
             let info = self.by_address.get(&pool)?;
             if info.last_sync.elapsed() > age && !self.feed_live() {
                 return None;
@@ -640,7 +650,7 @@ impl PoolCache {
         amount_in: U256,
     ) -> Option<(U256, u128, U256)> {
         let pool_addr = *self.v3_by_key.get(key)?;
-        if self.is_shallow(pool_addr) { return None; }
+        if self.is_skipped(pool_addr) { return None; }
 
         let state = self.v3_by_address.get(&pool_addr)?;
 
@@ -684,7 +694,7 @@ impl PoolCache {
         amount_in: U256,
     ) -> Option<U256> {
         let pool_addr = *self.v3_by_key.get(key)?;
-        if self.is_shallow(pool_addr) { return None; }
+        if self.is_skipped(pool_addr) { return None; }
         let state = self.v3_by_address.get(&pool_addr)?;
         let (vr_in, vr_out) = if token_in == state.token0 {
             (state.vr0, state.vr1)
@@ -922,8 +932,8 @@ mod tests {
             [(usdc, 6), (weth, 18), (vvv, 18), (mystery, 18), (other, 18)].into_iter().collect();
 
         assert_eq!(cache.recompute_shallow(&known, &decimals, 20_000.0), (1, 4));
-        assert!(cache.is_shallow(dust_vvv));
-        assert!(!cache.is_shallow(deep_vvv) && !cache.is_shallow(mystery_pool));
+        assert!(cache.is_skipped(dust_vvv));
+        assert!(!cache.is_skipped(deep_vvv) && !cache.is_skipped(mystery_pool));
         assert_eq!(cache.get_amount_out(dust_vvv, weth, U256::from(e18 / 10_000)), None);
         assert!(cache.get_amount_out(deep_vvv, weth, U256::from(e18)).is_some());
 

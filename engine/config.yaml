@@ -20,7 +20,10 @@ chain:
   native_currency: "ETH"
   wrapped_native: "0x4200000000000000000000000000000000000006"
   block_time_ms: 2000
-  contract_address: "0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2"
+  # Executor v4 (DirectCL / DirectPair pools, V4 borrowing), deployed 2026-10-29,
+  # tx 0x13729247b0bae4496ce308c53999f835da752d16af605282d54418cf31b5686c (block 53246126).
+  # Previous executor (v3, still holds its funds until withdrawn): 0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2
+  contract_address: "0xfbf0267661784B6770F76873F99c4a626fc66e96"
   min_native_balance: 0.005
   # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
   # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
@@ -52,6 +55,9 @@ chain:
     - "wss://mainnet-preconf.base.org"
   # Pools with one of these tokens on either side are watched on preconf_ws_rpc only (keyless),
   # never on ws_rpc (Alchemy bills each log event). Core-token pools stay on both feeds.
+  # Borrow each trade's amountIn from the Uniswap V4 PoolManager and repay it in the same tx
+  # (no fee, no interest; executor v4). Off until contract v4 is deployed and configured.
+  borrow: false
   preconf_only_tokens:
     - "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf"  # VVV
     - "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee"  # AERO (new)
@@ -131,6 +137,59 @@ routers:
     fee_bps: 5
     quoter_address: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"  # PancakeSwap QuoterV2
     factory_address: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"  # PancakeV3Factory
+
+  # ── Added 2026-10-29 (Stage 2). Aerodrome and Velodrome merged into Aero on 2026-10-21;
+  # much of the liquidity moved to Aero's own factories. ──
+
+  # Aerodrome Slipstream 3 (second official CL factory): same router ABI as Slipstream.
+  #   executor.setRouter(0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F, 5)
+  - id: "aerodrome-slipstream3-base"
+    name: "Aerodrome Slipstream 3 (Base)"
+    address: "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"   # Slipstream 3 SwapRouter
+    type: "v3"
+    slipstream: true
+    fee_tiers: [1, 10, 50, 80, 100, 150, 200, 500, 2000]     # factory.tickSpacings()
+    fee_bps: 0
+    quoter_address: "0x514c8B5f54112481E28028F1166Bd78501089259"
+    factory_address: "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"
+
+  # Uniswap V2: deepest VIRTUAL venue, $1M USDC/WETH.
+  #   executor.setRouter(0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24, 0)
+  - id: "uniswap-v2-base"
+    name: "Uniswap V2 (Base)"
+    address: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"   # UniswapV2Router02
+    type: "v2"
+    fee_bps: 30
+    factory_address: "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
+
+  # Aero CL (Slipstream-style pools: 6-field slot0, dynamic fee()). Traded on the pools
+  # directly (executor type 6, DirectCL): allowlist the pools the startup log lists with
+  # executor.setRouters([...], 6). Quoted through the Aero Metaquoter. `address` is the
+  # Aero Metarouter, an identifier only.
+  - id: "aero-cl-base"
+    name: "Aero CL (Base)"
+    address: "0x0fEf9e88A7b76BCDBF451780C6774FE32965Ee98"
+    type: "v3"
+    slipstream: true
+    direct: true
+    metaquoter: true
+    fee_tiers: [1, 10, 50, 100, 150, 200, 250]              # factory.tickSpacings()
+    fee_bps: 0
+    quoter_address: "0x1dDfeC5058180C207F55BB77D95AcDd0d8227868"   # Aero Metaquoter
+    factory_address: "0x9CB220581b91b0C83223012FE69688b92aD07a76"
+
+  # Aero V2 (Solidly pools; separate volatile / stable factories, fees from each factory's
+  # fee module). Traded on the pools directly (executor type 7, DirectPair: the pool's own
+  # getAmountOut): allowlist the listed pools with executor.setRouters([...], 7).
+  - id: "aero-v2-base"
+    name: "Aero V2 (Base)"
+    address: "0x8E6a9FCd1d638CC760Ffba397605Fe3355dE76D2"   # volatile factory (identifier)
+    type: "aerodrome"
+    direct: true
+    fee_bps: 30                                               # factory defaultFee()
+    stable_fee_bps: 5
+    factory_address: "0x8E6a9FCd1d638CC760Ffba397605Fe3355dE76D2"
+    stable_factory_address: "0x78589E876edcEbdce72ee3436ab3c9AD3a7cEF2D"
 
   # baseswap-v2 disabled: $29K USDC/WETH TVL → 0.8% price impact on $90 → confirmed reverts
   # - id: "baseswap-v2"

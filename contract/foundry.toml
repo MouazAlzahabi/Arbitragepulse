@@ -2,7 +2,9 @@
 src = "src"
 out = "out"
 libs = ["lib"]
-solc_version = "0.8.20"
+solc_version = "0.8.24"
+# Cancun: Base runs it, and the Uniswap V4 PoolManager (borrowing) uses transient storage.
+evm_version = "cancun"
 optimizer = true
 optimizer_runs = 1000
 via_ir = true
