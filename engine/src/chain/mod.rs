@@ -28,6 +28,7 @@ pub mod scan;
 pub mod state;
 pub mod discover;
 pub mod pending;
+pub mod maintain;
 
 /// Cooldown after a dry-run failure or balance-guard skip (cheap check, no RPC spent).
 pub(crate) fn cooldown_secs() -> u64 { crate::config::tuning().cooldown_secs }
@@ -230,6 +231,7 @@ pub async fn run_chain(
     if preconf_http.is_some() {
         strategy.write().await.quote_block = alloy::eips::BlockId::pending();
     }
+    maintain::spawn_depth_refresh(strategy.clone(), pool_cache.clone(), chain_pairs.clone(), cfg.name.clone());
 
     // ── Contract balance cache ─────────────────────────────────────────────────
     // Caches the ArbitrageExecutor's token_in balances. Refreshed every 30s and

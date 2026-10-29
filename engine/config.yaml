@@ -369,6 +369,12 @@ tuning:
   quoter_haircut_dbps: 5
   p15_gate_spread: 0.00005               # local spread that triggers QuoterV2 verification
   min_v3_liquidity: 1000000000
+  # Pools under this USD depth (both sides; V3 = in-range virtual reserves) are skipped by
+  # every local quote until they fill — they stay subscribed. Recomputed from the cache
+  # (no RPC) every pool_depth_refresh_ms. Tokens are priced via their deepest pool; a pool
+  # with no priced token is never skipped. 0 = off. (Lowering it: GitHub issue.)
+  min_pool_depth_usd: 20000
+  pool_depth_refresh_ms: 5000
   v3_spot_max_vr_fraction_bps: 200
   v3_spot_overestimate_bps: 30           # per V3 leg, optimistic mode only
   phantom_cap_bps: 500                   # profit > 5% of input = phantom quote
