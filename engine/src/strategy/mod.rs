@@ -889,6 +889,11 @@ pub struct QuoteGate {
     ok: std::sync::atomic::AtomicU64,
     timeout: std::sync::atomic::AtomicU64,
     err: std::sync::atomic::AtomicU64,
+    /// Chunks the endpoint rate-limited (429), counted once each even when the retry answers.
+    limited: std::sync::atomic::AtomicU64,
+    /// Until when new chunks wait after a rate limit (ms since `created`; 0 = not limited).
+    limited_until_ms: std::sync::atomic::AtomicU64,
+    created: std::time::Instant,
 }
 
 impl QuoteGate {
@@ -900,18 +905,47 @@ impl QuoteGate {
             ok: Default::default(),
             timeout: Default::default(),
             err: Default::default(),
+            limited: Default::default(),
+            limited_until_ms: Default::default(),
+            created: std::time::Instant::now(),
         }
     }
 
-    /// `ok/timeout/err` chunk counts since the last call (heartbeat `qmc=`), then reset.
-    /// ok = the node answered (incl. a reverted aggregate); err = transport/RPC error.
+    /// `ok/timeout/err/limited` chunk counts since the last call (heartbeat `qmc=`), then
+    /// reset. ok = the node answered (incl. a reverted aggregate); err = transport/RPC error;
+    /// limited = chunks that got a rate limit first (also counted ok or err by their retry).
     pub fn take_summary(&self) -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "{}/{}/{}",
+            "{}/{}/{}/{}",
             self.ok.swap(0, Relaxed), self.timeout.swap(0, Relaxed), self.err.swap(0, Relaxed),
+            self.limited.swap(0, Relaxed),
         )
     }
+
+    fn now_ms(&self) -> u64 { self.created.elapsed().as_millis() as u64 }
+
+    /// The endpoint rate-limited a chunk: hold new chunks for `quote_rate_limit_backoff_ms`.
+    fn mark_limited(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.limited.fetch_add(1, Relaxed);
+        let until = self.now_ms() + crate::config::tuning().quote_rate_limit_backoff_ms;
+        self.limited_until_ms.fetch_max(until, Relaxed);
+    }
+
+    /// Wait out a rate-limit hold, if one is active.
+    async fn wait_if_limited(&self) {
+        let until = self.limited_until_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let now = self.now_ms();
+        if until > now {
+            tokio::time::sleep(std::time::Duration::from_millis(until - now)).await;
+        }
+    }
+}
+
+/// True for a transport error that is the endpoint's rate limit (HTTP 429, "request limit").
+fn is_rate_limited(err: &alloy::transports::TransportError) -> bool {
+    crate::util::classify_rpc_failure(&err.to_string()) == crate::util::RpcFailure::RateLimited
 }
 
 /// Batch all calls into a single `eth_call` to Multicall3.
@@ -978,7 +1012,20 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
             use std::sync::atomic::Ordering::Relaxed;
             // Permit first: queueing behind other batches must not eat the chunk's timeout.
             let _permit = gate.permits.acquire().await;
-            let res = tokio::time::timeout(multicall_chunk_timeout(), p.call(tx).block(block)).await
+            gate.wait_if_limited().await;
+            // A rate-limited chunk holds the gate and is retried once: firing more chunks at an
+            // endpoint that is refusing would only lose them too.
+            let call = async {
+                match p.call(tx.clone()).block(block).await {
+                    Err(e) if is_rate_limited(&e) => {
+                        gate.mark_limited();
+                        gate.wait_if_limited().await;
+                        p.call(tx).block(block).await
+                    }
+                    r => r,
+                }
+            };
+            let res = tokio::time::timeout(multicall_chunk_timeout(), call).await
                 .map(|r| r.map_err(|e| {
                     let revert = multicall_error_is_revert(&e);
                     if !revert {
@@ -1162,11 +1209,13 @@ mod multicall_tests {
         (0..n).map(|i| (Address::repeat_byte(i + 1), vec![0u8; 4])).collect()
     }
 
-    /// A rate-limited multicall is one request: the chunk is failed, not replayed per call.
-    #[tokio::test]
+    /// A rate-limited multicall is retried once (after the gate's hold), then failed — never
+    /// replayed per call.
+    #[tokio::test(start_paused = true)]
     async fn rpc_error_does_not_replay_chunk() {
         let asserter = Asserter::new();
-        asserter.push_failure(err(-32011, "request limit reached"));
+        asserter.push_failure(err(-32011, "1/second request limit reached"));
+        asserter.push_failure(err(-32011, "1/second request limit reached"));
         // Sentinels: any sequential replay would consume these.
         for _ in 0..3 {
             asserter.push_failure(err(3, "execution reverted"));
@@ -1176,8 +1225,25 @@ mod multicall_tests {
         let out = run_multicall(&provider, calls(3), &gate, BlockId::latest()).await;
         assert_eq!(out, vec![None; 3]);
         assert_eq!(asserter.read_q().len(), 3);
-        assert_eq!(gate.take_summary(), "0/0/1");
-        assert_eq!(gate.take_summary(), "0/0/0");
+        assert_eq!(gate.take_summary(), "0/0/1/1");
+        assert_eq!(gate.take_summary(), "0/0/0/0");
+    }
+
+    /// A rate limit that clears: the retry answers and the chunk counts ok (and limited).
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_chunk_retry_answers() {
+        let results: Vec<IMulticall3::McResult> = (0..2)
+            .map(|_| IMulticall3::McResult { success: true, returnData: vec![9u8; 32].into() })
+            .collect();
+        let asserter = Asserter::new();
+        asserter.push_failure(err(-32011, "1/second request limit reached"));
+        asserter.push_success(&alloy::primitives::Bytes::from(IMulticall3::aggregate3Call::abi_encode_returns(&results)));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let gate = QuoteGate::new(1);
+        let out = run_multicall_answered(&provider, calls(2), &gate, BlockId::latest()).await;
+        assert!(out.iter().all(|(r, a)| r.is_some() && *a));
+        assert!(asserter.read_q().is_empty());
+        assert_eq!(gate.take_summary(), "1/0/0/1");
     }
 
     /// A reverted aggregate (e.g. out of gas) still falls back to per-call eth_calls.
@@ -1194,12 +1260,12 @@ mod multicall_tests {
         assert_eq!(out, vec![None; 3]);
         assert_eq!(asserter.read_q().len(), 0);
         // The node answered the aggregate (with a revert); fallback calls aren't chunks.
-        assert_eq!(gate.take_summary(), "1/0/0");
+        assert_eq!(gate.take_summary(), "1/0/0/0");
     }
 
     /// Two chunks, the second rate-limited: only the first chunk's calls are answered, so a
     /// caller never caches the second chunk's `None`s as real reverts.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failed_chunk_calls_are_not_answered() {
         let n = multicall_chunk_size() + 1;
         let results: Vec<IMulticall3::McResult> = (0..multicall_chunk_size())
@@ -1208,6 +1274,7 @@ mod multicall_tests {
         let ret = IMulticall3::aggregate3Call::abi_encode_returns(&results);
         let asserter = Asserter::new();
         asserter.push_success(&alloy::primitives::Bytes::from(ret));
+        asserter.push_failure(err(-32011, "request limit reached"));
         asserter.push_failure(err(-32011, "request limit reached"));
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let gate = QuoteGate::new(1);
@@ -1219,7 +1286,7 @@ mod multicall_tests {
         // Chunk 2: failed in transport — not answered.
         assert_eq!(out[n - 1], (None, false));
         assert!(asserter.read_q().is_empty());
-        assert_eq!(gate.take_summary(), "1/0/1");
+        assert_eq!(gate.take_summary(), "1/0/1/1");
     }
 
     #[test]

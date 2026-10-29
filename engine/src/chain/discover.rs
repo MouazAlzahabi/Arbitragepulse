@@ -486,6 +486,10 @@ fn discover_call_timeout() -> std::time::Duration { crate::config::tuning().disc
 /// reverts inside a successful multicall (pool doesn't exist) is an answer, not retried.
 const DISCOVER_ATTEMPTS: u32 = 3;
 
+/// Waits (1, 2, 4, 8, 16 s) a chunk may spend on rate-limit responses before they count
+/// as failed attempts.
+const DISCOVER_RATE_LIMIT_WAITS: u32 = 5;
+
 /// Returns one result per call (None = reverted or lost) and how many calls were lost to RPC
 /// failure after retries — the caller warns, since those pools are then silently missing.
 pub(crate) async fn discover_mc<P: Provider>(
@@ -509,7 +513,11 @@ pub(crate) async fn discover_mc<P: Provider>(
     // attempt each, so a dead RPC can't stretch startup to chunks × attempts × timeout.
     let mut attempts = DISCOVER_ATTEMPTS;
 
-    for chunk in calls.chunks(discover_chunk()) {
+    for (ci, chunk) in calls.chunks(discover_chunk()).enumerate() {
+        // Spread the chunks out: a free endpoint caps requests per second.
+        if ci > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(crate::config::tuning().discover_chunk_gap_ms)).await;
+        }
         let mc_calls: Vec<crate::abi::IMulticall3::Call3> = chunk
             .iter()
             .map(|(t, d)| crate::abi::IMulticall3::Call3 {
@@ -525,13 +533,26 @@ pub(crate) async fn discover_mc<P: Provider>(
         // timeout or retryable error response (rate limit). Any other error *response* (node
         // rejected the multicall) skips the retries and goes to the sequential fallback below.
         let mut answered: Option<Result<alloy::primitives::Bytes, ()>> = None;
-        for attempt in 1..=attempts {
+        // A rate-limited endpoint is up, just busy: wait it out with its own, longer budget
+        // (1, 2, 4, 8, 16 s) instead of spending the outage attempts — and counting the
+        // chunk lost — on a 429 that a short pause clears.
+        let mut limited = 0u32;
+        let mut attempt = 1;
+        while attempt <= attempts {
             // Bounded: a hung RPC otherwise blocks startup forever (seen on a cold fork).
             match tokio::time::timeout(discover_call_timeout(), provider.call(tx.clone())).await {
                 Ok(Ok(raw)) => { answered = Some(Ok(raw)); break; }
                 Ok(Err(alloy::transports::RpcError::ErrorResp(p))) if !p.is_retry_err() => {
                     answered = Some(Err(()));
                     break;
+                }
+                Ok(Err(e)) if limited < DISCOVER_RATE_LIMIT_WAITS
+                    && crate::util::classify_rpc_failure(&e.to_string()) == crate::util::RpcFailure::RateLimited =>
+                {
+                    limited += 1;
+                    tracing::debug!("Pool discovery multicall rate limited — waiting {}s", 1u64 << (limited - 1));
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << (limited - 1))).await;
+                    continue;
                 }
                 Ok(Err(e)) => tracing::warn!("Pool discovery multicall failed (attempt {attempt}/{attempts}): {e}"),
                 Err(_) => tracing::warn!("Pool discovery multicall timed out after {:?} (attempt {attempt}/{attempts})",
@@ -540,6 +561,11 @@ pub(crate) async fn discover_mc<P: Provider>(
             if attempt < attempts {
                 tokio::time::sleep(std::time::Duration::from_millis(250 * 3u64.pow(attempt - 1))).await;
             }
+            attempt += 1;
+        }
+        if limited > 0 {
+            tracing::info!("Pool discovery: endpoint rate limited, chunk {} after {} wait(s)",
+                           if answered.is_some() { "answered" } else { "lost" }, limited);
         }
         let Some(answered) = answered else {
             // RPC stuck/failing: skip the sequential fallback (more calls would only stall
@@ -659,8 +685,8 @@ mod tests {
 
     /// A rate-limit error response is a lost call (retried, then counted), not a revert;
     /// a plain error response (revert) is a missing pool, not counted.
-    #[tokio::test]
-    async fn rate_limit_error_response_counts_as_lost() {
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_error_response_counts_as_lost_after_waits() {
         use alloy::transports::mock::Asserter;
         // ErrorPayload (alloy's json-rpc feature isn't enabled, so build it from JSON).
         fn err<T: serde::de::DeserializeOwned>(code: i64, msg: &str) -> T {
@@ -668,12 +694,27 @@ mod tests {
         }
         let calls = vec![(Address::repeat_byte(7), vec![0u8; 4])];
 
+        // A persistent rate limit: the waits (1+2+4+8+16 s) and then the attempts are spent.
         let asserter = Asserter::new();
-        for _ in 0..DISCOVER_ATTEMPTS {
+        for _ in 0..DISCOVER_RATE_LIMIT_WAITS + DISCOVER_ATTEMPTS {
             asserter.push_failure(err(429, "Too Many Requests"));
         }
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let t = tokio::time::Instant::now();
         assert_eq!(discover_mc(calls.clone(), &provider).await, (vec![None], 1));
+        assert!(asserter.read_q().is_empty());
+        assert!(t.elapsed() >= std::time::Duration::from_secs(31));
+
+        // A rate limit that clears after one wait: answered, nothing lost.
+        use alloy::sol_types::SolCall;
+        let ret = crate::abi::IMulticall3::aggregate3Call::abi_encode_returns(&vec![
+            crate::abi::IMulticall3::McResult { success: true, returnData: vec![5u8; 32].into() },
+        ]);
+        let asserter = Asserter::new();
+        asserter.push_failure(err(-32011, "1/second request limit reached"));
+        asserter.push_success(&alloy::primitives::Bytes::from(ret));
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        assert_eq!(discover_mc(calls.clone(), &provider).await, (vec![Some(vec![5u8; 32])], 0));
 
         let asserter = Asserter::new();
         asserter.push_failure(err(3, "execution reverted")); // multicall

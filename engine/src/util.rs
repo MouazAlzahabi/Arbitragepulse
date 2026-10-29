@@ -236,6 +236,8 @@ pub fn classify_rpc_failure(err: &str) -> RpcFailure {
         RpcFailure::Unreachable
     } else if contains_status_429(&e) || e.contains("too many requests")
         || e.contains("compute units") || e.contains("rate limit")
+        // Base's public endpoint: {"code":-32011,"message":"N/second request limit reached"}
+        || e.contains("request limit")
     {
         RpcFailure::RateLimited
     } else {

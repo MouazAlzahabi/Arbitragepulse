@@ -447,11 +447,18 @@ tuning:
   # Re-run pool discovery (on http_rpc, free) this often to pick up pools created after
   # startup; new pools are added and both log feeds resubscribed. 0 = startup only.
   pool_rediscover_ms: 21600000           # 6 h
+  # Background reads (discovery, rediscovery, fee refresh) go to http_rpc, the free endpoint,
+  # which caps requests per second ("N/second request limit reached"): pause between their
+  # multicall chunks, and wait out a rate limit (1-16 s back-off) instead of losing calls.
+  discover_chunk_gap_ms: 100
+  # Quote endpoint rate limited (429 / "request limit"): hold all quote chunks this long and
+  # retry the limited one once. Heartbeat qmc=ok/timeout/err/limited.
+  quote_rate_limit_backoff_ms: 250
   # Swap-fee refresh on the free http_rpc, outside the quote budget. Slipstream fees are
   # dynamic (150 → 698 ppm within 40 blocks seen): re-read fee() for pools that traded,
   # every cl_fee_refresh_ms. Aerodrome V2 fees are admin-set: re-read every v2_fee_refresh_ms.
   # Uniswap V3 / PancakeSwap V3 / Uniswap V2 fees are fixed per pool. 0 = off.
-  cl_fee_refresh_ms: 10000
+  cl_fee_refresh_ms: 30000
   v2_fee_refresh_ms: 3600000             # 1 h
   v3_spot_max_vr_fraction_bps: 200
   v3_spot_overestimate_bps: 30           # per V3 leg, optimistic mode only
