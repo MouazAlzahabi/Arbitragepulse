@@ -921,40 +921,41 @@ pub async fn run_chain(
             // last_scan_at is NOT updated — targeted scans must not suppress the
             // block-triggered full scan or the poll_tick fallback.
             Some(event) = swap_rx.recv() => {
-                let is_large = event.magnitude == SwapMagnitude::Large;
-
-                // Per-pool burst protection — skipped for large swaps
-                if !is_large {
-                    if let Some(&fired_at) = pool_last_scan.get(&event.pool) {
-                        if fired_at.elapsed() < Duration::from_millis(50) {
-                            continue;
-                        }
+                // Swaps that queued while the previous scan ran are merged into this one
+                // scan (only what is already waiting — the first event never waits). Each
+                // queued scan would otherwise run in turn on prices that are by then stale.
+                let mut batch = vec![event];
+                while batch.len() < 256 {
+                    match swap_rx.try_recv() {
+                        Ok(ev) => batch.push(ev),
+                        Err(_) => break,
                     }
                 }
-                pool_last_scan.insert(event.pool, Instant::now());
+                // Per-pool burst protection (50 ms) — skipped for large swaps.
+                batch.retain(|ev| {
+                    ev.magnitude == SwapMagnitude::Large
+                        || !pool_last_scan.get(&ev.pool).is_some_and(|t| t.elapsed() < Duration::from_millis(50))
+                });
+                if batch.is_empty() {
+                    continue;
+                }
+                let now = Instant::now();
+                for ev in &batch {
+                    pool_last_scan.insert(ev.pool, now);
+                }
+                let is_large = batch.iter().any(|ev| ev.magnitude == SwapMagnitude::Large);
+                let merged = batch.len() - 1;
+                let event = batch.iter().find(|ev| ev.magnitude == SwapMagnitude::Large).unwrap_or(&batch[0]).clone();
 
-                // Single strategy read: pool tokens + affected pair indices.
+                // Single strategy read: pool tokens + affected pair indices, merged over the batch.
                 let (pair_mask, token_filter, affected_pair_ids) = {
                     let strat = strategy.read().await;
-                    let (tok_a, tok_b) = match strat.pool_cache.get_pool_tokens(event.pool) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    let indices = strat.pairs_for_tokens(tok_a, tok_b);
-                    if indices.is_empty() {
-                        continue;
-                    }
-                    let ids: Vec<String> = if is_large {
-                        indices.iter().map(|&i| strat.pairs[i].id.clone()).collect()
-                    } else {
-                        vec![]
-                    };
-                    (
-                        indices.into_iter().collect::<HashSet<usize>>(),
-                        vec![tok_a, tok_b],
-                        ids,
-                    )
+                    merge_swap_batch(&batch, |p| strat.pool_cache.get_pool_tokens(p), |a, b| strat.pairs_for_tokens(a, b),
+                                     |i| strat.pairs[i].id.clone())
                 };
+                if pair_mask.is_empty() {
+                    continue;
+                }
 
                 // Clear cooldowns for affected pairs. Fingerprints contain pair_id as a prefix
                 // so a simple contains() check works without any allocations per entry.
@@ -987,8 +988,8 @@ pub async fn run_chain(
                     broadcast_log(&log_tx, "info", &msg, None);
                 } else {
                     debug!(
-                        "[{}] Swap on {:?} — targeted scan ({} pairs)",
-                        cfg.name, event.pool, pair_mask.len()
+                        "[{}] Swap on {:?} — targeted scan ({} pairs, {} queued swap(s) merged)",
+                        cfg.name, event.pool, pair_mask.len(), merged
                     );
                 }
 
@@ -1307,6 +1308,38 @@ async fn connect_first(
     ))
 }
 
+/// Merge a batch of swap events into one targeted scan: the union of their affected pair
+/// indices and pool tokens, plus the pair ids of large swaps (their cooldowns are cleared).
+/// Events on pools not in the cache contribute nothing.
+fn merge_swap_batch(
+    batch: &[SwapEvent],
+    tokens_of: impl Fn(Address) -> Option<(Address, Address)>,
+    pairs_for: impl Fn(Address, Address) -> Vec<usize>,
+    pair_id: impl Fn(usize) -> String,
+) -> (HashSet<usize>, Vec<Address>, Vec<String>) {
+    let mut mask: HashSet<usize> = HashSet::new();
+    let mut tokens: Vec<Address> = Vec::new();
+    let mut large_ids: Vec<String> = Vec::new();
+    for ev in batch {
+        let Some((a, b)) = tokens_of(ev.pool) else { continue };
+        let idx = pairs_for(a, b);
+        if idx.is_empty() {
+            continue;
+        }
+        for t in [a, b] {
+            if !tokens.contains(&t) { tokens.push(t); }
+        }
+        if ev.magnitude == SwapMagnitude::Large {
+            for &i in &idx {
+                let id = pair_id(i);
+                if !large_ids.contains(&id) { large_ids.push(id); }
+            }
+        }
+        mask.extend(idx);
+    }
+    (mask, tokens, large_ids)
+}
+
 /// Pools for the sealed (primary ws_rpc) log filter: every address except pools with a
 /// `preconf_only` token on either side. Returns those addresses and how many were left out.
 /// Pools with unknown tokens stay on the sealed filter.
@@ -1328,6 +1361,36 @@ fn split_preconf_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_swap_batch_unions_pairs_and_tracks_large_ids() {
+        let (usdc, weth, vvv) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
+        let (p_core, p_vvv, p_unknown) = (Address::repeat_byte(10), Address::repeat_byte(11), Address::repeat_byte(12));
+        let ev = |pool, large: bool| SwapEvent {
+            chain_id: 8453, pool, block_number: 1,
+            magnitude: if large { SwapMagnitude::Large } else { SwapMagnitude::Normal },
+        };
+        let tokens = |p: Address| match p {
+            p if p == p_core => Some((usdc, weth)),
+            p if p == p_vvv => Some((weth, vvv)),
+            _ => None,
+        };
+        // pair 0 = USDC/WETH, pair 1 = USDC/VVV (reaches WETH/VVV via triangles)
+        let pairs_for = |a: Address, b: Address| -> Vec<usize> {
+            let mut v = Vec::new();
+            if a == weth || b == weth { v.push(0); }
+            if a == vvv || b == vvv { v.push(1); }
+            v
+        };
+        let id = |i: usize| format!("pair{i}");
+        let batch = vec![ev(p_core, false), ev(p_vvv, true), ev(p_unknown, true), ev(p_core, false)];
+        let (mask, toks, large) = merge_swap_batch(&batch, tokens, pairs_for, id);
+        assert_eq!(mask, [0usize, 1].into_iter().collect());
+        assert_eq!(toks, vec![usdc, weth, vvv]);
+        assert_eq!(large, vec!["pair0".to_string(), "pair1".to_string()]);
+        // A batch of only unknown pools scans nothing.
+        assert!(merge_swap_batch(&[ev(p_unknown, false)], tokens, pairs_for, id).0.is_empty());
+    }
 
     #[test]
     fn split_preconf_only_keeps_core_pools_sealed() {
