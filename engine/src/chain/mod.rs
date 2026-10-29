@@ -435,6 +435,7 @@ pub async fn run_chain(
         })
     };
     let log_feed_handles = start_log_feeds();
+    maintain::spawn_fee_refresh(rediscover_reads.clone(), chain_routers.clone(), pool_cache.clone(), cfg.name.clone());
     maintain::spawn_rediscovery(
         rediscover_reads, chain_routers.clone(), chain_pairs.clone(), pool_cache.clone(),
         start_log_feeds.clone(), log_feed_handles, cfg.name.clone(),

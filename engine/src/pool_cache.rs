@@ -314,6 +314,25 @@ impl PoolCache {
         })
     }
 
+    /// Set a V3-type pool's swap fee (ppm) — Slipstream fees are dynamic. Recomputes the
+    /// derived quote fields. Returns true when the fee changed.
+    pub fn set_v3_swap_fee(&self, pool: Address, swap_fee: u32) -> bool {
+        let Some(mut s) = self.v3_by_address.get_mut(&pool) else { return false };
+        if s.swap_fee == swap_fee { return false; }
+        s.swap_fee = swap_fee;
+        s.refresh_vr();
+        true
+    }
+
+    /// Set a V2/Aerodrome pool's fee (bps). Returns true when the fee changed.
+    pub fn set_v2_fee_bps(&self, pool: Address, fee_bps: u32) -> bool {
+        let Some(mut i) = self.by_address.get_mut(&pool) else { return false };
+        if i.fee_bps == fee_bps { return false; }
+        i.fee_bps = fee_bps;
+        i.fee_num = FEE_DENOM_V2.saturating_sub(U256::from(fee_bps));
+        true
+    }
+
     /// True when the pool is below `tuning.min_pool_depth_usd` (see `recompute_shallow`).
     pub fn is_shallow(&self, pool: Address) -> bool {
         !self.shallow.is_empty() && self.shallow.contains(&pool)

@@ -378,6 +378,12 @@ tuning:
   # Re-run pool discovery (on http_rpc, free) this often to pick up pools created after
   # startup; new pools are added and both log feeds resubscribed. 0 = startup only.
   pool_rediscover_ms: 21600000           # 6 h
+  # Swap-fee refresh on the free http_rpc, outside the quote budget. Slipstream fees are
+  # dynamic (150 → 698 ppm within 40 blocks seen): re-read fee() for pools that traded,
+  # every cl_fee_refresh_ms. Aerodrome V2 fees are admin-set: re-read every v2_fee_refresh_ms.
+  # Uniswap V3 / PancakeSwap V3 / Uniswap V2 fees are fixed per pool. 0 = off.
+  cl_fee_refresh_ms: 10000
+  v2_fee_refresh_ms: 3600000             # 1 h
   v3_spot_max_vr_fraction_bps: 200
   v3_spot_overestimate_bps: 30           # per V3 leg, optimistic mode only
   phantom_cap_bps: 500                   # profit > 5% of input = phantom quote
