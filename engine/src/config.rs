@@ -447,6 +447,19 @@ pub struct Tuning {
     pub p15_gate_spread: f64,
     /// Minimum active-tick liquidity for a V3 pool to be tradeable.
     pub min_v3_liquidity: u128,
+    /// Pools shallower than this (USD, both sides; V3 = in-range virtual reserves) are skipped
+    /// by every local quote until they fill. They stay subscribed. 0 = off.
+    pub min_pool_depth_usd: f64,
+    /// How often the shallow-pool set is recomputed from the cache (ms, no RPC).
+    pub pool_depth_refresh_ms: u64,
+    /// Re-run pool discovery this often (ms) to pick up pools created after startup and
+    /// resubscribe the log feeds. 0 = startup only.
+    pub pool_rediscover_ms: u64,
+    /// Re-read dynamic swap fees of Slipstream-type pools that traded since the last read (ms).
+    /// 0 = off (fee read once at discovery).
+    pub cl_fee_refresh_ms: u64,
+    /// Re-read Aerodrome V2 pool fees (admin-set, rarely change) this often (ms). 0 = off.
+    pub v2_fee_refresh_ms: u64,
     /// Cap on a V3 spot quote's input as a fraction of virtual reserves (bps).
     pub v3_spot_max_vr_fraction_bps: u64,
     /// Per-V3-leg spot overestimate deducted in optimistic mode (bps).
@@ -555,6 +568,11 @@ impl Default for Tuning {
             quoter_haircut_dbps: 5,
             p15_gate_spread: 0.00005,
             min_v3_liquidity: 1_000_000_000,
+            min_pool_depth_usd: 20_000.0,
+            pool_depth_refresh_ms: 5_000,
+            pool_rediscover_ms: 21_600_000,
+            cl_fee_refresh_ms: 10_000,
+            v2_fee_refresh_ms: 3_600_000,
             v3_spot_max_vr_fraction_bps: 200,
             v3_spot_overestimate_bps: 30,
             phantom_cap_bps: 500,
@@ -612,7 +630,7 @@ impl Tuning {
         if block_time_ms == 0 {
             return Err(anyhow!("chain.block_time_ms must be > 0"));
         }
-        let positive: [(&str, u64); 20] = [
+        let positive: [(&str, u64); 21] = [
             ("balance_refresh_ms", self.balance_refresh_ms),
             ("volatile_pool_max_age_ms", self.volatile_pool_max_age_ms),
             ("stable_pool_max_age_ms", self.stable_pool_max_age_ms),
@@ -633,12 +651,16 @@ impl Tuning {
             ("max_consecutive_failures", self.max_consecutive_failures as u64),
             ("block_stall_exit_ms", self.block_stall_exit_ms),
             ("rpc_latency_sample_ms", self.rpc_latency_sample_ms),
+            ("pool_depth_refresh_ms", self.pool_depth_refresh_ms),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(anyhow!("tuning.{} must be > 0", name));
         }
         if self.health_hold_max_ms < self.health_hold_base_ms {
             return Err(anyhow!("tuning.health_hold_max_ms must be >= health_hold_base_ms"));
+        }
+        if !(self.min_pool_depth_usd >= 0.0 && self.min_pool_depth_usd.is_finite()) {
+            return Err(anyhow!("tuning.min_pool_depth_usd must be a finite number >= 0"));
         }
         if self.quoter_haircut_dbps > 1_000 {
             return Err(anyhow!("tuning.quoter_haircut_dbps is in tenths of a bp and must be <= 1000 (10 bp)"));
@@ -687,6 +709,7 @@ impl Tuning {
     pub fn block_stall_exit(&self) -> std::time::Duration { ms(self.block_stall_exit_ms) }
     pub fn volatile_pool_max_age(&self) -> std::time::Duration { ms(self.volatile_pool_max_age_ms) }
     pub fn stable_pool_max_age(&self) -> std::time::Duration { ms(self.stable_pool_max_age_ms) }
+    pub fn pool_depth_refresh(&self) -> std::time::Duration { ms(self.pool_depth_refresh_ms) }
     pub fn v3_fresh_window(&self) -> std::time::Duration { ms(self.v3_fresh_window_ms) }
     pub fn price_refresh(&self) -> std::time::Duration { ms(self.price_refresh_ms) }
     pub fn balance_refresh(&self) -> std::time::Duration { ms(self.balance_refresh_ms) }

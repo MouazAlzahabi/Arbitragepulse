@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, U256};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -195,6 +196,37 @@ const SCALE: [U256; 19] = [
 ];
 
 
+/// USD per whole token: `known` as given, then each other token from its deepest pool
+/// against an already-priced token (by that side's USD value), in two passes.
+fn price_tokens(
+    sides: &[(Address, Address, f64, Address, f64)],
+    known: &HashMap<Address, (f64, u8)>,
+    decimals: &HashMap<Address, u8>,
+) -> HashMap<Address, f64> {
+    let mut prices: HashMap<Address, f64> = known.iter().map(|(t, (p, _))| (*t, *p)).collect();
+    let dec = |t: &Address| decimals.get(t).copied().or_else(|| known.get(t).map(|k| k.1));
+    for _ in 0..2 {
+        // token -> (depth of the priced side in USD, price)
+        let mut best: HashMap<Address, (f64, f64)> = HashMap::new();
+        for (_, t0, r0, t1, r1) in sides {
+            for (a, ra, b, rb) in [(t0, r0, t1, r1), (t1, r1, t0, r0)] {
+                // a is priced, b is not
+                let (Some(&pa), false) = (prices.get(a), prices.contains_key(b)) else { continue };
+                let (Some(da), Some(db)) = (dec(a), dec(b)) else { continue };
+                if *ra <= 0.0 || *rb <= 0.0 { continue; }
+                let side_usd = ra / 10f64.powi(da as i32) * pa;
+                let price_b = side_usd / (rb / 10f64.powi(db as i32));
+                if best.get(b).is_none_or(|(d, _)| side_usd > *d) {
+                    best.insert(*b, (side_usd, price_b));
+                }
+            }
+        }
+        if best.is_empty() { break; }
+        prices.extend(best.into_iter().map(|(t, (_, p))| (t, p)));
+    }
+    prices
+}
+
 // ─── Pool cache ───────────────────────────────────────────────────────────────
 
 /// Thread-safe pool reserve cache.
@@ -230,6 +262,10 @@ pub struct PoolCache {
     /// live and a quiet pool's reserves are current — see [`PoolCache::feed_live`].
     last_log_ms: Arc<AtomicU64>,
     created: Instant,
+    /// Pools below `tuning.min_pool_depth_usd`: every local quote treats them as missing.
+    /// Recomputed from cached state by [`PoolCache::recompute_shallow`]; they stay
+    /// subscribed, so a pool that fills is quoted again after the next recompute.
+    shallow: Arc<dashmap::DashSet<Address>>,
 }
 
 impl Default for PoolCache {
@@ -244,6 +280,7 @@ impl Default for PoolCache {
             log_pos: Arc::new(DashMap::new()),
             last_log_ms: Arc::new(AtomicU64::new(u64::MAX)),
             created: Instant::now(),
+            shallow: Arc::new(dashmap::DashSet::new()),
         }
     }
 }
@@ -275,6 +312,79 @@ impl PoolCache {
             let max = if i.is_stable { stable_max_age() } else { volatile_max_age() };
             i.last_sync.elapsed() > max
         })
+    }
+
+    /// Set a V3-type pool's swap fee (ppm) — Slipstream fees are dynamic. Recomputes the
+    /// derived quote fields. Returns true when the fee changed.
+    pub fn set_v3_swap_fee(&self, pool: Address, swap_fee: u32) -> bool {
+        let Some(mut s) = self.v3_by_address.get_mut(&pool) else { return false };
+        if s.swap_fee == swap_fee { return false; }
+        s.swap_fee = swap_fee;
+        s.refresh_vr();
+        true
+    }
+
+    /// Set a V2/Aerodrome pool's fee (bps). Returns true when the fee changed.
+    pub fn set_v2_fee_bps(&self, pool: Address, fee_bps: u32) -> bool {
+        let Some(mut i) = self.by_address.get_mut(&pool) else { return false };
+        if i.fee_bps == fee_bps { return false; }
+        i.fee_bps = fee_bps;
+        i.fee_num = FEE_DENOM_V2.saturating_sub(U256::from(fee_bps));
+        true
+    }
+
+    /// True when the pool is below `tuning.min_pool_depth_usd` (see `recompute_shallow`).
+    pub fn is_shallow(&self, pool: Address) -> bool {
+        !self.shallow.is_empty() && self.shallow.contains(&pool)
+    }
+
+    /// Recompute the shallow-pool set from cached state. `known` holds USD per whole token
+    /// and decimals for tokens priced from outside the cache (stables, wrapped native);
+    /// every other token is priced from its deepest cached pool against a priced token
+    /// (two passes, so e.g. X/cbBTC works once cbBTC is priced via USDC). Depth = USD value
+    /// of both sides (V2: reserves, V3: in-range virtual reserves); with one side unpriced it
+    /// is twice the priced side, and a pool with neither priced is kept (never hidden blind).
+    /// Returns (shallow, total) pool counts. No RPC.
+    pub fn recompute_shallow(&self, known: &HashMap<Address, (f64, u8)>, decimals: &HashMap<Address, u8>, min_usd: f64) -> (usize, usize) {
+        let sides = self.pool_sides();
+        let total = sides.len();
+        if min_usd <= 0.0 {
+            self.shallow.clear();
+            return (0, total);
+        }
+        let prices = price_tokens(&sides, known, decimals);
+        let usd = |t: &Address, raw: f64| -> Option<f64> {
+            let p = prices.get(t)?;
+            let d = decimals.get(t).copied().or_else(|| known.get(t).map(|k| k.1))?;
+            Some(raw / 10f64.powi(d as i32) * p)
+        };
+        let mut n = 0;
+        for (pool, t0, r0, t1, r1) in &sides {
+            let depth = match (usd(t0, *r0), usd(t1, *r1)) {
+                (Some(a), Some(b)) => Some(a + b),
+                (Some(a), None) | (None, Some(a)) => Some(2.0 * a),
+                (None, None) => None,
+            };
+            if depth.is_some_and(|d| d < min_usd) {
+                self.shallow.insert(*pool);
+                n += 1;
+            } else {
+                self.shallow.remove(pool);
+            }
+        }
+        (n, total)
+    }
+
+    /// (pool, token0, raw amount0, token1, raw amount1) for every pool: V2 reserves, V3
+    /// in-range virtual reserves.
+    fn pool_sides(&self) -> Vec<(Address, Address, f64, Address, f64)> {
+        let f = crate::util::u256_to_f64;
+        let mut v: Vec<_> = self.by_address.iter()
+            .map(|e| (*e.key(), e.token0, f(e.reserve0), e.token1, f(e.reserve1)))
+            .collect();
+        v.extend(self.v3_by_address.iter()
+            .map(|e| (*e.key(), e.token0, f(e.vr0), e.token1, f(e.vr1))));
+        v
     }
 
     fn mark_watch_addrs_dirty(&self) {
@@ -341,6 +451,7 @@ impl PoolCache {
     /// Routes to xy=k or x³y+xy³=k formula based on `PoolInfo.is_stable`.
     /// Returns None if pool not cached or reserves are zero.
     pub fn get_amount_out(&self, pool: Address, token_in: Address, amount_in: U256) -> Option<U256> {
+        if self.is_shallow(pool) { return None; }
         let info = self.by_address.get(&pool)?;
         compute_amount_out(&info, token_in, amount_in)
     }
@@ -362,6 +473,7 @@ impl PoolCache {
         let key = V2PoolKey::new(router_id, token_in, token_out);
         let pool = *self.by_key.get(&key)?;
         if let Some(age) = max_age {
+            if self.is_shallow(pool) { return None; }
             let info = self.by_address.get(&pool)?;
             if info.last_sync.elapsed() > age && !self.feed_live() {
                 return None; // stale — caller skips this DEX for this scan
@@ -386,6 +498,7 @@ impl PoolCache {
     ) -> Option<U256> {
         let pool = *self.by_key.get(key)?;
         if let Some(age) = max_age {
+            if self.is_shallow(pool) { return None; }
             let info = self.by_address.get(&pool)?;
             if info.last_sync.elapsed() > age && !self.feed_live() {
                 return None;
@@ -527,6 +640,7 @@ impl PoolCache {
         amount_in: U256,
     ) -> Option<(U256, u128, U256)> {
         let pool_addr = *self.v3_by_key.get(key)?;
+        if self.is_shallow(pool_addr) { return None; }
 
         let state = self.v3_by_address.get(&pool_addr)?;
 
@@ -570,6 +684,7 @@ impl PoolCache {
         amount_in: U256,
     ) -> Option<U256> {
         let pool_addr = *self.v3_by_key.get(key)?;
+        if self.is_shallow(pool_addr) { return None; }
         let state = self.v3_by_address.get(&pool_addr)?;
         let (vr_in, vr_out) = if token_in == state.token0 {
             (state.vr0, state.vr1)
@@ -772,5 +887,53 @@ mod tests {
         cache.v3_by_address.get_mut(&Address::repeat_byte(0xaa)).unwrap().last_updated =
             Instant::now() - Duration::from_secs(60);
         assert_eq!(cache.count_fresh_v3_pools(Duration::from_secs(30)), (0, 1));
+    }
+
+    fn v2(t0: Address, r0: u128, t1: Address, r1: u128) -> PoolInfo {
+        PoolInfo {
+            token0: t0, token1: t1, reserve0: U256::from(r0), reserve1: U256::from(r1),
+            fee_bps: 30, router_id: "r".into(), is_stable: false, decimals0: 18, decimals1: 18,
+            last_sync: Instant::now(), fee_num: U256::ZERO,
+        }
+    }
+
+    /// The depth floor prices tokens through the cache (VVV via a deep VVV/WETH pool, then a
+    /// dust pool is measured in dollars), hides only pools below it, and un-hides them once
+    /// they fill. A pool with no priced token is never hidden.
+    #[test]
+    fn shallow_set_uses_usd_depth_and_follows_refills() {
+        let e18 = 10u128.pow(18);
+        let (usdc, weth, vvv, mystery, other) = (
+            Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3),
+            Address::repeat_byte(4), Address::repeat_byte(5),
+        );
+        let (deep_usdc, deep_vvv, dust_vvv, mystery_pool) =
+            (Address::repeat_byte(0x10), Address::repeat_byte(0x11), Address::repeat_byte(0x12), Address::repeat_byte(0x13));
+        let cache = PoolCache::new();
+        // 1M USDC / 250 WETH, and 100 WETH ($400k) / 200k VVV → VVV = $2.
+        cache.insert(deep_usdc, v2(usdc, 1_000_000 * 10u128.pow(6), weth, 250 * e18));
+        cache.insert(deep_vvv, v2(weth, 100 * e18, vvv, 200_000 * e18));
+        // Dust: 0.001 WETH / 2 VVV ≈ $8. Its raw L-style size would pass a units check.
+        cache.insert(dust_vvv, v2(weth, e18 / 1000, vvv, 2 * e18));
+        cache.insert(mystery_pool, v2(mystery, 5 * e18, other, 5 * e18));
+
+        let known: HashMap<Address, (f64, u8)> = [(usdc, (1.0, 6)), (weth, (4000.0, 18))].into_iter().collect();
+        let decimals: HashMap<Address, u8> =
+            [(usdc, 6), (weth, 18), (vvv, 18), (mystery, 18), (other, 18)].into_iter().collect();
+
+        assert_eq!(cache.recompute_shallow(&known, &decimals, 20_000.0), (1, 4));
+        assert!(cache.is_shallow(dust_vvv));
+        assert!(!cache.is_shallow(deep_vvv) && !cache.is_shallow(mystery_pool));
+        assert_eq!(cache.get_amount_out(dust_vvv, weth, U256::from(e18 / 10_000)), None);
+        assert!(cache.get_amount_out(deep_vvv, weth, U256::from(e18)).is_some());
+
+        // Liquidity arrives: 10 WETH / 20k VVV ($80k) → quoted again after the next recompute.
+        cache.update_reserves(dust_vvv, U256::from(10 * e18), U256::from(20_000 * e18));
+        assert_eq!(cache.recompute_shallow(&known, &decimals, 20_000.0), (0, 4));
+        assert!(cache.get_amount_out(dust_vvv, weth, U256::from(e18 / 10)).is_some());
+
+        // 0 turns the floor off.
+        cache.update_reserves(dust_vvv, U256::from(1u64), U256::from(1u64));
+        assert_eq!(cache.recompute_shallow(&known, &decimals, 0.0), (0, 4));
     }
 }

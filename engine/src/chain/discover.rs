@@ -205,7 +205,7 @@ pub(crate) async fn discover_pools<P: Provider>(
 
 /// Per-pool Aerodrome fee from a factory.getFee(pool, stable) return, else the configured
 /// fallback (call failed / undecodable / not a sane bps value).
-fn aerodrome_fee_bps(raw: Option<&[u8]>, fallback_bps: u32) -> u32 {
+pub(crate) fn aerodrome_fee_bps(raw: Option<&[u8]>, fallback_bps: u32) -> u32 {
     use alloy::sol_types::SolCall;
     raw.and_then(|r| IAerodromeFactory::getFeeCall::abi_decode_returns(r).ok())
         .and_then(|f| u32::try_from(f).ok())

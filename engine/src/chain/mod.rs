@@ -28,6 +28,7 @@ pub mod scan;
 pub mod state;
 pub mod discover;
 pub mod pending;
+pub mod maintain;
 
 /// Cooldown after a dry-run failure or balance-guard skip (cheap check, no RPC spent).
 pub(crate) fn cooldown_secs() -> u64 { crate::config::tuning().cooldown_secs }
@@ -100,6 +101,8 @@ pub async fn run_chain(
     let main_reads = provider.as_ref().clone().erased();
     let startup_reads = http_rpc_provider.as_ref().unwrap_or(&main_reads);
     let has_startup_fallback = http_rpc_provider.is_some();
+    // Periodic pool rediscovery reads on the same endpoint as startup discovery.
+    let rediscover_reads = startup_reads.clone();
 
     // ── Executor setup check: owner = signer (exit 2), router allowlist (exit 2 live), paused ──
     // Runs before pool discovery so a wrong key fails within seconds. Startup only.
@@ -230,6 +233,7 @@ pub async fn run_chain(
     if preconf_http.is_some() {
         strategy.write().await.quote_block = alloy::eips::BlockId::pending();
     }
+    maintain::spawn_depth_refresh(strategy.clone(), pool_cache.clone(), chain_pairs.clone(), cfg.name.clone());
 
     // ── Contract balance cache ─────────────────────────────────────────────────
     // Caches the ArbitrageExecutor's token_in balances. Refreshed every 30s and
@@ -377,49 +381,65 @@ pub async fn run_chain(
     // re-read before trading (recheck_quiet_pools) and V3 legs are QuoterV2-verified.
     let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
     let preconf_logs = Arc::new(AtomicU64::new(0));
-    {
-        let preconf_only: HashSet<Address> = if cfg.preconf_ws_rpc.is_some() {
-            cfg.preconf_only_tokens.iter().filter_map(|t| match t.parse::<Address>() {
-                Ok(a) => Some(a),
-                Err(_) => { warn!("[{}] preconf_only_tokens: invalid address {}", cfg.name, t); None }
-            }).collect()
-        } else {
-            if !cfg.preconf_only_tokens.is_empty() {
-                warn!("[{}] preconf_only_tokens set without preconf_ws_rpc — watching those pools on ws_rpc", cfg.name);
+    let preconf_only: HashSet<Address> = if cfg.preconf_ws_rpc.is_some() {
+        cfg.preconf_only_tokens.iter().filter_map(|t| match t.parse::<Address>() {
+            Ok(a) => Some(a),
+            Err(_) => { warn!("[{}] preconf_only_tokens: invalid address {}", cfg.name, t); None }
+        }).collect()
+    } else {
+        if !cfg.preconf_only_tokens.is_empty() {
+            warn!("[{}] preconf_only_tokens set without preconf_ws_rpc — watching those pools on ws_rpc", cfg.name);
+        }
+        HashSet::new()
+    };
+    let log_feed = LogFeed {
+        cache: pool_cache.clone(),
+        swap_tx: swap_tx_for_sub.clone(),
+        chain_id: cfg.id,
+        chain_name: cfg.name.clone(),
+        solidly_sync_hash: solidly_sync_hash_sub,
+        large_swap_bps: cfg.large_swap_threshold_bps,
+        large_v3_bps: cfg.large_v3_threshold_bps,
+    };
+    // Starts both log feeds for the cache's current pools. Re-run by pool rediscovery
+    // (maintain.rs) when new pools appear: the new feeds start before the old ones are
+    // aborted, so no log is missed; the overlap's duplicates are dropped by the cache's
+    // log-position guard.
+    let start_log_feeds: Arc<dyn Fn() -> Vec<tokio::task::JoinHandle<()>> + Send + Sync> = {
+        let (cache, provider, preconf_url) = (pool_cache.clone(), provider.clone(), cfg.preconf_ws_rpc.clone());
+        let (feed, counter, chain_name) = (log_feed.clone(), preconf_logs.clone(), cfg.name.clone());
+        Arc::new(move || {
+            let all_addrs = cache.watch_addresses();
+            let (sealed_addrs, preconf_only_n) = split_preconf_only(&all_addrs, &preconf_only, |p| cache.get_pool_tokens(p));
+            if preconf_only_n > 0 {
+                info!("[{}] {} of {} pools watched on the preconf feed only (preconf_only_tokens)",
+                      chain_name, preconf_only_n, all_addrs.len());
             }
-            HashSet::new()
-        };
-        let all_addrs = pool_cache.watch_addresses();
-        let (sealed_addrs, preconf_only_n) = split_preconf_only(&all_addrs, &preconf_only, |p| pool_cache.get_pool_tokens(p));
-        if preconf_only_n > 0 {
-            info!("[{}] {} of {} pools watched on the preconf feed only (preconf_only_tokens)",
-                  cfg.name, preconf_only_n, all_addrs.len());
-        }
-        let topics = crate::listener::pool_log_topics(solidly_sync_hash_sub);
-        let sealed_filter = alloy::rpc::types::Filter::new()
-            .address(sealed_addrs.clone())
-            .event_signature(topics.clone());
-        let log_filter = alloy::rpc::types::Filter::new()
-            .address(all_addrs)
-            .event_signature(topics);
-        let feed = LogFeed {
-            cache: pool_cache.clone(),
-            swap_tx: swap_tx_for_sub.clone(),
-            chain_id: cfg.id,
-            chain_name: cfg.name.clone(),
-            solidly_sync_hash: solidly_sync_hash_sub,
-            large_swap_bps: cfg.large_swap_threshold_bps,
-            large_v3_bps: cfg.large_v3_threshold_bps,
-        };
-        // An address-less filter would match every log on the chain: skip it instead.
-        if !sealed_addrs.is_empty() {
-            spawn_log_subscription((*provider).clone(), sealed_filter, feed.clone(), None, None);
-        }
-        if let Some(url) = cfg.preconf_ws_rpc.clone() {
-            // Connected in the background: an optional feed must never hold up startup.
-            spawn_preconf_subscription(url, log_filter, feed, preconf_logs.clone());
-        }
-    }
+            let topics = crate::listener::pool_log_topics(solidly_sync_hash_sub);
+            let mut handles = Vec::new();
+            // An address-less filter would match every log on the chain: skip it instead.
+            if !sealed_addrs.is_empty() {
+                let sealed_filter = alloy::rpc::types::Filter::new()
+                    .address(sealed_addrs)
+                    .event_signature(topics.clone());
+                handles.push(spawn_log_subscription((*provider).clone(), sealed_filter, feed.clone(), None, None));
+            }
+            if let Some(url) = preconf_url.clone() {
+                // Connected in the background: an optional feed must never hold up startup.
+                let log_filter = alloy::rpc::types::Filter::new()
+                    .address(all_addrs)
+                    .event_signature(topics);
+                handles.push(spawn_preconf_subscription(url, log_filter, feed.clone(), counter.clone()));
+            }
+            handles
+        })
+    };
+    let log_feed_handles = start_log_feeds();
+    maintain::spawn_fee_refresh(rediscover_reads.clone(), chain_routers.clone(), pool_cache.clone(), cfg.name.clone());
+    maintain::spawn_rediscovery(
+        rediscover_reads, chain_routers.clone(), chain_pairs.clone(), pool_cache.clone(),
+        start_log_feeds.clone(), log_feed_handles, cfg.name.clone(),
+    );
 
     // ── Pending TX monitor (optional, requires mempool-enabled WS endpoint) ──
     // Fires a targeted arb scan with matching tip when a large swap is detected
@@ -902,40 +922,41 @@ pub async fn run_chain(
             // last_scan_at is NOT updated — targeted scans must not suppress the
             // block-triggered full scan or the poll_tick fallback.
             Some(event) = swap_rx.recv() => {
-                let is_large = event.magnitude == SwapMagnitude::Large;
-
-                // Per-pool burst protection — skipped for large swaps
-                if !is_large {
-                    if let Some(&fired_at) = pool_last_scan.get(&event.pool) {
-                        if fired_at.elapsed() < Duration::from_millis(50) {
-                            continue;
-                        }
+                // Swaps that queued while the previous scan ran are merged into this one
+                // scan (only what is already waiting — the first event never waits). Each
+                // queued scan would otherwise run in turn on prices that are by then stale.
+                let mut batch = vec![event];
+                while batch.len() < 256 {
+                    match swap_rx.try_recv() {
+                        Ok(ev) => batch.push(ev),
+                        Err(_) => break,
                     }
                 }
-                pool_last_scan.insert(event.pool, Instant::now());
+                // Per-pool burst protection (50 ms) — skipped for large swaps.
+                batch.retain(|ev| {
+                    ev.magnitude == SwapMagnitude::Large
+                        || !pool_last_scan.get(&ev.pool).is_some_and(|t| t.elapsed() < Duration::from_millis(50))
+                });
+                if batch.is_empty() {
+                    continue;
+                }
+                let now = Instant::now();
+                for ev in &batch {
+                    pool_last_scan.insert(ev.pool, now);
+                }
+                let is_large = batch.iter().any(|ev| ev.magnitude == SwapMagnitude::Large);
+                let merged = batch.len() - 1;
+                let event = batch.iter().find(|ev| ev.magnitude == SwapMagnitude::Large).unwrap_or(&batch[0]).clone();
 
-                // Single strategy read: pool tokens + affected pair indices.
+                // Single strategy read: pool tokens + affected pair indices, merged over the batch.
                 let (pair_mask, token_filter, affected_pair_ids) = {
                     let strat = strategy.read().await;
-                    let (tok_a, tok_b) = match strat.pool_cache.get_pool_tokens(event.pool) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    let indices = strat.pairs_for_tokens(tok_a, tok_b);
-                    if indices.is_empty() {
-                        continue;
-                    }
-                    let ids: Vec<String> = if is_large {
-                        indices.iter().map(|&i| strat.pairs[i].id.clone()).collect()
-                    } else {
-                        vec![]
-                    };
-                    (
-                        indices.into_iter().collect::<HashSet<usize>>(),
-                        vec![tok_a, tok_b],
-                        ids,
-                    )
+                    merge_swap_batch(&batch, |p| strat.pool_cache.get_pool_tokens(p), |a, b| strat.pairs_for_tokens(a, b),
+                                     |i| strat.pairs[i].id.clone())
                 };
+                if pair_mask.is_empty() {
+                    continue;
+                }
 
                 // Clear cooldowns for affected pairs. Fingerprints contain pair_id as a prefix
                 // so a simple contains() check works without any allocations per entry.
@@ -968,8 +989,8 @@ pub async fn run_chain(
                     broadcast_log(&log_tx, "info", &msg, None);
                 } else {
                     debug!(
-                        "[{}] Swap on {:?} — targeted scan ({} pairs)",
-                        cfg.name, event.pool, pair_mask.len()
+                        "[{}] Swap on {:?} — targeted scan ({} pairs, {} queued swap(s) merged)",
+                        cfg.name, event.pool, pair_mask.len(), merged
                     );
                 }
 
@@ -1060,8 +1081,8 @@ fn spawn_log_subscription<P: Provider + Clone + 'static>(
     feed: LogFeed,
     method: Option<&'static str>,
     counter: Option<Arc<AtomicU64>>,
-) {
-    tokio::spawn(run_log_subscription(provider, filter, feed, method, counter));
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_log_subscription(provider, filter, feed, method, counter))
 }
 
 /// Bound on one WebSocket handshake. alloy's `connect_ws` has none, so a stalled
@@ -1076,7 +1097,7 @@ fn spawn_preconf_subscription(
     filter: alloy::rpc::types::Filter,
     feed: LogFeed,
     counter: Arc<AtomicU64>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let shown = crate::util::redact_url(&url);
         let mut backoff = Duration::from_secs(1);
@@ -1099,7 +1120,7 @@ fn spawn_preconf_subscription(
         };
         info!("[{}] Flashblocks pre-confirmed logs: subscribing on {}", feed.chain_name, shown);
         run_log_subscription(preconf, filter, feed, Some("pendingLogs"), Some(counter)).await;
-    });
+    })
 }
 
 async fn run_log_subscription<P: Provider + Clone + 'static>(
@@ -1288,6 +1309,38 @@ async fn connect_first(
     ))
 }
 
+/// Merge a batch of swap events into one targeted scan: the union of their affected pair
+/// indices and pool tokens, plus the pair ids of large swaps (their cooldowns are cleared).
+/// Events on pools not in the cache contribute nothing.
+fn merge_swap_batch(
+    batch: &[SwapEvent],
+    tokens_of: impl Fn(Address) -> Option<(Address, Address)>,
+    pairs_for: impl Fn(Address, Address) -> Vec<usize>,
+    pair_id: impl Fn(usize) -> String,
+) -> (HashSet<usize>, Vec<Address>, Vec<String>) {
+    let mut mask: HashSet<usize> = HashSet::new();
+    let mut tokens: Vec<Address> = Vec::new();
+    let mut large_ids: Vec<String> = Vec::new();
+    for ev in batch {
+        let Some((a, b)) = tokens_of(ev.pool) else { continue };
+        let idx = pairs_for(a, b);
+        if idx.is_empty() {
+            continue;
+        }
+        for t in [a, b] {
+            if !tokens.contains(&t) { tokens.push(t); }
+        }
+        if ev.magnitude == SwapMagnitude::Large {
+            for &i in &idx {
+                let id = pair_id(i);
+                if !large_ids.contains(&id) { large_ids.push(id); }
+            }
+        }
+        mask.extend(idx);
+    }
+    (mask, tokens, large_ids)
+}
+
 /// Pools for the sealed (primary ws_rpc) log filter: every address except pools with a
 /// `preconf_only` token on either side. Returns those addresses and how many were left out.
 /// Pools with unknown tokens stay on the sealed filter.
@@ -1309,6 +1362,36 @@ fn split_preconf_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_swap_batch_unions_pairs_and_tracks_large_ids() {
+        let (usdc, weth, vvv) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
+        let (p_core, p_vvv, p_unknown) = (Address::repeat_byte(10), Address::repeat_byte(11), Address::repeat_byte(12));
+        let ev = |pool, large: bool| SwapEvent {
+            chain_id: 8453, pool, block_number: 1,
+            magnitude: if large { SwapMagnitude::Large } else { SwapMagnitude::Normal },
+        };
+        let tokens = |p: Address| match p {
+            p if p == p_core => Some((usdc, weth)),
+            p if p == p_vvv => Some((weth, vvv)),
+            _ => None,
+        };
+        // pair 0 = USDC/WETH, pair 1 = USDC/VVV (reaches WETH/VVV via triangles)
+        let pairs_for = |a: Address, b: Address| -> Vec<usize> {
+            let mut v = Vec::new();
+            if a == weth || b == weth { v.push(0); }
+            if a == vvv || b == vvv { v.push(1); }
+            v
+        };
+        let id = |i: usize| format!("pair{i}");
+        let batch = vec![ev(p_core, false), ev(p_vvv, true), ev(p_unknown, true), ev(p_core, false)];
+        let (mask, toks, large) = merge_swap_batch(&batch, tokens, pairs_for, id);
+        assert_eq!(mask, [0usize, 1].into_iter().collect());
+        assert_eq!(toks, vec![usdc, weth, vvv]);
+        assert_eq!(large, vec!["pair0".to_string(), "pair1".to_string()]);
+        // A batch of only unknown pools scans nothing.
+        assert!(merge_swap_batch(&[ev(p_unknown, false)], tokens, pairs_for, id).0.is_empty());
+    }
 
     #[test]
     fn split_preconf_only_keeps_core_pools_sealed() {
