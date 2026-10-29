@@ -66,8 +66,36 @@ interface IAerodromeRouter {
     ) external returns (uint256[] memory amounts);
 }
 
+/// @dev Concentrated-liquidity pool, called directly (no router): Uniswap V3, PancakeSwap V3,
+///      Aerodrome Slipstream (both factories) and Aero CL all share this `swap` and pay
+///      through `uniswapV3SwapCallback` (PancakeSwap: `pancakeV3SwapCallback`).
+interface ICLPool {
+    function token0() external view returns (address);
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
+        external returns (int256 amount0, int256 amount1);
+}
+
+/// @dev Uniswap V2-style pair, called directly: Uniswap V2, Aerodrome V2 and Aero V2 pools.
+///      Solidly-family pools (Aerodrome / Aero) also quote their own curve and fee.
+interface IPair {
+    function token0() external view returns (address);
+    function getReserves() external view returns (uint256 reserve0, uint256 reserve1);
+    function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+/// @dev Uniswap V4 PoolManager flash accounting: inside `unlock`, `take` sends tokens out as
+///      a debt that must be repaid (`sync` + transfer + `settle`) before `unlock` returns.
+///      No fee, no interest.
+interface IPoolManagerV4 {
+    function unlock(bytes calldata data) external returns (bytes memory);
+    function take(address currency, address to, uint256 amount) external;
+    function sync(address currency) external;
+    function settle() external payable returns (uint256);
+}
+
 /**
- * @title ArbitrageExecutor v3
+ * @title ArbitrageExecutor v4
  * @notice Atomic cross-DEX arbitrage: 2-hop (buy on A, sell on B) and triangular
  *         (A → B → C → A). Each trade either ends with at least `minProfit` more of the
  *         start token or reverts — the contract never keeps a loss.
@@ -93,7 +121,13 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     /// @dev Ordinals are part of the off-chain interface (setRouter takes a uint8):
     ///      0 = V2, 1 = V3, 4 = Aerodrome, 5 = Slipstream. 2 and 3 (Solidly v1, SyncSwap) are
     ///      retired — no Base deployment — and rejected; they keep their slots so 4 stays Aerodrome.
-    enum RouterType { V2, V3, RetiredSolidly, RetiredSyncSwap, Aerodrome, Slipstream }
+    ///      6 = DirectCL and 7 = DirectPair: the "router" is a pool, swapped on directly
+    ///      (allowlisted per pool with setRouter / setRouters, like a router).
+    enum RouterType { V2, V3, RetiredSolidly, RetiredSyncSwap, Aerodrome, Slipstream, DirectCL, DirectPair }
+
+    /// @dev Uniswap V3 TickMath bounds: price limits that never bind for an exact-input swap.
+    uint160 internal constant MIN_SQRT_RATIO_PLUS_ONE = 4295128740;
+    uint160 internal constant MAX_SQRT_RATIO_MINUS_ONE = 1461446703485210103287273052203988822378723970341;
 
     // ─── State ────────────────────────────────────────────────
 
@@ -108,6 +142,31 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Router protocol type (set together with the allowlist by setRouter)
     mapping(address => RouterType) public routerType;
+
+    /// @notice Uniswap V4 PoolManager lent from by the *Borrowed entry points (address(0) =
+    ///         borrowing unavailable).
+    address public immutable poolManager;
+
+    /// @dev The DirectCL pool currently being swapped on and the most it may be paid: the
+    ///      only caller (and amount) a swap callback accepts. Zero outside a DirectCL leg.
+    address private _activePool;
+    uint256 private _activeMaxIn;
+
+    /// @dev True only while a *Borrowed entry point is inside poolManager.unlock: the only
+    ///      time unlockCallback runs a trade.
+    bool private _borrowActive;
+
+    /// @dev One trade: `n` legs over tokens[0] → tokens[1] (→ tokens[2]) → tokens[0].
+    struct Trade {
+        address[3] tokens;
+        address[3] routers;
+        RouterType[3] types;
+        uint24[3] fees;
+        uint8 n;
+        uint256 amountIn;
+        uint256 minProfit;
+        uint256 deadline;
+    }
 
     // ─── Events ───────────────────────────────────────────────
 
@@ -134,6 +193,9 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     event RouterApproved(address indexed router, bool approved);
     event RouterTypeSet(address indexed router, RouterType rtype);
     event ApprovalRevoked(address indexed token, address indexed spender);
+    /// @notice A *Borrowed trade took `amount` of `token` from the V4 PoolManager and repaid
+    ///         exactly that amount in the same transaction.
+    event Borrowed(address indexed token, uint256 amount);
     /// @notice A leftover allowance could not be cleared (token rejects approve(0) and
     ///         approve(1)); `revokeApproval` it once the token allows.
     event AllowanceNotCleared(address indexed token, address indexed spender, uint256 remaining);
@@ -172,11 +234,22 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     error LegExhaustedGas(uint8 leg, address router, bytes reason);
     /// @notice Ownership can be transferred but not renounced: every withdrawal is onlyOwner.
     error RenounceDisabled();
+    /// @notice A swap or unlock callback from an address (or for an amount) this contract
+    ///         did not just call — never a pool / PoolManager mid-trade.
+    error UnexpectedCallback(address caller);
+    /// @notice A DirectPair leg's `fee` (Uniswap V2 formula, bps) is 10000 or more.
+    error InvalidPairFee(uint8 leg, address pool, uint24 fee);
+    /// @notice A *Borrowed entry point was called on a deployment without a PoolManager.
+    error BorrowUnavailable();
 
     // ─── Constructor ──────────────────────────────────────────
 
     /// @dev Ownable2Step: deployer is initial owner; transfer needs acceptOwnership().
-    constructor() Ownable(msg.sender) {}
+    /// @param poolManager_ Uniswap V4 PoolManager for *Borrowed trades (Base:
+    ///        0x498581fF718922c3f8e6A244956aF099B2652b2b), or address(0) to disable borrowing.
+    constructor(address poolManager_) Ownable(msg.sender) {
+        poolManager = poolManager_;
+    }
 
     /// @dev Renouncing would lock every token in the contract (all withdrawals are onlyOwner).
     function renounceOwnership() public view override onlyOwner {
@@ -198,6 +271,20 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         emit RouterApproved(router, true);
     }
 
+    /// @notice setRouter for many addresses of one type (e.g. every DirectCL pool).
+    function setRouters(address[] calldata routers, RouterType rtype) external onlyOwner {
+        if (!_isSupported(rtype)) revert UnsupportedRouterType(address(0), rtype);
+        for (uint256 i = 0; i < routers.length; i++) {
+            address router = routers[i];
+            if (router == address(0)) revert ZeroAddress();
+            if (router.code.length == 0) revert NotAContract(router);
+            routerType[router] = rtype;
+            allowedRouters[router] = true;
+            emit RouterTypeSet(router, rtype);
+            emit RouterApproved(router, true);
+        }
+    }
+
     /// @notice Stop using a router.
     function revokeRouter(address router) external onlyOwner {
         allowedRouters[router] = false;
@@ -206,7 +293,7 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
 
     function _isSupported(RouterType rtype) internal pure returns (bool) {
         return rtype == RouterType.V2 || rtype == RouterType.V3 || rtype == RouterType.Aerodrome
-            || rtype == RouterType.Slipstream;
+            || rtype == RouterType.Slipstream || rtype == RouterType.DirectCL || rtype == RouterType.DirectPair;
     }
 
     // ─── Receive ETH ──────────────────────────────────────────
@@ -223,9 +310,13 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * @notice Buy `tokenOut` with `tokenIn` on routerA, sell it back on routerB.
+     * @notice Buy `tokenOut` with `tokenIn` on routerA, sell it back on routerB, with the
+     *         contract's own `tokenIn`.
      * @param feeA/feeB  V2: ignored. V3: fee tier (100/500/2500/3000/10000).
      *                   Aerodrome: 0 = volatile pool, non-zero = stable pool.
+     *                   Slipstream: tick spacing. DirectCL: ignored (the router is the pool).
+     *                   DirectPair: 0 = the pool quotes itself (Aerodrome / Aero),
+     *                   else the Uniswap V2 formula with this fee in bps (30).
      * @param minProfit  Minimum gain in tokenIn. Enforced by the contract on the final
      *                   balance (NotProfitable), not by the routers: they get a zero
      *                   min-out, so slippage reads the same on every DEX (PancakeSwap's
@@ -243,17 +334,28 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 minProfit,
         uint256 deadline
     ) external onlyOwner whenNotPaused nonReentrant checkDeadline(deadline) {
-        if (amountIn == 0) revert ZeroAmount();
-        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
-        if (tokenIn == tokenOut) revert InvalidPath();
-        RouterType typeA = _checkRouter(routerA);
-        RouterType typeB = _checkRouter(routerB);
-        uint256 balanceBefore = _checkBalance(tokenIn, amountIn);
+        Trade memory t = _trade2(tokenIn, tokenOut, amountIn, routerA, routerB, feeA, feeB, minProfit, deadline);
+        uint256 profit = _runFunded(t);
+        emit ArbitrageExecuted(tokenIn, tokenOut, routerA, routerB, amountIn, profit);
+    }
 
-        (uint256 mid,) = _swap(1, routerA, typeA, tokenIn, tokenOut, amountIn, feeA, deadline);
-        (, uint256 balanceAfter) = _swap(2, routerB, typeB, tokenOut, tokenIn, mid, feeB, deadline);
-
-        uint256 profit = _settle(tokenIn, balanceBefore, balanceAfter, minProfit);
+    /// @notice executeArbitrage with `amountIn` borrowed from the Uniswap V4 PoolManager and
+    ///         repaid in the same transaction (no fee, no interest). Needs no `tokenIn`
+    ///         balance: the trade's own output repays the loan, and anything short of
+    ///         amountIn + minProfit reverts.
+    function executeArbitrageBorrowed(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address routerA,
+        address routerB,
+        uint24 feeA,
+        uint24 feeB,
+        uint256 minProfit,
+        uint256 deadline
+    ) external onlyOwner whenNotPaused nonReentrant checkDeadline(deadline) {
+        Trade memory t = _trade2(tokenIn, tokenOut, amountIn, routerA, routerB, feeA, feeB, minProfit, deadline);
+        uint256 profit = _runBorrowed(t);
         emit ArbitrageExecuted(tokenIn, tokenOut, routerA, routerB, amountIn, profit);
     }
 
@@ -279,25 +381,143 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 minProfit,
         uint256 deadline
     ) external onlyOwner whenNotPaused nonReentrant checkDeadline(deadline) {
-        if (amountIn == 0) revert ZeroAmount();
-        if (tokenA == address(0) || tokenB == address(0) || tokenC == address(0)) revert ZeroAddress();
-        if (tokenA == tokenB || tokenB == tokenC || tokenA == tokenC) revert InvalidPath();
-        RouterType typeAB = _checkRouter(routerAB);
-        RouterType typeBC = _checkRouter(routerBC);
-        RouterType typeCA = _checkRouter(routerCA);
-        uint256 balanceBefore = _checkBalance(tokenA, amountIn);
-
-        (uint256 amountB,) = _swap(1, routerAB, typeAB, tokenA, tokenB, amountIn, feeAB, deadline);
-        (uint256 amountC,) = _swap(2, routerBC, typeBC, tokenB, tokenC, amountB, feeBC, deadline);
-        (, uint256 balanceAfter) = _swap(3, routerCA, typeCA, tokenC, tokenA, amountC, feeCA, deadline);
-
-        uint256 profit = _settle(tokenA, balanceBefore, balanceAfter, minProfit);
+        Trade memory t = _trade3(tokenA, tokenB, tokenC, amountIn, routerAB, routerBC, routerCA,
+            feeAB, feeBC, feeCA, minProfit, deadline);
+        uint256 profit = _runFunded(t);
         emit TriangularArbitrageExecuted(tokenA, tokenB, tokenC, routerAB, routerBC, routerCA, amountIn, profit);
+    }
+
+    /// @notice executeTriangularArbitrage with `amountIn` borrowed from the V4 PoolManager
+    ///         (see executeArbitrageBorrowed).
+    function executeTriangularArbitrageBorrowed(
+        address tokenA,
+        address tokenB,
+        address tokenC,
+        uint256 amountIn,
+        address routerAB,
+        address routerBC,
+        address routerCA,
+        uint24 feeAB,
+        uint24 feeBC,
+        uint24 feeCA,
+        uint256 minProfit,
+        uint256 deadline
+    ) external onlyOwner whenNotPaused nonReentrant checkDeadline(deadline) {
+        Trade memory t = _trade3(tokenA, tokenB, tokenC, amountIn, routerAB, routerBC, routerCA,
+            feeAB, feeBC, feeCA, minProfit, deadline);
+        uint256 profit = _runBorrowed(t);
+        emit TriangularArbitrageExecuted(tokenA, tokenB, tokenC, routerAB, routerBC, routerCA, amountIn, profit);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Borrow callback (Uniswap V4)
+    // ═══════════════════════════════════════════════════════════
+
+    /// @notice Called by the PoolManager inside `unlock`: take the trade amount, run the
+    ///         legs, repay exactly the amount taken, then settle profit. Only runs while one
+    ///         of this contract's *Borrowed entry points (onlyOwner) is waiting on unlock.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != poolManager || !_borrowActive) revert UnexpectedCallback(msg.sender);
+        Trade memory t = abi.decode(data, (Trade));
+        address token = t.tokens[0];
+        IPoolManagerV4 pm = IPoolManagerV4(poolManager);
+
+        uint256 balanceBefore = IERC20(token).balanceOf(address(this));
+        pm.take(token, address(this), t.amountIn);
+        uint256 balanceAfter = _runLegs(t);
+        // Check before repaying, so a losing trade reverts with the trade's own numbers.
+        uint256 net = balanceAfter > t.amountIn ? balanceAfter - t.amountIn : 0;
+        if (net < balanceBefore + t.minProfit) revert NotProfitable(balanceBefore, net, t.minProfit);
+
+        pm.sync(token);
+        IERC20(token).safeTransfer(poolManager, t.amountIn);
+        pm.settle();
+        emit Borrowed(token, t.amountIn);
+        return abi.encode(_settle(token, balanceBefore, net, t.minProfit));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CL pool swap callbacks (DirectCL legs)
+    // ═══════════════════════════════════════════════════════════
+
+    /// @notice Uniswap V3 / Slipstream / Aero CL pool callback: pay the pool what it asks.
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _payPool(amount0Delta, amount1Delta, data);
+    }
+
+    /// @notice PancakeSwap V3 pool callback (same contract as Uniswap's, renamed).
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _payPool(amount0Delta, amount1Delta, data);
+    }
+
+    /// @dev Only the pool this contract is swapping on right now, and at most the leg's input.
+    function _payPool(int256 amount0Delta, int256 amount1Delta, bytes calldata data) internal {
+        if (msg.sender != _activePool || msg.sender == address(0)) revert UnexpectedCallback(msg.sender);
+        uint256 owed = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
+        if (owed > _activeMaxIn) revert UnexpectedCallback(msg.sender);
+        IERC20(abi.decode(data, (address))).safeTransfer(msg.sender, owed);
     }
 
     // ═══════════════════════════════════════════════════════════
     // Internal
     // ═══════════════════════════════════════════════════════════
+
+    function _trade2(
+        address tokenIn, address tokenOut, uint256 amountIn, address routerA, address routerB,
+        uint24 feeA, uint24 feeB, uint256 minProfit, uint256 deadline
+    ) internal view returns (Trade memory t) {
+        if (amountIn == 0) revert ZeroAmount();
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
+        if (tokenIn == tokenOut) revert InvalidPath();
+        t.n = 2;
+        t.tokens[0] = tokenIn; t.tokens[1] = tokenOut;
+        t.routers[0] = routerA; t.routers[1] = routerB;
+        t.types[0] = _checkRouter(routerA); t.types[1] = _checkRouter(routerB);
+        t.fees[0] = feeA; t.fees[1] = feeB;
+        t.amountIn = amountIn; t.minProfit = minProfit; t.deadline = deadline;
+    }
+
+    function _trade3(
+        address tokenA, address tokenB, address tokenC, uint256 amountIn,
+        address routerAB, address routerBC, address routerCA,
+        uint24 feeAB, uint24 feeBC, uint24 feeCA, uint256 minProfit, uint256 deadline
+    ) internal view returns (Trade memory t) {
+        if (amountIn == 0) revert ZeroAmount();
+        if (tokenA == address(0) || tokenB == address(0) || tokenC == address(0)) revert ZeroAddress();
+        if (tokenA == tokenB || tokenB == tokenC || tokenA == tokenC) revert InvalidPath();
+        t.n = 3;
+        t.tokens[0] = tokenA; t.tokens[1] = tokenB; t.tokens[2] = tokenC;
+        t.routers[0] = routerAB; t.routers[1] = routerBC; t.routers[2] = routerCA;
+        t.types[0] = _checkRouter(routerAB); t.types[1] = _checkRouter(routerBC); t.types[2] = _checkRouter(routerCA);
+        t.fees[0] = feeAB; t.fees[1] = feeBC; t.fees[2] = feeCA;
+        t.amountIn = amountIn; t.minProfit = minProfit; t.deadline = deadline;
+    }
+
+    /// @dev Trade with the contract's own balance of the start token.
+    function _runFunded(Trade memory t) internal returns (uint256 profit) {
+        uint256 balanceBefore = _checkBalance(t.tokens[0], t.amountIn);
+        uint256 balanceAfter = _runLegs(t);
+        profit = _settle(t.tokens[0], balanceBefore, balanceAfter, t.minProfit);
+    }
+
+    /// @dev Trade with the start amount borrowed from the V4 PoolManager (see unlockCallback).
+    function _runBorrowed(Trade memory t) internal returns (uint256 profit) {
+        if (poolManager == address(0)) revert BorrowUnavailable();
+        _borrowActive = true;
+        bytes memory ret = IPoolManagerV4(poolManager).unlock(abi.encode(t));
+        _borrowActive = false;
+        profit = abi.decode(ret, (uint256));
+    }
+
+    /// @dev Run every leg; returns the start token's balance after the last one.
+    function _runLegs(Trade memory t) internal returns (uint256 balanceAfter) {
+        uint256 amount = t.amountIn;
+        for (uint8 i = 0; i < t.n; i++) {
+            address tokenOut = t.tokens[(i + 1) % t.n];
+            (amount, balanceAfter) =
+                _swap(i + 1, t.routers[i], t.types[i], t.tokens[i], tokenOut, amount, t.fees[i], t.deadline);
+        }
+    }
 
     /// @dev setRouter is the only way in and rejects retired types, so an allowed
     ///      router's type is always supported.
@@ -348,6 +568,17 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         if (rtype == RouterType.Slipstream && (fee == 0 || fee > 16_384)) revert InvalidTickSpacing(leg, router, fee);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
+        if (rtype == RouterType.DirectCL || rtype == RouterType.DirectPair) {
+            if (rtype == RouterType.DirectCL) {
+                _directCL(leg, router, tokenIn, amountIn);
+            } else {
+                _directPair(leg, router, tokenIn, amountIn, fee);
+            }
+            outAfter = IERC20(tokenOut).balanceOf(address(this));
+            if (outAfter <= outBefore) revert NoOutput(leg, router);
+            unchecked { received = outAfter - outBefore; }
+            return (received, outAfter);
+        }
         IERC20(tokenIn).forceApprove(router, amountIn);
 
         // Low-level call: the router's return value is never decoded (we measure the
@@ -388,6 +619,55 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             data = abi.encodeCall(IUniswapV2Router02.swapExactTokensForTokens,
                 (amountIn, 0, path, address(this), deadline));
         }
+        _call(leg, router, rtype, data);
+
+        _clearAllowance(tokenIn, router);
+        outAfter = IERC20(tokenOut).balanceOf(address(this));
+        // `<=` rather than a checked subtraction: a balance that shrank (rebasing token,
+        // router pulling tokenOut) must still name the leg, not panic.
+        if (outAfter <= outBefore) revert NoOutput(leg, router);
+        unchecked { received = outAfter - outBefore; }
+    }
+
+    /// @dev Exact-input swap on a CL pool; the pool pulls its input through _payPool.
+    function _directCL(uint8 leg, address pool, address tokenIn, uint256 amountIn) internal {
+        if (amountIn > uint256(type(int256).max)) revert ZeroAmount();
+        bool zeroForOne = ICLPool(pool).token0() == tokenIn;
+        _activePool = pool;
+        _activeMaxIn = amountIn;
+        _call(leg, pool, RouterType.DirectCL, abi.encodeCall(ICLPool.swap, (
+            address(this), zeroForOne, int256(amountIn),
+            zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE,
+            abi.encode(tokenIn)
+        )));
+        _activePool = address(0);
+        _activeMaxIn = 0;
+    }
+
+    /// @dev Pay a V2-style pair first, then ask for the output it owes. `fee` 0: the pool's
+    ///      own getAmountOut (Aerodrome / Aero — their curve and current fee); else the
+    ///      Uniswap V2 formula with `fee` bps on the pair's reserves.
+    function _directPair(uint8 leg, address pair, address tokenIn, uint256 amountIn, uint24 fee) internal {
+        if (fee >= 10_000) revert InvalidPairFee(leg, pair, fee);
+        bool inIs0 = IPair(pair).token0() == tokenIn;
+        uint256 out;
+        if (fee == 0) {
+            out = IPair(pair).getAmountOut(amountIn, tokenIn);
+        } else {
+            (uint256 r0, uint256 r1) = IPair(pair).getReserves();
+            (uint256 rIn, uint256 rOut) = inIs0 ? (r0, r1) : (r1, r0);
+            uint256 inWithFee = amountIn * (10_000 - fee);
+            out = (inWithFee * rOut) / (rIn * 10_000 + inWithFee);
+        }
+        if (out == 0) revert NoOutput(leg, pair);
+        IERC20(tokenIn).safeTransfer(pair, amountIn);
+        _call(leg, pair, RouterType.DirectPair, abi.encodeCall(IPair.swap, (
+            inIs0 ? 0 : out, inIs0 ? out : 0, address(this), bytes("")
+        )));
+    }
+
+    /// @dev Call a router / pool; a revert becomes LegFailed (or LegExhaustedGas).
+    function _call(uint8 leg, address router, RouterType rtype, bytes memory data) internal {
         uint256 gasBefore = gasleft();
         (bool ok, bytes memory reason) = router.call(data);
         if (!ok) {
@@ -405,13 +685,6 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
             }
             revert LegFailed(leg, router, rtype, reason);
         }
-
-        _clearAllowance(tokenIn, router);
-        outAfter = IERC20(tokenOut).balanceOf(address(this));
-        // `<=` rather than a checked subtraction: a balance that shrank (rebasing token,
-        // router pulling tokenOut) must still name the leg, not panic.
-        if (outAfter <= outBefore) revert NoOutput(leg, router);
-        unchecked { received = outAfter - outBefore; }
     }
 
     /// @dev True for revert data an out-of-gas inner call can turn into: empty, or Uniswap
