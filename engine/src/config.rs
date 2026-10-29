@@ -536,6 +536,12 @@ pub struct Tuning {
     /// Startup pool-discovery batch size and timeout (ms).
     pub discover_chunk_size: usize,
     pub discover_call_timeout_ms: u64,
+    /// Pause between discovery / fee-refresh multicall chunks (ms): keeps background reads
+    /// under a free endpoint's per-second cap. 0 = back to back.
+    pub discover_chunk_gap_ms: u64,
+    /// After a rate-limited quote chunk, hold every new quote chunk this long (ms) and retry
+    /// the limited one once.
+    pub quote_rate_limit_backoff_ms: u64,
     /// Max age of a cached 2-hop QuoterV2 result (ms). Block-relative: 3 blocks.
     pub quote_cache_max_age_ms: Option<u64>,
     pub quote_cache_max_pools: usize,
@@ -606,7 +612,7 @@ impl Default for Tuning {
             min_pool_depth_usd: 20_000.0,
             pool_depth_refresh_ms: 5_000,
             pool_rediscover_ms: 21_600_000,
-            cl_fee_refresh_ms: 10_000,
+            cl_fee_refresh_ms: 30_000,
             v2_fee_refresh_ms: 3_600_000,
             v3_spot_max_vr_fraction_bps: 200,
             v3_spot_overestimate_bps: 30,
@@ -628,6 +634,8 @@ impl Default for Tuning {
             multicall_chunk_timeout_ms: 3_000,
             discover_chunk_size: 20,
             discover_call_timeout_ms: 15_000,
+            discover_chunk_gap_ms: 100,
+            quote_rate_limit_backoff_ms: 250,
             quote_cache_max_age_ms: None,
             quote_cache_max_pools: 1024,
             quote_cache_settle_ms: 500,

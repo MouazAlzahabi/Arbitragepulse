@@ -45,3 +45,7 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # Config env-var substitution
 regex = "1"
+
+[dev-dependencies]
+# Paused-clock tests (rate-limit back-off waits) — test builds only.
+tokio = { workspace = true, features = ["test-util"] }
