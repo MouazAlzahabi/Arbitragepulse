@@ -298,6 +298,8 @@ pub struct Strategy {
     pub quoter_by_router: HashMap<String, Address>,
     /// Quoters of Slipstream routers — they take a tick spacing, see [`Strategy::encode_quote`].
     pub slipstream_quoters: std::collections::HashSet<Address>,
+    /// Aero Metaquoters → their router id: quoted by pool address, resolved from the cache.
+    pub metaquoters: HashMap<Address, String>,
     /// Solidly/Aerodrome effective pool-cache IDs: router_id → (volatile, stable).
     pub solidly_pool_keys: HashMap<String, (String, String)>,
     /// Reverse index: token address → pair indices that include that token.
@@ -349,6 +351,7 @@ impl Strategy {
             .collect();
 
         let slipstream_quoters = slipstream_quoters(&routers);
+        let metaquoters = metaquoters(&routers);
         let quoter_by_router: HashMap<String, Address> = routers
             .iter()
             .filter_map(|r| {
@@ -402,6 +405,7 @@ impl Strategy {
             quote_block: BlockId::latest(),
             router_addr_map,
             slipstream_quoters,
+            metaquoters,
             quoter_by_router,
             solidly_pool_keys,
             token_pair_index: HashMap::new(),
@@ -628,6 +632,7 @@ impl Strategy {
             })
             .collect();
         self.slipstream_quoters = slipstream_quoters(&self.routers);
+        self.metaquoters = metaquoters(&self.routers);
         self.solidly_pool_keys = self
             .routers
             .iter()
@@ -750,8 +755,17 @@ impl Strategy {
         if self.quote_block == BlockId::pending() { self.http_provider.clone() } else { None }
     }
 
-    /// Quote calldata for `quoter`: Slipstream's ABI for Slipstream quoters, QuoterV2's otherwise.
+    /// Quote calldata for `quoter`: the Aero Metaquoter's (by pool) for Aero CL, Slipstream's
+    /// ABI for Slipstream quoters, QuoterV2's otherwise.
     pub(crate) fn encode_quote(&self, quoter: Address, token_in: Address, token_out: Address, fee: u32, amount_in: U256) -> Vec<u8> {
+        if let Some(router_id) = self.metaquoters.get(&quoter) {
+            // A pool missing from the cache gets empty calldata: the quote fails, the leg is skipped.
+            let key = crate::pool_cache::V3PoolKey::new(router_id, token_in, token_out, fee);
+            return match self.pool_cache.v3_by_key.get(&key) {
+                Some(pool) => encode_metaquote(*pool, token_in, amount_in),
+                None => Vec::new(),
+            };
+        }
         if self.slipstream_quoters.contains(&quoter) {
             encode_slipstream_quote(token_in, token_out, fee, amount_in)
         } else {
@@ -764,9 +778,22 @@ impl Strategy {
     }
 }
 
+fn metaquoters(routers: &[RouterConfig]) -> HashMap<Address, String> {
+    routers.iter()
+        .filter(|r| r.metaquoter)
+        .filter_map(|r| Some((r.quoter_address.as_deref()?.parse::<Address>().ok()?, r.id.clone())))
+        .collect()
+}
+
+/// Aero Metaquoter calldata for one pool. Its return starts with amountOut, then two dynamic
+/// arrays' offsets and a word — the same 4-word head [`decode_v3_quote`] reads.
+pub(crate) fn encode_metaquote(pool: Address, token_in: Address, amount_in: U256) -> Vec<u8> {
+    crate::abi::IAeroMetaquoter::quoteExactInputCall { pools: vec![pool], tokenIn: token_in, amountIn: amount_in }.abi_encode()
+}
+
 fn slipstream_quoters(routers: &[RouterConfig]) -> std::collections::HashSet<Address> {
     routers.iter()
-        .filter(|r| r.slipstream)
+        .filter(|r| r.slipstream && !r.metaquoter)
         .filter_map(|r| r.quoter_address.as_deref()?.parse::<Address>().ok())
         .collect()
 }
@@ -1086,6 +1113,23 @@ pub(crate) fn token_amount_to_usd(amount: U256, decimals: u8, symbol: &str, nati
 #[cfg(test)]
 mod quote_encoding_tests {
     use super::*;
+
+    /// Real Aero Metaquoter response (5000 USDC → WETH on Aero CL ts50, 2026-10-29): the
+    /// QuoterV2 decoder reads its amountOut.
+    #[test]
+    fn metaquote_response_decodes_as_quoter_v2() {
+        let hex = "0000000000000000000000000000000000000000000000001e1bb716661d1d90\
+                   0000000000000000000000000000000000000000000000000000000000000060\
+                   00000000000000000000000000000000000000000000000000000000000000a0\
+                   0000000000000000000000000000000000000000000000000000000000000001\
+                   0000000000000000000000000000000000000000000325450ff32a2bea551ee2\
+                   0000000000000000000000000000000000000000000000000000000000000001\
+                   0000000000000000000000000000000000000000000000000000000000000001";
+        let raw: Vec<u8> = alloy::hex::decode(hex.replace(' ', "")).unwrap();
+        assert_eq!(decode_v3_quote(Some(&raw)), Some(U256::from(0x1e1bb716661d1d90u64)));
+        let cd = encode_metaquote(Address::repeat_byte(7), Address::repeat_byte(1), U256::from(5u64));
+        assert_eq!(&cd[..4], &alloy::primitives::keccak256(b"quoteExactInput(address[],address,uint256)")[..4]);
+    }
 
     #[test]
     fn slipstream_quote_uses_int24_tick_spacing_selector_and_same_decoder() {

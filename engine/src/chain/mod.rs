@@ -108,7 +108,7 @@ pub async fn run_chain(
     // Runs before pool discovery so a wrong key fails within seconds. Startup only.
     let dry_run_at_start = shared_state.read().await.dry_run;
     let setup = |p| state::check_contract_setup(
-        p, contract_addr, signer_address, &routers, &cfg.name, dry_run_at_start, &log_tx,
+        p, contract_addr, signer_address, &routers, &cfg.name, dry_run_at_start, cfg.borrow, &log_tx,
     );
     let start_paused = match setup(startup_reads).await {
         Err(e) if has_startup_fallback => {
@@ -256,8 +256,10 @@ pub async fn run_chain(
     // Signer gas check (chain.min_native_balance): warn once per low period.
     let gas_low_warned = Arc::new(AtomicBool::new(false));
     state::check_signer_gas(reads.as_ref(), signer_address, cfg.min_native_balance, &gas_low_warned, &log_tx, &cfg.name).await;
-    // Startup funding check: warn for any underfunded pair.
-    state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances, &log_tx).await;
+    // Startup funding check: warn for any underfunded pair (borrowed trades need no balance).
+    if !cfg.borrow {
+        state::check_contract_funding(&cfg.name, &chain_pairs, contract_addr, &contract_balances, &log_tx).await;
+    }
     // Balance slots for dry-run's assumed balance (simulate unfunded trades instead of
     // skipping them). On the simulation endpoint, which must accept eth_call state overrides.
     {
@@ -274,6 +276,17 @@ pub async fn run_chain(
     }
     // Wire balances into executor for post-trade immediate refresh.
     { executor.lock().await.contract_balances = Some(contract_balances.clone()); }
+    // Direct venues (legs sent to pools) and V4 borrowing.
+    {
+        let mut exec = executor.lock().await;
+        exec.direct = Arc::new(crate::executor::DirectVenues::from_routers(&chain_routers, pool_cache.clone()));
+        exec.borrow = cfg.borrow;
+    }
+    if cfg.borrow {
+        info!("[{}] Borrowing: every trade takes its amountIn from the Uniswap V4 PoolManager (no fee, no interest) — contract balance not used", cfg.name);
+    }
+    // Direct venues trade only on pools the executor allowlists: report the missing ones.
+    state::check_direct_pools(reads.as_ref(), contract_addr, &chain_routers, &pool_cache, dry_run_at_start, &cfg.name, &log_tx).await;
     // Pre-fetch nonce at startup so first submission has zero RPC overhead.
     { executor.lock().await.prefetch_nonce(provider.as_ref()).await; }
 
@@ -439,6 +452,7 @@ pub async fn run_chain(
     maintain::spawn_rediscovery(
         rediscover_reads, chain_routers.clone(), chain_pairs.clone(), pool_cache.clone(),
         start_log_feeds.clone(), log_feed_handles, cfg.name.clone(),
+        (contract_addr, dry_run_at_start, log_tx.clone()),
     );
 
     // ── Pending TX monitor (optional, requires mempool-enabled WS endpoint) ──
@@ -684,7 +698,7 @@ pub async fn run_chain(
                 let preconf_n = preconf_logs.swap(0, Ordering::Relaxed);
                 let recheck_drop_n = recheck_drops.load(Ordering::Relaxed);
                 // Pairs the executor can't fund (cached balances, no RPC): they detect but never trade.
-                let unfunded = state::underfunded_pairs(&chain_pairs, &*contract_balances.read().await).len();
+                let unfunded = if cfg.borrow { 0 } else { state::underfunded_pairs(&chain_pairs, &*contract_balances.read().await).len() };
                 let heartbeat_msg = format!(
                     "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} spot2={} tri={} triV={} | quotes={} active={}/{} cross={} | opps={}{} | v2={} v3={}/{}{}{}",
                     cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, spot2_str, tri_str, tri_v_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,

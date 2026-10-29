@@ -475,7 +475,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     let dry_run = shared_state.read().await.dry_run;
     // Dry-run with a known balance slot: an unfunded trade is simulated with an assumed
     // balance (executor::balance_override) instead of skipped. Never in live mode.
-    let assume_balance = |token: &Address| dry_run && balance_slots.contains_key(token);
+    // With chain.borrow every trade borrows its amountIn: no balance guard at all.
+    let assume_balance = |token: &Address| cfg.borrow || (dry_run && balance_slots.contains_key(token));
 
     // Try each opportunity in priority order (profit descending). On gas-rejection or
     // pre-flight failure, fall through to the next candidate. On a successful send or
@@ -580,7 +581,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     match best_opp {
         Opportunity::TwoHop(opp) => {
             // Two-round adaptive size optimizer (only for 2-hop)
-            let max_bal = {
+            let max_bal = if cfg.borrow {
+                None // borrowed: the optimizer is capped by max_trade only
+            } else {
                 // A token missing from the cache (pair added by a config reload) counts as
                 // unfunded: the balance guard below must not be skipped.
                 let bals = contract_balances.read().await;

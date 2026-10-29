@@ -68,6 +68,8 @@ pub(crate) fn spawn_rediscovery(
     start_log_feeds: Arc<dyn Fn() -> Vec<tokio::task::JoinHandle<()>> + Send + Sync>,
     mut feeds: Vec<tokio::task::JoinHandle<()>>,
     chain_name: String,
+    // (executor, dry-run at start, log sink): new direct-venue pools get the allowlist check.
+    direct_check: (Address, bool, LogBroadcaster),
 ) {
     let every = crate::config::tuning().pool_rediscover_ms;
     if every == 0 {
@@ -87,6 +89,8 @@ pub(crate) fn spawn_rediscovery(
             if added == 0 {
                 continue;
             }
+            let (contract, dry_run, ref log_tx) = direct_check;
+            state::check_direct_pools(&reads, contract, &routers, &cache, dry_run, &chain_name, log_tx).await;
             let fresh = start_log_feeds();
             tokio::time::sleep(Duration::from_secs(15)).await;
             for h in feeds.drain(..) {
@@ -132,9 +136,20 @@ pub(crate) fn spawn_fee_refresh(
     let t = crate::config::tuning();
     let (cl_every, v2_every) = (t.cl_fee_refresh_ms, t.v2_fee_refresh_ms);
     let slipstream: HashSet<String> = routers.iter().filter(|r| r.slipstream).map(|r| r.id.clone()).collect();
+    // Aerodrome V2: factory.getFee(pool, stable). Aero V2 (stable_factory_address set):
+    // (volatile factory, stable factory, default bps volatile, stable) → fee module customFee.
     let aero_factories: HashMap<String, Address> = routers.iter()
-        .filter(|r| r.router_type == RouterType::Aerodrome)
+        .filter(|r| r.router_type == RouterType::Aerodrome && r.stable_factory_address.is_none())
         .filter_map(|r| Some((r.id.clone(), r.factory_address.as_deref()?.parse().ok()?)))
+        .collect();
+    let aero_v2: HashMap<String, (Address, Address, u32, u32)> = routers.iter()
+        .filter(|r| r.router_type == RouterType::Aerodrome)
+        .filter_map(|r| Some((r.id.clone(), (
+            r.factory_address.as_deref()?.parse().ok()?,
+            r.stable_factory_address.as_deref()?.parse().ok()?,
+            r.fee_bps,
+            r.stable_fee_bps.unwrap_or(r.fee_bps),
+        ))))
         .collect();
     if cl_every > 0 && !slipstream.is_empty() {
         let (reads, cache, name) = (reads.clone(), cache.clone(), chain_name.clone());
@@ -162,25 +177,43 @@ pub(crate) fn spawn_fee_refresh(
             }
         });
     }
-    if v2_every > 0 && !aero_factories.is_empty() {
+    if v2_every > 0 && !(aero_factories.is_empty() && aero_v2.is_empty()) {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(v2_every));
             tick.tick().await;
             loop {
                 tick.tick().await;
-                // (pool, factory, stable, current fee)
-                let pools: Vec<(Address, Address, bool, u32)> = cache.by_address.iter().filter_map(|e| {
+                // Aero V2 fee modules, one per factory (read each round: they can be replaced).
+                let factories: Vec<Address> = aero_v2.values().flat_map(|v| [v.0, v.1]).collect();
+                let (mods_raw, _) = discover::discover_mc(
+                    factories.iter().map(|f| (*f, crate::abi::IAeroV2Factory::feeModuleCall {}.abi_encode())).collect(),
+                    &reads,
+                ).await;
+                let modules: HashMap<Address, Address> = factories.iter().zip(mods_raw)
+                    .filter_map(|(f, r)| Some((*f, crate::abi::IAeroV2Factory::feeModuleCall::abi_decode_returns(&r?).ok()?)))
+                    .collect();
+                // (pool, call target, calldata, Aero default bps or None for Aerodrome, current fee)
+                let pools: Vec<(Address, Address, Vec<u8>, Option<u32>, u32)> = cache.by_address.iter().filter_map(|e| {
                     let router = e.router_id.split("::").next()?;
-                    Some((*e.key(), *aero_factories.get(router)?, e.is_stable, e.fee_bps))
+                    if let Some(f) = aero_factories.get(router) {
+                        let cd = crate::abi::IAerodromeFactory::getFeeCall { pool: *e.key(), _stable: e.is_stable }.abi_encode();
+                        return Some((*e.key(), *f, cd, None, e.fee_bps));
+                    }
+                    let &(vol, sta, d_vol, d_sta) = aero_v2.get(router)?;
+                    let module = *modules.get(if e.is_stable { &sta } else { &vol })?;
+                    let cd = crate::abi::IAeroFeeModule::customFeeCall { pool: *e.key() }.abi_encode();
+                    Some((*e.key(), module, cd, Some(if e.is_stable { d_sta } else { d_vol }), e.fee_bps))
                 }).collect();
                 if pools.is_empty() { continue; }
-                let calls = pools.iter()
-                    .map(|&(p, f, stable, _)| (f, crate::abi::IAerodromeFactory::getFeeCall { pool: p, _stable: stable }.abi_encode()))
-                    .collect();
+                let calls = pools.iter().map(|(_, to, cd, _, _)| (*to, cd.clone())).collect();
                 let (raw, _) = discover::discover_mc(calls, &reads).await;
-                let changed = pools.iter().zip(raw).filter(|((p, _, _, cur), r)| {
+                let changed = pools.iter().zip(raw).filter(|((p, _, _, aero_default, cur), r)| {
                     // An unreadable fee keeps the current one.
-                    let fee = discover::aerodrome_fee_bps(r.as_deref(), *cur);
+                    let fee = match aero_default {
+                        Some(d) if r.is_some() => discover::aero_custom_fee_bps(r.as_deref(), *d),
+                        Some(_) => *cur,
+                        None => discover::aerodrome_fee_bps(r.as_deref(), *cur),
+                    };
                     cache.set_v2_fee_bps(*p, fee)
                 }).count();
                 if changed > 0 {
