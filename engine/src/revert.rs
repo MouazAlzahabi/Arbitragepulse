@@ -121,7 +121,10 @@ alloy::sol! {
 }
 
 fn router_type_name(t: u8) -> &'static str {
-    match t { 0 => "V2", 1 => "V3", 4 => "Aerodrome", 5 => "Slipstream", _ => "retired type" }
+    match t {
+        0 => "V2", 1 => "V3", 4 => "Aerodrome", 5 => "Slipstream",
+        6 => "DirectCL", 7 => "DirectPair", _ => "retired type",
+    }
 }
 
 /// Classify revert bytes from `eth_call` replay or RPC error payload. `detail` is a
@@ -171,7 +174,9 @@ fn explain_executor(e: Executor::ExecutorErrors) -> (RevertClass, String) {
                  "reverted with no reason (no pool for this pair/fee tier, wrong router type — check setRouter — or out of gas)".to_string())
             } else {
                 let (inner, text) = explain_router_reason(&e.reason);
-                (inner, format!("reverted: {text}"))
+                // Aero CL's swap hook: require(gasleft() > 250_000, "IG").
+                let hint = if text == "\"IG\"" { " — Aero swap hook: not enough gas left (tuning.gas_per_hooked_leg)" } else { "" };
+                (inner, format!("reverted: {text}{hint}"))
             };
             (class, format!("leg {} ({} router {}) {}", e.leg, router_type_name(e.rtype), e.router, why))
         }
@@ -486,6 +491,16 @@ mod tests {
         let detail = d.detail.unwrap();
         assert!(detail.starts_with("leg 2 (V3 router 0x2626"), "{detail}");
         assert!(detail.contains("\"Too little received\""), "{detail}");
+    }
+
+    /// The log seen on the server: an Aero CL pool (type 6) leg reverting "IG".
+    #[test]
+    fn aero_hook_ig_is_named_and_explained() {
+        let pool = address!("4A7af46bC8aBc00048c6c7920a1488DAF568366c");
+        let data = LegFailed { leg: 3, router: pool, rtype: 6, reason: Bytes::from(error_string("IG")) }.abi_encode();
+        let detail = classify_revert_bytes(&data).detail.unwrap();
+        assert!(detail.starts_with("leg 3 (DirectCL router 0x4A7a"), "{detail}");
+        assert!(detail.contains("not enough gas") && !detail.contains("retired"), "{detail}");
     }
 
     #[test]
