@@ -339,6 +339,16 @@ pairs:
     trade_amount: "4"
     max_trade: "4"
 
+  - id: "base-weth-vvv"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf"
+    token_in_symbol: "WETH"
+    token_out_symbol: "VVV"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "4"
+    max_trade: "4"
+
 
 
 # ─── TUNING ────────────────────────────────────────────────
