@@ -760,6 +760,10 @@ impl Strategy {
     pub(crate) fn encode_quote(&self, quoter: Address, token_in: Address, token_out: Address, fee: u32, amount_in: U256) -> Vec<u8> {
         if let Some(router_id) = self.metaquoters.get(&quoter) {
             // A pool missing from the cache gets empty calldata: the quote fails, the leg is skipped.
+            // So does every hooked pool when `pending` calls can't carry the real block time.
+            if !crate::util::pending_time_ok() {
+                return Vec::new();
+            }
             let key = crate::pool_cache::V3PoolKey::new(router_id, token_in, token_out, fee);
             return match self.pool_cache.v3_by_key.get(&key) {
                 Some(pool) => encode_metaquote(*pool, token_in, amount_in),
@@ -804,7 +808,7 @@ fn slipstream_quoters(routers: &[RouterConfig]) -> std::collections::HashSet<Add
 /// out-of-gas (the aggregate itself failed — per-call replay can still succeed). False for
 /// transport/RPC errors (rate limit, 5xx, reset): replaying 10× to the same endpoint would
 /// only amplify the load that caused them.
-fn multicall_error_is_revert(err: &alloy::transports::TransportError) -> bool {
+pub(crate) fn multicall_error_is_revert(err: &alloy::transports::TransportError) -> bool {
     match err {
         alloy::transports::RpcError::ErrorResp(p) if !p.is_retry_err() => {
             let msg = p.message.to_lowercase();
@@ -1016,11 +1020,12 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
             // A rate-limited chunk holds the gate and is retried once: firing more chunks at an
             // endpoint that is refusing would only lose them too.
             let call = async {
-                match p.call(tx.clone()).block(block).await {
+                let at = crate::util::pending_block_overrides(block);
+                match p.call(tx.clone()).block(block).with_block_overrides_opt(at.clone()).await {
                     Err(e) if is_rate_limited(&e) => {
                         gate.mark_limited();
                         gate.wait_if_limited().await;
-                        p.call(tx).block(block).await
+                        p.call(tx).block(block).with_block_overrides_opt(at).await
                     }
                     r => r,
                 }
@@ -1085,7 +1090,7 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
                         .to(*target)
                         .input(data.clone().into());
                     let _permit = gate.permits.acquire().await;
-                    let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx).block(block)).await;
+                    let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx).block(block).with_block_overrides_opt(crate::util::pending_block_overrides(block))).await;
                     out.push(match r {
                         Ok(Ok(b)) => (Some(b.to_vec()), true),
                         Ok(Err(e)) => (None, multicall_error_is_revert(&e)),
