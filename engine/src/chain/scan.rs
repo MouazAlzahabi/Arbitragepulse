@@ -823,6 +823,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 };
                                 let our_tip_bg = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 let our_sender_bg = prep.tx.from.unwrap_or_default();
+                                let replay_bg = crate::race::replay_request(&prep.tx);
                                 let ra_type_bg = crate::revert::router_type_label(&optimized.router_a_type);
                                 let rb_type_bg = crate::revert::router_type_label(&optimized.router_b_type);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -956,7 +957,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                                 let race = match (receipt.block_hash(), receipt.transaction_index()) {
                                                     (Some(bh), Some(idx)) => crate::race::analyze(
-                                                        provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg,
+                                                        provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg, replay_bg,
                                                     ).await,
                                                     _ => None,
                                                 };
@@ -1305,6 +1306,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 };
                                 let our_tip_bg = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 let our_sender_bg = prep.tx.from.unwrap_or_default();
+                                let replay_bg = crate::race::replay_request(&prep.tx);
                                 let ra_type_bg = crate::revert::router_type_label(&opp.router_ab_type);
                                 let rb_type_bg = crate::revert::router_type_label(&opp.router_ca_type);
                                 let confirmed_success_bg = prep.confirmed_success.clone();
@@ -1438,7 +1440,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 }
                                                 let race = match (receipt.block_hash(), receipt.transaction_index()) {
                                                     (Some(bh), Some(idx)) => crate::race::analyze(
-                                                        provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg,
+                                                        provider_bg.as_ref(), bh, idx, our_tip_bg, our_sender_bg, &race_pools_bg, replay_bg,
                                                     ).await,
                                                     _ => None,
                                                 };

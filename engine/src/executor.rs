@@ -125,9 +125,11 @@ pub(crate) async fn simulate_call<P: Provider>(
     tx: TransactionRequest,
     overrides: Option<StateOverride>,
 ) -> alloy::transports::TransportResult<alloy::primitives::Bytes> {
+    // `pending` runs with a stale block time; see [`crate::util::pending_block_overrides`].
+    let pending_at = crate::util::pending_block_overrides(alloy::eips::BlockId::pending());
     match (preconf, overrides) {
-        (Some(pc), Some(o)) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending()).overrides(o)).await,
-        (Some(pc), None) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending())).await,
+        (Some(pc), Some(o)) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending()).overrides(o).with_block_overrides_opt(pending_at)).await,
+        (Some(pc), None) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending()).with_block_overrides_opt(pending_at)).await,
         (None, Some(o)) => transport_timeout(rpc_simulate_timeout(), provider.call(tx).overrides(o)).await,
         (None, None) => transport_timeout(rpc_simulate_timeout(), provider.call(tx)).await,
     }

@@ -1,4 +1,5 @@
 use alloy::primitives::{Address, U256}; // U256 used by u256_to_f64
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Convert a U256 to f64 (lossy for very large values).
 /// Fast path for values ≤ u128::MAX (all configured trade amounts) — no heap alloc.
@@ -24,6 +25,74 @@ pub fn addr_key(addr: Address) -> String {
     format!("{:?}", addr).to_lowercase()
 }
 
+
+// ─── Block time for `pending` calls ──────────────────────────────────────────
+// A `pending` eth_call runs on flashblock state, but every Base node (Alchemy, Infura,
+// mainnet.base.org, …) executes it with the block number/timestamp of a block 1–4 back.
+// Aero's swap hook charges its floor fee when `block.timestamp` is earlier than its last
+// update, so Aero CL quotes and simulations came out up to ~800 ppm too cheap and sent
+// trades that could only revert. Every `pending` call therefore overrides the block time
+// with the latest the pending block can carry: the next slot after now, plus one.
+
+/// Latest head: its timestamp and the wall-clock ms it arrived at (0 = none yet).
+static HEAD_TS: AtomicU64 = AtomicU64::new(0);
+static HEAD_SEEN_MS: AtomicU64 = AtomicU64::new(0);
+/// Block time in seconds (Base: 2).
+static SLOT_SECS: AtomicU64 = AtomicU64::new(2);
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+pub fn set_slot_secs(block_time_ms: u64) {
+    SLOT_SECS.store((block_time_ms / 1000).max(1), Ordering::Relaxed);
+}
+
+/// Record a new head. Returns the server clock's lead over the chain in seconds (wall
+/// clock minus head timestamp; negative = the server clock is behind the chain).
+pub fn note_head(timestamp: u64) -> i64 {
+    let now = wall_ms();
+    HEAD_TS.store(timestamp, Ordering::Relaxed);
+    HEAD_SEEN_MS.store(now, Ordering::Relaxed);
+    (now / 1000) as i64 - timestamp as i64
+}
+
+/// Block time for a `pending` call at wall-clock `now_ms`. Chain time is the later of the
+/// wall clock and the last head advanced by the time since it arrived, so a server clock
+/// running behind can't pull the override before the hook's last update.
+fn pending_time_at(now_ms: u64, head_ts: u64, head_seen_ms: u64, slot: u64) -> u64 {
+    let since_head = if head_seen_ms == 0 { 0 } else { now_ms.saturating_sub(head_seen_ms) };
+    let chain_ms = now_ms.max(head_ts * 1000 + since_head);
+    if head_ts == 0 {
+        // No head yet: round up to a whole second, then add a slot.
+        return chain_ms.div_ceil(1000) + slot;
+    }
+    // Slots are aligned on the head's timestamp: first slot at/after chain time, plus one.
+    let ahead = chain_ms.saturating_sub(head_ts * 1000).div_ceil(slot * 1000);
+    head_ts + slot * (ahead + 1)
+}
+
+/// False when the quote endpoint ignores block overrides (startup probe): its `pending`
+/// block time can't be fixed, so hooked (Aero CL) quotes are switched off.
+static PENDING_TIME_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_pending_time_ok(ok: bool) {
+    PENDING_TIME_OK.store(ok, Ordering::Relaxed);
+}
+
+pub fn pending_time_ok() -> bool {
+    PENDING_TIME_OK.load(Ordering::Relaxed)
+}
+
+/// Block overrides for a call at `block`: the pending block's time for `pending`, none
+/// otherwise (a mined block's environment is already consistent with its state).
+pub fn pending_block_overrides(block: alloy::eips::BlockId) -> Option<alloy::rpc::types::BlockOverrides> {
+    if block != alloy::eips::BlockId::pending() {
+        return None;
+    }
+    let time = pending_time_at(wall_ms(), HEAD_TS.load(Ordering::Relaxed), HEAD_SEEN_MS.load(Ordering::Relaxed), SLOT_SECS.load(Ordering::Relaxed));
+    Some(alloy::rpc::types::BlockOverrides { time: Some(time), ..Default::default() })
+}
 
 // ─── RPC timeouts ─────────────────────────────────────────────────────────────
 // Every RPC call the chain loop awaits must be bounded: one hung request (stuck HTTP
@@ -384,5 +453,25 @@ mod tests {
         assert!(is_sim_failure("Triangular simulation failed: x"));
         assert!(is_sim_failure("Pre-flight eth_call rejected: x"));
         assert!(!is_sim_failure("Send failed: node said: simulation failed"));
+    }
+
+    #[test]
+    fn pending_time_is_the_slot_after_next() {
+        // Head at t=100 seen at 100.4 s: next slot at/after now is 102, override 104.
+        assert_eq!(pending_time_at(100_400, 100, 100_400, 2), 104);
+        // Exactly on a slot boundary: that slot, plus one.
+        assert_eq!(pending_time_at(102_000, 100, 100_000, 2), 104);
+        // Server clock 5 s behind the chain: head time + elapsed wins, never earlier.
+        assert_eq!(pending_time_at(95_000, 100, 95_000, 2), 102);
+        assert_eq!(pending_time_at(98_500, 100, 95_000, 2), 106);
+        // No head yet: wall clock rounded up, plus a slot.
+        assert_eq!(pending_time_at(100_400, 0, 0, 2), 103);
+    }
+
+    #[test]
+    fn only_pending_gets_block_overrides() {
+        assert!(pending_block_overrides(alloy::eips::BlockId::latest()).is_none());
+        let o = pending_block_overrides(alloy::eips::BlockId::pending()).expect("pending overrides");
+        assert!(o.time.is_some() && o.number.is_none());
     }
 }

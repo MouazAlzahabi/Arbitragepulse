@@ -68,7 +68,7 @@ impl Metrics {
         registry.register(Box::new(gas_spent_usd.clone()))?;
 
         let lost_races = CounterVec::new(
-            Opts::new("arb_lost_race_total", "Mined reverts by cause: tip (outbid in the same block), ordering (same block, reached the sequencer first), timing (price moved in an earlier block), unknown"),
+            Opts::new("arb_lost_race_total", "Mined reverts by cause: phantom (reverts at the start of its block too — never profitable), tip (outbid in the same block), ordering (same block, reached the sequencer first), timing (price moved in an earlier block), unknown"),
             &["chain", "cause"],
         )?;
         registry.register(Box::new(lost_races.clone()))?;

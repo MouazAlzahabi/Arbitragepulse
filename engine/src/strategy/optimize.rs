@@ -350,7 +350,7 @@ async fn quote_v3<P: Provider>(
         super::encode_v3_quote(token_in, token_out, fee, amount_in)
     };
     let tx = alloy::rpc::types::TransactionRequest::default().to(quoter).input(data.into());
-    match provider.call(tx).block(block).await {
+    match provider.call(tx).block(block).with_block_overrides_opt(crate::util::pending_block_overrides(block)).await {
         Ok(raw) => super::decode_v3_quote(Some(&raw.to_vec())),
         Err(e) => {
             debug!("V3 quote failed on {:?} fee={}: {}", quoter, fee, e);

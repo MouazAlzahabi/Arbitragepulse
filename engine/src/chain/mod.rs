@@ -230,8 +230,9 @@ pub async fn run_chain(
         cfg.optimistic_submission,
         http_provider,
     )));
-    if preconf_http.is_some() {
+    if let Some(pc) = &preconf_http {
         strategy.write().await.quote_block = alloy::eips::BlockId::pending();
+        probe_pending_time(pc, &cfg.name).await;
     }
     maintain::spawn_depth_refresh(strategy.clone(), pool_cache.clone(), chain_pairs.clone(), cfg.name.clone());
 
@@ -358,8 +359,10 @@ pub async fn run_chain(
         let provider_for_blocks = (*provider).clone();
         let chain_name_b = cfg.name.clone();
         let block_tx_b = block_tx.clone();
+        crate::util::set_slot_secs(cfg.block_time_ms);
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
+            let mut clock_warned: Option<Instant> = None;
             loop {
                 match provider_for_blocks.subscribe_blocks().await {
                     Ok(sub) => {
@@ -368,6 +371,14 @@ pub async fn run_chain(
                         while let Some(header) = stream.next().await {
                             let num = header.number;
                             let base_fee = header.base_fee_per_gas.unwrap_or(1_000_000_000) as u128;
+                            // Feeds the block time of `pending` calls. A server clock behind the
+                            // chain is corrected there; one far ahead quotes a later (cheaper)
+                            // hooked-pool fee, so say so.
+                            let lead = crate::util::note_head(header.timestamp);
+                            if !(-1..=4).contains(&lead) && clock_warned.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
+                                warn!("[{}] Server clock is {}s {} the chain head — sync it (NTP): pending quotes use the chain's block time", chain_name_b, lead.abs(), if lead < 0 { "behind" } else { "ahead of" });
+                                clock_warned = Some(Instant::now());
+                            }
                             debug!("[{}] New block #{}", chain_name_b, num);
                             let _ = block_tx_b.send((num, base_fee)).await;
                         }
@@ -1371,6 +1382,30 @@ fn split_preconf_only(
         .collect();
     let left_out = addrs.len() - sealed.len();
     (sealed, left_out)
+}
+
+/// Check that the quote endpoint applies the block-time override on `pending` calls
+/// (see [`crate::util::pending_block_overrides`]): Multicall3 must echo the overridden
+/// time. If it doesn't, hooked (Aero CL) quotes are switched off, since their fee would be
+/// priced at the wrong time; every other venue keeps quoting at `pending`. A probe that
+/// gets no answer changes nothing.
+async fn probe_pending_time(provider: &alloy::providers::DynProvider, chain_name: &str) {
+    let block = alloy::eips::BlockId::pending();
+    let Some(at) = crate::util::pending_block_overrides(block) else { return };
+    let want = at.time;
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(alloy::primitives::address!("0xcA11bde05977b3631167028862bE2a173976CA11"))
+        .input(alloy::primitives::Bytes::from_static(&[0x0f, 0x28, 0xc9, 0x7d]).into()); // getCurrentBlockTimestamp()
+    match rpc_timeout(rpc_read_timeout(), provider.call(tx).block(block).with_block_overrides(at)).await {
+        Ok(raw) if raw.len() == 32 && Some(U256::from_be_slice(&raw).to::<u64>()) == want => {
+            info!("[{}] Pending calls carry the chain's block time (override honoured)", chain_name);
+        }
+        Ok(_) => {
+            crate::util::set_pending_time_ok(false);
+            warn!("[{}] Quote endpoint ignores block-time overrides on `pending` — hooked (Aero CL) quotes disabled; use an endpoint that supports eth_call block overrides", chain_name);
+        }
+        Err(e) => warn!("[{}] Block-time override probe failed ({}) — keeping hooked quotes on", chain_name, e),
+    }
 }
 
 #[cfg(test)]
