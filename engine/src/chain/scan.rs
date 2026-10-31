@@ -380,12 +380,17 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     tip_override: Option<u128>,
     // Scan source: block | poll | swap | pending — execution telemetry (see chain/mod.rs call sites).
     trigger: &'static str,
+    // Arrival time and slot position of the event that triggered this scan (swap scans);
+    // None = the scan's own start (block / poll / pending). For the exec_lat line.
+    trigger_at: Option<(Instant, Option<(u64, u64)>)>,
 ) {
     // Detection phase timer (evaluate + triangular) — shared across all candidates this scan.
     let detect_start = Instant::now();
     // Warn on return (any path) if this scan held the chain loop too long. The heartbeat
     // can't report it: it runs in the same loop, so it never fires mid-scan.
     let _slow_scan_guard = SlowScanGuard { chain: &cfg.name, trigger, start: detect_start };
+    // Reaction time in the exec_lat line runs from the triggering event's arrival.
+    let lat_origin = trigger_at.map_or(detect_start, |(at, _)| at);
 
     let (all_opportunities, optimistic_submission) = {
         let strat = strategy.read().await;
@@ -647,6 +652,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             // On FCFS chains (Base), 200ms of optimizer latency = ~65 positions lost.
             // Also skipped during an RPC backoff: it makes its own QuoterV2 multicalls, and
             // the candidate won't be executed anyway.
+            let mut lat = CandidateLat::default();
+            let optimize_start = Instant::now();
             let optimized = if optimistic_submission || !cfg.optimize_size || skip_execution {
                 opp.clone()
             } else {
@@ -656,6 +663,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     None => strat.optimize(opp, provider.as_ref(), max_bal).await,
                 }
             };
+            lat.optimize_ms = optimize_start.elapsed().as_millis() as u64;
 
             // Log the opportunity first so detection is always visible.
             if gas_log_throttled {
@@ -706,12 +714,19 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
             if dry_run {
                 // Dry-run: simulate with lock held (test mode, latency not critical)
+                let lock_start = Instant::now();
                 let mut exec = executor.lock().await;
+                lat.lock_ms = lock_start.elapsed().as_millis() as u64;
                 exec.dry_run = true;
+                // A live send would leave about here (no preflight); the simulation is dry-run only.
+                let reaction_ms = lat_origin.elapsed().as_millis() as u64;
+                let sim_start = Instant::now();
                 match exec.execute(provider.as_ref(), &optimized).await {
                     Ok(tx_hash) => {
                         let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
+                        log_exec_lat(&cfg.name, "2hop", true, trigger, reaction_ms, detect_start, trigger_at, &timing, &lat,
+                                     ("sim_ms", sim_start.elapsed().as_millis() as u64), &optimized.pair_id);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         handle_execution_success(
@@ -739,17 +754,24 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 // Live: prepare (nonce + tx build) with brief lock, release, then send
                 // without holding the mutex. Prevents blocking the select! loop for
                 // the 500ms–2s a slow send_transaction can take.
+                let lock_start = Instant::now();
                 let prep_result: Result<TxPrep> = {
                     let mut exec = executor.lock().await;
+                    lat.lock_ms = lock_start.elapsed().as_millis() as u64;
+                    let prep_start = Instant::now();
                     exec.dry_run = false;
-                    exec.prepare_2hop(provider.as_ref(), &optimized, tip_override).await
+                    let r = exec.prepare_2hop(provider.as_ref(), &optimized, tip_override).await;
+                    lat.prep_ms = prep_start.elapsed().as_millis() as u64;
+                    r
                     // lock drops here — secp256k1 signing happens below, outside the lock
                 };
                 // Sign for secondary broadcast outside the mutex (~10ms freed from lock hold).
+                let sign_start = Instant::now();
                 let prep_result = match prep_result {
                     Ok(p) => Ok(p.sign_if_needed().await),
                     Err(e) => Err(e),
                 };
+                lat.sign_ms = sign_start.elapsed().as_millis() as u64;
                 match prep_result {
                     Err(e) => {
                         failure |= handle_execution_failure(&mut scan_rpc, 
@@ -811,6 +833,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         }
                         // Where in the chain's slot the tx leaves (for exec_send / exec_confirm).
                         let send_pos = crate::util::block_position_now();
+                        let reaction_ms = lat_origin.elapsed().as_millis() as u64;
                         let send_start = std::time::Instant::now();
                         // Use pre-signed raw bytes when available (skips re-signing in WalletFiller).
                         let send_result = if let Some(ref raw) = prep.raw_tx {
@@ -832,6 +855,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     prep.profit_usd, prep.net_profit_usd, optimized.pair_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
+                                log_exec_lat(&cfg.name, "2hop", false, trigger, reaction_ms, detect_start, trigger_at, &timing, &lat,
+                                             ("send_ms", elapsed_send), &optimized.pair_id);
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
                                 cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
@@ -1169,6 +1194,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             if skip_execution { continue 'candidates; }
             pending_pairs.insert(fingerprint.clone());
 
+            let mut lat = CandidateLat::default(); // no size optimizer on triangles
             let exec_start = std::time::Instant::now();
             let router_ids = vec![
                 opp.router_ab_id.clone(),
@@ -1178,12 +1204,19 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
 
             if dry_run {
                 // Dry-run: simulate with lock held (test mode, latency not critical)
+                let lock_start = Instant::now();
                 let mut exec = executor.lock().await;
+                lat.lock_ms = lock_start.elapsed().as_millis() as u64;
                 exec.dry_run = true;
+                // A live send would leave about here (no preflight); the simulation is dry-run only.
+                let reaction_ms = lat_origin.elapsed().as_millis() as u64;
+                let sim_start = Instant::now();
                 match exec.execute_triangular(provider.as_ref(), opp).await {
                     Ok(tx_hash) => {
                         let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
+                        log_exec_lat(&cfg.name, "triangular", true, trigger, reaction_ms, detect_start, trigger_at, &timing, &lat,
+                                     ("sim_ms", sim_start.elapsed().as_millis() as u64), &opp.triplet_id);
                         cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(cooldown_secs()));
                         handle_execution_success(
@@ -1209,16 +1242,23 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 }
             } else {
                 // Live: prepare with brief lock, release, then send without holding mutex
+                let lock_start = Instant::now();
                 let prep_result: Result<TxPrep> = {
                     let mut exec = executor.lock().await;
+                    lat.lock_ms = lock_start.elapsed().as_millis() as u64;
+                    let prep_start = Instant::now();
                     exec.dry_run = false;
-                    exec.prepare_triangular(provider.as_ref(), opp, tip_override).await
+                    let r = exec.prepare_triangular(provider.as_ref(), opp, tip_override).await;
+                    lat.prep_ms = prep_start.elapsed().as_millis() as u64;
+                    r
                     // lock drops here — secp256k1 signing happens below, outside the lock
                 };
+                let sign_start = Instant::now();
                 let prep_result = match prep_result {
                     Ok(p) => Ok(p.sign_if_needed().await),
                     Err(e) => Err(e),
                 };
+                lat.sign_ms = sign_start.elapsed().as_millis() as u64;
                 match prep_result {
                     Err(e) => {
                         failure |= handle_execution_failure(&mut scan_rpc, 
@@ -1272,6 +1312,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                         }
                         // Where in the chain's slot the tx leaves (for exec_send / exec_confirm).
                         let send_pos = crate::util::block_position_now();
+                        let reaction_ms = lat_origin.elapsed().as_millis() as u64;
                         let send_start = std::time::Instant::now();
                         let send_result = if let Some(ref raw) = prep.raw_tx {
                             transport_timeout(rpc_send_timeout(), provider.send_raw_transaction(raw)).await
@@ -1292,6 +1333,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                     prep.profit_usd, prep.net_profit_usd, opp.triplet_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
+                                log_exec_lat(&cfg.name, "triangular", false, trigger, reaction_ms, detect_start, trigger_at, &timing, &lat,
+                                             ("send_ms", elapsed_send), &opp.triplet_id);
                                 { let mut exec = executor.lock().await; exec.record_sent(&tx_hash, elapsed_send); }
                                 cooldowns.insert(fingerprint.clone(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
                                 cooldowns.insert(display_id.to_string(), Instant::now() + Duration::from_secs(send_cooldown_secs()));
@@ -1620,11 +1663,51 @@ struct SlowScanGuard<'a> {
 impl Drop for SlowScanGuard<'_> {
     fn drop(&mut self) {
         let took = self.start.elapsed();
+        match self.trigger {
+            "swap" | "pending" => crate::util::LAT_SCAN_TARGETED.record(took.as_millis() as u64),
+            _ => crate::util::LAT_SCAN_FULL.record(took.as_millis() as u64),
+        }
         if took > slow_scan_warn() {
             warn!("[{}] Slow scan: {} scan held the chain loop for {:.1}s — RPC slow or down?",
                   self.chain, self.trigger, took.as_secs_f64());
         }
     }
+}
+
+/// One candidate's own stages after detection (ms), for the exec_lat line.
+#[derive(Default)]
+struct CandidateLat {
+    /// 2-hop size optimizer (QuoterV2 rounds).
+    optimize_ms: u64,
+    /// Waiting for the executor mutex.
+    lock_ms: u64,
+    /// prepare_2hop / prepare_triangular (gas price and nonce are cached).
+    prep_ms: u64,
+    /// Signing the raw tx for the broadcast.
+    sign_ms: u64,
+}
+
+/// `exec_lat` line: where the time went from the triggering event to the send, for dry-run
+/// and live alike. `reaction_ms` runs from the event's arrival (the scan start for block /
+/// poll / pending scans) to the moment the tx leaves — in dry-run, where it would leave;
+/// `last` is the send round trip (live) or the dry-run simulation.
+#[allow(clippy::too_many_arguments)]
+fn log_exec_lat(
+    chain: &str, route: &str, dry_run: bool, trigger: &str, reaction_ms: u64, scan_start: Instant,
+    trigger_at: Option<(Instant, Option<(u64, u64)>)>, timing: &str, lat: &CandidateLat,
+    last: (&str, u64), id: &str,
+) {
+    let queue_ms = trigger_at.map(|(at, _)| scan_start.saturating_duration_since(at).as_millis() as u64);
+    let seen = match trigger_at.and_then(|(_, pos)| pos) {
+        Some((block, ms)) => format!("seen_block={} seen_ms_into_block={}", block, ms),
+        None => "seen=n/a".to_string(),
+    };
+    info!(
+        "[{}] exec_lat | route={} | mode={} | trigger={} | reaction_ms={} | queue_ms={} | {} | {} | optimize_ms={} lock_ms={} prep_ms={} sign_ms={} | {}={} | id={}",
+        chain, route, if dry_run { "dry" } else { "live" }, trigger, reaction_ms,
+        queue_ms.map_or("n/a".to_string(), |q| q.to_string()), seen, timing,
+        lat.optimize_ms, lat.lock_ms, lat.prep_ms, lat.sign_ms, last.0, last.1, id,
+    );
 }
 
 /// Handle successful execution (both 2-hop and triangular).

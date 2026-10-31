@@ -100,6 +100,95 @@ pub fn block_position_now() -> Option<(u64, u64)> {
     )
 }
 
+// ── Latency windows for the heartbeat's `lat` field ──────────────────────────────
+// Logging only: each window collects ms samples between two heartbeats, which then
+// takes p50/p95/max and clears it.
+
+/// Samples kept per window and beat; later ones overwrite round-robin (the count stays exact).
+const LATENCY_WINDOW_CAP: usize = 4096;
+
+/// ms samples between two heartbeats (see [`LatencyWindow::take_summary`]).
+pub struct LatencyWindow {
+    inner: std::sync::Mutex<(Vec<u64>, usize)>,
+}
+
+impl LatencyWindow {
+    pub const fn new() -> Self {
+        Self { inner: std::sync::Mutex::new((Vec::new(), 0)) }
+    }
+
+    pub fn record(&self, ms: u64) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        let (samples, n) = &mut *g;
+        if samples.len() < LATENCY_WINDOW_CAP {
+            samples.push(ms);
+        } else {
+            samples[*n % LATENCY_WINDOW_CAP] = ms;
+        }
+        *n += 1;
+    }
+
+    /// `p50/p95/max(n)` in ms since the last call, or `-` without samples; clears the window.
+    pub fn take_summary(&self) -> String {
+        let Ok(mut g) = self.inner.lock() else { return "-".into() };
+        let (mut samples, n) = std::mem::take(&mut *g);
+        match percentiles(&mut samples) {
+            Some((p50, p95, max)) => format!("{}/{}/{}({})", p50, p95, max, n),
+            None => "-".into(),
+        }
+    }
+}
+
+/// (p50, p95, max) by nearest rank; None when empty. Sorts `samples`.
+fn percentiles(samples: &mut [u64]) -> Option<(u64, u64, u64)> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let rank = |p: usize| samples[(samples.len() * p).div_ceil(100).saturating_sub(1)];
+    Some((rank(50), rank(95), samples[samples.len() - 1]))
+}
+
+/// ms into the slot of the block being built when a pool log arrived, for logs of that
+/// block (flashblock preconf). A proxy for feed lag: preconf logs carry no flashblock index.
+pub static LAT_SEEN: LatencyWindow = LatencyWindow::new();
+/// Pool logs that arrived after their block was sealed (no preconf copy came first).
+pub static LAT_SEEN_LATE: AtomicU64 = AtomicU64::new(0);
+/// How long a swap event waited in the scan queue while the chain loop was busy.
+pub static LAT_QUEUE: LatencyWindow = LatencyWindow::new();
+/// Scan duration (the chain loop is busy for it): full (block / poll) and targeted (swap / pending).
+pub static LAT_SCAN_FULL: LatencyWindow = LatencyWindow::new();
+pub static LAT_SCAN_TARGETED: LatencyWindow = LatencyWindow::new();
+/// Swap events dropped because the scan queue was full.
+pub static SWAP_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Last endpoint round trips (`host=Xms …`) from the background RTT sampler.
+pub static ENDPOINT_RTT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Record a pool log's arrival against `pos` (`block_position_now()` at arrival).
+pub fn note_log_seen(log_block: u64, pos: Option<(u64, u64)>) {
+    let Some((building, ms)) = pos else { return };
+    if log_block >= building {
+        LAT_SEEN.record(ms);
+    } else if log_block > 0 {
+        LAT_SEEN_LATE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The heartbeat's `lat` field; clears the windows.
+pub fn take_latency_summary() -> String {
+    let rtt = ENDPOINT_RTT.lock().map(|s| s.clone()).unwrap_or_default();
+    format!(
+        "seen={} late={} queue={} scan_full={} scan_targeted={} drops={} rtt=[{}]",
+        LAT_SEEN.take_summary(),
+        LAT_SEEN_LATE.swap(0, Ordering::Relaxed),
+        LAT_QUEUE.take_summary(),
+        LAT_SCAN_FULL.take_summary(),
+        LAT_SCAN_TARGETED.take_summary(),
+        SWAP_DROPS.swap(0, Ordering::Relaxed),
+        if rtt.is_empty() { "-" } else { rtt.as_str() },
+    )
+}
+
 /// False when the quote endpoint ignores block overrides (startup probe): its `pending`
 /// block time can't be fixed, so hooked (Aero CL) quotes are switched off.
 static PENDING_TIME_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -397,6 +486,21 @@ pub fn redact_url(raw: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn latency_window_percentiles() {
+        assert_eq!(percentiles(&mut []), None);
+        assert_eq!(percentiles(&mut [7]), Some((7, 7, 7)));
+        let mut v: Vec<u64> = (1..=100).rev().collect();
+        assert_eq!(percentiles(&mut v), Some((50, 95, 100)));
+        let w = LatencyWindow::new();
+        assert_eq!(w.take_summary(), "-");
+        for ms in [30, 10, 20] { w.record(ms); }
+        assert_eq!(w.take_summary(), "20/30/30(3)");
+        assert_eq!(w.take_summary(), "-"); // cleared
+        for ms in 0..(LATENCY_WINDOW_CAP as u64 + 10) { w.record(ms); }
+        assert!(w.take_summary().ends_with(&format!("({})", LATENCY_WINDOW_CAP + 10)));
+    }
 
     #[test]
     fn redact_url_masks_keys() {

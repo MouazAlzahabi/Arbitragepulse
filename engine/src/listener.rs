@@ -182,6 +182,10 @@ pub struct SwapEvent {
     pub pool: Address,
     pub block_number: u64,
     pub magnitude: SwapMagnitude,
+    /// When the log arrived (queue wait and reaction time in the latency logs).
+    pub received_at: std::time::Instant,
+    /// `util::block_position_now()` at arrival: (block being built, ms into its slot).
+    pub seen_pos: Option<(u64, u64)>,
 }
 
 // ─── Listener ─────────────────────────────────────────────────────────────────
@@ -344,12 +348,16 @@ impl Listener {
                                 large_swap_bps,
                                 large_v3_bps,
                             ) {
-                                let _ = tx.try_send(SwapEvent {
+                                if tx.try_send(SwapEvent {
                                     chain_id,
                                     pool,
                                     block_number: block,
                                     magnitude,
-                                });
+                                    received_at: std::time::Instant::now(),
+                                    seen_pos: crate::util::block_position_now(),
+                                }).is_err() {
+                                    crate::util::SWAP_DROPS.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         last_block = to;

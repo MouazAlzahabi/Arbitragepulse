@@ -822,6 +822,8 @@ pub(crate) fn multicall_error_is_revert(err: &alloy::transports::TransportError)
 /// One scan runs at a time per chain; evaluate and detect_triangular write disjoint fields.
 #[derive(Default)]
 pub struct ScanTimings {
+    /// 2-hop local work (Phase 1/2 math, quote batching) before the Phase 1.5 round trip.
+    pub phase1_ms: std::sync::atomic::AtomicU64,
     /// 2-hop Phase 1.5 (V3 forward QuoterV2), overlapped with 1.5c.
     pub p15_ms: std::sync::atomic::AtomicU64,
     /// 2-hop Phase 1.5b / remaining 1.5c (after Phase 1.5).
@@ -833,12 +835,12 @@ pub struct ScanTimings {
 }
 
 impl ScanTimings {
-    /// `p15=…ms p15bc=…ms tri_verify=…ms×N` for the execution log lines.
+    /// `phase1=…ms p15=…ms p15bc=…ms tri_verify=…ms×N` for the execution log lines.
     pub fn summary(&self) -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "p15={}ms p15bc={}ms tri_verify={}ms×{}",
-            self.p15_ms.load(Relaxed), self.p15bc_ms.load(Relaxed),
+            "phase1={}ms p15={}ms p15bc={}ms tri_verify={}ms×{}",
+            self.phase1_ms.load(Relaxed), self.p15_ms.load(Relaxed), self.p15bc_ms.load(Relaxed),
             self.tri_verify_ms.load(Relaxed), self.tri_verify_rounds.load(Relaxed),
         )
     }
