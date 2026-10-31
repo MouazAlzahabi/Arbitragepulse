@@ -374,7 +374,7 @@ pub async fn run_chain(
                             // Feeds the block time of `pending` calls. A server clock behind the
                             // chain is corrected there; one far ahead quotes a later (cheaper)
                             // hooked-pool fee, so say so.
-                            let lead = crate::util::note_head(header.timestamp);
+                            let lead = crate::util::note_head(header.number, header.timestamp);
                             if !(-1..=4).contains(&lead) && clock_warned.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
                                 warn!("[{}] Server clock is {}s {} the chain head — sync it (NTP): pending quotes use the chain's block time", chain_name_b, lead.abs(), if lead < 0 { "behind" } else { "ahead of" });
                                 clock_warned = Some(Instant::now());

@@ -215,6 +215,53 @@ async fn diagnose_and_count_revert<P: Provider>(
 }
 
 /// Structured receipt line for grep / dashboards: timing, trigger, tip, block position.
+/// `target_block=N ms_into_block=M` for the send/confirm lines ("-" before the first head).
+fn fmt_block_position(pos: Option<(u64, u64)>) -> String {
+    match pos {
+        Some((block, ms)) => format!("target_block={} ms_into_block={}", block, ms),
+        None => "target_block=- ms_into_block=-".to_string(),
+    }
+}
+
+/// Send the signed tx to every `submission_rpcs` endpoint at once (fire-and-forget, pooled
+/// connections) and log each one's round trip and answer on one line:
+/// `send_acks | tx=0x… | mainnet-sequencer.base.org=14ms ok | …`. Hosts only — the URLs
+/// can carry API keys.
+fn broadcast_raw(client: Arc<reqwest::Client>, urls: Vec<url::Url>, raw: &[u8], chain: String) {
+    let tx = alloy::primitives::keccak256(raw);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_sendRawTransaction",
+        "params": [format!("0x{}", alloy::primitives::hex::encode(raw))],
+        "id": 1
+    });
+    tokio::spawn(async move {
+        let acks = futures::future::join_all(urls.into_iter().map(|url| {
+            let (c, b) = (client.clone(), body.clone());
+            async move {
+                let host = url.host_str().unwrap_or("?").to_string();
+                let start = Instant::now();
+                let sent = tokio::time::timeout(rpc_send_timeout(), async {
+                    let r = c.post(url.as_str()).json(&b).send().await?;
+                    r.json::<serde_json::Value>().await
+                }).await;
+                let ms = start.elapsed().as_millis();
+                let answer = match sent {
+                    Err(_) => "timeout".to_string(),
+                    Ok(Err(e)) => format!("err: {}", e.without_url()),
+                    Ok(Ok(v)) => match v.get("error") {
+                        // e.g. "already known" when the primary got there first: still delivered.
+                        Some(e) => format!("rpc_err: {}", e.get("message").and_then(|m| m.as_str()).unwrap_or("?")),
+                        None => "ok".to_string(),
+                    },
+                };
+                format!("{}={}ms {}", host, ms, answer)
+            }
+        })).await;
+        info!("[{}] send_acks | tx={} | {}", chain, &format!("{:?}", tx)[..10], acks.join(" | "));
+    });
+}
+
 fn log_exec_confirm(
     chain: &str,
     route: &str,
@@ -231,14 +278,20 @@ fn log_exec_confirm(
     scan_to_submit_ms: Option<u64>,
     router_a_type: &str,
     router_b_type: &str,
+    target_block: Option<u64>,
 ) {
     let block = receipt.block_number();
+    // Blocks after the one being built when we sent (0 = landed in it).
+    let blocks_late = match (block, target_block) {
+        (Some(b), Some(t)) => (b as i64 - t as i64).to_string(),
+        _ => "-".to_string(),
+    };
     let tx_index = receipt.transaction_index();
     let gas_used = receipt.gas_used();
     let eff_gas = receipt.effective_gas_price();
     let total_ms = exec_start.elapsed().as_millis() as u64;
     let msg = format!(
-        "[{}] exec_confirm | route={} | ok={} | revert_class={} | scan_to_submit_ms={} | router_a={} | router_b={} | block={:?} | tx_index={:?} | gas_used={} | eff_gas_price_wei={} | total_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | profit_usd={:.4} | opp={} | tx={}",
+        "[{}] exec_confirm | route={} | ok={} | revert_class={} | scan_to_submit_ms={} | router_a={} | router_b={} | block={:?} | tx_index={:?} | blocks_late={} | gas_used={} | eff_gas_price_wei={} | total_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | profit_usd={:.4} | opp={} | tx={}",
         chain,
         route,
         ok,
@@ -248,6 +301,7 @@ fn log_exec_confirm(
         router_b_type,
         block,
         tx_index,
+        blocks_late,
         gas_used,
         eff_gas,
         total_ms,
@@ -751,38 +805,12 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             prep.profit_usd, prep.gas_cost_usd, prep.net_profit_usd,
                             optimized.fee_a, optimized.fee_b,
                         );
-                        // ── Multi-RPC broadcast (fire-and-forget) ─────────────
-                        // Send pre-signed raw bytes to secondary HTTP endpoints concurrently
-                        // using a shared reqwest::Client connection pool — no TCP/TLS handshake
-                        // per transaction after the first submission.
-                        if !prep.submission_rpcs.is_empty() {
-                            if let Some(raw_bytes) = prep.raw_tx.clone() {
-                                let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&raw_bytes));
-                                let urls_sec = prep.submission_rpcs.clone();
-                                let client = prep.http_client.clone();
-                                let cname_sec = cfg.name.clone();
-                                tokio::spawn(async move {
-                                    let body = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "eth_sendRawTransaction",
-                                        "params": [raw_hex],
-                                        "id": 1
-                                    });
-                                    let futs = urls_sec.into_iter().map(|url| {
-                                        let b = body.clone();
-                                        let c = client.clone();
-                                        let cname = cname_sec.clone();
-                                        async move {
-                                            match c.post(url.as_str()).json(&b).send().await {
-                                                Ok(r) => debug!("[{}] secondary RPC: {}", cname, r.status()),
-                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e.without_url()),
-                                            }
-                                        }
-                                    });
-                                    futures::future::join_all(futs).await;
-                                });
-                            }
+                        // ── Multi-RPC broadcast (fire-and-forget, see broadcast_raw) ──
+                        if let Some(raw) = prep.raw_tx.as_ref().filter(|_| !prep.submission_rpcs.is_empty()) {
+                            broadcast_raw(prep.http_client.clone(), prep.submission_rpcs.clone(), raw, cfg.name.clone());
                         }
+                        // Where in the chain's slot the tx leaves (for exec_send / exec_confirm).
+                        let send_pos = crate::util::block_position_now();
                         let send_start = std::time::Instant::now();
                         // Use pre-signed raw bytes when available (skips re-signing in WalletFiller).
                         let send_result = if let Some(ref raw) = prep.raw_tx {
@@ -799,8 +827,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 info!(
-                                    "[{}] exec_send | route=2hop | scan_to_submit_ms={} | {} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
-                                    cfg.name, scan_to_submit_ms, timing, exec_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=2hop | scan_to_submit_ms={} | {} | exec_ms={} | send_rpc_ms={} | {} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | pair={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, timing, exec_ms, elapsed_send, fmt_block_position(send_pos), trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, optimized.pair_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
@@ -913,6 +941,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 Some(scan_to_submit_bg),
                                                 ra_type_bg,
                                                 rb_type_bg,
+                                                send_pos.map(|p| p.0),
                                             );
                                             if ok {
                                                 confirmed_success_bg.fetch_add(1, Ordering::Relaxed);
@@ -1238,34 +1267,11 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                             }
                         }
                         // Pre-flight skipped by default: same reasoning as 2-hop path above.
-                        if !prep.submission_rpcs.is_empty() {
-                            if let Some(raw_bytes) = prep.raw_tx.clone() {
-                                let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&raw_bytes));
-                                let urls_sec = prep.submission_rpcs.clone();
-                                let client = prep.http_client.clone();
-                                let cname_sec = cfg.name.clone();
-                                tokio::spawn(async move {
-                                    let body = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "eth_sendRawTransaction",
-                                        "params": [raw_hex],
-                                        "id": 1
-                                    });
-                                    let futs = urls_sec.into_iter().map(|url| {
-                                        let b = body.clone();
-                                        let c = client.clone();
-                                        let cname = cname_sec.clone();
-                                        async move {
-                                            match c.post(url.as_str()).json(&b).send().await {
-                                                Ok(r) => debug!("[{}] secondary RPC: {}", cname, r.status()),
-                                                Err(e) => debug!("[{}] secondary RPC error: {}", cname, e.without_url()),
-                                            }
-                                        }
-                                    });
-                                    futures::future::join_all(futs).await;
-                                });
-                            }
+                        if let Some(raw) = prep.raw_tx.as_ref().filter(|_| !prep.submission_rpcs.is_empty()) {
+                            broadcast_raw(prep.http_client.clone(), prep.submission_rpcs.clone(), raw, cfg.name.clone());
                         }
+                        // Where in the chain's slot the tx leaves (for exec_send / exec_confirm).
+                        let send_pos = crate::util::block_position_now();
                         let send_start = std::time::Instant::now();
                         let send_result = if let Some(ref raw) = prep.raw_tx {
                             transport_timeout(rpc_send_timeout(), provider.send_raw_transaction(raw)).await
@@ -1281,8 +1287,8 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                 let exec_ms = exec_start.elapsed().as_millis() as u64;
                                 let tip_w = prep.tx.max_priority_fee_per_gas.unwrap_or_default();
                                 info!(
-                                    "[{}] exec_send | route=triangular | scan_to_submit_ms={} | {} | exec_ms={} | send_rpc_ms={} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
-                                    cfg.name, scan_to_submit_ms, timing, exec_ms, elapsed_send, trigger, tip_w,
+                                    "[{}] exec_send | route=triangular | scan_to_submit_ms={} | {} | exec_ms={} | send_rpc_ms={} | {} | trigger={} | tip_wei={} | gross_usd={:.4} | net_usd={:.4} | triplet={} | tx={}",
+                                    cfg.name, scan_to_submit_ms, timing, exec_ms, elapsed_send, fmt_block_position(send_pos), trigger, tip_w,
                                     prep.profit_usd, prep.net_profit_usd, opp.triplet_id,
                                     &tx_hash[..10.min(tx_hash.len())],
                                 );
@@ -1397,6 +1403,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                                                 Some(scan_to_submit_bg),
                                                 ra_type_bg,
                                                 rb_type_bg,
+                                                send_pos.map(|p| p.0),
                                             );
                                             if ok {
                                                 confirmed_success_bg.fetch_add(1, Ordering::Relaxed);

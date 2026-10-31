@@ -34,7 +34,8 @@ pub fn addr_key(addr: Address) -> String {
 // trades that could only revert. Every `pending` call therefore overrides the block time
 // with the latest the pending block can carry: the next slot after now, plus one.
 
-/// Latest head: its timestamp and the wall-clock ms it arrived at (0 = none yet).
+/// Latest head: its number, timestamp and the wall-clock ms it arrived at (0 = none yet).
+static HEAD_NUM: AtomicU64 = AtomicU64::new(0);
 static HEAD_TS: AtomicU64 = AtomicU64::new(0);
 static HEAD_SEEN_MS: AtomicU64 = AtomicU64::new(0);
 /// Block time in seconds (Base: 2).
@@ -50,8 +51,9 @@ pub fn set_slot_secs(block_time_ms: u64) {
 
 /// Record a new head. Returns the server clock's lead over the chain in seconds (wall
 /// clock minus head timestamp; negative = the server clock is behind the chain).
-pub fn note_head(timestamp: u64) -> i64 {
+pub fn note_head(number: u64, timestamp: u64) -> i64 {
     let now = wall_ms();
+    HEAD_NUM.store(number, Ordering::Relaxed);
     HEAD_TS.store(timestamp, Ordering::Relaxed);
     HEAD_SEEN_MS.store(now, Ordering::Relaxed);
     (now / 1000) as i64 - timestamp as i64
@@ -70,6 +72,32 @@ fn pending_time_at(now_ms: u64, head_ts: u64, head_seen_ms: u64, slot: u64) -> u
     // Slots are aligned on the head's timestamp: first slot at/after chain time, plus one.
     let ahead = chain_ms.saturating_sub(head_ts * 1000).div_ceil(slot * 1000);
     head_ts + slot * (ahead + 1)
+}
+
+/// The block being built at wall-clock `now_ms` and how many ms into its slot that is. A
+/// block with timestamp T is built during the slot before T, so a tx sent now can land in
+/// it at the earliest. Chain time as in [`pending_time_at`]. None before the first head.
+fn block_position_at(now_ms: u64, head_num: u64, head_ts: u64, head_seen_ms: u64, slot: u64) -> Option<(u64, u64)> {
+    if head_ts == 0 {
+        return None;
+    }
+    let since_head = if head_seen_ms == 0 { 0 } else { now_ms.saturating_sub(head_seen_ms) };
+    let chain_ms = now_ms.max(head_ts * 1000 + since_head);
+    let into_head = chain_ms.saturating_sub(head_ts * 1000);
+    let k = into_head / (slot * 1000) + 1;
+    Some((head_num + k, into_head % (slot * 1000)))
+}
+
+/// [`block_position_at`] now: `(block being built, ms into its slot)`, for the send and
+/// receipt logs (with ~10 flashblocks per slot, ms / 200 is roughly the flashblock index).
+pub fn block_position_now() -> Option<(u64, u64)> {
+    block_position_at(
+        wall_ms(),
+        HEAD_NUM.load(Ordering::Relaxed),
+        HEAD_TS.load(Ordering::Relaxed),
+        HEAD_SEEN_MS.load(Ordering::Relaxed),
+        SLOT_SECS.load(Ordering::Relaxed),
+    )
 }
 
 /// False when the quote endpoint ignores block overrides (startup probe): its `pending`
@@ -466,6 +494,20 @@ mod tests {
         assert_eq!(pending_time_at(98_500, 100, 95_000, 2), 106);
         // No head yet: wall clock rounded up, plus a slot.
         assert_eq!(pending_time_at(100_400, 0, 0, 2), 103);
+    }
+
+    #[test]
+    fn block_position_is_the_block_being_built() {
+        // Head 50 (t=100) seen at 100.3 s: block 51 (t=102) is being built, 300 ms in.
+        assert_eq!(block_position_at(100_300, 50, 100, 100_300, 2), Some((51, 300)));
+        // 1.9 s after the head: still block 51, near the end of its slot.
+        assert_eq!(block_position_at(101_900, 50, 100, 100_000, 2), Some((51, 1_900)));
+        // On the next slot boundary: block 52 starts.
+        assert_eq!(block_position_at(102_000, 50, 100, 100_000, 2), Some((52, 0)));
+        // Server clock 5 s behind: head time + elapsed wins.
+        assert_eq!(block_position_at(95_500, 50, 100, 95_000, 2), Some((51, 500)));
+        // No head yet.
+        assert_eq!(block_position_at(100_000, 0, 0, 0, 2), None);
     }
 
     #[test]
