@@ -67,3 +67,11 @@ The Phase 1.5 gate needs > +0.005%, and no deep route reached it.
 ## Notes (minor, no action)
 - **Why the market looks flat.** The engine reads each flashblock after it is sealed. Gaps opened by large swaps are usually closed inside the same flashblock by searchers ordered right behind the swap. So top-of-flashblock state rarely shows a gap above two pool fees, especially overnight. That is a latency and ordering limit, not a detection bug. To get more chances, add venues or pairs, for example Uniswap V4 pools (not watched today), rather than loosen thresholds.
 - **Aero CL fees in local math.** These use the pool's `fee()`. For hooked pools the real fee can be higher (see the pending block-time fix). The local screen can therefore be slightly optimistic for Aero CL legs. That only costs extra quotes; it never hides a route.
+
+## Addendum: 24-hour backtest (2026-10-31, blocks ~53286000–53330300)
+- **Setup.** The same engine-math emulator was run on historical state: 720 blocks, one every 2 minutes, at full size, over the same 138 pools.
+- **Raw result.** 59 blocks showed a 2-hop gap above +0.5 bp. Almost all were WETH/cbBTC across the Aero CL 1/10 pools; the maximum was +0.113%.
+- **Real-quote check.** Each flagged block was re-quoted at that block with the real quoters: the Aero Metaquoter, plus Slipstream and Slipstream 3 QuoterV2. **Every one is a loss.**
+  - WETH/cbBTC Aero CL round trips: −0.025% to −0.395%. The listed `fee()` understates the hook fee.
+  - USDC/WETH Slipstream 100 → Slipstream 3 50, the best non-hooked gap at +0.049% on spot: −0.12% to −0.20% when quoted.
+- **Conclusion.** For 24 hours, no profitable 2-hop route existed at block level on the configured pairs and venues. Detection is correct. The setup has no edge at the end of each block.
