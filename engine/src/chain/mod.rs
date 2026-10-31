@@ -582,6 +582,45 @@ pub async fn run_chain(
             }
         });
     }
+    // Quote and submission endpoint round trips for the heartbeat's `lat rtt=[…]` (hosts
+    // only — URLs can carry API keys): one eth_chainId each per `rpc_latency_sample_ms` on
+    // a reused connection (warm) and on a new one (cold = what a send pays after the
+    // send pool dropped its idle connection). Own clients, so the send pool isn't warmed.
+    {
+        let endpoints: Vec<(&'static str, url::Url)> = cfg.preconf_http_rpc.iter()
+            .filter_map(|u| u.parse().ok()).map(|u| ("quote", u))
+            .chain(cfg.submission_rpcs.iter().filter_map(|u| u.parse().ok()).map(|u| ("send", u)))
+            .collect();
+        let warm = reqwest::Client::builder().timeout(rpc_read_timeout()).build();
+        let cold = reqwest::Client::builder().timeout(rpc_read_timeout()).pool_max_idle_per_host(0).build();
+        if let (false, Ok(warm), Ok(cold)) = (endpoints.is_empty(), warm, cold) {
+            tokio::spawn(async move {
+                let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1});
+                let rtt = |c: &reqwest::Client, url: &url::Url| {
+                    let (req, start) = (c.post(url.as_str()).json(&body).send(), Instant::now());
+                    async move {
+                        match req.await {
+                            Ok(r) if r.status().is_success() => format!("{}ms", start.elapsed().as_millis()),
+                            _ => "err".to_string(),
+                        }
+                    }
+                };
+                let mut tick = tokio::time::interval(crate::config::tuning().rpc_latency_sample());
+                loop {
+                    tick.tick().await;
+                    let mut parts = Vec::with_capacity(endpoints.len());
+                    for (role, url) in &endpoints {
+                        let w = rtt(&warm, url).await;
+                        let c = rtt(&cold, url).await;
+                        parts.push(format!("{}:{}={}/cold={}", role, url.host_str().unwrap_or("?"), w, c));
+                    }
+                    if let Ok(mut s) = crate::util::ENDPOINT_RTT.lock() {
+                        *s = parts.join(" ");
+                    }
+                }
+            });
+        }
+    }
     let balance_refresh_busy = Arc::new(AtomicBool::new(false));
     // When the last block header arrived: a long gap means the WS backend is dead (E1-3).
     let mut last_block_seen = Instant::now();
@@ -722,6 +761,8 @@ pub async fn run_chain(
                 // chunks on the quote endpoint (ok/timeout/err) since the last beat.
                 let qmc = strategy.read().await.quote_gate.take_summary();
                 let heartbeat_msg = format!("{} | rpc={} | qmc={}", heartbeat_msg, rpc_counter.take_summary(), qmc);
+                // Latency since the last beat (p50/p95/max(n) ms): see util::take_latency_summary.
+                let heartbeat_msg = format!("{} | lat {}", heartbeat_msg, crate::util::take_latency_summary());
                 // Mirror to server terminal so it's visible even when WS is disconnected.
                 // A full scan normally runs every block (~2 s); a long gap means scanning has
                 // stalled (e.g. RPC outage), which the counters alone don't show.
@@ -901,6 +942,7 @@ pub async fn run_chain(
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &opps_found, &recheck_drops, &contract_balances, None, disabled_set, None,
                     "block",
+                    None,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -935,6 +977,7 @@ pub async fn run_chain(
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &opps_found, &recheck_drops, &contract_balances, None, disabled_set, None,
                     "poll",
+                    None,
                 ).await;
                 last_scan_at = Instant::now();
             }
@@ -957,6 +1000,9 @@ pub async fn run_chain(
                         Err(_) => break,
                     }
                 }
+                for ev in &batch {
+                    crate::util::LAT_QUEUE.record(ev.received_at.elapsed().as_millis() as u64);
+                }
                 // Per-pool burst protection (50 ms) — skipped for large swaps.
                 batch.retain(|ev| {
                     ev.magnitude == SwapMagnitude::Large
@@ -972,6 +1018,9 @@ pub async fn run_chain(
                 let is_large = batch.iter().any(|ev| ev.magnitude == SwapMagnitude::Large);
                 let merged = batch.len() - 1;
                 let event = batch.iter().find(|ev| ev.magnitude == SwapMagnitude::Large).unwrap_or(&batch[0]).clone();
+                // The longest-waiting event this scan answers: the reaction time in the
+                // exec_lat line starts at its arrival.
+                let trigger_at = oldest_event(&batch);
 
                 // Single strategy read: pool tokens + affected pair indices, merged over the batch.
                 let (pair_mask, token_filter, affected_pair_ids) = {
@@ -1026,6 +1075,7 @@ pub async fn run_chain(
                     &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     None,
                     "swap",
+                    trigger_at,
                 ).await;
                 // NOTE: last_scan_at intentionally NOT updated here.
             }
@@ -1071,6 +1121,7 @@ pub async fn run_chain(
                     &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
                     Some(tip_override),
                     "pending",
+                    None,
                 ).await;
                 info!(
                     "[{}] Pending swap processed: {:?}→{:?} amt={} tip={}wei ({} pairs)",
@@ -1172,15 +1223,23 @@ async fn run_log_subscription<P: Provider + Clone + 'static>(
                     if let Some(c) = &counter {
                         c.fetch_add(1, Ordering::Relaxed);
                     }
+                    let received_at = Instant::now();
+                    let seen_pos = crate::util::block_position_now();
+                    let block_number = log.block_number.unwrap_or(0);
+                    crate::util::note_log_seen(block_number, seen_pos);
                     if let Some(magnitude) = crate::listener::apply_log_to_cache(
                         &log, &feed.cache, feed.solidly_sync_hash, feed.large_swap_bps, feed.large_v3_bps,
                     ) {
-                        let _ = feed.swap_tx.try_send(SwapEvent {
+                        if feed.swap_tx.try_send(SwapEvent {
                             chain_id: feed.chain_id,
                             pool: log.address(),
-                            block_number: log.block_number.unwrap_or(0),
+                            block_number,
                             magnitude,
-                        });
+                            received_at,
+                            seen_pos,
+                        }).is_err() {
+                            crate::util::SWAP_DROPS.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 debug!("[{}] {} subscription ended, reconnecting...", feed.chain_name, label);
@@ -1247,6 +1306,11 @@ fn spawn_rpc_monitor<P: Provider + Clone + 'static>(
             }
         }
     });
+}
+
+/// Arrival time and slot position of the event in `batch` that has waited longest.
+fn oldest_event(batch: &[SwapEvent]) -> Option<(Instant, Option<(u64, u64)>)> {
+    batch.iter().min_by_key(|ev| ev.received_at).map(|ev| (ev.received_at, ev.seen_pos))
 }
 
 /// Median and maximum of the latency samples (ms); (0, 0) when empty.
@@ -1413,12 +1477,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oldest_event_is_the_longest_waiting() {
+        assert!(oldest_event(&[]).is_none());
+        let now = Instant::now();
+        let ev = |ago_ms: u64, pos| SwapEvent {
+            chain_id: 8453, pool: Address::ZERO, block_number: 1, magnitude: SwapMagnitude::Normal,
+            received_at: now - Duration::from_millis(ago_ms), seen_pos: pos,
+        };
+        let (at, pos) = oldest_event(&[ev(5, Some((2, 100))), ev(40, Some((2, 65))), ev(0, None)]).unwrap();
+        assert_eq!(at, now - Duration::from_millis(40));
+        assert_eq!(pos, Some((2, 65)));
+    }
+
+    #[test]
     fn merge_swap_batch_unions_pairs_and_tracks_large_ids() {
         let (usdc, weth, vvv) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
         let (p_core, p_vvv, p_unknown) = (Address::repeat_byte(10), Address::repeat_byte(11), Address::repeat_byte(12));
         let ev = |pool, large: bool| SwapEvent {
             chain_id: 8453, pool, block_number: 1,
             magnitude: if large { SwapMagnitude::Large } else { SwapMagnitude::Normal },
+            received_at: Instant::now(), seen_pos: None,
         };
         let tokens = |p: Address| match p {
             p if p == p_core => Some((usdc, weth)),

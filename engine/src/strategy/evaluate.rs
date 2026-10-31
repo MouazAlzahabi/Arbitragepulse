@@ -114,6 +114,7 @@ impl Strategy {
         is_full_scan: bool,
     ) -> (Vec<ArbOpportunity>, f64, f64, usize, usize, f64, usize) {
         let scan_start = std::time::Instant::now();
+        self.timings.phase1_ms.store(0, Relaxed);
         self.timings.p15_ms.store(0, Relaxed);
         self.timings.p15bc_ms.store(0, Relaxed);
 
@@ -622,6 +623,7 @@ impl Strategy {
         let prefetch_fut = futures::future::maybe_done(self.prefetch_quiet_reserves(provider, prefetch_pools));
         tokio::pin!(prefetch_fut);
         let p15c_queued = p15c_candidates.len() - p15c_pre.iter().filter(|v| v.is_some()).count();
+        self.timings.phase1_ms.store(scan_start.elapsed().as_millis() as u64, Relaxed);
 
         // ── Phase 1.5: Gated V3 QuoterV2 upgrade ─────────────────────────────────────
         // Fires only when Phase 2 local data showed cross-DEX spread > p15_gate_spread
