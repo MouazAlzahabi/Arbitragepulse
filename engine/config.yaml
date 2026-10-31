@@ -436,7 +436,9 @@ tuning:
   # ÷ gas limit), capped at tip_max_wei. The tip is paid on reverts too, so a share raises
   # the cost of every lost race; set it from arb_lost_race_total{cause="tip"}. The tip is
   # counted in the gas cost, so the net-profit gate and on-chain floor still cover it.
-  tip_profit_share_bps: 0                # e.g. 1000 = up to 10% of gross profit (max 9000)
+  # 2026-10-31: 30%. Block 53330577: a real +0.9% WETH/AERO gap was taken by bots tipping
+  # 0.2-1.5 gwei; at the 0.01 gwei floor we would have been ordered behind all of them.
+  tip_profit_share_bps: 3000             # e.g. 1000 = up to 10% of gross profit (max 9000)
   tip_max_wei: 2000000000                # 2 gwei per gas cap
   # ── Detection ──
   # Tenths of a bp: 5 = 0.5 bp ($0.25 on a 5k trade). Quotes are exact (QuoterV2 / xy=k at the
