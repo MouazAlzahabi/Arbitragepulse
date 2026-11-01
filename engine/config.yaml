@@ -20,10 +20,12 @@ chain:
   native_currency: "ETH"
   wrapped_native: "0x4200000000000000000000000000000000000006"
   block_time_ms: 2000
-  # Executor v4 (DirectCL / DirectPair pools, V4 borrowing), deployed 2026-10-29,
-  # tx 0x13729247b0bae4496ce308c53999f835da752d16af605282d54418cf31b5686c (block 53246126).
-  # Previous executor (v3, still holds its funds until withdrawn): 0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2
-  contract_address: "0xfbf0267661784B6770F76873F99c4a626fc66e96"
+  # Executor v5 (adds Uniswap V4 legs, type 8), deployed 2026-11-01,
+  # tx 0x9dea91e728cec46a13b72492454682ba40113f051e2caf4ddea6e8aa106bbf8e (block 53375831).
+  # Allowlisted: the 8 router venues, 68 DirectCL + 18 DirectPair pools, 101 V4 pools.
+  # Previous executor (v4, empty): 0xfbf0267661784B6770F76873F99c4a626fc66e96
+  # Older executor (v3, still holds its funds until withdrawn): 0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2
+  contract_address: "0x68a33770b9CD62B6589Ea54B0d62828D71E92590"
   min_native_balance: 0.005
   # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
   # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
