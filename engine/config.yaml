@@ -453,6 +453,152 @@ pairs:
 # Every timing and threshold, with the values tuned for Base. All keys are optional —
 # omit one to use the default shown. Unknown keys are rejected. Keys marked
 # "block-relative" default to a multiple of chain.block_time_ms when omitted.
+  # ── Added 2026-11-01 from DexScreener per-token pools (≥ $50K on ≥ 2 of our venues, or two
+  # of our base tokens for triangles). Transfers checked on a fork (pool → executor → EOA,
+  # full amount both hops: no fee-on-transfer / blocklist). Skipped: the 0xb2000… tokenized
+  # stocks and cbZEC (unsupported opcode on Anvil — can't be simulated; may restrict transfers).
+  # Sizes small: many second venues are $50–300K deep.
+  # WETH: Aero CL $1.9M, Aerodrome $289K, Alien Base $114K, Pancake $89K
+  - id: "base-weth-cbeth"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"
+    token_in_symbol: "WETH"
+    token_out_symbol: "cbETH"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # WETH: Aero CL $1.8M, UniV3 $950K, Aerodrome $555K; USDC UniV3 $457K
+  - id: "base-weth-morpho"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842"
+    token_in_symbol: "WETH"
+    token_out_symbol: "MORPHO"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # WETH: Aero CL $1.2M, Aerodrome $829K, UniV3 $207K
+  - id: "base-weth-aave"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0x63706e401c06ac8513145b7687A14804d17f814b"
+    token_in_symbol: "WETH"
+    token_out_symbol: "AAVE"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # USDC: Aero CL $399K, Aerodrome $120K, UniV3 $67K; cbBTC Pancake $678K, Aero CL $460K
+  - id: "base-usdc-sol"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x311935Cd80B76769bF2ecC9D8Ab7635b2139cf82"
+    token_in_symbol: "USDC"
+    token_out_symbol: "SOL"
+    token_in_decimals: 6
+    token_out_decimals: 9
+    trade_amount: "3000"
+    max_trade: "3000"
+  # WETH: Aero CL $312K, Aerodrome $54K, UniV3 $51K
+  - id: "base-weth-zro"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0x6985884C4392D348587B19cb9eAAf157F13271cd"
+    token_in_symbol: "WETH"
+    token_out_symbol: "ZRO"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # WETH: Aerodrome $770K, Aero CL $365K, UniV3 $87K
+  - id: "base-weth-wsteth"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"
+    token_in_symbol: "WETH"
+    token_out_symbol: "wstETH"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # WETH: Aerodrome $1.6M, Aero CL $585K; cbBTC Aerodrome $1.3M
+  - id: "base-weth-zen"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0xf43eB8De897Fbc7F2502483B2Bef7Bb9EA179229"
+    token_in_symbol: "WETH"
+    token_out_symbol: "ZEN"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # WETH: Aero CL $1.0M, Aerodrome $520K, UniV3 $96K; USDC Aerodrome $1.1M
+  - id: "base-weth-drv"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0x9d0E8f5b25384C7310CB8C6aE32C8fbeb645d083"
+    token_in_symbol: "WETH"
+    token_out_symbol: "DRV"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # USDC: UniV3 $482K, Aerodrome $96K; WETH UniV3 $63K
+  - id: "base-usdc-flock"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x5aB3D4c385B400F3aBB49e80DE2fAF6a88A7B691"
+    token_in_symbol: "USDC"
+    token_out_symbol: "FLOCK"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "3000"
+    max_trade: "3000"
+  # USDC: UniV3 $1.8M, Aero CL $458K
+  - id: "base-usdc-xdp"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x07b3D902783c3C12b077508c3B5c00113d1291D0"
+    token_in_symbol: "USDC"
+    token_out_symbol: "XDP"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+  # USDC: Aero CL $199K, Aerodrome $136K; VVV Aerodrome $8.5M; WETH UniV3 $161K
+  - id: "base-usdc-diem"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0xF4d97F2da56e8c3098f3a8D538DB630A2606a024"
+    token_in_symbol: "USDC"
+    token_out_symbol: "DIEM"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "3000"
+    max_trade: "3000"
+  # WETH: Aero CL $1.0M, Aerodrome $1.0M
+  - id: "base-weth-mseth"
+    token_in: "0x4200000000000000000000000000000000000006"
+    token_out: "0x7Ba6F01772924a82D9626c126347A28299E98c98"
+    token_in_symbol: "WETH"
+    token_out_symbol: "msETH"
+    token_in_decimals: 18
+    token_out_decimals: 18
+    trade_amount: "1"
+    max_trade: "1"
+  # USDC: Aero CL $888K, Aerodrome $426K
+  - id: "base-usdc-msusd"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0x526728DBc96689597F85ae4cd716d4f7fCcBAE9d"
+    token_in_symbol: "USDC"
+    token_out_symbol: "msUSD"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "5000"
+    max_trade: "5000"
+  # triangles only: WETH Aerodrome $973K, USDC Aero CL $358K
+  - id: "base-usdc-edel"
+    token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    token_out: "0xFb31f85A8367210B2e4Ed2360D2dA9Dc2D2Ccc95"
+    token_in_symbol: "USDC"
+    token_out_symbol: "EDEL"
+    token_in_decimals: 6
+    token_out_decimals: 18
+    trade_amount: "3000"
+    max_trade: "3000"
+
 tuning:
   # ── Execution ──
   gas_limit_2hop: 700000
