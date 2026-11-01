@@ -412,3 +412,57 @@ sol! {
         );
     }
 }
+
+// ─── Uniswap V4 (singleton PoolManager) ──────────────────────────────────────
+// Every pool lives in the PoolManager and is named by its PoolId =
+// keccak256(abi.encode(PoolKey)). State is read through StateView, quotes through
+// V4Quoter, and both events below are emitted by the PoolManager with the id in topic1.
+// Native ETH is currency address(0).
+
+sol! {
+    interface IV4PoolManager {
+        event Swap(
+            bytes32 indexed id,
+            address indexed sender,
+            int128 amount0,
+            int128 amount1,
+            uint160 sqrtPriceX96,
+            uint128 liquidity,
+            int24 tick,
+            uint24 fee
+        );
+        event ModifyLiquidity(
+            bytes32 indexed id,
+            address indexed sender,
+            int24 tickLower,
+            int24 tickUpper,
+            int256 liquidityDelta,
+            bytes32 salt
+        );
+    }
+
+    interface IV4StateView {
+        function getSlot0(bytes32 poolId)
+            external view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee);
+        function getLiquidity(bytes32 poolId) external view returns (uint128 liquidity);
+    }
+
+    interface IV4Quoter {
+        struct PoolKey {
+            address currency0;
+            address currency1;
+            uint24 fee;
+            int24 tickSpacing;
+            address hooks;
+        }
+        struct QuoteExactSingleParams {
+            PoolKey poolKey;
+            bool zeroForOne;
+            uint128 exactAmount;
+            bytes hookData;
+        }
+        /// Returns (amountOut, gasEstimate): amountOut is the first word, as in QuoterV2.
+        function quoteExactInputSingle(QuoteExactSingleParams memory params)
+            external returns (uint256 amountOut, uint256 gasEstimate);
+    }
+}

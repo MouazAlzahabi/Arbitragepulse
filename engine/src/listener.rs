@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::abi::{IPancakeV3Pool, IUniswapV3Pool, Swap, Sync};
+use crate::abi::{IPancakeV3Pool, IUniswapV3Pool, IV4PoolManager, Swap, Sync};
 use crate::api::{broadcast_log, LogBroadcaster};
 use crate::pool_cache::PoolCache;
 
@@ -43,6 +43,23 @@ pub fn pool_log_topics(solidly_sync_hash: B256) -> Vec<B256> {
     ]
 }
 
+/// topic0s of the Uniswap V4 PoolManager logs the engine applies (topic1 = PoolId). On
+/// their own feed (address = PoolManager, topic1 = the cached pool ids), not the pools'.
+pub fn v4_log_topics() -> Vec<B256> {
+    vec![IV4PoolManager::Swap::SIGNATURE_HASH, IV4PoolManager::ModifyLiquidity::SIGNATURE_HASH]
+}
+
+/// The pool a log belongs to: its emitter, or for a V4 PoolManager log the pool address
+/// of its PoolId (topic1, see `pool_cache::v4_pool_address`).
+pub fn log_pool(log: &alloy::rpc::types::Log) -> Address {
+    let topics = log.topics();
+    match (topics.first(), topics.get(1)) {
+        (Some(t0), Some(id)) if *t0 == IV4PoolManager::Swap::SIGNATURE_HASH
+            || *t0 == IV4PoolManager::ModifyLiquidity::SIGNATURE_HASH => crate::pool_cache::v4_pool_address(*id),
+        _ => log.address(),
+    }
+}
+
 /// Decode a single Swap/Sync log, apply it to the pool cache, and classify magnitude.
 /// Returns `Some(magnitude)` when the log was recognized, applied, and is new — the caller
 /// should trigger a scan. A log older than the pool's last applied one is skipped; the
@@ -58,7 +75,7 @@ pub fn apply_log_to_cache(
     large_swap_bps: u32,
     large_v3_bps: u32,
 ) -> Option<SwapMagnitude> {
-    let pool = log.address();
+    let pool = log_pool(log);
     let topic0 = log.topics().first().copied()?;
     if log.removed {
         return None;
@@ -139,6 +156,34 @@ pub fn apply_log_to_cache(
         }
         cache.update_v3_state(pool, sqrtp, liq, decoded.tick.as_i32());
         return (!repeat).then_some(magnitude);
+    }
+
+    if topic0 == IV4PoolManager::Swap::SIGNATURE_HASH {
+        let key = *cache.v4_keys.get(&pool)?; // None: another V4 pool (the poll fallback doesn't filter by id)
+        let decoded = IV4PoolManager::Swap::decode_log(log.as_ref()).ok()?;
+        let (sqrtp, tick) = key.to_cache_price(U256::from(decoded.sqrtPriceX96), decoded.tick.as_i32());
+        if let Some(old) = cache.v3_by_address.get(&pool) {
+            if sqrtp_delta_bps(old.sqrt_price_x96, sqrtp, large_v3_bps) {
+                magnitude = SwapMagnitude::Large;
+            }
+        }
+        cache.update_v3_state(pool, sqrtp, decoded.liquidity, tick);
+        return (!repeat).then_some(magnitude);
+    }
+
+    if topic0 == IV4PoolManager::ModifyLiquidity::SIGNATURE_HASH {
+        let key = cache.v4_keys.get(&pool).map(|k| *k);
+        if let (false, true, Some(key)) = (repeat, positioned, key) {
+            let d = IV4PoolManager::ModifyLiquidity::decode_log(log.as_ref()).ok()?;
+            let delta = d.liquidityDelta;
+            let amount = delta.unsigned_abs().saturating_to::<u128>();
+            let (lo, hi) = key.to_cache_range(d.tickLower.as_i32(), d.tickUpper.as_i32());
+            if amount > 0 && cache.apply_v3_liquidity_delta(pool, lo, hi, amount, delta.is_positive()) {
+                debug!("V4 ModifyLiquidity in range | pool={} | delta={} | liquidity={}", pool, delta,
+                       cache.v3_by_address.get(&pool).map(|e| e.liquidity).unwrap_or(0));
+            }
+        }
+        return None;
     }
 
     if topic0 == IUniswapV3Pool::Mint::SIGNATURE_HASH {
@@ -574,6 +619,91 @@ mod tests {
         assert_eq!(liq(&cache), 2_000_000);
         apply(&cache, &mint(-600, -400, 5, 10, 2));
         assert_eq!(liq(&cache), 2_000_005);
+    }
+
+    /// A V4 pool (cached under its pool address) and PoolManager logs carrying its id.
+    fn cache_with_v4_pool() -> (PoolCache, crate::pool_cache::V4PoolKey) {
+        let cache = PoolCache::new();
+        let key = crate::pool_cache::V4PoolKey {
+            currency0: Address::ZERO, currency1: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), fee: 500, tick_spacing: 10,
+        };
+        cache.v4_keys.insert(key.pool_address(), key);
+        let state = cache_with_v3_pool().v3_by_address.get(&V3).unwrap().clone();
+        cache.insert_v3(key.pool_address(), state);
+        (cache, key)
+    }
+
+    fn pm_log(data: alloy::primitives::LogData, block: u64, index: u64) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log { address: address!("498581fF718922c3f8e6A244956aF099B2652b2b"), data },
+            block_number: Some(block),
+            log_index: Some(index),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v4_swap_and_modify_liquidity_apply_to_the_pool_of_their_id() {
+        let (cache, key) = cache_with_v4_pool();
+        let pool = key.pool_address();
+        let swap = IV4PoolManager::Swap {
+            id: key.id(), sender: Address::ZERO, amount0: 0, amount1: 0,
+            sqrtPriceX96: alloy::primitives::aliases::U160::from(2u64) << 96,
+            liquidity: 3_000_000, tick: i24(13_863), fee: alloy::primitives::aliases::U24::from(500u32),
+        }.encode_log_data();
+        let log = pm_log(swap, 10, 0);
+        assert_eq!(log_pool(&log), pool);
+        assert!(apply(&cache, &log).is_some(), "new swap triggers a scan");
+        let s = cache.v3_by_address.get(&pool).unwrap().clone();
+        assert_eq!((s.sqrt_price_x96, s.liquidity, s.tick), (U256::from(2u64) << 96, 3_000_000, 13_863));
+
+        let modify = |delta: i64, index| pm_log(IV4PoolManager::ModifyLiquidity {
+            id: key.id(), sender: Address::ZERO, tickLower: i24(13_000), tickUpper: i24(14_000),
+            liquidityDelta: alloy::primitives::I256::try_from(delta).unwrap(), salt: B256::ZERO,
+        }.encode_log_data(), 10, index);
+        assert!(apply(&cache, &modify(500, 1)).is_none());
+        apply(&cache, &modify(500, 1)); // its sealed copy: not applied again
+        assert_eq!(cache.v3_by_address.get(&pool).unwrap().liquidity, 3_000_500);
+        apply(&cache, &modify(-200, 2));
+        assert_eq!(cache.v3_by_address.get(&pool).unwrap().liquidity, 3_000_300);
+
+        // Another V4 pool's log (same PoolManager) is ignored.
+        let other = crate::pool_cache::V4PoolKey { fee: 3000, tick_spacing: 60, ..key };
+        let swap = IV4PoolManager::Swap {
+            id: other.id(), sender: Address::ZERO, amount0: 0, amount1: 0,
+            sqrtPriceX96: alloy::primitives::aliases::U160::from(9u64) << 96,
+            liquidity: 1, tick: i24(0), fee: alloy::primitives::aliases::U24::from(3000u32),
+        }.encode_log_data();
+        assert!(apply(&cache, &pm_log(swap, 10, 3)).is_none());
+        assert!(cache.v3_by_address.get(&other.pool_address()).is_none());
+    }
+
+    #[test]
+    fn v4_inverted_native_pool_logs_are_mirrored() {
+        // Native ETH / VIRTUAL: VIRTUAL sorts below WETH, so the cache mirrors price and ticks.
+        let cache = PoolCache::new();
+        let key = crate::pool_cache::V4PoolKey {
+            currency0: Address::ZERO, currency1: address!("0b3e328455c4059EEb9e3f84b5543F74E24e7E1b"), fee: 3000, tick_spacing: 60,
+        };
+        let pool = key.pool_address();
+        cache.v4_keys.insert(pool, key);
+        let state = cache_with_v3_pool().v3_by_address.get(&V3).unwrap().clone();
+        cache.insert_v3(pool, state);
+        let swap = IV4PoolManager::Swap {
+            id: key.id(), sender: Address::ZERO, amount0: 0, amount1: 0,
+            sqrtPriceX96: alloy::primitives::aliases::U160::from(2u64) << 96,
+            liquidity: 3_000_000, tick: i24(13_863), fee: alloy::primitives::aliases::U24::from(3000u32),
+        }.encode_log_data();
+        apply(&cache, &pm_log(swap, 10, 0));
+        let s = cache.v3_by_address.get(&pool).unwrap().clone();
+        assert_eq!((s.sqrt_price_x96, s.tick), ((U256::from(1u64) << 96) / U256::from(2u64), -13_864));
+        // Pool range [13_800, 13_920) holds tick 13_863: in range after mirroring too.
+        let modify = pm_log(IV4PoolManager::ModifyLiquidity {
+            id: key.id(), sender: Address::ZERO, tickLower: i24(13_800), tickUpper: i24(13_920),
+            liquidityDelta: alloy::primitives::I256::try_from(500).unwrap(), salt: B256::ZERO,
+        }.encode_log_data(), 10, 1);
+        apply(&cache, &modify);
+        assert_eq!(cache.v3_by_address.get(&pool).unwrap().liquidity, 3_000_500);
     }
 
     #[test]

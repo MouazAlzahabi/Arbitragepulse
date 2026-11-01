@@ -5,6 +5,67 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+// ─── Uniswap V4 pool keys ─────────────────────────────────────────────────────
+
+/// A Uniswap V4 PoolKey (hookless). `currency0` is address(0) for native ETH; the cache
+/// stores such a pool under WETH so routes join it with every other WETH pool, and the
+/// executor wraps / unwraps on the leg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V4PoolKey {
+    pub currency0: Address,
+    pub currency1: Address,
+    pub fee: u32,
+    pub tick_spacing: i32,
+}
+
+impl V4PoolKey {
+    /// PoolId = keccak256(abi.encode(currency0, currency1, fee, tickSpacing, hooks = 0)).
+    pub fn id(&self) -> alloy::primitives::B256 {
+        let word = |a: Address| alloy::primitives::B256::left_padding_from(a.as_slice());
+        let mut buf = Vec::with_capacity(160);
+        buf.extend_from_slice(word(self.currency0).as_slice());
+        buf.extend_from_slice(word(self.currency1).as_slice());
+        buf.extend_from_slice(&U256::from(self.fee).to_be_bytes::<32>());
+        buf.extend_from_slice(&alloy::primitives::I256::try_from(self.tick_spacing as i64)
+            .unwrap_or_default().to_be_bytes::<32>());
+        buf.extend_from_slice(&[0u8; 32]); // hooks
+        alloy::primitives::keccak256(buf)
+    }
+
+    /// The address the cache and the executor know this pool by: the low 160 bits of its
+    /// PoolId (executor `v4PoolAddress`).
+    pub fn pool_address(&self) -> Address {
+        v4_pool_address(self.id())
+    }
+
+    /// A native ETH pool whose partner sorts below WETH (e.g. VIRTUAL, tBTC): in the cache,
+    /// where WETH stands for ETH, the partner is token0, so the pool's price is stored
+    /// inverted ([`V4PoolKey::to_cache_price`]).
+    pub fn inverted(&self) -> bool {
+        self.currency0.is_zero() && self.currency1 < crate::util::WETH
+    }
+
+    /// The pool's (sqrtPriceX96, tick) as the cache stores them: unchanged, or for an
+    /// [`inverted`](Self::inverted) pool 2^192 / sqrtP and -tick - 1. The -1 keeps tick
+    /// ranges exact: the pool's [lower, upper) holds tick t iff [-upper, -lower) holds -t-1.
+    pub fn to_cache_price(&self, sqrt_price_x96: U256, tick: i32) -> (U256, i32) {
+        if !self.inverted() || sqrt_price_x96.is_zero() {
+            return (sqrt_price_x96, tick);
+        }
+        ((U256::from(1u8) << 192) / sqrt_price_x96, -tick - 1)
+    }
+
+    /// A position's tick range as the cache sees it (mirrored for an inverted pool).
+    pub fn to_cache_range(&self, lower: i32, upper: i32) -> (i32, i32) {
+        if self.inverted() { (-upper, -lower) } else { (lower, upper) }
+    }
+}
+
+/// Low 160 bits of a V4 PoolId (a Swap / ModifyLiquidity log's topic1).
+pub fn v4_pool_address(id: alloy::primitives::B256) -> Address {
+    Address::from_slice(&id.as_slice()[12..])
+}
+
 // ─── Structured pool lookup keys (no per-quote format! / string hashing) ────────
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -268,6 +329,10 @@ pub struct PoolCache {
     shallow: Arc<dashmap::DashSet<Address>>,
     /// Pools of direct venues the executor does not allowlist (live mode): never quoted.
     disabled: Arc<dashmap::DashSet<Address>>,
+    /// Uniswap V4 pools (by their pool address, see [`V4PoolKey::pool_address`]): kept in
+    /// `v3_by_address` like any CL pool; this holds the PoolKey for quotes and the
+    /// executor. Their logs come from the PoolManager, so they are not in `watch_addresses`.
+    pub v4_keys: Arc<DashMap<Address, V4PoolKey>>,
 }
 
 impl Default for PoolCache {
@@ -284,6 +349,7 @@ impl Default for PoolCache {
             created: Instant::now(),
             shallow: Arc::new(dashmap::DashSet::new()),
             disabled: Arc::new(dashmap::DashSet::new()),
+            v4_keys: Arc::new(DashMap::new()),
         }
     }
 }
@@ -406,13 +472,18 @@ impl PoolCache {
             return;
         }
         let mut addrs: Vec<Address> = self.by_address.iter().map(|e| *e.key()).collect();
-        addrs.extend(self.v3_by_address.iter().map(|e| *e.key()));
+        addrs.extend(self.v3_by_address.iter().map(|e| *e.key()).filter(|a| !self.v4_keys.contains_key(a)));
         if let Ok(mut guard) = self.watch_addrs.write() {
             *guard = addrs;
         }
     }
 
-    /// All pool addresses (V2 + V3) for eth_subscribe / getLogs filters.
+    /// V4 pool ids (log topic1) for the PoolManager log filter.
+    pub fn v4_pool_ids(&self) -> Vec<alloy::primitives::B256> {
+        self.v4_keys.iter().map(|e| e.value().id()).collect()
+    }
+
+    /// All pool addresses (V2 + V3, not V4) for eth_subscribe / getLogs filters.
     /// Rebuilt only when pools are inserted or pruned — avoids O(n) collect per poll.
     pub fn watch_addresses(&self) -> Vec<Address> {
         self.rebuild_watch_addrs_if_dirty();
@@ -874,6 +945,59 @@ fn stable_get_y(x0: U256, xy: U256, y_init: U256, one: U256) -> U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v4_native_pool_below_weth_is_inverted_in_the_cache() {
+        let virtual_: Address = "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b".parse().unwrap();
+        let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().unwrap();
+        let inv = V4PoolKey { currency0: Address::ZERO, currency1: virtual_, fee: 3000, tick_spacing: 60 };
+        assert!(inv.inverted());
+        assert!(!V4PoolKey { currency1: usdc, ..inv }.inverted(), "USDC sorts above WETH");
+        assert!(!V4PoolKey { currency0: virtual_, currency1: crate::util::WETH, ..inv }.inverted(), "ERC-20 pool");
+        // Price VIRTUAL per ETH = 4 → sqrtP = 2·2^96; cached (WETH per VIRTUAL) = 1/4 → 2^96 / 2.
+        let (s, t) = inv.to_cache_price(U256::from(2u8) << 96, 13_863);
+        assert_eq!(s, (U256::from(1u8) << 96) / U256::from(2u8));
+        assert_eq!(t, -13_864);
+        // A tick is in a position's range in the pool iff the mirrored tick is in the mirrored range.
+        for (lo, hi) in [(-120, 60), (0, 60), (60, 120)] {
+            for tick in -130..130 {
+                let (_, ct) = inv.to_cache_price(U256::from(1u8) << 96, tick);
+                let (clo, chi) = inv.to_cache_range(lo, hi);
+                assert_eq!(lo <= tick && tick < hi, clo <= ct && ct < chi, "tick {tick} range [{lo},{hi})");
+            }
+        }
+    }
+
+    #[test]
+    fn v4_pool_id_matches_solidity_abi_encode() {
+        // Base native ETH/USDC 0.05 % (cast keccak $(cast abi-encode "f(address,address,uint24,int24,address)" …)).
+        let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().unwrap();
+        let key = V4PoolKey { currency0: Address::ZERO, currency1: usdc, fee: 500, tick_spacing: 10 };
+        let id: alloy::primitives::B256 = "0x96d4b53a38337a5733179751781178a2613306063c511b78cd02684739288c0a".parse().unwrap();
+        assert_eq!(key.id(), id);
+        assert_eq!(key.pool_address(), "0x781178a2613306063c511b78cd02684739288c0a".parse::<Address>().unwrap());
+        assert_eq!(v4_pool_address(id), key.pool_address());
+        // Negative tick spacing sign-extends (int24 in the ABI word).
+        let neg = V4PoolKey { tick_spacing: -10, ..key };
+        assert_eq!(neg.id(), "0x472b306de6ffbe2b8f7d3eb7ea822428181097a61d3afc3c0d7c604d15879477".parse::<alloy::primitives::B256>().unwrap());
+    }
+
+    #[test]
+    fn v4_pools_are_not_watch_addresses() {
+        let cache = PoolCache::new();
+        let state = |router: &str| V3PoolState {
+            token0: Address::repeat_byte(1), token1: Address::repeat_byte(2), fee: 500, swap_fee: 500,
+            sqrt_price_x96: U256::from(1u128 << 96), liquidity: 1_000_000, tick: 0,
+            router_id: router.into(), last_updated: Instant::now(),
+            vr0: U256::ZERO, vr1: U256::ZERO, fee_num_v3: U256::ZERO,
+        };
+        let key = V4PoolKey { currency0: Address::repeat_byte(1), currency1: Address::repeat_byte(2), fee: 500, tick_spacing: 10 };
+        cache.v4_keys.insert(key.pool_address(), key);
+        cache.insert_v3(key.pool_address(), state("v4"));
+        cache.insert_v3(Address::repeat_byte(0xaa), state("v3"));
+        assert_eq!(cache.watch_addresses(), vec![Address::repeat_byte(0xaa)]);
+        assert_eq!(cache.v4_pool_ids(), vec![key.id()]);
+    }
 
     #[test]
     fn fresh_v3_count_reflects_pools_aging_out_without_updates() {

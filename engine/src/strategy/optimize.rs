@@ -83,10 +83,10 @@ impl Strategy {
         }
 
         // (quoter, is Slipstream's quoter)
-        // Aero Metaquoters quote by pool, not (tokens, fee): the optimizer leaves those legs
-        // unprobed (None), so such a route keeps its detected size.
+        // Aero Metaquoters and V4Quoters quote by pool, not (tokens, fee): the optimizer
+        // leaves those legs unprobed (None), so such a route keeps its detected size.
         let quoter_of = |id: &str| self.quoter_by_router.get(id)
-            .filter(|&q| !self.metaquoters.contains_key(q))
+            .filter(|&q| !self.metaquoters.contains_key(q) && !self.v4_quoters.contains_key(q))
             .map(|&q| (q, self.slipstream_quoters.contains(&q)));
         let quoter_a = quoter_of(&opp.router_a_id);
         let quoter_b = quoter_of(&opp.router_b_id);

@@ -182,6 +182,15 @@ pub async fn run_chain(
         warn!("[{}] V3 discovery lost {} call(s) on http_rpc — retrying on the main RPC", cfg.name, lost_v3);
         lost_v3 = discover::discover_v3_pools(&chain_routers, &chain_pairs, &main_reads, &pool_cache).await;
     }
+    let mut lost_v4 = discover::discover_v4_pools(&chain_routers, &chain_pairs, startup_reads, &pool_cache).await;
+    if lost_v4 > 0 && has_startup_fallback {
+        warn!("[{}] V4 discovery lost {} call(s) on http_rpc — retrying on main RPC", cfg.name, lost_v4);
+        lost_v4 = discover::discover_v4_pools(&chain_routers, &chain_pairs, &main_reads, &pool_cache).await;
+    }
+    lost_v3 += lost_v4;
+    if !pool_cache.v4_keys.is_empty() {
+        info!("[{}] V4 pool cache: {} hookless pools seeded", cfg.name, pool_cache.v4_keys.len());
+    }
     info!("[{}] V3 pool cache: {} pools seeded", cfg.name, pool_cache.v3_by_address.len());
     // Discovery calls lost to RPC failure (after retries) leave pools silently untracked
     // until the next restart — say so where the operator looks, but keep running.
@@ -429,6 +438,9 @@ pub async fn run_chain(
     // (maintain.rs) when new pools appear: the new feeds start before the old ones are
     // aborted, so no log is missed; the overlap's duplicates are dropped by the cache's
     // log-position guard.
+    // V4 pools log through their PoolManager (the `v4: true` router's address).
+    let v4_managers: Vec<Address> = chain_routers.iter().filter(|r| r.v4)
+        .filter_map(|r| r.address.parse().ok()).collect();
     let start_log_feeds: Arc<dyn Fn() -> Vec<tokio::task::JoinHandle<()>> + Send + Sync> = {
         let (cache, provider, preconf_url) = (pool_cache.clone(), provider.clone(), cfg.preconf_ws_rpc.clone());
         let (feed, counter, chain_name) = (log_feed.clone(), preconf_logs.clone(), cfg.name.clone());
@@ -454,6 +466,19 @@ pub async fn run_chain(
                     .address(all_addrs)
                     .event_signature(topics);
                 handles.push(spawn_preconf_subscription(url, log_filter, feed.clone(), counter.clone()));
+            }
+            // V4: the PoolManager's Swap / ModifyLiquidity for the cached pool ids only (it
+            // logs for every V4 pool on the chain). Both feeds, like the pools above.
+            let v4_ids = cache.v4_pool_ids();
+            if !v4_managers.is_empty() && !v4_ids.is_empty() {
+                let v4_filter = alloy::rpc::types::Filter::new()
+                    .address(v4_managers.clone())
+                    .event_signature(crate::listener::v4_log_topics())
+                    .topic1(v4_ids);
+                handles.push(spawn_log_subscription((*provider).clone(), v4_filter.clone(), feed.clone(), None, None));
+                if let Some(url) = preconf_url.clone() {
+                    handles.push(spawn_preconf_subscription(url, v4_filter, feed.clone(), counter.clone()));
+                }
             }
             handles
         })
@@ -1243,7 +1268,7 @@ async fn run_log_subscription<P: Provider + Clone + 'static>(
                     ) {
                         if feed.swap_tx.try_send(SwapEvent {
                             chain_id: feed.chain_id,
-                            pool: log.address(),
+                            pool: crate::listener::log_pool(&log),
                             block_number,
                             magnitude,
                             received_at,

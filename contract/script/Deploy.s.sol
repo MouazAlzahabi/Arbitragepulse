@@ -63,6 +63,11 @@ contract DeployExecutor is Script {
         console.log(string.concat(
             "       cast send ", vm.toString(address(executor)), " 'setRouters(address[],uint8)' '[<pool>,...]' 6"
         ));
+        console.log("     V4 pools (type 8; hookless, borrowed trades only) by PoolKey, as the engine lists them:");
+        console.log(string.concat(
+            "       cast send ", vm.toString(address(executor)),
+            " 'setV4Pools((address,address,uint24,int24,address)[])' '[(<c0>,<c1>,<fee>,<tickSpacing>,0x0000000000000000000000000000000000000000),...]'"
+        ));
         console.log("  3. Fund:    send the pair's start token (e.g. USDC) to", address(executor));
         console.log("  4. Engine:  chain.contract_address =", address(executor));
         console.log("     Trades are onlyOwner: the engine's PRIVATE_KEY must be this owner:", executor.owner());

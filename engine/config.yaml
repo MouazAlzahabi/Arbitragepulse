@@ -20,10 +20,12 @@ chain:
   native_currency: "ETH"
   wrapped_native: "0x4200000000000000000000000000000000000006"
   block_time_ms: 2000
-  # Executor v4 (DirectCL / DirectPair pools, V4 borrowing), deployed 2026-10-29,
-  # tx 0x13729247b0bae4496ce308c53999f835da752d16af605282d54418cf31b5686c (block 53246126).
-  # Previous executor (v3, still holds its funds until withdrawn): 0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2
-  contract_address: "0xfbf0267661784B6770F76873F99c4a626fc66e96"
+  # Executor v5 (adds Uniswap V4 legs, type 8), deployed 2026-11-01,
+  # tx 0x9dea91e728cec46a13b72492454682ba40113f051e2caf4ddea6e8aa106bbf8e (block 53375831).
+  # Allowlisted: the 8 router venues, 68 DirectCL + 18 DirectPair pools, 101 V4 pools.
+  # Previous executor (v4, empty): 0xfbf0267661784B6770F76873F99c4a626fc66e96
+  # Older executor (v3, still holds its funds until withdrawn): 0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2
+  contract_address: "0x68a33770b9CD62B6589Ea54B0d62828D71E92590"
   min_native_balance: 0.005
   # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
   # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
@@ -193,23 +195,56 @@ routers:
     factory_address: "0x8E6a9FCd1d638CC760Ffba397605Fe3355dE76D2"
     stable_factory_address: "0x78589E876edcEbdce72ee3436ab3c9AD3a7cEF2D"
 
-  # baseswap-v2 disabled: $29K USDC/WETH TVL → 0.8% price impact on $90 → confirmed reverts
-  # - id: "baseswap-v2"
-  #   name: "BaseSwap (Base)"
-  #   address: "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86"
-  #   type: "v2"
-  #   fee_bps: 30
+  # ── Added 2026-11-01: more venues. Thin pools are dropped by min_pool_depth_usd and the
+  # phantom cap (both were missing when these two were first disabled for phantom routes). ──
 
-  # alienbase-v2 disabled: thin liquidity, contributes phantom V2 routes
-  # - id: "alienbase-v2"
-  #   name: "Alien Base (Base)"
-  #   address: "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7"
-  #   type: "v2"
-  #   fee_bps: 12  # 0.12% protocol fee
+  # BaseSwap V2 (Uniswap V2 fork). Fee from router.getAmountOut: 0.25%.
+  #   executor.setRouter(0x327Df1E6de05895d2ab08513aaDD9313Fe505d86, 0)
+  - id: "baseswap-v2"
+    name: "BaseSwap (Base)"
+    address: "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86"
+    type: "v2"
+    fee_bps: 25
+    factory_address: "0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB"
 
-  # SushiSwap V3: factory confirmed (0xc35DADB65012eC5796536bD9864eD8773aBc74C4) but
-  # SwapRouter + QuoterV2 addresses not found in official docs — skipped until confirmed.
+  # Alien Base V2 (Uniswap V2 fork). Fee from router.getAmountOut: 0.16%.
+  #   executor.setRouter(0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7, 0)
+  - id: "alienbase-v2"
+    name: "Alien Base (Base)"
+    address: "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7"
+    type: "v2"
+    fee_bps: 16
+    factory_address: "0x3E84D913803b02A4a7f027165E8cA42C14C0FdE7"
 
+  # SushiSwap V3 (Uniswap V3 fork). Its router 0x80C7DD17…314de has neither exactInputSingle
+  # ABI, so it is traded on the pools directly (executor type 6, DirectCL, paid back through
+  # uniswapV3SwapCallback): allowlist the pools the startup log lists with
+  # executor.setRouters([...], 6). `address` is the factory, an identifier only.
+  - id: "sushi-v3-base"
+    name: "SushiSwap V3 (Base)"
+    address: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4"
+    type: "v3"
+    direct: true
+    fee_tiers: [100, 500, 3000, 10000]
+    fee_bps: 0
+    quoter_address: "0xb1E835Dc2785b52265711e17fCCb0fd018226a6e"   # SushiSwap QuoterV2
+    factory_address: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4"
+
+  # Uniswap V4: hookless pools in the singleton PoolManager (`address`), found per token pair
+  # × fee tier at Uniswap's default tick spacing (100/1, 500/10, 3000/60, 10000/200). The deep
+  # ETH pools are native ETH: cached under WETH, the executor unwraps / wraps on the leg.
+  # Executor type 8, borrowed trades only: register the pools the startup log lists with
+  #   executor.setV4Pools([(currency0, currency1, fee, tickSpacing, 0x0), ...])
+  - id: "uniswap-v4-base"
+    name: "Uniswap V4 (Base)"
+    address: "0x498581fF718922c3f8e6A244956aF099B2652b2b"    # PoolManager
+    type: "v3"
+    direct: true
+    v4: true
+    fee_tiers: [100, 500, 3000, 10000]
+    fee_bps: 0
+    quoter_address: "0x0d5e0f971ed27fbff6c2837bf31316121532048d"   # V4Quoter
+    state_view: "0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71"       # StateView
 
 # ─── PAIRS ─────────────────────────────────────────────────
 # Chosen 2026-10-22 from GeckoTerminal 24h volume per venue (≥ $50k depth on ≥ 2 venues).
@@ -427,6 +462,7 @@ tuning:
   # ~1.04M and ran out at 1.02M (mainnet replay 2026-10-29); with this it gets 2.07M.
   # You pay for gas used, not the limit; only the profit gate's estimate grows (~$0.03).
   gas_per_hooked_leg: 350000
+  gas_per_v4_leg: 100000          # Uniswap V4 leg: PoolManager swap + settle/take (+ WETH wrap on native ETH pools)
   onchain_min_profit_bps: 6076           # on-chain minProfit = 60.76% of the gas-cost floor
                                          # (replaces router_min_out_slack_bps × sell_leg_minprofit_mul_bps:
                                          #  (10000 − slack) × mul / 10000; old 200 / 6200 → 6076)

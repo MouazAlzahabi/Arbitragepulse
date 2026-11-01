@@ -94,13 +94,51 @@ contract MockPair {
 /**
  * @dev Mock Uniswap V4 PoolManager flash accounting: `take` adds a debt, `sync` + transfer +
  *      `settle` pays it, and `unlock` reverts unless every debt is cleared. No fee.
+ *      Currency address(0) is native ETH (`take` sends ETH, `settle` with value pays it).
+ *      `swap` trades at a fixed rate per PoolId (`setRate`): exact input only.
  */
 contract MockPoolManager {
+    struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }
+    struct SwapParams { bool zeroForOne; int256 amountSpecified; uint160 sqrtPriceLimitX96; }
+
     mapping(address => int256) public debt;
     address[] internal touched;
     address internal synced;
     uint256 internal syncedBalance;
     bool internal unlocked;
+    mapping(bytes32 => uint256) public rateNum;
+    mapping(bytes32 => uint256) public rateDen;
+    /// Input actually used per swap, as a fraction (1/1 = all): models a pool running dry.
+    uint256 public useNum = 1;
+    uint256 public useDen = 1;
+
+    receive() external payable {}
+
+    function setRate(PoolKey calldata key, uint256 num, uint256 den) external {
+        bytes32 id = keccak256(abi.encode(key));
+        rateNum[id] = num;
+        rateDen[id] = den;
+    }
+
+    function setInputUse(uint256 num, uint256 den) external { useNum = num; useDen = den; }
+
+    function swap(PoolKey calldata key, SwapParams calldata params, bytes calldata) external returns (int256) {
+        require(unlocked, "ManagerLocked");
+        require(params.amountSpecified < 0, "exact input only");
+        bytes32 id = keccak256(abi.encode(key));
+        require(rateDen[id] != 0, "PoolNotInitialized");
+        uint256 amountIn = uint256(-params.amountSpecified) * useNum / useDen;
+        uint256 out = amountIn * rateNum[id] / rateDen[id];
+        (address cIn, address cOut) = params.zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
+        debt[cIn] += int256(amountIn);
+        debt[cOut] -= int256(out);
+        touched.push(cIn);
+        touched.push(cOut);
+        (int128 d0, int128 d1) = params.zeroForOne
+            ? (-int128(int256(amountIn)), int128(int256(out)))
+            : (int128(int256(out)), -int128(int256(amountIn)));
+        return (int256(d0) << 128) | int256(uint256(uint128(d1)));
+    }
 
     function unlock(bytes calldata data) external returns (bytes memory ret) {
         require(!unlocked, "AlreadyUnlocked");
@@ -115,7 +153,12 @@ contract MockPoolManager {
         require(unlocked, "ManagerLocked");
         debt[currency] += int256(amount);
         touched.push(currency);
-        IERC20(currency).transfer(to, amount);
+        if (currency == address(0)) {
+            (bool ok,) = to.call{value: amount}("");
+            require(ok, "ETH transfer");
+        } else {
+            IERC20(currency).transfer(to, amount);
+        }
     }
 
     function sync(address currency) external {
@@ -125,6 +168,10 @@ contract MockPoolManager {
 
     function settle() external payable returns (uint256 paid) {
         require(unlocked, "ManagerLocked");
+        if (msg.value > 0) {
+            debt[address(0)] -= int256(msg.value);
+            return msg.value;
+        }
         paid = IERC20(synced).balanceOf(address(this)) - syncedBalance;
         debt[synced] -= int256(paid);
     }
@@ -132,5 +179,39 @@ contract MockPoolManager {
     /// Lets a test call any contract's unlockCallback as the PoolManager outside an unlock.
     function poke(address target, bytes calldata data) external {
         IUnlockCallback(target).unlockCallback(data);
+    }
+}
+
+/// @dev Minimal WETH9 (deposit / withdraw / ERC20), etched at the OP Stack predeploy in tests.
+contract MockWETH {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    receive() external payable { deposit(); }
+
+    function deposit() public payable { balanceOf[msg.sender] += msg.value; }
+
+    function withdraw(uint256 amount) external {
+        balanceOf[msg.sender] -= amount;
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, "ETH transfer");
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        if (from != msg.sender) allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
     }
 }

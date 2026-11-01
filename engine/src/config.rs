@@ -222,6 +222,27 @@ pub struct RouterConfig {
     /// amountIn)` — instead of a QuoterV2 (needed for Aero CL pools, `slipstream: true`).
     #[serde(default)]
     pub metaquoter: bool,
+    /// Uniswap V4 (with `type: "v3"` and `direct: true`): hookless pools in the singleton
+    /// PoolManager (`address`), found per token pair × `fee_tiers` (standard tick spacing,
+    /// see [`v4_tick_spacing`]) — the native ETH pool stands in for WETH. State is read
+    /// through `state_view`, quotes through `quoter_address` (V4Quoter). Executor type 8:
+    /// each pool is registered with setV4Pools; borrowed trades only (`chain.borrow`).
+    #[serde(default)]
+    pub v4: bool,
+    /// Uniswap V4 StateView (getSlot0 / getLiquidity by PoolId), with `v4: true`.
+    #[serde(default)]
+    pub state_view: Option<String>,
+}
+
+/// Tick spacing of a V4 pool with fee tier `fee` (Uniswap's defaults); None = no default.
+pub fn v4_tick_spacing(fee: u32) -> Option<i32> {
+    match fee {
+        100 => Some(1),
+        500 => Some(10),
+        3000 => Some(60),
+        10000 => Some(200),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -372,6 +393,23 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
         if r.metaquoter && !(r.router_type == RouterType::V3 && r.quoter_address.is_some()) {
             return Err(anyhow!("router '{}': metaquoter: true needs type \"v3\" and quoter_address (Aero Metaquoter)", r.id));
         }
+        if r.v4 && (r.router_type != RouterType::V3 || !r.direct || r.slipstream || r.metaquoter
+            || r.state_view.is_none() || r.quoter_address.is_none())
+        {
+            return Err(anyhow!(
+                "router '{}': v4: true needs type \"v3\", direct: true, state_view (V4 StateView) and quoter_address (V4Quoter); address is the PoolManager",
+                r.id
+            ));
+        }
+        if r.v4 && !chain.borrow {
+            return Err(anyhow!("router '{}': V4 pools trade only inside a borrow — set chain.borrow: true", r.id));
+        }
+        if let Some(f) = r.fee_tiers.iter().find(|&&f| r.v4 && v4_tick_spacing(f).is_none()) {
+            return Err(anyhow!("router '{}': V4 fee tier {} has no default tick spacing (100, 500, 3000, 10000)", r.id, f));
+        }
+        if r.state_view.is_some() && !r.v4 {
+            return Err(anyhow!("router '{}': state_view is only for v4: true", r.id));
+        }
         if r.stable_factory_address.is_some() && !(r.router_type == RouterType::Aerodrome && r.direct && r.factory_address.is_some()) {
             return Err(anyhow!(
                 "router '{}': stable_factory_address (Aero V2) needs type \"aerodrome\", direct: true and factory_address (the volatile factory)",
@@ -461,6 +499,9 @@ pub struct Tuning {
     /// Extra gas per leg on a hooked venue (Aero CL, `metaquoter: true`): its swap costs
     /// ~250-290k and its hook reverts "IG" unless 250k gas is left when it runs.
     pub gas_per_hooked_leg: u64,
+    /// Extra gas per Uniswap V4 leg (`v4: true`): PoolManager swap + settle / take, and a
+    /// WETH wrap / unwrap on native ETH pools.
+    pub gas_per_v4_leg: u64,
     /// On-chain `minProfit` as bps of the gas-cost floor (6076 = 60.76%). The contract
     /// reverts `NotProfitable` unless final balance ≥ starting balance + minProfit; < 10000 leaves room for
     /// same-block drift, with the off-chain net-profit check as the economic guard.
@@ -605,6 +646,7 @@ impl Default for Tuning {
             gas_limit_triangular: 900_000,
             gas_borrow_extra: 120_000,
             gas_per_hooked_leg: 350_000,
+            gas_per_v4_leg: 100_000,
             onchain_min_profit_bps: 6076, // = the former 98% slack × 62% multiplier
             gas_fallback_margin_bps: 2_500,
             gas_fallback_max_age_ms: 120_000,
