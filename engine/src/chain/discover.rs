@@ -468,6 +468,104 @@ pub(crate) async fn discover_v3_pools<P: Provider>(
     lost
 }
 
+/// Discover Uniswap V4 pools (`v4: true` routers): for every token pair × fee tier, the
+/// hookless PoolKey at the fee's default tick spacing — with native ETH in place of WETH
+/// (V4's deep ETH pools are native; the cache keeps them under WETH, the executor wraps).
+/// One multicall round: StateView `getSlot0(id)` + `getLiquidity(id)`; uninitialised pools
+/// (sqrtPrice 0) are skipped. A native pool whose partner sorts below WETH (VIRTUAL, tBTC)
+/// is cached with its price inverted (`V4PoolKey::to_cache_price`), since there the partner
+/// is token0. Swap fee = lpFee plus the larger protocol fee.
+///
+/// Returns how many calls were lost to RPC failure after retries (0 = complete).
+pub(crate) async fn discover_v4_pools<P: Provider>(
+    routers: &[RouterConfig],
+    pairs: &[PairConfig],
+    provider: &P,
+    pool_cache: &PoolCache,
+) -> usize {
+    use crate::abi::IV4StateView;
+    use crate::pool_cache::V4PoolKey;
+    use alloy::primitives::U256;
+    use alloy::sol_types::SolCall;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    struct Query { router_id: String, key: V4PoolKey, token0: Address, token1: Address }
+    let mut calls: Vec<(Address, Vec<u8>)> = Vec::new();
+    let mut queries: Vec<Query> = Vec::new();
+    let mut seen: HashSet<Address> = HashSet::new();
+    for r in routers.iter().filter(|r| r.v4) {
+        let Some(state_view) = r.state_view.as_deref().and_then(|s| s.parse::<Address>().ok()) else { continue };
+        let tiers = if r.fee_tiers.is_empty() { vec![100u32, 500, 3000, 10000] } else { r.fee_tiers.clone() };
+        for &(ta, _, tb, _) in &token_pairs(pairs) {
+            let (t0, t1) = if ta < tb { (ta, tb) } else { (tb, ta) };
+            // The ERC-20 pool, and for a WETH pair the native ETH pool (if it sorts the same).
+            let mut keys = vec![(t0, t1)];
+            if t0 == crate::util::WETH {
+                keys.push((Address::ZERO, t1));
+            } else if t1 == crate::util::WETH {
+                keys.push((Address::ZERO, t0)); // inverted in the cache
+            }
+            for (c0, c1) in keys {
+                for &fee in &tiers {
+                    let Some(ts) = crate::config::v4_tick_spacing(fee) else { continue };
+                    let key = V4PoolKey { currency0: c0, currency1: c1, fee, tick_spacing: ts };
+                    if !seen.insert(key.pool_address()) {
+                        continue;
+                    }
+                    let id = key.id();
+                    calls.push((state_view, IV4StateView::getSlot0Call { poolId: id }.abi_encode()));
+                    calls.push((state_view, IV4StateView::getLiquidityCall { poolId: id }.abi_encode()));
+                    queries.push(Query { router_id: r.id.clone(), key, token0: t0, token1: t1 });
+                }
+            }
+        }
+    }
+    if calls.is_empty() {
+        return 0;
+    }
+    let (raw, lost) = discover_mc(calls, provider).await;
+    // A WETH pair's native and ERC-20 pools share one cache key (router, tokens, fee): keep
+    // the one with more liquidity (same pair, so the units compare).
+    let mut best: std::collections::HashMap<(String, Address, Address, u32), u128> = std::collections::HashMap::new();
+    for (q, r) in queries.iter().zip(raw.chunks(2)) {
+        let liq = r[1].as_deref().and_then(|b| IV4StateView::getLiquidityCall::abi_decode_returns(b).ok()).unwrap_or(0);
+        let e = best.entry((q.router_id.clone(), q.token0, q.token1, q.key.fee)).or_insert(0);
+        *e = (*e).max(liq);
+    }
+    for (q, r) in queries.iter().zip(raw.chunks(2)) {
+        let Some(slot0) = r[0].as_deref().and_then(|b| IV4StateView::getSlot0Call::abi_decode_returns(b).ok()) else { continue };
+        let Some(liquidity) = r[1].as_deref().and_then(|b| IV4StateView::getLiquidityCall::abi_decode_returns(b).ok()) else { continue };
+        let sqrt_price_x96 = U256::from(slot0.sqrtPriceX96);
+        if sqrt_price_x96.is_zero() {
+            continue; // not initialised
+        }
+        if best.get(&(q.router_id.clone(), q.token0, q.token1, q.key.fee)).is_some_and(|&b| liquidity < b) {
+            continue; // the other (native / ERC-20) pool of this pair is deeper
+        }
+        let (sqrt_price_x96, tick) = q.key.to_cache_price(sqrt_price_x96, slot0.tick.as_i32());
+        let protocol_fee: u32 = slot0.protocolFee.to();
+        let swap_fee = slot0.lpFee.to::<u32>() + (protocol_fee & 0xfff).max(protocol_fee >> 12);
+        let pool = q.key.pool_address();
+        pool_cache.v4_keys.insert(pool, q.key);
+        pool_cache.insert_v3(pool, V3PoolState {
+            token0: q.token0,
+            token1: q.token1,
+            fee: q.key.fee,
+            swap_fee,
+            sqrt_price_x96,
+            liquidity,
+            tick,
+            router_id: q.router_id.clone(),
+            last_updated: Instant::now(),
+            vr0: U256::ZERO,
+            vr1: U256::ZERO,
+            fee_num_v3: U256::ZERO,
+        });
+    }
+    lost
+}
+
 // ─── Chunked multicall for pool discovery ─────────────────────────────────────
 
 /// Multicall3 helper used at startup by discover_pools / discover_v3_pools.

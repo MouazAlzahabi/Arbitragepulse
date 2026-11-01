@@ -88,10 +88,23 @@ interface IPair {
 ///      a debt that must be repaid (`sync` + transfer + `settle`) before `unlock` returns.
 ///      No fee, no interest.
 interface IPoolManagerV4 {
+    /// @dev currency0 < currency1; address(0) = native ETH. hooks = address(0): no hook.
+    struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }
+    /// @dev amountSpecified < 0 = exact input.
+    struct SwapParams { bool zeroForOne; int256 amountSpecified; uint160 sqrtPriceLimitX96; }
+
     function unlock(bytes calldata data) external returns (bytes memory);
     function take(address currency, address to, uint256 amount) external;
     function sync(address currency) external;
     function settle() external payable returns (uint256);
+    /// @dev Returns the caller's BalanceDelta: amount0 in the upper 128 bits, amount1 in the
+    ///      lower; negative = owed to the pool, positive = owed to the caller.
+    function swap(PoolKey memory key, SwapParams memory params, bytes calldata hookData) external returns (int256);
+}
+
+interface IWETH {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
 }
 
 /**
@@ -123,7 +136,15 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     ///      retired — no Base deployment — and rejected; they keep their slots so 4 stays Aerodrome.
     ///      6 = DirectCL and 7 = DirectPair: the "router" is a pool, swapped on directly
     ///      (allowlisted per pool with setRouter / setRouters, like a router).
-    enum RouterType { V2, V3, RetiredSolidly, RetiredSyncSwap, Aerodrome, Slipstream, DirectCL, DirectPair }
+    ///      8 = V4: a Uniswap V4 pool, named by the low 160 bits of its PoolId (registered
+    ///      with setV4Pools, which stores the PoolKey); swapped on through the PoolManager.
+    enum RouterType { V2, V3, RetiredSolidly, RetiredSyncSwap, Aerodrome, Slipstream, DirectCL, DirectPair, V4 }
+
+    /// @dev OP Stack WETH predeploy (Base, Base Sepolia). V4 pools quote native ETH as
+    ///      currency address(0); V4 legs wrap / unwrap so every other leg sees WETH.
+    address internal constant WETH = 0x4200000000000000000000000000000000000006;
+    /// @dev V4 dynamic-fee flag in PoolKey.fee: the hook sets the fee (not supported).
+    uint24 internal constant V4_DYNAMIC_FEE = 0x800000;
 
     /// @dev Uniswap V3 TickMath bounds: price limits that never bind for an exact-input swap.
     uint160 internal constant MIN_SQRT_RATIO_PLUS_ONE = 4295128740;
@@ -153,8 +174,11 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     uint256 private _activeMaxIn;
 
     /// @dev True only while a *Borrowed entry point is inside poolManager.unlock: the only
-    ///      time unlockCallback runs a trade.
+    ///      time unlockCallback runs a trade (and the only time a V4 leg can run).
     bool private _borrowActive;
+
+    /// @notice PoolKey of each registered V4 leg address (see setV4Pools).
+    mapping(address => IPoolManagerV4.PoolKey) public v4Pools;
 
     /// @dev One trade: `n` legs over tokens[0] → tokens[1] (→ tokens[2]) → tokens[0].
     struct Trade {
@@ -241,6 +265,12 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
     error InvalidPairFee(uint8 leg, address pool, uint24 fee);
     /// @notice A *Borrowed entry point was called on a deployment without a PoolManager.
     error BorrowUnavailable();
+    /// @notice A V4 leg outside a *Borrowed trade: V4 swaps need the PoolManager unlocked.
+    error V4NeedsBorrow(uint8 leg, address pool);
+    /// @notice setV4Pools: hooked, dynamic-fee, unordered or ETH/WETH key (unsupported).
+    error InvalidV4Key(address pool);
+    /// @notice A V4 leg's tokens are not the registered pool's currencies.
+    error V4WrongPool(uint8 leg, address pool, address tokenIn, address tokenOut);
 
     // ─── Constructor ──────────────────────────────────────────
 
@@ -285,6 +315,30 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         }
     }
 
+    /// @notice Register V4 pools: each leg address is `address(uint160(uint256(poolId)))`
+    ///         with `poolId = keccak256(abi.encode(key))`, allowlisted as type 8. Hookless,
+    ///         static-fee pools only. Needs a PoolManager (V4 legs only run when borrowing).
+    function setV4Pools(IPoolManagerV4.PoolKey[] calldata keys) external onlyOwner {
+        if (poolManager == address(0)) revert BorrowUnavailable();
+        for (uint256 i = 0; i < keys.length; i++) {
+            IPoolManagerV4.PoolKey calldata k = keys[i];
+            address pool = v4PoolAddress(k);
+            bool ethWeth = k.currency0 == address(0) && k.currency1 == WETH;
+            if (k.hooks != address(0) || k.fee >= 1_000_000 || k.tickSpacing <= 0
+                || k.currency0 >= k.currency1 || k.currency1 == address(0) || ethWeth) revert InvalidV4Key(pool);
+            v4Pools[pool] = k;
+            routerType[pool] = RouterType.V4;
+            allowedRouters[pool] = true;
+            emit RouterTypeSet(pool, RouterType.V4);
+            emit RouterApproved(pool, true);
+        }
+    }
+
+    /// @notice The leg address a V4 PoolKey is registered under (low 160 bits of its PoolId).
+    function v4PoolAddress(IPoolManagerV4.PoolKey memory key) public pure returns (address) {
+        return address(uint160(uint256(keccak256(abi.encode(key)))));
+    }
+
     /// @notice Stop using a router.
     function revokeRouter(address router) external onlyOwner {
         allowedRouters[router] = false;
@@ -295,6 +349,8 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         return rtype == RouterType.V2 || rtype == RouterType.V3 || rtype == RouterType.Aerodrome
             || rtype == RouterType.Slipstream || rtype == RouterType.DirectCL || rtype == RouterType.DirectPair;
     }
+    // V4 is not in _isSupported: setRouter / setRouters can't register it (a leg address
+    // has no code and needs its PoolKey) — setV4Pools is the only way in.
 
     // ─── Receive ETH ──────────────────────────────────────────
 
@@ -568,9 +624,11 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         if (rtype == RouterType.Slipstream && (fee == 0 || fee > 16_384)) revert InvalidTickSpacing(leg, router, fee);
 
         uint256 outBefore = IERC20(tokenOut).balanceOf(address(this));
-        if (rtype == RouterType.DirectCL || rtype == RouterType.DirectPair) {
+        if (rtype == RouterType.DirectCL || rtype == RouterType.DirectPair || rtype == RouterType.V4) {
             if (rtype == RouterType.DirectCL) {
                 _directCL(leg, router, tokenIn, amountIn);
+            } else if (rtype == RouterType.V4) {
+                _v4Swap(leg, router, tokenIn, tokenOut, amountIn);
             } else {
                 _directPair(leg, router, tokenIn, amountIn, fee);
             }
@@ -642,6 +700,51 @@ contract ArbitrageExecutor is Ownable2Step, ReentrancyGuard, Pausable {
         )));
         _activePool = address(0);
         _activeMaxIn = 0;
+    }
+
+    /// @dev Exact-input swap on a registered V4 pool, inside the borrow's open unlock: swap,
+    ///      pay the input (native ETH: unwrap WETH and settle with value), take the output
+    ///      (native ETH: wrap it back to WETH). Swap reverts become LegFailed.
+    function _v4Swap(uint8 leg, address pool, address tokenIn, address tokenOut, uint256 amountIn) internal {
+        if (!_borrowActive) revert V4NeedsBorrow(leg, pool);
+        if (amountIn > uint256(uint128(type(int128).max))) revert ZeroAmount();
+        IPoolManagerV4.PoolKey memory key = v4Pools[pool];
+        bool native = key.currency0 == address(0);
+        address cIn = native && tokenIn == WETH ? address(0) : tokenIn;
+        address cOut = native && tokenOut == WETH ? address(0) : tokenOut;
+        bool zeroForOne = cIn == key.currency0;
+        if (!(zeroForOne ? cOut == key.currency1 : (cIn == key.currency1 && cOut == key.currency0))) {
+            revert V4WrongPool(leg, pool, tokenIn, tokenOut);
+        }
+        IPoolManagerV4 pm = IPoolManagerV4(poolManager);
+        bytes memory data = abi.encodeCall(IPoolManagerV4.swap, (key, IPoolManagerV4.SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: zeroForOne ? MIN_SQRT_RATIO_PLUS_ONE : MAX_SQRT_RATIO_MINUS_ONE
+        }), bytes("")));
+        (bool ok, bytes memory ret) = poolManager.call(data);
+        if (!ok) revert LegFailed(leg, pool, RouterType.V4, ret);
+        int256 delta = abi.decode(ret, (int256));
+        int128 d0 = int128(delta >> 128);
+        int128 d1 = int128(delta);
+        (int128 inDelta, int128 outDelta) = zeroForOne ? (d0, d1) : (d1, d0);
+        if (outDelta <= 0) revert NoOutput(leg, pool);
+
+        // Pay what the swap used: all of amountIn, unless the pool ran out of liquidity
+        // (then the rest stays here and the profit check judges the trade).
+        uint256 paid = inDelta < 0 ? uint256(uint128(-inDelta)) : 0;
+        if (paid > amountIn) revert UnexpectedCallback(pool);
+        if (cIn == address(0)) {
+            IWETH(WETH).withdraw(paid);
+            pm.settle{value: paid}();
+        } else {
+            pm.sync(cIn);
+            IERC20(cIn).safeTransfer(poolManager, paid);
+            pm.settle();
+        }
+        uint256 out = uint256(uint128(outDelta));
+        pm.take(cOut, address(this), out);
+        if (cOut == address(0)) IWETH(WETH).deposit{value: out}();
     }
 
     /// @dev Pay a V2-style pair first, then ask for the output it owes. `fee` 0: the pool's

@@ -121,7 +121,8 @@ pub(crate) async fn update_native_price<P: Provider>(
     {
         let mut best_v3_price = 0.0;
         // Slipstream quoters take a tick spacing — the Uniswap/Pancake V3 routers suffice here.
-        for router in routers.iter().filter(|r| r.router_type == RouterType::V3 && !r.slipstream) {
+        // V4 quotes take a PoolKey (V4Quoter) — also left out.
+        for router in routers.iter().filter(|r| r.router_type == RouterType::V3 && !r.slipstream && !r.v4) {
             // Effective quoter: per-router first, chain-level fallback
             let quoter_str = router.quoter_address.as_deref()
                 .map(str::to_owned)
@@ -498,6 +499,14 @@ pub(crate) async fn check_direct_pools<P: Provider>(
     broadcast_log(log_tx, "warn", &msg, None);
     for (ty, pools) in &missing {
         for chunk in pools.chunks(40) {
+            if *ty == 8 {
+                // V4 pools are registered by PoolKey, not address.
+                let keys: Vec<String> = chunk.iter().filter_map(|p| cache.v4_keys.get(p).map(|k| format!(
+                    "({},{},{},{},{})", k.currency0, k.currency1, k.fee, k.tick_spacing, Address::ZERO,
+                ))).collect();
+                info!("[{chain}]   cast send {contract} 'setV4Pools((address,address,uint24,int24,address)[])' '[{}]'", keys.join(","));
+                continue;
+            }
             let list: Vec<String> = chunk.iter().map(|p| p.to_string()).collect();
             info!("[{chain}]   cast send {contract} 'setRouters(address[],uint8)' '[{}]' {ty}", list.join(","));
         }
@@ -511,10 +520,10 @@ pub(crate) async fn check_direct_pools<P: Provider>(
 }
 
 /// (pool, executor router type) for every cached pool of a `direct: true` venue:
-/// 6 DirectCL for V3-type venues, 7 DirectPair for V2 / Aerodrome-type ones.
+/// 6 DirectCL for V3-type venues, 7 DirectPair for V2 / Aerodrome-type ones, 8 for V4.
 pub(crate) fn direct_pools(routers: &[RouterConfig], cache: &PoolCache) -> Vec<(Address, u8)> {
     let direct: HashMap<&str, u8> = routers.iter().filter(|r| r.direct)
-        .map(|r| (r.id.as_str(), if r.router_type == RouterType::V3 { 6 } else { 7 }))
+        .map(|r| (r.id.as_str(), if r.v4 { 8 } else if r.router_type == RouterType::V3 { 6 } else { 7 }))
         .collect();
     if direct.is_empty() {
         return Vec::new();

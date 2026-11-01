@@ -1,6 +1,10 @@
 use alloy::primitives::{Address, U256}; // U256 used by u256_to_f64
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// OP Stack WETH predeploy (Base, Base Sepolia) — the executor's `WETH`: a V4 native ETH
+/// pool is cached under it and the executor wraps / unwraps on the leg.
+pub const WETH: Address = alloy::primitives::address!("4200000000000000000000000000000000000006");
+
 /// Convert a U256 to f64 (lossy for very large values).
 /// Fast path for values ≤ u128::MAX (all configured trade amounts) — no heap alloc.
 pub fn u256_to_f64(value: U256) -> f64 {

@@ -71,9 +71,12 @@ pub(crate) fn encode_slipstream_quote(token_in: Address, token_out: Address, tic
 
 /// Decode one QuoterV2 result from [`run_multicall`]. None = call failed or quoted 0.
 pub(crate) fn decode_v3_quote(raw: Option<&Vec<u8>>) -> Option<U256> {
-    raw.and_then(|r| IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(r).ok())
-        .map(|r| r.amountOut)
-        .filter(|a| !a.is_zero())
+    raw.and_then(|r| {
+        IQuoterV2::quoteExactInputSingleCall::abi_decode_returns(r).ok().map(|q| q.amountOut)
+            // V4Quoter: (amountOut, gasEstimate).
+            .or_else(|| crate::abi::IV4Quoter::quoteExactInputSingleCall::abi_decode_returns(r).ok().map(|q| q.amountOut))
+    })
+    .filter(|a| !a.is_zero())
 }
 
 /// Warn when a router's QuoterV2 has never returned a quote and every batch for it has
@@ -300,6 +303,8 @@ pub struct Strategy {
     pub slipstream_quoters: std::collections::HashSet<Address>,
     /// Aero Metaquoters → their router id: quoted by pool address, resolved from the cache.
     pub metaquoters: HashMap<Address, String>,
+    /// V4Quoters → their router id: quoted by PoolKey, resolved from the cache.
+    pub v4_quoters: HashMap<Address, String>,
     /// Solidly/Aerodrome effective pool-cache IDs: router_id → (volatile, stable).
     pub solidly_pool_keys: HashMap<String, (String, String)>,
     /// Reverse index: token address → pair indices that include that token.
@@ -352,6 +357,7 @@ impl Strategy {
 
         let slipstream_quoters = slipstream_quoters(&routers);
         let metaquoters = metaquoters(&routers);
+        let v4_quoters = v4_quoters(&routers);
         let quoter_by_router: HashMap<String, Address> = routers
             .iter()
             .filter_map(|r| {
@@ -406,6 +412,7 @@ impl Strategy {
             router_addr_map,
             slipstream_quoters,
             metaquoters,
+            v4_quoters,
             quoter_by_router,
             solidly_pool_keys,
             token_pair_index: HashMap::new(),
@@ -633,6 +640,7 @@ impl Strategy {
             .collect();
         self.slipstream_quoters = slipstream_quoters(&self.routers);
         self.metaquoters = metaquoters(&self.routers);
+        self.v4_quoters = v4_quoters(&self.routers);
         self.solidly_pool_keys = self
             .routers
             .iter()
@@ -770,6 +778,14 @@ impl Strategy {
                 None => Vec::new(),
             };
         }
+        if let Some(router_id) = self.v4_quoters.get(&quoter) {
+            // By PoolKey; a pool missing from the cache gets empty calldata (leg skipped).
+            let key = crate::pool_cache::V3PoolKey::new(router_id, token_in, token_out, fee);
+            return self.pool_cache.v3_by_key.get(&key)
+                .and_then(|pool| self.pool_cache.v4_keys.get(&*pool).map(|k| *k))
+                .map(|k| encode_v4_quote(&k, token_in, amount_in))
+                .unwrap_or_default();
+        }
         if self.slipstream_quoters.contains(&quoter) {
             encode_slipstream_quote(token_in, token_out, fee, amount_in)
         } else {
@@ -793,6 +809,35 @@ fn metaquoters(routers: &[RouterConfig]) -> HashMap<Address, String> {
 /// arrays' offsets and a word — the same 4-word head [`decode_v3_quote`] reads.
 pub(crate) fn encode_metaquote(pool: Address, token_in: Address, amount_in: U256) -> Vec<u8> {
     crate::abi::IAeroMetaquoter::quoteExactInputCall { pools: vec![pool], tokenIn: token_in, amountIn: amount_in }.abi_encode()
+}
+
+fn v4_quoters(routers: &[RouterConfig]) -> HashMap<Address, String> {
+    routers.iter()
+        .filter(|r| r.v4)
+        .filter_map(|r| Some((r.quoter_address.as_deref()?.parse::<Address>().ok()?, r.id.clone())))
+        .collect()
+}
+
+/// V4Quoter `quoteExactInputSingle` calldata for `key` (hookless). `token_in` is the cached
+/// token: WETH stands for native ETH on a native pool. Returns (amountOut, gasEstimate) —
+/// amountOut first, as [`decode_v3_quote`] reads it.
+pub(crate) fn encode_v4_quote(key: &crate::pool_cache::V4PoolKey, token_in: Address, amount_in: U256) -> Vec<u8> {
+    use crate::abi::IV4Quoter;
+    let currency_in = if key.currency0.is_zero() && token_in == crate::util::WETH { Address::ZERO } else { token_in };
+    IV4Quoter::quoteExactInputSingleCall {
+        params: IV4Quoter::QuoteExactSingleParams {
+            poolKey: IV4Quoter::PoolKey {
+                currency0: key.currency0,
+                currency1: key.currency1,
+                fee: Uint::from(key.fee),
+                tickSpacing: alloy::primitives::aliases::I24::try_from(key.tick_spacing).unwrap_or_default(),
+                hooks: Address::ZERO,
+            },
+            zeroForOne: currency_in == key.currency0,
+            exactAmount: amount_in.saturating_to::<u128>(),
+            hookData: Default::default(),
+        },
+    }.abi_encode()
 }
 
 fn slipstream_quoters(routers: &[RouterConfig]) -> std::collections::HashSet<Address> {
@@ -1422,5 +1467,36 @@ mod quote_cache_tests {
         assert_eq!(len(), QUOTE_CACHE_MAX_AMOUNTS);
         let last = U256::from(100 + n - 1);
         assert_eq!(cache.get(&pools, &key, last), Some(last));
+    }
+}
+
+#[cfg(test)]
+mod v4_quote_tests {
+    use super::*;
+    use crate::abi::IV4Quoter;
+    use alloy::sol_types::SolCall;
+
+    fn decode(cd: &[u8]) -> IV4Quoter::QuoteExactSingleParams {
+        IV4Quoter::quoteExactInputSingleCall::abi_decode(cd).unwrap().params
+    }
+
+    #[test]
+    fn native_pool_quotes_weth_as_currency0_eth() {
+        let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().unwrap();
+        let key = crate::pool_cache::V4PoolKey { currency0: Address::ZERO, currency1: usdc, fee: 500, tick_spacing: 10 };
+        // WETH in = native ETH in = currency0 → zeroForOne.
+        let p = decode(&encode_v4_quote(&key, crate::util::WETH, U256::from(10u64)));
+        assert!(p.zeroForOne);
+        assert_eq!(p.poolKey.currency0, Address::ZERO);
+        assert_eq!(p.exactAmount, 10u128);
+        // USDC in → oneForZero.
+        assert!(!decode(&encode_v4_quote(&key, usdc, U256::from(10u64))).zeroForOne);
+    }
+
+    #[test]
+    fn decode_v3_quote_reads_v4_return() {
+        let raw = IV4Quoter::quoteExactInputSingleCall::abi_encode_returns(
+            &IV4Quoter::quoteExactInputSingleReturn { amountOut: U256::from(1234u64), gasEstimate: U256::from(9u64) });
+        assert_eq!(decode_v3_quote(Some(&raw)), Some(U256::from(1234u64)));
     }
 }

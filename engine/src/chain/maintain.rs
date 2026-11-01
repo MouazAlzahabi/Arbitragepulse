@@ -82,7 +82,8 @@ pub(crate) fn spawn_rediscovery(
             tick.tick().await;
             let scratch = PoolCache::new();
             let lost = discover::discover_pools(&routers, &pairs, &reads, &scratch).await
-                + discover::discover_v3_pools(&routers, &pairs, &reads, &scratch).await;
+                + discover::discover_v3_pools(&routers, &pairs, &reads, &scratch).await
+            + discover::discover_v4_pools(&routers, &pairs, &reads, &scratch).await;
             let added = adopt_new_pools(&cache, &scratch);
             info!("[{}] Pool rediscovery: {} new pool(s){}", chain_name, added,
                   if lost > 0 { format!(", {} call(s) lost — retried next round", lost) } else { String::new() });
@@ -112,6 +113,10 @@ pub(crate) fn adopt_new_pools(cache: &PoolCache, scratch: &PoolCache) -> usize {
     }
     for e in scratch.v3_by_address.iter() {
         if !cache.v3_by_address.contains_key(e.key()) {
+            // A V4 pool's key first, so it never shows up as a watch address.
+            if let Some(k) = scratch.v4_keys.get(e.key()) {
+                cache.v4_keys.insert(*e.key(), *k);
+            }
             cache.insert_v3(*e.key(), e.value().clone());
             added += 1;
         }

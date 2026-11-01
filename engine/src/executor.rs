@@ -261,6 +261,8 @@ pub struct DirectVenues {
     /// Router ids whose pools run a swap hook needing gas headroom (Aero CL: its hook
     /// reverts "IG" unless 250k gas is left). Each leg on one adds `tuning.gas_per_hooked_leg`.
     pub hooked: std::collections::HashSet<String>,
+    /// Uniswap V4 router ids (`v4: true`). Each leg on one adds `tuning.gas_per_v4_leg`.
+    pub v4: std::collections::HashSet<String>,
 }
 
 impl DirectVenues {
@@ -271,7 +273,8 @@ impl DirectVenues {
             crate::config::RouterType::V2 => Some(r.fee_bps),
         })).collect();
         let hooked = routers.iter().filter(|r| r.metaquoter).map(|r| r.id.clone()).collect();
-        Self { cache: Some(cache), venues, hooked }
+        let v4 = routers.iter().filter(|r| r.v4).map(|r| r.id.clone()).collect();
+        Self { cache: Some(cache), venues, hooked, v4 }
     }
 
     /// Legs of a route on hooked venues (router ids may carry a "::volatile/stable" suffix).
@@ -279,6 +282,11 @@ impl DirectVenues {
         router_ids.iter()
             .filter(|id| self.hooked.contains(id.split("::").next().unwrap_or(id)))
             .count() as u64
+    }
+
+    /// Legs of a route on Uniswap V4.
+    pub fn v4_legs(&self, router_ids: &[&str]) -> u64 {
+        router_ids.iter().filter(|id| self.v4.contains(**id)).count() as u64
     }
 
     /// The (router, fee) the executor gets for one leg: unchanged for router venues; the
@@ -1140,6 +1148,7 @@ impl Executor {
         gas_limit_2hop()
             + if self.borrow { t.gas_borrow_extra } else { 0 }
             + self.direct.hooked_legs(&[&opp.router_a_id, &opp.router_b_id]) * t.gas_per_hooked_leg
+            + self.direct.v4_legs(&[&opp.router_a_id, &opp.router_b_id]) * t.gas_per_v4_leg
     }
 
     fn gas_triangular(&self, opp: &TriangularOpportunity) -> u64 {
@@ -1147,6 +1156,7 @@ impl Executor {
         gas_limit_triangular()
             + if self.borrow { t.gas_borrow_extra } else { 0 }
             + self.direct.hooked_legs(&[&opp.router_ab_id, &opp.router_bc_id, &opp.router_ca_id]) * t.gas_per_hooked_leg
+            + self.direct.v4_legs(&[&opp.router_ab_id, &opp.router_bc_id, &opp.router_ca_id]) * t.gas_per_v4_leg
     }
 
     fn build_calldata(&self, opp: &ArbOpportunity, deadline: U256, min_profit: U256) -> Result<Vec<u8>> {
