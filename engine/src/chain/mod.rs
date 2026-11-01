@@ -583,9 +583,12 @@ pub async fn run_chain(
         });
     }
     // Quote and submission endpoint round trips for the heartbeat's `lat rtt=[…]` (hosts
-    // only — URLs can carry API keys): one eth_chainId each per `rpc_latency_sample_ms` on
-    // a reused connection (warm) and on a new one (cold = what a send pays after the
-    // send pool dropped its idle connection). Own clients, so the send pool isn't warmed.
+    // only — URLs can carry API keys): one request each per `rpc_latency_sample_ms` on a
+    // reused connection (warm) and on a new one (cold = what a send pays after the send
+    // pool dropped its idle connection). Own clients, so the send pool isn't warmed.
+    // Quote endpoints get eth_chainId. Send endpoints get eth_sendRawTransaction with an
+    // undecodable tx ("0x00"): the sequencer refuses every other method (403), and any
+    // JSON-RPC answer, an error included, means the send path is up.
     {
         let endpoints: Vec<(&'static str, url::Url)> = cfg.preconf_http_rpc.iter()
             .filter_map(|u| u.parse().ok()).map(|u| ("quote", u))
@@ -595,14 +598,19 @@ pub async fn run_chain(
         let cold = reqwest::Client::builder().timeout(rpc_read_timeout()).pool_max_idle_per_host(0).build();
         if let (false, Ok(warm), Ok(cold)) = (endpoints.is_empty(), warm, cold) {
             tokio::spawn(async move {
-                let body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1});
-                let rtt = |c: &reqwest::Client, url: &url::Url| {
-                    let (req, start) = (c.post(url.as_str()).json(&body).send(), Instant::now());
+                let quote_body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1});
+                let send_body = serde_json::json!({"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": ["0x00"], "id": 1});
+                let rtt = |c: &reqwest::Client, role: &str, url: &url::Url| {
+                    let body = if role == "send" { &send_body } else { &quote_body };
+                    let (req, start) = (c.post(url.as_str()).json(body).send(), Instant::now());
                     async move {
-                        match req.await {
-                            Ok(r) if r.status().is_success() => format!("{}ms", start.elapsed().as_millis()),
-                            _ => "err".to_string(),
-                        }
+                        let answered = match req.await {
+                            Ok(r) => r.json::<serde_json::Value>().await
+                                .is_ok_and(|v| v.get("result").is_some() || v.get("error").is_some()),
+                            Err(_) => false,
+                        };
+                        let ms = start.elapsed().as_millis();
+                        if answered { format!("{}ms", ms) } else { "err".to_string() }
                     }
                 };
                 let mut tick = tokio::time::interval(crate::config::tuning().rpc_latency_sample());
@@ -610,8 +618,8 @@ pub async fn run_chain(
                     tick.tick().await;
                     let mut parts = Vec::with_capacity(endpoints.len());
                     for (role, url) in &endpoints {
-                        let w = rtt(&warm, url).await;
-                        let c = rtt(&cold, url).await;
+                        let w = rtt(&warm, role, url).await;
+                        let c = rtt(&cold, role, url).await;
                         parts.push(format!("{}:{}={}/cold={}", role, url.host_str().unwrap_or("?"), w, c));
                     }
                     if let Ok(mut s) = crate::util::ENDPOINT_RTT.lock() {
@@ -1226,7 +1234,10 @@ async fn run_log_subscription<P: Provider + Clone + 'static>(
                     let received_at = Instant::now();
                     let seen_pos = crate::util::block_position_now();
                     let block_number = log.block_number.unwrap_or(0);
-                    crate::util::note_log_seen(block_number, seen_pos);
+                    // Flashblocks feed only: sealed-block logs are later copies by design.
+                    if method.is_some() {
+                        crate::util::note_log_seen(block_number, seen_pos);
+                    }
                     if let Some(magnitude) = crate::listener::apply_log_to_cache(
                         &log, &feed.cache, feed.solidly_sync_hash, feed.large_swap_bps, feed.large_v3_bps,
                     ) {
