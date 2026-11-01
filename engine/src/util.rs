@@ -152,7 +152,7 @@ fn percentiles(samples: &mut [u64]) -> Option<(u64, u64, u64)> {
 /// ms into the slot of the block being built when a pool log arrived, for logs of that
 /// block (flashblock preconf). A proxy for feed lag: preconf logs carry no flashblock index.
 pub static LAT_SEEN: LatencyWindow = LatencyWindow::new();
-/// Pool logs that arrived after their block was sealed (no preconf copy came first).
+/// Flashblocks pool logs that arrived after their block's slot ended (by our clock).
 pub static LAT_SEEN_LATE: AtomicU64 = AtomicU64::new(0);
 /// How long a swap event waited in the scan queue while the chain loop was busy.
 pub static LAT_QUEUE: LatencyWindow = LatencyWindow::new();
