@@ -53,10 +53,16 @@ rm -f /usr/local/bin/ap-watchdog
 echo "[3/4] Installing logrotate config..."
 cp "${SCRIPTS_DIR}/logrotate" /etc/logrotate.d/arbitragepulse
 echo "      /etc/logrotate.d/arbitragepulse installed"
+# logrotate runs once a day by default; hourly runs let `maxsize` cut a runaway log early.
+mkdir -p /etc/systemd/system/logrotate.timer.d
+printf '[Timer]\nOnCalendar=\nOnCalendar=hourly\nAccuracySec=1m\n' > /etc/systemd/system/logrotate.timer.d/hourly.conf
+echo "      logrotate.timer: hourly"
 
 # ── 4. Reload systemd + enable engine ────────────────────────────────────────
 echo "[4/4] Enabling and starting arbitragepulse@${INSTANCE}..."
 systemctl daemon-reload
+systemctl enable --now logrotate.timer && systemctl restart logrotate.timer \
+    || echo "      WARN: logrotate.timer not available — runaway logs rotate only daily"
 systemctl enable "arbitragepulse@${INSTANCE}"
 systemctl restart "arbitragepulse@${INSTANCE}"
 sleep 6

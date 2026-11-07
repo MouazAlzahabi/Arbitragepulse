@@ -135,6 +135,17 @@ pub struct PoolInfo {
     pub fee_num: U256,
 }
 
+/// One swap leg as a constant-product curve, in raw token units:
+/// `out(x) = gamma·x·r_out / (r_in + gamma·x)`, exact for inputs up to `max_in`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegCurve {
+    pub r_in: f64,
+    pub r_out: f64,
+    /// 1 − fee.
+    pub gamma: f64,
+    pub max_in: f64,
+}
+
 // ─── V3 pool state ────────────────────────────────────────────────────────────
 
 /// Concentrated-liquidity pool state, kept fresh from `Swap` events.
@@ -315,9 +326,9 @@ pub struct PoolCache {
     /// Cached union of V2 + V3 pool addresses for log filters / listeners.
     watch_addrs: Arc<RwLock<Vec<Address>>>,
     watch_addrs_dirty: Arc<AtomicBool>,
-    /// Last applied (block number, log index) per pool. Two log feeds update the cache —
-    /// pre-confirmed (flashblocks, ~1.2 s earlier) and sealed — so a late sealed log must
-    /// never overwrite newer pre-confirmed state.
+    /// Last applied (block number, log index) per pool. Log feeds overlap (a rediscovery
+    /// starts the new subscriptions before aborting the old, a reconnect may replay), so a
+    /// duplicate or late log must never overwrite newer state or trigger a second scan.
     log_pos: Arc<DashMap<Address, (u64, u64)>>,
     /// When any pool log was last applied (ms since `created`). While recent, the feed is
     /// live and a quiet pool's reserves are current — see [`PoolCache::feed_live`].
@@ -362,6 +373,14 @@ impl PoolCache {
     /// A pool log was applied (either feed): the feed is live.
     pub fn note_log(&self) {
         self.last_log_ms.store(self.created.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Time since the last pool log was applied; None before the first.
+    pub fn since_last_log(&self) -> Option<Duration> {
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        (last != u64::MAX).then(|| {
+            Duration::from_millis((self.created.elapsed().as_millis() as u64).saturating_sub(last))
+        })
     }
 
     /// True while a pool log arrived within `tuning.feed_silence_ms`. Every Sync/Swap is
@@ -778,6 +797,49 @@ impl PoolCache {
         let num = amount_in.checked_mul(state.fee_num_v3)?.checked_mul(vr_out)?;
         let den = vr_in.checked_mul(FEE_DENOM_V3)?;
         Some(num / den)
+    }
+
+    /// The V3 pool behind `key` as an xy=k leg for trade sizing: its in-range virtual
+    /// reserves, fee, and the tick-cap input limit within which the local math is exact.
+    pub fn leg_curve_v3(&self, key: &V3PoolKey, token_in: Address) -> Option<LegCurve> {
+        let pool_addr = *self.v3_by_key.get(key)?;
+        if self.is_skipped(pool_addr) { return None; }
+        let state = self.v3_by_address.get(&pool_addr)?;
+        let (vr_in, vr_out) = if token_in == state.token0 { (state.vr0, state.vr1) } else { (state.vr1, state.vr0) };
+        if vr_in.is_zero() || vr_out.is_zero() {
+            return None;
+        }
+        let f = crate::util::u256_to_f64;
+        Some(LegCurve {
+            r_in: f(vr_in),
+            r_out: f(vr_out),
+            gamma: f(state.fee_num_v3) / f(FEE_DENOM_V3),
+            max_in: f(cap_v3_spot_amount_in(vr_in, U256::MAX)),
+        })
+    }
+
+    /// A V2 / Aerodrome-volatile pool as an xy=k leg for trade sizing (no input limit).
+    /// None for stable pools (not xy=k) and, with `max_age`, the same pools
+    /// [`Self::get_amount_out_by_v2_key`] would refuse to quote.
+    pub fn leg_curve_v2(&self, key: &V2PoolKey, token_in: Address, max_age: Option<Duration>) -> Option<LegCurve> {
+        let pool = *self.by_key.get(key)?;
+        if max_age.is_some() && self.is_skipped(pool) { return None; }
+        let info = self.by_address.get(&pool)?;
+        if max_age.is_some_and(|age| info.last_sync.elapsed() > age && !self.feed_live()) || info.is_stable {
+            return None;
+        }
+        let (r_in, r_out) = if token_in == info.token0 {
+            (info.reserve0, info.reserve1)
+        } else if token_in == info.token1 {
+            (info.reserve1, info.reserve0)
+        } else {
+            return None;
+        };
+        if r_in.is_zero() || r_out.is_zero() {
+            return None;
+        }
+        let f = crate::util::u256_to_f64;
+        Some(LegCurve { r_in: f(r_in), r_out: f(r_out), gamma: f(info.fee_num) / f(FEE_DENOM_V2), max_in: f64::INFINITY })
     }
 
     /// Current (sqrtPriceX96, active liquidity) of the pool behind `key`, if cached.

@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Read-only RPC latency benchmark for choosing chain.http_rpc / chain.preconf_http_rpc.
+# Read-only RPC latency benchmark for choosing chain.http_rpc / chain.quote_http_rpc.
 # Run it on the server the engine runs on (latency from a laptop says nothing).
 #
 #   ALCHEMY_KEY=… scripts/rpc-latency.sh            # default endpoints, 50 rounds
 #   N=100 scripts/rpc-latency.sh https://a.example https://b.example
 #
 # Per endpoint: p50/p95/max ms and errors for a QuoterV2 eth_call (1 WETH → USDC, 0.05%)
-# at `latest` and at `pending`, and whether `pending` is Flashblocks state (the pending
-# block grows between two reads 300 ms apart). Only eth_call / eth_getBlockByNumber are sent — no keys,
-# no transactions. URLs are printed with any key path redacted.
+# at `latest` (the engine's quote tag since Base retired Flashblocks and `pending`). Only
+# eth_call is sent — no keys, no transactions. URLs are printed with any key path redacted.
 set -euo pipefail
 
 N="${N:-50}"
@@ -18,7 +17,7 @@ QUOTE_DATA=0xc6a5026a00000000000000000000000042000000000000000000000000000000000
 if [ "$#" -gt 0 ]; then
   URLS=("$@")
 else
-  URLS=("https://mainnet.base.org" "https://mainnet-preconf.base.org")
+  URLS=("https://mainnet.base.org")
   # Spends the production key's Alchemy quota (2N+ calls) when ALCHEMY_KEY is set.
   [ -n "${ALCHEMY_KEY:-}" ] && URLS+=("https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}")
 fi
@@ -48,19 +47,7 @@ bench() { # url tag
   printf '  quote @%-8s %s  errors %d/%d\n' "$tag" "$(printf '%s\n' "${ok[@]+"${ok[@]}"}" | grep . | stats)" "$err" "$N"
 }
 
-pending_state() { # url → "<number> <tx count>"
-  rpc "$1" '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["pending",false]}' | cut -d' ' -f2- \
-    | python3 -c 'import json,sys; b=json.load(sys.stdin)["result"]; print(int(b["number"],16), len(b["transactions"]))' 2>/dev/null
-}
-
 for url in "${URLS[@]}"; do
   echo "$(redact "$url")"
-  first=$(pending_state "$url" || true); sleep 0.3; second=$(pending_state "$url" || true)
-  if [ -n "$first" ] && [ -n "$second" ] && [ "$first" != "$second" ]; then
-    echo "  pending block: $first → $second (block, txs) — Flashblocks state"
-  else
-    echo "  pending block: ${first:-none} → ${second:-none} — not growing; don't use as preconf_http_rpc"
-  fi
   bench "$url" latest
-  bench "$url" pending
 done

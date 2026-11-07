@@ -20,17 +20,15 @@ chain:
   http_rpc: "https://sepolia.base.org"
   native_currency: "ETH"
   wrapped_native: "0x4200000000000000000000000000000000000006"
-  block_time_ms: 2000
+  block_time_ms: 200                 # Denim upgrade: 200 ms canonical blocks
   # ArbitrageExecutor deployed to Base Sepolia (forge script script/Deploy.s.sol).
   contract_address: "YOUR_BASE_SEPOLIA_EXECUTOR"
   min_native_balance: 0.001
   min_profit_usd: 0.01
   deadline_seconds: 120
   quoter_v2_address: "0xC5290058841028F1614F3A6F0F5816cAd0df5E27"  # Uniswap V3 QuoterV2 (Base Sepolia)
-  scan_interval_ms: 2000
+  scan_interval_ms: 10000            # full scan; swaps trigger targeted scans per block
   rpc_concurrency: 3
-  # preconf_ws_rpc / preconf_http_rpc: no public Base Sepolia Flashblocks log endpoint
-  # found (2026-10-22) — off.
   ws_rpc_fallbacks:
     - "wss://base-sepolia-rpc.publicnode.com"
   submission_rpcs: []
@@ -38,8 +36,6 @@ chain:
   preflight_eth_call: true       # testnet: simulate every send and log revert reasons
   optimize_size: false
   priority_fee_wei: 1000000      # 1 Mwei — no competition on testnet
-  pending_tx_monitoring: false
-  pending_only_submission: false
   poll_logs_fallback: false
 
 
@@ -92,7 +88,8 @@ pairs:
 
 
 # ─── TUNING ────────────────────────────────────────────────
-# Defaults (see config.yaml for the full list) suit Base Sepolia's 2 s blocks.
+# Defaults (see config.yaml for the full list) suit Base Sepolia's 200 ms blocks.
 # Testnet: trip the circuit breaker early so misconfigurations surface fast.
 tuning:
   max_consecutive_failures: 5
+  feed_blind_ms: 0                 # mock pools trade rarely: a silent log feed is normal here

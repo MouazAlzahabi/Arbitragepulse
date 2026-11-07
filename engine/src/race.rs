@@ -62,7 +62,7 @@ pub struct RaceReport {
     /// profitable, so nobody beat us (a quoting error, not a race). "tip": someone ahead in
     /// our block bid a higher tip. "ordering": someone ahead with an equal/lower tip (they
     /// reached the sequencer first). "timing": nobody ahead in our block — the price moved
-    /// in an earlier block/flashblock (we were late).
+    /// in an earlier block (we were late).
     pub cause: &'static str,
     pub our_index: u64,
     pub our_tip_wei: u128,

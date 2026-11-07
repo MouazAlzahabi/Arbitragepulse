@@ -116,6 +116,7 @@ async fn main() -> Result<()> {
                         dry_run: env.dry_run,
                         paused: false,
                         rpc_ok: false,
+                        blind: None,
                         last_block: 0,
                         last_block_at: 0,
                         rpc_latency_ms: 0.0,

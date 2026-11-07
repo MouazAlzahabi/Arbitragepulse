@@ -150,7 +150,9 @@ impl Strategy {
         let max_tokens = 25usize;
         let mut triplets: Vec<Triplet> = Vec::new();
 
-        for &(token_a, ref key_a) in tokens.iter().take(max_tokens) {
+        // Start tokens are the ones with a trade size (USDC/USDT/WETH): filter BEFORE the cap,
+        // or the HashMap's random order could cap a start token out of the scan.
+        for &(token_a, ref key_a) in tokens.iter().filter(|(_, k)| token_amounts.contains_key(k)).take(max_tokens) {
             let Some(&amount_in) = token_amounts.get(key_a) else { continue };
             let Some((sym_a, _)) = token_info.get(key_a) else { continue };
 
@@ -482,15 +484,26 @@ impl Strategy {
                 Some(a) if !a.is_zero() => a,
                 _ => continue,
             };
-            let amount_a_final = apply_exec_quote_haircut(amount_a_final);
             let trip = &triplets[p3e.triplet_idx];
+            // Re-size the route to its profit peak (closed form on the cached curves, at most
+            // the configured size): kept only if it earns more than the configured size.
+            let legs = [
+                (p3e.router_ab_id.as_str(), p3e.router_ab_type, p3e.fee_ab, trip.token_a, trip.token_b),
+                (p3e.router_bc_id.as_str(), p3e.router_bc_type, p3e.fee_bc, trip.token_b, trip.token_c),
+                (p3e.router_ca_id.as_str(), p3e.router_ca_type, p3e.fee_ca, trip.token_c, trip.token_a),
+            ];
+            let (effective_amount_in, amount_a_final) = match self.size_route(&legs, p3e.effective_amount_in) {
+                Some((x, back)) if back.saturating_add(p3e.effective_amount_in) > amount_a_final.saturating_add(x) => (x, back),
+                _ => (p3e.effective_amount_in, amount_a_final),
+            };
+            let amount_a_final = apply_exec_quote_haircut(amount_a_final);
             let v3_legs = v3_leg_count(p3e.router_ab_type, p3e.router_bc_type, p3e.router_ca_type);
             let v3_route = v3_legs > 0;
             // Optimistic mode submits V3-leg routes unverified: deduct the known V3 spot
             // overestimate (per V3 leg — each leg overstates independently) BEFORE the
             // spread diagnostic, the 5% cap and the floor, so all see a realistic output.
             let amount_a_final = if self.optimistic_submission && v3_route {
-                let overestimate = p3e.effective_amount_in
+                let overestimate = effective_amount_in
                     * U256::from(v3_spot_overestimate_bps() * v3_legs) / U256::from(10_000u32);
                 amount_a_final.saturating_sub(overestimate)
             } else {
@@ -498,29 +511,42 @@ impl Strategy {
             };
 
             // Track best triangular spread (even negative) for diagnostics
-            let tri_spread = if !p3e.effective_amount_in.is_zero() {
+            let tri_spread = if !effective_amount_in.is_zero() {
                 let final_f = amount_a_final.to::<u128>() as f64;
-                let input_f = p3e.effective_amount_in.to::<u128>() as f64;
+                let input_f = effective_amount_in.to::<u128>() as f64;
                 (final_f / input_f) - 1.0
             } else { 0.0 };
-            if tri_spread > best_tri_spread { best_tri_spread = tri_spread; }
-
-            // Compare against effective_amount_in (may be < trip.amount_in if V3 leg was capped)
-            if amount_a_final <= p3e.effective_amount_in { continue; }
 
             // Sanity cap: profit > 5% of input is almost certainly a detection artifact.
             // Catches Solidly-echo phantoms and V3 spot mismatch phantoms (including
-            // medium-range $37-$121 phantoms that passed the old 3× absolute cap).
-            if crate::config::tuning().is_phantom(amount_a_final - p3e.effective_amount_in, p3e.effective_amount_in) {
-                warn!(
-                    "[{}] Triangular phantom skipped: {} | profit/input > 5%",
-                    self.chain_id,
-                    trip.triplet_id,
-                );
+            // medium-range $37-$121 phantoms that passed the old 3× absolute cap), and
+            // narrow-range CL pools far off the market (a tick-spacing-1 USDC/AAVE pool 26%
+            // off price logged 2.35M of these in 5 h). Kept out of `tri=`, logged once per
+            // route per 10 min.
+            if amount_a_final > effective_amount_in
+                && crate::config::tuning().is_phantom(amount_a_final - effective_amount_in, effective_amount_in)
+            {
+                let route = format!("{}|{}/{}/{}", trip.triplet_id, p3e.router_ab_id, p3e.router_bc_id, p3e.router_ca_id);
+                if let Some(held) = crate::util::throttle(&route, crate::util::WARN_EVERY) {
+                    let pools = crate::race::route_pools(&self.pool_cache, &[
+                        (&p3e.router_ab_id, p3e.router_ab_type, p3e.fee_ab, trip.token_a, trip.token_b),
+                        (&p3e.router_bc_id, p3e.router_bc_type, p3e.fee_bc, trip.token_b, trip.token_c),
+                        (&p3e.router_ca_id, p3e.router_ca_type, p3e.fee_ca, trip.token_c, trip.token_a),
+                    ]);
+                    warn!(
+                        "[{}] Triangular phantom skipped: {} | profit/input > 5% | {:+.1}% | {}/{}/{} | pools {:?}{}",
+                        self.chain_id, trip.triplet_id, tri_spread * 100.0,
+                        p3e.router_ab_id, p3e.router_bc_id, p3e.router_ca_id, pools, crate::util::held_suffix(held),
+                    );
+                }
                 continue;
             }
+            if tri_spread > best_tri_spread { best_tri_spread = tri_spread; }
 
-            let profit = amount_a_final - p3e.effective_amount_in;
+            // Compare against effective_amount_in (may be < trip.amount_in if V3 leg was capped)
+            if amount_a_final <= effective_amount_in { continue; }
+
+            let profit = amount_a_final - effective_amount_in;
 
             // Use correct decimals for profit-to-USD conversion (token_a may be USDC, WETH, etc.)
             let (sym_a, dec_a) = match token_info.get(&trip.key_a) {
@@ -551,7 +577,7 @@ impl Strategy {
                 token_a: trip.token_a,
                 token_b: trip.token_b,
                 token_c: trip.token_c,
-                amount_in: p3e.effective_amount_in,
+                amount_in: effective_amount_in,
                 router_ab: p3e.router_ab_addr,
                 router_bc: p3e.router_bc_addr,
                 router_ca: p3e.router_ca_addr,
@@ -909,6 +935,48 @@ impl Strategy {
             ),
             RouterType::V3 => None,
         }
+    }
+
+    /// One route leg `(router id, type, fee, token in, token out)` as an xy=k curve for
+    /// sizing, through the pool the transaction will use. None for stable pools / no state.
+    fn leg_curve(&self, (router_id, rtype, fee, token_in, token_out): (&str, RouterType, u32, Address, Address)) -> Option<crate::pool_cache::LegCurve> {
+        match rtype {
+            RouterType::V3 => self.pool_cache.leg_curve_v3(&V3PoolKey::new(router_id, token_in, token_out, fee), token_in),
+            RouterType::V2 => self.pool_cache.leg_curve_v2(&V2PoolKey::new(router_id, token_in, token_out), token_in, None),
+            RouterType::Aerodrome => {
+                if fee != 0 { return None; } // stable curve
+                let (vol, _) = self.solidly_pool_keys.get(router_id)?;
+                self.pool_cache.leg_curve_v2(&V2PoolKey::new(vol, token_in, token_out), token_in, Some(volatile_max_age()))
+            }
+        }
+    }
+
+    /// The route re-quoted at its profit-maximising input (closed form on the cached curves,
+    /// no RPC), at most `upper`: (input, final output). None when the route has no edge at
+    /// the margin, can't be sized (stable pool) or the size is dust.
+    fn size_route(&self, legs: &[(&str, RouterType, u32, Address, Address)], upper: U256) -> Option<(U256, U256)> {
+        let curves: Option<Vec<_>> = legs.iter().map(|&l| self.leg_curve(l)).collect();
+        let x = super::size::optimal_input(&curves?)?.min(crate::util::u256_to_f64(upper));
+        // A hair under, so f64 rounding can't land just over a binding tick cap (see size_2hop).
+        let x = U256::from((x * (1.0 - 1e-9)) as u128);
+        if x.is_zero() || x < upper / U256::from(200u32) {
+            return None;
+        }
+        let mut amount = x;
+        for &(router_id, rtype, fee, token_in, token_out) in legs {
+            amount = match rtype {
+                // A tick-capped leg quotes only part of `amount`: not a valid sized route.
+                RouterType::V3 => self.pool_cache
+                    .quote_v3_spot_key(&V3PoolKey::new(router_id, token_in, token_out, fee), token_in, amount)
+                    .filter(|&(_, _, eff)| eff == amount)
+                    .map(|(out, _, _)| out),
+                _ => self.local_leg_out(router_id, rtype, fee, token_in, token_out, amount),
+            }?;
+            if amount.is_zero() {
+                return None;
+            }
+        }
+        Some((x, amount))
     }
 
     /// Local pool-cache quote for one non-V3 leg of a found route, through exactly the pool
