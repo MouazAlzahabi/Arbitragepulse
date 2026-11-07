@@ -18,6 +18,7 @@ use crate::util::u256_to_f64;
 pub mod evaluate;
 pub mod triangular;
 pub mod optimize;
+pub(crate) mod size;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -157,9 +158,9 @@ impl QuoteCache {
     /// longer matches and is never served.
     ///
     /// Skipped while the pool's local state is younger than [`quote_cache_settle()`]: a
-    /// quote sent right after a pre-confirmed log can price the state before it (the
-    /// quote RPC's `pending` lags the pendingLogs feed), and caching it under the new
-    /// state would keep serving that stale result. The quote itself is still used.
+    /// quote sent right after a pool log can price the block before it (the quote RPC is a
+    /// different node from the WS log feed), and caching it under the new state would keep
+    /// serving that stale result. The quote itself is still used.
     pub(crate) fn insert(&self, pools: &PoolCache, key: V3PoolKey, amount_in: U256, state_at_send: (U256, u128), amount_out: U256) {
         self.insert_settled(pools, key, amount_in, state_at_send, amount_out, quote_cache_settle());
     }
@@ -245,6 +246,9 @@ pub(crate) struct ReverseTask {
     pub token_out: Address,
     /// Pre-computed reverse amount from pool cache (zero eth_call). None = needs multicall.
     pub local_back: Option<U256>,
+    /// The forward leg's local quote took all of `amount_in` (a V3 spot quote is capped at
+    /// the tick-cap limit): only then can QuoterV2 verify the route at `amount_in`.
+    pub fwd_uncapped: bool,
 }
 
 // ─── Strategy ─────────────────────────────────────────────────────────────────
@@ -290,8 +294,8 @@ pub struct Strategy {
     /// HTTP/2 connection pooling is faster than WS for single request-response calls.
     /// Falls back to the WS provider passed to evaluate() when None.
     pub http_provider: Option<DynProvider>,
-    /// Block tag for quote reads: `pending` when `http_provider` is the preconf endpoint
-    /// (`chain.preconf_http_rpc`), else `latest`.
+    /// Block tag for quote reads: `latest` (Base retired the `pending` preview with
+    /// Flashblocks; each 200 ms block is canonical).
     pub quote_block: BlockId,
     /// Pre-parsed router addresses keyed by router ID.
     /// Populated once at construction — avoids Address::from_str() O(pairs × routers)
@@ -757,10 +761,10 @@ impl Strategy {
         }
     }
 
-    /// The preconf quote provider (`chain.preconf_http_rpc`), when set — for callers that
-    /// would otherwise quote on the WS provider (the optimizer).
-    pub fn preconf_quote_provider(&self) -> Option<DynProvider> {
-        if self.quote_block == BlockId::pending() { self.http_provider.clone() } else { None }
+    /// The quote endpoint (`chain.quote_http_rpc`), when set — for callers that would
+    /// otherwise quote on the WS provider (the optimizer).
+    pub fn quote_provider(&self) -> Option<DynProvider> {
+        self.http_provider.clone()
     }
 
     /// Quote calldata for `quoter`: the Aero Metaquoter's (by pool) for Aero CL, Slipstream's
@@ -768,10 +772,6 @@ impl Strategy {
     pub(crate) fn encode_quote(&self, quoter: Address, token_in: Address, token_out: Address, fee: u32, amount_in: U256) -> Vec<u8> {
         if let Some(router_id) = self.metaquoters.get(&quoter) {
             // A pool missing from the cache gets empty calldata: the quote fails, the leg is skipped.
-            // So does every hooked pool when `pending` calls can't carry the real block time.
-            if !crate::util::pending_time_ok() {
-                return Vec::new();
-            }
             let key = crate::pool_cache::V3PoolKey::new(router_id, token_in, token_out, fee);
             return match self.pool_cache.v3_by_key.get(&key) {
                 Some(pool) => encode_metaquote(*pool, token_in, amount_in),
@@ -929,6 +929,30 @@ pub fn fmt_spread(v: f64) -> String {
     if v.is_finite() { format!("{:+.3}%", v * 100.0) } else { "n/a".to_string() }
 }
 
+/// Quote chunks since the last heartbeat (see [`QuoteGate::take_counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuoteChunkCounts {
+    pub ok: u64,
+    pub timeout: u64,
+    pub err: u64,
+    pub limited: u64,
+}
+
+impl QuoteChunkCounts {
+    /// Heartbeat `qmc=ok/timeout/err/limited`.
+    pub fn summary(&self) -> String {
+        format!("{}/{}/{}/{}", self.ok, self.timeout, self.err, self.limited)
+    }
+
+    /// At least 90% of a meaningful sample (20+ chunks) failed: the quote endpoint is down
+    /// or refusing, so nothing can be verified and detection is blind.
+    pub fn mostly_failing(&self) -> bool {
+        let failed = self.timeout + self.err;
+        let total = self.ok + failed;
+        total >= 20 && failed * 10 >= total * 9
+    }
+}
+
 /// Multicall3 chunk budget on the quote endpoint, shared by every batch of one chain.
 /// Phase 1.5/1.5b/1.5c, the quiet-pool prefetch and triangular verification are joined
 /// concurrently; each used to get its own `rpc_concurrency` chunks, so several in flight
@@ -965,13 +989,12 @@ impl QuoteGate {
     /// `ok/timeout/err/limited` chunk counts since the last call (heartbeat `qmc=`), then
     /// reset. ok = the node answered (incl. a reverted aggregate); err = transport/RPC error;
     /// limited = chunks that got a rate limit first (also counted ok or err by their retry).
-    pub fn take_summary(&self) -> String {
+    pub fn take_counts(&self) -> QuoteChunkCounts {
         use std::sync::atomic::Ordering::Relaxed;
-        format!(
-            "{}/{}/{}/{}",
-            self.ok.swap(0, Relaxed), self.timeout.swap(0, Relaxed), self.err.swap(0, Relaxed),
-            self.limited.swap(0, Relaxed),
-        )
+        QuoteChunkCounts {
+            ok: self.ok.swap(0, Relaxed), timeout: self.timeout.swap(0, Relaxed),
+            err: self.err.swap(0, Relaxed), limited: self.limited.swap(0, Relaxed),
+        }
     }
 
     fn now_ms(&self) -> u64 { self.created.elapsed().as_millis() as u64 }
@@ -1067,12 +1090,11 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
             // A rate-limited chunk holds the gate and is retried once: firing more chunks at an
             // endpoint that is refusing would only lose them too.
             let call = async {
-                let at = crate::util::pending_block_overrides(block);
-                match p.call(tx.clone()).block(block).with_block_overrides_opt(at.clone()).await {
+                match p.call(tx.clone()).block(block).await {
                     Err(e) if is_rate_limited(&e) => {
                         gate.mark_limited();
                         gate.wait_if_limited().await;
-                        p.call(tx).block(block).with_block_overrides_opt(at).await
+                        p.call(tx).block(block).await
                     }
                     r => r,
                 }
@@ -1081,7 +1103,12 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
                 .map(|r| r.map_err(|e| {
                     let revert = multicall_error_is_revert(&e);
                     if !revert {
-                        warn!("Multicall3 chunk RPC error — calls counted as failed, no sequential fallback: {e}");
+                        // Once per kind per 10 min: a refusing endpoint fails every chunk.
+                        let kind = crate::util::classify_rpc_failure(&e.to_string());
+                        if let Some(held) = crate::util::throttle(&format!("multicall-err:{kind:?}"), crate::util::WARN_EVERY) {
+                            warn!("Multicall3 chunk RPC error — calls counted as failed, no sequential fallback: {e}{}",
+                                  crate::util::held_suffix(held));
+                        }
                     }
                     revert
                 }))
@@ -1137,7 +1164,7 @@ pub(crate) async fn run_multicall_answered<P: Provider + Clone>(
                         .to(*target)
                         .input(data.clone().into());
                     let _permit = gate.permits.acquire().await;
-                    let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx).block(block).with_block_overrides_opt(crate::util::pending_block_overrides(block))).await;
+                    let r = tokio::time::timeout(multicall_chunk_timeout(), provider.call(tx).block(block)).await;
                     out.push(match r {
                         Ok(Ok(b)) => (Some(b.to_vec()), true),
                         Ok(Err(e)) => (None, multicall_error_is_revert(&e)),
@@ -1277,8 +1304,8 @@ mod multicall_tests {
         let out = run_multicall(&provider, calls(3), &gate, BlockId::latest()).await;
         assert_eq!(out, vec![None; 3]);
         assert_eq!(asserter.read_q().len(), 3);
-        assert_eq!(gate.take_summary(), "0/0/1/1");
-        assert_eq!(gate.take_summary(), "0/0/0/0");
+        assert_eq!(gate.take_counts().summary(), "0/0/1/1");
+        assert_eq!(gate.take_counts().summary(), "0/0/0/0");
     }
 
     /// A rate limit that clears: the retry answers and the chunk counts ok (and limited).
@@ -1295,7 +1322,7 @@ mod multicall_tests {
         let out = run_multicall_answered(&provider, calls(2), &gate, BlockId::latest()).await;
         assert!(out.iter().all(|(r, a)| r.is_some() && *a));
         assert!(asserter.read_q().is_empty());
-        assert_eq!(gate.take_summary(), "1/0/0/1");
+        assert_eq!(gate.take_counts().summary(), "1/0/0/1");
     }
 
     /// A reverted aggregate (e.g. out of gas) still falls back to per-call eth_calls.
@@ -1312,7 +1339,7 @@ mod multicall_tests {
         assert_eq!(out, vec![None; 3]);
         assert_eq!(asserter.read_q().len(), 0);
         // The node answered the aggregate (with a revert); fallback calls aren't chunks.
-        assert_eq!(gate.take_summary(), "1/0/0/0");
+        assert_eq!(gate.take_counts().summary(), "1/0/0/0");
     }
 
     /// Two chunks, the second rate-limited: only the first chunk's calls are answered, so a
@@ -1338,7 +1365,7 @@ mod multicall_tests {
         // Chunk 2: failed in transport — not answered.
         assert_eq!(out[n - 1], (None, false));
         assert!(asserter.read_q().is_empty());
-        assert_eq!(gate.take_summary(), "1/0/1/1");
+        assert_eq!(gate.take_counts().summary(), "1/0/1/1");
     }
 
     #[test]
@@ -1346,6 +1373,22 @@ mod multicall_tests {
         let gate = QuoteGate::new(0);
         assert_eq!(gate.width, 1);
         assert_eq!(gate.permits.available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod quote_chunk_counts_tests {
+    use super::QuoteChunkCounts;
+
+    #[test]
+    fn mostly_failing_needs_a_sample_and_90_percent() {
+        let c = |ok, timeout, err| QuoteChunkCounts { ok, timeout, err, limited: 0 };
+        assert!(c(0, 0, 750).mostly_failing(), "Nov 6: every chunk refused");
+        assert!(c(2, 3, 15).mostly_failing());
+        assert!(!c(3, 3, 14).mostly_failing(), "85% is not blind");
+        assert!(!c(0, 0, 19).mostly_failing(), "too few chunks to judge");
+        assert!(!c(1100, 0, 20).mostly_failing(), "Nov 5: CU/s 429s on 2%");
+        assert_eq!(c(1, 2, 3).summary(), "1/2/3/0");
     }
 }
 

@@ -287,7 +287,9 @@ pub(crate) async fn refresh_contract_balances<P: Provider + Clone>(
                 b.insert(token, bal);
             }
             Err(e) => {
-                warn!("Failed to fetch balance for {:?}: {}", token, e);
+                if let Some(held) = crate::util::throttle(&format!("balance:{token:?}"), crate::util::WARN_EVERY) {
+                    warn!("Failed to fetch balance for {:?}: {}{}", token, e, crate::util::held_suffix(held));
+                }
             }
         }
     }

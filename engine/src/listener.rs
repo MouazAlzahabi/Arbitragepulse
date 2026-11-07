@@ -499,14 +499,14 @@ mod tests {
     }
 
     #[test]
-    fn preconfirmed_then_sealed_logs_stay_ordered_and_trigger_once() {
+    fn duplicate_and_late_logs_stay_ordered_and_trigger_once() {
         let cache = cache_with_pool();
-        // Pre-confirmed log of block 11 arrives first and triggers a scan.
+        // Log of block 11 arrives first and triggers a scan.
         assert!(apply(&cache, &sync_log(11, 3, 2_000, false)).is_some());
         assert_eq!(reserve0(&cache), U256::from(2_000u64));
-        // Its sealed copy: re-applied (same data), but no second scan.
+        // Its duplicate (overlapping feed): re-applied (same data), but no second scan.
         assert!(apply(&cache, &sync_log(11, 3, 2_000, false)).is_none());
-        // A late sealed log of block 10 must not overwrite the newer state.
+        // A late log of block 10 must not overwrite the newer state.
         assert!(apply(&cache, &sync_log(10, 9, 1_500, false)).is_none());
         assert_eq!(reserve0(&cache), U256::from(2_000u64));
         // A newer log applies and triggers.

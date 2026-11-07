@@ -24,7 +24,7 @@ scripts/      deploy.sh (local → server) and server/ (systemd template, logrot
 1. **Pool state, locally.** At startup the engine discovers pools for every configured
    pair on every router (Uniswap/PancakeSwap V3, Aerodrome, V2), then keeps their state
    fresh from on-chain `Swap`/`Sync` events. Detection is pure local math — no RPC.
-2. **Detection** each block (and on large swaps / pending mempool swaps): 2-hop routes
+2. **Detection** on each block's pool swaps (a targeted scan; a full scan every 10 s): 2-hop routes
    across DEXes and triangular A→B→C→A routes.
 3. **Verification.** Routes involving V3 are re-quoted live with QuoterV2 (V3 spot math
    ignores tick crossings); a haircut and a phantom cap guard against bad quotes.

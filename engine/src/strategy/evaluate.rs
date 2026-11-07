@@ -9,21 +9,22 @@ use crate::types::{ArbOpportunity, PairScanInfo};
 use crate::util::u256_to_f64;
 use super::{ForwardTask, QuoteCache, QuoterBatchHealth, ReverseTask, Strategy, apply_exec_quote_haircut, decode_v3_quote, run_multicall_answered, token_amount_to_usd, min_v3_liquidity};
 
-/// Phase 1.5 gate: true when a Phase 2 route should be QuoterV2-verified at full size.
-/// Requires a V3 forward leg, a local spread above the gate (`amount_back / capped_in >
-/// mul / den`, integer math) and an uncapped forward leg (`capped_in == full_in`): a leg
-/// tick-capped below the full size can't take the full size at spot.
+/// Phase 1.5 gate: true when a Phase 2 route should be QuoterV2-verified at its input
+/// `amount_in` (the configured size, or the route's optimal size). Requires a V3 forward
+/// leg, a local spread above the gate (`amount_back / amount_in > mul / den`, integer math)
+/// and a forward leg whose spot quote took all of `amount_in`: a leg tick-capped below it
+/// can't take that input at spot.
 pub(super) fn p15_gate_eligible(
     amount_back: U256,
-    capped_in: U256,
-    full_in: Option<U256>,
+    amount_in: U256,
+    fwd_uncapped: bool,
     fwd: &RouterType,
     mul: u64,
     den: u64,
 ) -> bool {
     matches!(fwd, RouterType::V3)
-        && full_in == Some(capped_in)
-        && amount_back.saturating_mul(U256::from(den)) > capped_in.saturating_mul(U256::from(mul))
+        && fwd_uncapped
+        && amount_back.saturating_mul(U256::from(den)) > amount_in.saturating_mul(U256::from(mul))
 }
 
 /// True when a 2-hop route may pair leg A with leg B. Legs on different router contracts
@@ -46,6 +47,12 @@ pub(super) fn route_legs_eligible(
         && a_fee != b_fee
         && matches!(a_type, RouterType::V3)
         && matches!(b_type, RouterType::V3)
+}
+
+/// Reserve freshness limit for a V2 / Aerodrome leg: stable Aerodrome pools (fee 1) are
+/// held to the stricter `stable_max_age`.
+fn leg_max_age(t: &ForwardTask) -> std::time::Duration {
+    if matches!(t.router_type, RouterType::Aerodrome) && t.fee != 0 { stable_max_age() } else { volatile_max_age() }
 }
 
 /// True when the local V3 spot quote of `amount_in` on `key` is not tick-capped
@@ -85,6 +92,60 @@ fn quote_cache_precheck(
 }
 
 impl Strategy {
+    /// Local quote of a Phase 1 forward leg at `amount_in`: (output, whole input taken).
+    fn local_forward(&self, t: &ForwardTask, amount_in: U256) -> Option<(U256, bool)> {
+        match t.router_type {
+            RouterType::V3 => t.v3_key.as_ref().and_then(|k| self.pool_cache.quote_v3_spot_key(k, t.token_in, amount_in))
+                .map(|(out, _, eff)| (out, eff == amount_in)),
+            RouterType::V2 | RouterType::Aerodrome => t.v2_key.as_ref()
+                .and_then(|k| self.pool_cache.get_amount_out_by_v2_key(k, t.token_in, amount_in, Some(leg_max_age(t))))
+                .map(|out| (out, true)),
+        }
+    }
+
+    /// Local quote selling `amount` of the pair's token_out back on `t`'s pool.
+    fn local_reverse(&self, t: &ForwardTask, amount: U256) -> Option<U256> {
+        match t.router_type {
+            RouterType::V3 => t.rev_v3_key.as_ref()
+                .and_then(|k| self.pool_cache.quote_v3_spot_key(k, t.token_out, amount))
+                .map(|(out, _, _)| out),
+            RouterType::V2 | RouterType::Aerodrome => t.rev_v2_key.as_ref()
+                .and_then(|k| self.pool_cache.get_amount_out_by_v2_key(k, t.token_out, amount, Some(leg_max_age(t)))),
+        }
+    }
+
+    /// The forward leg of `a` then the reverse leg of `b` as xy=k curves (None for stable
+    /// pools and missing state).
+    fn route_curves(&self, a: &ForwardTask, b: &ForwardTask) -> Option<[crate::pool_cache::LegCurve; 2]> {
+        let fwd = match a.router_type {
+            RouterType::V3 => self.pool_cache.leg_curve_v3(a.v3_key.as_ref()?, a.token_in),
+            _ => self.pool_cache.leg_curve_v2(a.v2_key.as_ref()?, a.token_in, Some(leg_max_age(a))),
+        }?;
+        let rev = match b.router_type {
+            RouterType::V3 => self.pool_cache.leg_curve_v3(b.rev_v3_key.as_ref()?, b.token_out),
+            _ => self.pool_cache.leg_curve_v2(b.rev_v2_key.as_ref()?, b.token_out, Some(leg_max_age(b))),
+        }?;
+        Some([fwd, rev])
+    }
+
+    /// The route A→B re-quoted at its profit-maximising input (closed form on the cached
+    /// curves, no RPC), at most `upper`: (input, forward output, return). None when the
+    /// route has no edge at the margin, can't be sized (stable pool) or the size is dust.
+    fn size_2hop(&self, a: &ForwardTask, b: &ForwardTask, upper: U256) -> Option<(U256, U256, U256)> {
+        let x = super::size::optimal_input(&self.route_curves(a, b)?)?.min(u256_to_f64(upper));
+        // A hair under: at a binding tick cap above 2^53 (18-decimal input), f64 rounding can
+        // land one unit over the integer cap, and the capped forward leg would drop the size.
+        let x = U256::from((x * (1.0 - 1e-9)) as u128);
+        if x.is_zero() || x < upper / U256::from(200u32) {
+            return None;
+        }
+        let (mid, uncapped) = self.local_forward(a, x)?;
+        if !uncapped || mid.is_zero() {
+            return None;
+        }
+        Some((x, mid, self.local_reverse(b, mid)?))
+    }
+
     /// Evaluate all pairs on all router combinations for arb opportunities.
     /// All quotes run concurrently (two phases: forward then reverse).
     /// Returns `(opportunities, best_raw_profit_usd, best_verified_spread, fwd_quotes_ok, pairs_with_multi, best_spread_pct, pairs_with_any)`:
@@ -341,33 +402,27 @@ impl Strategy {
                     let fee_b = q_b.fee;
 
                     // Try local reverse quote — keys carried on ForwardTask from phase 1.
-                    let local_back = match q_b.router_type {
-                        RouterType::V2 => q_b.rev_v2_key.as_ref().and_then(|k| {
-                            self.pool_cache.get_amount_out_by_v2_key(
-                                k, token_out, token_out_amount, Some(volatile_max_age()),
-                            )
-                        }),
-                        RouterType::Aerodrome => {
-                            let max_age = if fee_b != 0 { stable_max_age() } else { volatile_max_age() };
-                            q_b.rev_v2_key.as_ref().and_then(|k| {
-                                self.pool_cache.get_amount_out_by_v2_key(
-                                    k, token_out, token_out_amount, Some(max_age),
-                                )
-                            })
-                        }
-                        RouterType::V3 => q_b.rev_v3_key.as_ref().and_then(|k| {
-                            self.pool_cache
-                                .quote_v3_spot_key(k, token_out, token_out_amount)
-                                .map(|(spot_out, _, _)| spot_out)
-                        }),
-                    };
+                    let local_back = self.local_reverse(q_b, token_out_amount);
 
                     // All DEX types: stale/absent cache = no recent activity = no arb → skip.
                     // Check before constructing ReverseTask to avoid 2 String clones on the
                     // stale path (~20-50% of iterations depending on pool activity).
-                    if local_back.is_none() {
+                    let Some(back) = local_back else {
                         continue;
+                    };
+
+                    // Re-size the route to its profit peak (closed form on the cached curves,
+                    // at most the configured size): a gap worth $0.20 at $400 is a loss at the
+                    // configured $1K and would never reach QuoterV2. Kept only if it earns more.
+                    let full = self.pair_resolved.get(*pi).and_then(|o| o.as_ref())
+                        .map_or(q_a.capped_amount_in, |r| r.amount_in);
+                    let mut leg = (q_a.capped_amount_in, token_out_amount, back, q_a.capped_amount_in == full);
+                    if let Some((x, mid, x_back)) = self.size_2hop(q_a, q_b, full) {
+                        if x_back.saturating_add(leg.0) > back.saturating_add(x) {
+                            leg = (x, mid, x_back, true);
+                        }
                     }
+                    let (amount_in, token_out_amount, local_back, fwd_uncapped) = leg;
 
                     rev_tasks.push(ReverseTask {
                         pair_idx: *pi,
@@ -378,9 +433,9 @@ impl Strategy {
                         router_a_addr: q_a.router_addr,
                         router_a_type: q_a.router_type.clone(),
                         fee_a: q_a.fee,
-                        // Use the capped amount so spread/profit is relative to what was
-                        // actually quoted (V3 may have been capped to single-tick capacity).
-                        amount_in: q_a.capped_amount_in,
+                        // Use the capped (or sized) amount so spread/profit is relative to what
+                        // was actually quoted (V3 may have been capped to single-tick capacity).
+                        amount_in,
                         router_b_id: q_b.router_id.clone(),
                         router_b_addr: rb_addr,
                         router_b_type: q_b.router_type.clone(),
@@ -388,7 +443,8 @@ impl Strategy {
                         token_out_amount,
                         token_in,
                         token_out,
-                        local_back,
+                        local_back: Some(local_back),
+                        fwd_uncapped,
                     });
                 }
             }
@@ -411,7 +467,9 @@ impl Strategy {
         // Integer spread gate: amount_back/amount_in > 1.00005  (avoids float in hot loop)
         let p15_gate_mul: u64 = 1_000_000 + (p15_gate_spread * 1_000_000.0).round() as u64;
         let p15_gate_den: u64 = 1_000_000;
-        let mut p15_gate: std::collections::HashSet<(usize, String, u32)> = std::collections::HashSet::new();
+        // (pair, forward router, fee) → (input to verify at, its local profit): one forward
+        // QuoterV2 call each, at the size of the most profitable route through that leg.
+        let mut p15_gate: std::collections::HashMap<(usize, String, u32), (U256, U256)> = std::collections::HashMap::new();
         // Best QuoterV2-verified spread (signed). NEG_INFINITY when Phase 1.5 didn't run or
         // all reverse lookups failed. Exposed in heartbeat as "bestV=" to distinguish real
         // profit ($0.001 verified) from V3 spot phantom ($0.29 raw).
@@ -429,10 +487,14 @@ impl Strategy {
             if amount_back > task.amount_in
                 && crate::config::tuning().is_phantom(amount_back - task.amount_in, task.amount_in)
             {
-                warn!(
-                    "[{}] 2-hop phantom skipped: {} | profit/input > 5% | {}/{}",
-                    self.chain_id, task.pair_id, task.router_a_id, task.router_b_id
-                );
+                // Logged once per route per 10 min (it repeats every scan while it lasts).
+                let route = format!("{}|{}/{}", task.pair_id, task.router_a_id, task.router_b_id);
+                if let Some(held) = crate::util::throttle(&route, crate::util::WARN_EVERY) {
+                    warn!(
+                        "[{}] 2-hop phantom skipped: {} | profit/input > 5% | {}/{}{}",
+                        self.chain_id, task.pair_id, task.router_a_id, task.router_b_id, crate::util::held_suffix(held)
+                    );
+                }
                 continue;
             }
 
@@ -467,19 +529,19 @@ impl Strategy {
                 }
 
                 // Phase 1.5 gate: local cross-DEX spread is promising AND forward router is V3
-                // AND its forward leg was not tick-capped. QuoterV2 verifies at full trade size;
-                // liquid pools (task.amount_in == full) must reach it, or V3×V3 spreads are
-                // permanently blocked. A capped forward can't take the full size at spot, so a
-                // full-size QuoterV2 call there is wasted RPC (and the bestV -99.99% artefact).
-                let full_in = self
-                    .pair_resolved
-                    .get(task.pair_idx)
-                    .and_then(|o| o.as_ref())
-                    .map(|r| r.amount_in);
+                // AND its forward leg was not tick-capped. QuoterV2 verifies at the route's
+                // input (configured or optimal size); liquid pools must reach it, or V3×V3
+                // spreads are permanently blocked. A capped forward can't take its input at
+                // spot, so a QuoterV2 call there is wasted RPC (and the bestV -99.99% artefact).
                 if p15_gate_eligible(
-                    amount_back, task.amount_in, full_in, &task.router_a_type, p15_gate_mul, p15_gate_den,
+                    amount_back, task.amount_in, task.fwd_uncapped, &task.router_a_type, p15_gate_mul, p15_gate_den,
                 ) {
-                    p15_gate.insert((task.pair_idx, task.router_a_id.clone(), task.fee_a));
+                    let profit = amount_back.saturating_sub(task.amount_in);
+                    let e = p15_gate.entry((task.pair_idx, task.router_a_id.clone(), task.fee_a))
+                        .or_insert((task.amount_in, profit));
+                    if profit > e.1 {
+                        *e = (task.amount_in, profit);
+                    }
                 }
             }
 
@@ -556,15 +618,9 @@ impl Strategy {
                     > task.amount_in.saturating_mul(U256::from(p15_gate_mul));
                 if !p15_gate_hit { continue; }
 
-                let full_amount = match self
-                    .pair_resolved
-                    .get(task.pair_idx)
-                    .and_then(|o| o.as_ref())
-                    .map(|r| r.amount_in)
-                {
-                    Some(a) => a,
-                    None => continue,
-                };
+                // The route's input (configured or optimal size): token_out_amount is the local
+                // forward output for exactly this amount.
+                let full_amount = task.amount_in;
 
                 // Find quoter for the V3 reverse router from forward quotes of this pair
                 let quoter_b = match pair_quotes.get(&task.pair_idx)
@@ -607,7 +663,7 @@ impl Strategy {
         // read alongside the QuoterV2 round (see Strategy::prefetch_quiet_reserves).
         let mut prefetch_pools: Vec<Address> = Vec::new();
         if !p15_gate.is_empty() && !self.optimistic_submission {
-            for (pi, ..) in &p15_gate {
+            for (pi, ..) in p15_gate.keys() {
                 for t in pair_quotes.get(pi).into_iter().flatten()
                     .filter(|t| matches!(t.router_type, RouterType::V2 | RouterType::Aerodrome))
                 {
@@ -653,12 +709,7 @@ impl Strategy {
             let mut spec_routes: Vec<SpecKey> = Vec::new();
             let mut spec_mc: Vec<(Address, Vec<u8>)> = Vec::new();
 
-            for (pi, router_a_id, fee_a) in &p15_gate {
-                let resolved = match self.pair_resolved.get(*pi).and_then(|o| o.as_ref()) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                let full_amount = resolved.amount_in;
+            for ((pi, router_a_id, fee_a), &(full_amount, _)) in &p15_gate {
                 let fwd_task = match pair_quotes.get(pi)
                     .and_then(|ts| ts.iter().find(|t| &t.router_id == router_a_id && t.fee == *fee_a))
                 {
@@ -1265,15 +1316,15 @@ mod tests {
         let full = U256::from(10_000_000_000u64);
         let capped = U256::from(5_000_000u64);
         // (a) Tick-capped thin pool with a +0.5% spread on its capped input (WETH/AERO case).
-        assert!(!p15_gate_eligible(back(5_000_000, 5_000), capped, Some(full), &RouterType::V3, MUL, DEN));
+        assert!(!p15_gate_eligible(back(5_000_000, 5_000), capped, false, &RouterType::V3, MUL, DEN));
         // (b) Uncapped leg with +0.01% → gated.
-        assert!(p15_gate_eligible(back(10_000_000_000, 100), full, Some(full), &RouterType::V3, MUL, DEN));
+        assert!(p15_gate_eligible(back(10_000_000_000, 100), full, true, &RouterType::V3, MUL, DEN));
         // (c) Uncapped leg with +0.004% → below the 0.005% gate.
-        assert!(!p15_gate_eligible(back(10_000_000_000, 40), full, Some(full), &RouterType::V3, MUL, DEN));
+        assert!(!p15_gate_eligible(back(10_000_000_000, 40), full, true, &RouterType::V3, MUL, DEN));
         // (d) V2 forward → never gated (handled by Phase 2 / 1.5c).
-        assert!(!p15_gate_eligible(back(10_000_000_000, 100), full, Some(full), &RouterType::V2, MUL, DEN));
-        // Unresolved pair → not gated.
-        assert!(!p15_gate_eligible(back(10_000_000_000, 100), full, None, &RouterType::V3, MUL, DEN));
+        assert!(!p15_gate_eligible(back(10_000_000_000, 100), full, true, &RouterType::V2, MUL, DEN));
+        // (e) Re-sized below the cap (optimal size): verified at that size.
+        assert!(p15_gate_eligible(back(5_000_000, 5_000), capped, true, &RouterType::V3, MUL, DEN));
     }
 
     /// Price 1, L = 1e6 → vr0 = vr1 = 1e6; 2% cap = 20_000. Last moved `ago`.
@@ -1306,6 +1357,22 @@ mod tests {
         // Unknown pool → treated as not quotable at spot.
         let missing = V3PoolKey::new("other", t1, t0, 500);
         assert!(!v3_spot_uncapped(&cache, &missing, t1, U256::from(10_000u64)));
+    }
+
+    /// The sizing curve of a V3 leg reproduces its local spot quote, and stops at the tick cap.
+    #[test]
+    fn v3_leg_curve_matches_spot_quote() {
+        let (t0, t1) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let cache = pools_with_v3(t0, t1, Duration::ZERO);
+        let key = V3PoolKey::new("r", t0, t1, 500);
+        let c = cache.leg_curve_v3(&key, t0).unwrap();
+        assert_eq!(c.max_in, 20_000.0);
+        for x in [1_000u64, 10_000, 20_000] {
+            let (spot, _, eff) = cache.quote_v3_spot_key(&key, t0, U256::from(x)).unwrap();
+            assert_eq!(eff, U256::from(x));
+            let curve = c.gamma * x as f64 * c.r_out / (c.r_in + c.gamma * x as f64);
+            assert!((curve - u256_to_f64(spot)).abs() <= 1.0, "x={x}: curve {curve} vs spot {spot}");
+        }
     }
 
     /// Phase 1.5c: a second scan on unchanged pool state is served from QuoteCache.

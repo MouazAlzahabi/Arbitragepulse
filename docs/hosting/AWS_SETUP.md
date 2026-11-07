@@ -92,10 +92,9 @@ ssh botadmin@$IP 'free -h; swapon --show; timedatectl | grep synchronized'
 
 ## Phase 2 — Measure latency from the server (read-only)
 
-Sync the code and install Node 22 (`preconf-lag.mjs` needs Node ≥ 22). `--code-only` = rsync only, no build or restart:
+Sync the code. `--code-only` = rsync only, no build or restart:
 ```bash
 ARB_SERVER=botadmin@$IP scripts/deploy.sh --code-only
-ssh ubuntu@$IP 'curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs'
 ```
 
 Run the probes `[server]`:
@@ -103,8 +102,7 @@ Run the probes `[server]`:
 ssh botadmin@$IP
 cd ~/Arbitragepulse
 read -rs ALCHEMY_KEY && export ALCHEMY_KEY          # typed by the operator; not echoed
-N=100 scripts/rpc-latency.sh                         # Base public, Base preconf, Alchemy
-node scripts/preconf-lag.mjs 120                     # does mainnet.base.org `pending` lag the pendingLogs feed?
+N=100 scripts/rpc-latency.sh                         # Base public, Alchemy
 # Sequencer (accepts sends only): connect + TLS + round trip of a cheap request, 20×
 for i in $(seq 20); do curl -so /dev/null -w '%{time_connect} %{time_appconnect} %{time_total}\n' \
   -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
@@ -113,10 +111,9 @@ unset ALCHEMY_KEY
 ```
 
 Record the p50/p95 values in **Results** below. Then set, in `engine/config.yaml`:
-- `http_rpc` / `preconf_http_rpc`: the fastest error-free endpoint that serves Flashblocks `pending` state;
+- `http_rpc` / `quote_http_rpc`: the fastest error-free endpoint (quotes read at `latest`; Flashblocks and `pending` were retired with the Denim upgrade);
 - `submission_rpcs`: keep the sequencer plus the fastest others.
 
-If `preconf-lag.mjs` shows `pending` lagging, see the "Flashblocks HTTP `pending` lagging" entry in `docs/review-loop/OPEN_QUESTIONS.md`.
 
 **STOP — operator reviews the numbers.** If they're poor (e.g. p50 > 30 ms to Base endpoints), discuss another host before continuing.
 
@@ -178,7 +175,7 @@ curl -s -H "Authorization: Bearer <API_KEY>" localhost:3000/health   # 200 + "st
 
 Check the heartbeat in `ssh botadmin@$IP 'journalctl -u arbitragepulse@base -n 200 | grep ♥'`:
 - `v2=` / `v3=` show pool counts (fork reference: v2=30 v3=146);
-- `preconf_logs=` is above 0 (Flashblocks feed live);
+- `lat logs=` is above 0 (the pool log feed is live) and no `BLIND:` ERROR line;
 - `unfunded=7/7` is expected until Phase 5 funding.
 
 Exposure: from the Mac, `nmap -Pn -p 1-65535 $IP` should show only 22 open.

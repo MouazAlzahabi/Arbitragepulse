@@ -9,33 +9,28 @@ Run the [testing stage](TESTNET_DEPLOYMENT_GUIDE.md) first.
 ## 1. RPC
 
 The config expects Alchemy (`${ALCHEMY_KEY}` is substituted from the instance env):
-- `ws_rpc` — Alchemy Base WebSocket (block/log subscriptions and the pending-tx monitor
-  need a WS endpoint that exposes the mempool)
-- `http_rpc`, `ws_rpc_fallbacks`, `submission_rpcs` — public Base endpoints; signed txs
-  are broadcast to all submission RPCs at once (Base sequencer is first-come-first-served)
+- `ws_rpc` — Alchemy Base WebSocket: block headers and the pool log subscription that drives
+  detection
+- `quote_http_rpc` — Alchemy HTTP: QuoterV2/Multicall3 reads, pre-flight and dry-run
+  simulation, all at block tag `latest` (remove the key to use `http_rpc`)
+- `http_rpc`, `submission_rpcs` — public Base endpoints; signed txs are broadcast to all
+  submission RPCs at once (Base sequencer is first-come-first-served)
 
 Size `chain.rpc_concurrency` to your Alchemy plan (3 for the free tier, 10–12 for Growth).
 
-**Flashblocks** (`chain.preconf_ws_rpc: wss://mainnet-preconf.base.org`): Base builds each
-2 s block from 200 ms pre-confirmed sub-blocks. The engine subscribes to their pool logs
-(`pendingLogs`) and reacts ~1.2 s (p50; p90 ~1.9 s) before the sealed block. The sealed
-log subscription on `ws_rpc` stays on as the source of truth and fallback; a per-pool
-(block, log index) guard keeps the two feeds ordered and triggers one scan per event.
-The heartbeat shows `preconf_logs=N` per interval — 0 for minutes on mainnet means the
-endpoint is down (detection continues on sealed blocks, ~1.2 s later).
-
-`chain.preconf_http_rpc` (default `https://mainnet.base.org`, the same endpoint as
-`http_rpc`) makes QuoterV2/Multicall3 reads, the optimizer, pre-flight and dry-run
-simulation use block tag `pending` there — the state the pre-confirmed logs showed. A
-check at `latest` would price the block *before* the move. `pending` costs ~25 ms more
-per call than `latest`. Remove the key to quote at `latest`.
+**Blocks and detection:** since the Denim upgrade (2026-11-05) Base builds a canonical block
+every 200 ms; Flashblocks, their `pendingLogs` feed and the `pending` preview were retired.
+Each block's pool logs trigger one targeted scan of the pairs they touch; a full scan runs
+every `chain.scan_interval_ms` (10 s) as a safety net. There is no public mempool. The
+heartbeat's `lat logs=N` counts pool logs per interval; if none arrive for
+`tuning.feed_blind_ms` (2 min), or ≥90% of quote batches fail, the engine logs
+`BLIND: …` as an ERROR and `/health` answers 503.
 
 **Choosing endpoints:** latency from the server is what counts. On the server run
 `ALCHEMY_KEY=… scripts/rpc-latency.sh` (read-only; URLs printed with the key redacted).
-It reports p50/p95 of a QuoterV2 call at `latest` and `pending` for Base public, Base
-preconf and Alchemy, and whether each serves Flashblocks `pending` state. Use the fastest
-error-free endpoint for `http_rpc`, and the fastest Flashblocks one for `preconf_http_rpc`
-(add others as arguments: `scripts/rpc-latency.sh https://… https://…`).
+It reports p50/p95 of a QuoterV2 call at `latest` for Base public and Alchemy. Use the
+fastest error-free endpoint for `quote_http_rpc` (add others as arguments:
+`scripts/rpc-latency.sh https://… https://…`).
 
 ## 2. Server
 

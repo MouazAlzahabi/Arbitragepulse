@@ -72,6 +72,9 @@ pub struct ChainStats {
     pub paused: bool,
     /// True if the chain's RPC connection was healthy at last check.
     pub rpc_ok: bool,
+    /// Why the chain can't detect anything right now (quotes failing, pool log feed
+    /// silent), set each heartbeat; None = fine. A blind chain reports `degraded`.
+    pub blind: Option<String>,
     /// Last block number seen from the block-header subscription (0 = not yet seen).
     pub last_block: u64,
     /// Unix seconds when `last_block` last advanced (0 = no block yet).
@@ -320,7 +323,7 @@ fn health_verdict(chains: &[ChainStats], backoff: impl Fn(u64) -> bool, now: u64
         return ("paused", false);
     }
     let stale = |c: &ChainStats| c.last_block_at == 0 || now.saturating_sub(c.last_block_at) > stale_after_secs;
-    let healthy = chains.iter().all(|c| c.rpc_ok && !stale(c) && !backoff(c.chain_id));
+    let healthy = chains.iter().all(|c| c.rpc_ok && c.blind.is_none() && !stale(c) && !backoff(c.chain_id));
     (if healthy { "ok" } else { "degraded" }, healthy)
 }
 
@@ -340,6 +343,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "chain_id":   c.chain_id,
         "chain_name": c.chain_name,
         "rpc_ok":     c.rpc_ok,
+        "blind":      c.blind,
         "last_block": c.last_block,
         "last_block_age_s": if c.last_block_at == 0 { serde_json::Value::Null } else { now.saturating_sub(c.last_block_at).into() },
         "paused":     c.paused,
@@ -769,6 +773,7 @@ mod tests {
             dry_run: false,
             paused,
             rpc_ok,
+            blind: None,
             last_block: 0,
             last_block_at,
             rpc_latency_ms: 0.0,
@@ -785,6 +790,8 @@ mod tests {
         assert_eq!(health_verdict(&[chain(true, false, 0)], no, 1010, 30), ("degraded", false), "no block yet");
         assert_eq!(health_verdict(&[chain(false, false, 1000)], no, 1010, 30), ("degraded", false), "rpc lost");
         assert_eq!(health_verdict(&[chain(true, false, 1000)], |_| true, 1010, 30), ("degraded", false), "backoff");
+        let blind = ChainStats { blind: Some("quotes failing".into()), ..chain(true, false, 1000) };
+        assert_eq!(health_verdict(&[blind], no, 1010, 30), ("degraded", false), "blind");
     }
 
     #[test]

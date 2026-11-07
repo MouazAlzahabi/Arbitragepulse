@@ -21,28 +21,15 @@ pub struct ChainConfig {
     /// Optional QuoterV2 address for V3 quoting (chain-specific)
     #[serde(default)]
     pub quoter_v2_address: Option<String>,
-    /// Flashblocks-aware WS endpoint (Base: `wss://mainnet-preconf.base.org`). When set,
-    /// the engine also subscribes to `pendingLogs` there: pool events from 200 ms
-    /// pre-confirmed sub-blocks, ~1.2 s before the sealed block (measured). Read-only, no
-    /// key, no wallet. Unset = off.
-    #[serde(default)]
-    pub preconf_ws_rpc: Option<String>,
-    /// Flashblocks-aware HTTP endpoint. When set, QuoterV2/Multicall3 reads, the optimizer,
-    /// pre-flight and dry-run simulation call it at block tag `pending`, pricing the same
-    /// pre-confirmed state the `preconf_ws_rpc` logs moved the pool cache to. Unset =
-    /// `http_rpc` / the WS provider at `latest`.
-    #[serde(default)]
-    pub preconf_http_rpc: Option<String>,
+    /// HTTP endpoint for QuoterV2 / Multicall3 reads, the size optimizer, pre-flight and
+    /// dry-run simulation (all at `latest`). Unset = `http_rpc` / the WS provider.
+    /// `preconf_http_rpc` is the pre-Denim name (Flashblocks retired 2026-11-05).
+    #[serde(default, alias = "preconf_http_rpc")]
+    pub quote_http_rpc: Option<String>,
     /// Fallback WS endpoints tried in order if the primary ws_rpc fails.
     /// Leave empty to use only the primary.
     #[serde(default)]
     pub ws_rpc_fallbacks: Vec<String>,
-    /// Token addresses whose pools are watched only on the keyless `preconf_ws_rpc` feed,
-    /// not on the primary (metered) ws_rpc log subscription: any pool with one of these on
-    /// either side. Keeps added tokens off the paid event budget. Ignored (all pools on the
-    /// primary feed, with a warning) when `preconf_ws_rpc` is unset.
-    #[serde(default)]
-    pub preconf_only_tokens: Vec<String>,
     /// Trade with the start amount borrowed from the Uniswap V4 PoolManager and repaid in the
     /// same transaction (executor *Borrowed entry points: no fee, no interest). Trades no
     /// longer need the contract's own balance: the balance guards and "unfunded" warnings
@@ -56,9 +43,9 @@ pub struct ChainConfig {
     /// Each chunk = 1 eth_call (26 CU). Default: 3.
     #[serde(default = "default_rpc_concurrency")]
     pub rpc_concurrency: usize,
-    /// How often to scan for opportunities (milliseconds).
-    /// Decoupled from block_time_ms — set lower to scan more frequently.
-    /// Default: 1000ms (60 scans/min). Must be ≤ block_time_ms for meaningful effect.
+    /// Interval of the full scan (every pair and triangle), in ms. Detection runs on pool
+    /// logs: each block's swaps trigger one targeted scan of the pairs they touch. The full
+    /// scan is only the safety net for state that moved without a log we saw. Default: 10000.
     #[serde(default = "default_scan_interval_ms")]
     pub scan_interval_ms: u64,
     /// Reserve change threshold (basis points) to classify a V2/Solidly Sync event as "large".
@@ -103,20 +90,6 @@ pub struct ChainConfig {
     /// Set to 15_000_000 on Base to reach position 1-5 vs 50-200.
     #[serde(default = "default_priority_fee_wei")]
     pub priority_fee_wei: u128,
-    /// Enable pending transaction monitoring for same-block execution.
-    /// Subscribes to the mempool and fires an arb TX when a large swap is detected
-    /// before it confirms, matching the trigger TX's tip so both land in the same block.
-    /// Requires a WS endpoint that exposes the mempool (Alchemy, QuickNode).
-    /// Default: false.
-    #[serde(default)]
-    pub pending_tx_monitoring: bool,
-    /// When true, only submit TXs triggered by the pending monitor (which uses dynamic
-    /// tip matching for same-block landing). Block-scan, poll-tick, and swap-event
-    /// triggered scans will detect opportunities and log them but skip TX submission.
-    /// Prevents position-500+ failures from block-scan submissions on FCFS chains (Base).
-    /// Scans still run (pool state stays fresh). Default: false.
-    #[serde(default)]
-    pub pending_only_submission: bool,
     /// Poll `eth_getLogs` on an interval as a fallback when WS `eth_subscribe(logs)` is
     /// unavailable or unreliable on the provider. On Base with Alchemy WS,
     /// leave **false** — WS updates are faster and avoid duplicate RPC + cache writes.
@@ -135,7 +108,7 @@ fn default_rpc_concurrency() -> usize {
 }
 
 fn default_scan_interval_ms() -> u64 {
-    1000
+    10_000
 }
 
 fn default_true() -> bool { true }
@@ -423,9 +396,9 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
             ));
         }
     }
-    if let Some(u) = chain.preconf_http_rpc.as_deref() {
+    if let Some(u) = chain.quote_http_rpc.as_deref() {
         u.parse::<url::Url>()
-            .map_err(|e| anyhow!("chain.preconf_http_rpc is not a URL ({}): {}", crate::util::redact_url(u), e))?;
+            .map_err(|e| anyhow!("chain.quote_http_rpc is not a URL ({}): {}", crate::util::redact_url(u), e))?;
     }
     if !(10..=600).contains(&chain.deadline_seconds) {
         return Err(anyhow!("chain.deadline_seconds must be 10..=600 (got {})", chain.deadline_seconds));
@@ -444,6 +417,9 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
                 ));
             }
         }
+    }
+    if chain.scan_interval_ms == 0 {
+        return Err(anyhow!("chain.scan_interval_ms must be > 0 (the full-scan interval)"));
     }
     raw.tuning.validate(chain.block_time_ms)?;
 
@@ -481,9 +457,10 @@ pub fn check_chain_id(configured: u64, rpc_reported: u64, chain_name: &str) -> R
 
 // ─── Tuning ───────────────────────────────────────────────────────────────────
 // Every timing and threshold the engine uses, in one place. All fields default to the
-// values tuned on Base (2 s blocks); override any of them in the config's `tuning:`
-// section. Fields marked "block-relative" default to a multiple of `block_time_ms`, so a
-// chain with a different block interval gets sensible values without overriding them.
+// values tuned on Base; override any of them in the config's `tuning:` section. Fields
+// marked "block-relative" default to a multiple of `block_time_ms` with a floor, so a
+// chain with a different block interval gets sensible values without overriding them
+// (Base: 200 ms blocks since the Denim upgrade, 2026-11-05).
 // Read once at startup (config hot-reload does not change tuning — restart instead).
 
 #[derive(Debug, Deserialize, Clone)]
@@ -511,7 +488,7 @@ pub struct Tuning {
     /// Max age of the last known gas price to reuse it (ms).
     pub gas_fallback_max_age_ms: u64,
     /// Priority fee as a share of each trade's expected gross profit (bps; 0 = off — the
-    /// fixed `chain.priority_fee_wei` is used). Inside a 200 ms flashblock txs are ordered
+    /// fixed `chain.priority_fee_wei` is used). Inside a 200 ms block txs are ordered
     /// by priority fee, so a higher tip wins position — but it is paid even when the tx
     /// reverts, so every lost race costs more. Tune from `arb_lost_race_total`. Max 9000.
     pub tip_profit_share_bps: u64,
@@ -564,13 +541,18 @@ pub struct Tuning {
     /// applied) and re-checked on-chain before trading; the per-pool max ages above apply
     /// only when the feed is silent.
     pub feed_silence_ms: u64,
+    /// The heartbeat reports the chain BLIND (ERROR, /health 503) when no pool log arrived
+    /// for this long — since startup if none yet (ms). Far above `feed_silence_ms`: on a
+    /// busy chain minutes of silence over hundreds of pools means a dead subscription. 0 =
+    /// off (a testnet whose pools trade rarely).
+    pub feed_blind_ms: u64,
     /// V3 pools with no Swap event for this long count as stale in the heartbeat (ms).
     pub v3_fresh_window_ms: u64,
 
     // ── RPC ──
     /// Timeout for background reads: price, balances, gas, nonce, ping (ms).
     pub rpc_read_timeout_ms: u64,
-    /// Timeout for the pre-flight / dry-run simulation (ms). Block-relative: ½ block.
+    /// Timeout for the pre-flight / dry-run simulation (ms). Block-relative: ½ block, at least 800 ms.
     pub rpc_simulate_timeout_ms: Option<u64>,
     /// Timeout for eth_sendRawTransaction (ms).
     pub rpc_send_timeout_ms: u64,
@@ -586,20 +568,19 @@ pub struct Tuning {
     /// After a rate-limited quote chunk, hold every new quote chunk this long (ms) and retry
     /// the limited one once.
     pub quote_rate_limit_backoff_ms: u64,
-    /// Max age of a cached 2-hop QuoterV2 result (ms). Block-relative: 3 blocks.
+    /// Max age of a cached 2-hop QuoterV2 result (ms). Block-relative: 3 blocks, at least 1 s.
     pub quote_cache_max_age_ms: Option<u64>,
     pub quote_cache_max_pools: usize,
     /// Don't cache a QuoterV2 result while the pool's local state is younger than this
-    /// (ms). Right after a pre-confirmed log moves the pool, `pending` on the quote RPC can
-    /// still price the previous state (measured on mainnet.base.org from us-east-1: 19% of
-    /// calls, all caught up within 100 ms); cached under the new state, that stale quote
-    /// would be served for up to quote_cache_max_age. 0 = always cache.
+    /// (ms). Right after a pool log moves the pool, the quote RPC (another node than the WS
+    /// feed) can still price the previous block; cached under the new state, that stale
+    /// quote would be served for up to quote_cache_max_age. 0 = always cache.
     pub quote_cache_settle_ms: u64,
     /// RPC health: hold after an outage, cap for repeated relapses, relapse window (ms).
     pub health_hold_base_ms: u64,
     pub health_hold_max_ms: u64,
     pub health_relapse_window_ms: u64,
-    /// RPC health: monitor probe interval (ms). Block-relative: 1 block.
+    /// RPC health: monitor probe interval (ms). Block-relative: 1 block, at least 1 s.
     pub health_monitor_every_ms: Option<u64>,
     /// QuoterV2 health warnings: never-worked / broke-after-working thresholds (ms) and
     /// minimum failed batches.
@@ -672,6 +653,7 @@ impl Default for Tuning {
             volatile_pool_max_age_ms: 120_000,
             stable_pool_max_age_ms: 30_000,
             feed_silence_ms: 30_000,
+            feed_blind_ms: 120_000,
             v3_fresh_window_ms: 30_000,
             rpc_read_timeout_ms: 5_000,
             rpc_simulate_timeout_ms: None,
@@ -772,13 +754,13 @@ impl Tuning {
     }
 
     pub fn rpc_simulate_timeout(&self) -> std::time::Duration {
-        ms(self.rpc_simulate_timeout_ms.unwrap_or(self.block_time_ms / 2))
+        ms(self.rpc_simulate_timeout_ms.unwrap_or((self.block_time_ms / 2).max(800)))
     }
     pub fn quote_cache_max_age(&self) -> std::time::Duration {
-        ms(self.quote_cache_max_age_ms.unwrap_or(self.block_time_ms * 3))
+        ms(self.quote_cache_max_age_ms.unwrap_or((self.block_time_ms * 3).max(1_000)))
     }
     pub fn health_monitor_every(&self) -> std::time::Duration {
-        ms(self.health_monitor_every_ms.unwrap_or(self.block_time_ms))
+        ms(self.health_monitor_every_ms.unwrap_or(self.block_time_ms.max(1_000)))
     }
     pub fn rpc_read_timeout(&self) -> std::time::Duration { ms(self.rpc_read_timeout_ms) }
     pub fn quote_cache_settle(&self) -> std::time::Duration { ms(self.quote_cache_settle_ms) }
@@ -886,6 +868,20 @@ routers: []
         assert_eq!(t.quote_cache_max_age(), std::time::Duration::from_secs(36));
         let pinned = Tuning { rpc_simulate_timeout_ms: Some(800), ..Tuning::default() }.with_block_time(12_000);
         assert_eq!(pinned.rpc_simulate_timeout(), std::time::Duration::from_millis(800));
+        // Base's 200 ms blocks hit the floors instead of shrinking 10×.
+        let fast = Tuning::default().with_block_time(200);
+        assert_eq!(fast.rpc_simulate_timeout(), std::time::Duration::from_millis(800));
+        assert_eq!(fast.quote_cache_max_age(), std::time::Duration::from_secs(1));
+        assert_eq!(fast.health_monitor_every(), std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn quote_http_rpc_accepts_the_pre_denim_name() {
+        let url = "https://example.com/rpc";
+        let old = parse_config(&MIN.replace("chain:\n", &format!("chain:\n  preconf_http_rpc: \"{url}\"\n"))).unwrap();
+        assert_eq!(old.chain.quote_http_rpc.as_deref(), Some(url));
+        let removed = MIN.replace("chain:\n", "chain:\n  preconf_ws_rpc: \"wss://x\"\n");
+        assert!(parse_config(&removed).is_err(), "Flashblocks feed keys are gone");
     }
 
     #[test]

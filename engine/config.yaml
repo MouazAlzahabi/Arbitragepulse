@@ -19,7 +19,9 @@ chain:
   http_rpc: "https://mainnet.base.org"
   native_currency: "ETH"
   wrapped_native: "0x4200000000000000000000000000000000000006"
-  block_time_ms: 2000
+  # 200 ms canonical blocks since the Denim upgrade (block 53556128, 2026-11-05 18:00 UTC);
+  # Flashblocks and the `pending` preview were retired with it.
+  block_time_ms: 200
   # Executor v5 (adds Uniswap V4 legs, type 8), deployed 2026-11-01,
   # tx 0x9dea91e728cec46a13b72492454682ba40113f051e2caf4ddea6e8aa106bbf8e (block 53375831).
   # Allowlisted: the 8 router venues, 68 DirectCL + 18 DirectPair pools, 101 V4 pools.
@@ -33,7 +35,9 @@ chain:
   min_profit_usd: 0.0001
   deadline_seconds: 120
   quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
-  scan_interval_ms: 2000
+  # Full scan (every pair and triangle) interval. Detection itself runs on pool logs: each
+  # block's swaps trigger one targeted scan of the pairs they touch.
+  scan_interval_ms: 10000
   # Multicall3 chunks (tuning.multicall_chunk_size calls each) in flight at once on the quote
   # endpoint — ONE budget shared by every joined batch: Phase 1.5/1.5b/1.5c, the quiet-pool
   # prefetch and the triangular verify. 6 = the peak of the build before those were joined; a
@@ -41,32 +45,17 @@ chain:
   # `qmc=ok/timeout/err` chunk counts after changing it.
   rpc_concurrency: 6
   # Extra HTTP endpoints to broadcast signed txs concurrently (FCFS sequencer — race to arrive first)
-  # Flashblocks: pool events from 200 ms pre-confirmed sub-blocks (eth_subscribe
-  # "pendingLogs"), measured ~1.2 s (p50) before the sealed block. Read-only, keyless.
-  # Sealed-block logs stay on as the source of truth. Remove the line to turn it off.
-  preconf_ws_rpc: "wss://mainnet-preconf.base.org"
-  # Quotes (QuoterV2/Multicall3), optimizer and simulation at block tag `pending` here, so
-  # they price the same pre-confirmed state the logs above moved the pool cache to.
-  # Alchemy (paid) since 2026-10-29: the free endpoint rate-limited 25-28% of quote chunks
-  # in busy minutes. Alchemy serves Flashblocks `pending` (scripts/rpc-latency.sh on the
-  # server: pending grew 356 → 419 txs; quote @pending p50 79 ms / p95 90 ms vs free
-  # 72 / 108 ms). Background reads stay on http_rpc (free). Remove the line to quote at
-  # `latest` on http_rpc.
-  preconf_http_rpc: "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
-  # Used only if ws_rpc fails at (re)start. wss://mainnet.base.org refuses WebSocket (HTTP 405);
-  # the preconf endpoint serves eth_subscribe newHeads + filtered logs (checked 2026-10-28). No mempool.
-  ws_rpc_fallbacks:
-    - "wss://mainnet-preconf.base.org"
-  # Pools with one of these tokens on either side are watched on preconf_ws_rpc only (keyless),
-  # never on ws_rpc (Alchemy bills each log event). Core-token pools stay on both feeds.
+  # Quotes (QuoterV2/Multicall3), optimizer and simulation at `latest` here. Alchemy (paid)
+  # since 2026-10-29: the free endpoint rate-limited 25-28% of quote chunks in busy minutes.
+  # Background reads stay on http_rpc (free). Remove the line to quote on http_rpc.
+  quote_http_rpc: "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+  # Used only if ws_rpc fails at (re)start. wss://mainnet.base.org refuses WebSocket (HTTP 405),
+  # and wss://mainnet-preconf.base.org stopped serving log subscriptions with the Denim upgrade
+  # (checked 2026-11-06: accepts them, delivers nothing).
+  ws_rpc_fallbacks: []
   # Borrow each trade's amountIn from the Uniswap V4 PoolManager and repay it in the same tx
   # (no fee, no interest; executor v4). The executor needs no USDC/USDT; profit stays in it.
   borrow: true
-  preconf_only_tokens:
-    - "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf"  # VVV
-    - "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee"  # AERO (new)
-    - "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b"  # tBTC
-    - "0xcb585250f852C6c6bf90434AB21A00f02833a4af"  # cbXRP
   submission_rpcs:
     - "https://mainnet-sequencer.base.org"                     # Direct OP Stack sequencer (bypasses CDN)
     - "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"  # Alchemy parallel submit
@@ -87,11 +76,11 @@ chain:
   # If those routes start reverting, raise this floor — it is the only extra guard they have.
   # With optimistic_submission: true, V3-leg routes are submitted UNVERIFIED on spot quotes; the
   # engine then deducts the ~0.30% V3 overestimate (V3_SPOT_OVERESTIMATE_BPS) before this floor.
-  min_triangular_profit_usd: 0.15
-  optimize_size: false          # skip adaptive size optimizer (~80-100ms saved per opportunity)
-  priority_fee_wei: 10000000    # 10 Mwei floor — pending monitor uses max(trigger_tip, this); block 44487221 showed pos-1 at 15000 Mwei (trigger_tip dominates for pending path)
-  pending_tx_monitoring: true   # monitor mempool for large swaps before they confirm → same-block arb
-  pending_only_submission: false # only submit TXs from pending monitor path; block/poll scans detect but don't submit (avoids pos 500+ failures)
+  min_triangular_profit_usd: 0.05   # sized triangles (often $200–2K) earn $0.05–0.15 (gas ≈ $0.04)
+  # trade_amount / max_trade per pair are the CEILING (5000 USDC/USDT, 2 WETH since 2026-11-04):
+  # each route is re-sized locally to its profit peak below it (strategy/size.rs, no RPC).
+  optimize_size: false          # skip the RPC size optimizer (~80-100ms); local sizing replaces it
+  priority_fee_wei: 10000000    # 10 Mwei floor (tuning.tip_profit_share_bps raises it per trade)
   poll_logs_fallback: false     # Alchemy WS logs are live — skip duplicate eth_getLogs polling
 
 
@@ -265,8 +254,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $38M/day: UniV3, Slipstream, PancakeV3
   - id: "base-usdc-cbbtc"
@@ -276,8 +265,8 @@ pairs:
     token_out_symbol: "CBBTC"
     token_in_decimals: 6
     token_out_decimals: 8
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $14M/day: Slipstream (deepest), UniV3, PancakeV3
   - id: "base-usdc-usdt"
@@ -287,8 +276,8 @@ pairs:
     token_out_symbol: "USDT"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $5.7M/day: Slipstream $2.9M deep vs UniV3
   - id: "base-usdt-weth"
@@ -298,8 +287,8 @@ pairs:
     token_out_symbol: "WETH"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $5.2M/day: AerodromeV2 $17.8M, Slipstream, UniV3
   - id: "base-usdc-aero"
@@ -320,8 +309,8 @@ pairs:
     token_out_symbol: "EURC"
     token_in_decimals: 6
     token_out_decimals: 6
-    trade_amount: "10000"
-    max_trade: "10000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
   # $0.5M/day: UniV3, PancakeV3, AerodromeV2
   - id: "base-usdc-virtual"
@@ -334,8 +323,7 @@ pairs:
     trade_amount: "5000"
     max_trade: "5000"
 
-  # ── Added 2026-10-28 (Halal screen + scripts/token-scout.py). Pools of these tokens are
-  # watched on the keyless preconf feed only (chain.preconf_only_tokens), not on Alchemy.
+  # ── Added 2026-10-28 (Halal screen + scripts/token-scout.py).
   # All four passed a fork transfer test (received == sent: no transfer fee).
   # VVV (Venice AI): Aerodrome V2 $8.3M, Slipstream $2.5M, UniV3 USDC $1.0M, UniV3 WETH 1% $1.0M.
   - id: "base-usdc-vvv"
@@ -394,8 +382,8 @@ pairs:
     token_out_symbol: "USDC"
     token_in_decimals: 18
     token_out_decimals: 6
-    trade_amount: "5"
-    max_trade: "5"
+    trade_amount: "2"
+    max_trade: "2"
 
   - id: "base-weth-usdt"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -404,8 +392,8 @@ pairs:
     token_out_symbol: "USDT"
     token_in_decimals: 18
     token_out_decimals: 6
-    trade_amount: "5"
-    max_trade: "5"
+    trade_amount: "2"
+    max_trade: "2"
 
   - id: "base-weth-cbbtc"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -414,8 +402,8 @@ pairs:
     token_out_symbol: "CBBTC"
     token_in_decimals: 18
     token_out_decimals: 8
-    trade_amount: "5"
-    max_trade: "5"
+    trade_amount: "2"
+    max_trade: "2"
 
   - id: "base-weth-aero"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -424,8 +412,8 @@ pairs:
     token_out_symbol: "AERO"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "4"
-    max_trade: "4"
+    trade_amount: "2"
+    max_trade: "2"
 
   - id: "base-weth-virtual"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -434,8 +422,8 @@ pairs:
     token_out_symbol: "VIRTUAL"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "4"
-    max_trade: "4"
+    trade_amount: "2"
+    max_trade: "2"
 
   - id: "base-weth-vvv"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -444,8 +432,8 @@ pairs:
     token_out_symbol: "VVV"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "4"
-    max_trade: "4"
+    trade_amount: "2"
+    max_trade: "2"
 
 
 
@@ -466,8 +454,8 @@ pairs:
     token_out_symbol: "cbETH"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # WETH: Aero CL $1.8M, UniV3 $950K, Aerodrome $555K; USDC UniV3 $457K
   - id: "base-weth-morpho"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -476,8 +464,8 @@ pairs:
     token_out_symbol: "MORPHO"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # WETH: Aero CL $1.2M, Aerodrome $829K, UniV3 $207K
   - id: "base-weth-aave"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -486,8 +474,8 @@ pairs:
     token_out_symbol: "AAVE"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # USDC: Aero CL $399K, Aerodrome $120K, UniV3 $67K; cbBTC Pancake $678K, Aero CL $460K
   - id: "base-usdc-sol"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -496,8 +484,8 @@ pairs:
     token_out_symbol: "SOL"
     token_in_decimals: 6
     token_out_decimals: 9
-    trade_amount: "3000"
-    max_trade: "3000"
+    trade_amount: "5000"
+    max_trade: "5000"
   # WETH: Aero CL $312K, Aerodrome $54K, UniV3 $51K
   - id: "base-weth-zro"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -506,8 +494,8 @@ pairs:
     token_out_symbol: "ZRO"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # WETH: Aerodrome $770K, Aero CL $365K, UniV3 $87K
   - id: "base-weth-wsteth"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -516,8 +504,8 @@ pairs:
     token_out_symbol: "wstETH"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # WETH: Aerodrome $1.6M, Aero CL $585K; cbBTC Aerodrome $1.3M
   - id: "base-weth-zen"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -526,8 +514,8 @@ pairs:
     token_out_symbol: "ZEN"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # WETH: Aero CL $1.0M, Aerodrome $520K, UniV3 $96K; USDC Aerodrome $1.1M
   - id: "base-weth-drv"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -536,8 +524,8 @@ pairs:
     token_out_symbol: "DRV"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # USDC: UniV3 $482K, Aerodrome $96K; WETH UniV3 $63K
   - id: "base-usdc-flock"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -546,8 +534,8 @@ pairs:
     token_out_symbol: "FLOCK"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "3000"
-    max_trade: "3000"
+    trade_amount: "5000"
+    max_trade: "5000"
   # USDC: UniV3 $1.8M, Aero CL $458K
   - id: "base-usdc-xdp"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -566,8 +554,8 @@ pairs:
     token_out_symbol: "DIEM"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "3000"
-    max_trade: "3000"
+    trade_amount: "5000"
+    max_trade: "5000"
   # WETH: Aero CL $1.0M, Aerodrome $1.0M
   - id: "base-weth-mseth"
     token_in: "0x4200000000000000000000000000000000000006"
@@ -576,8 +564,8 @@ pairs:
     token_out_symbol: "msETH"
     token_in_decimals: 18
     token_out_decimals: 18
-    trade_amount: "1"
-    max_trade: "1"
+    trade_amount: "2"
+    max_trade: "2"
   # USDC: Aero CL $888K, Aerodrome $426K
   - id: "base-usdc-msusd"
     token_in: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -596,8 +584,8 @@ pairs:
     token_out_symbol: "EDEL"
     token_in_decimals: 6
     token_out_decimals: 18
-    trade_amount: "3000"
-    max_trade: "3000"
+    trade_amount: "5000"
+    max_trade: "5000"
 
 tuning:
   # ── Execution ──
@@ -620,12 +608,14 @@ tuning:
   # counted in the gas cost, so the net-profit gate and on-chain floor still cover it.
   # 2026-10-31: 30%. Block 53330577: a real +0.9% WETH/AERO gap was taken by bots tipping
   # 0.2-1.5 gwei; at the 0.01 gwei floor we would have been ordered behind all of them.
-  tip_profit_share_bps: 3000             # e.g. 1000 = up to 10% of gross profit (max 9000)
+  # 2026-11-04: 5%. At 30% the two lost races of Nov 2 paid $0.22/$0.30 in tip (~97% of
+  # their cost) on $1.3-1.7 gaps; winners of ordinary gaps tip ~0-0.06 gwei. 5% of a $20
+  # gap is still ~0.5 gwei, so large gaps keep a competitive tip.
+  tip_profit_share_bps: 500              # e.g. 1000 = up to 10% of gross profit (max 9000)
   tip_max_wei: 2000000000                # 2 gwei per gas cap
   # ── Detection ──
   # Tenths of a bp: 5 = 0.5 bp ($0.25 on a 5k trade). Quotes are exact (QuoterV2 / xy=k at the
-  # Flashblocks `pending` state), so this only covers drift between quote and inclusion (~1
-  # Flashblock). A trade that drifts below minProfit reverts on-chain, costing only gas. Was 2 bp
+  # `latest` state), so this only covers drift between quote and inclusion (~1 block, 200 ms). A trade that drifts below minProfit reverts on-chain, costing only gas. Was 2 bp
   # until 2026-10-28 ($1 per 5k candidate, more than the smallest hits); raise it if the dry-run
   # sim-fail / revert rate climbs.
   quoter_haircut_dbps: 5
@@ -668,30 +658,34 @@ tuning:
   volatile_pool_max_age_ms: 120000
   stable_pool_max_age_ms: 30000
   feed_silence_ms: 30000
+  feed_blind_ms: 120000                # no pool log this long → heartbeat BLIND (ERROR, /health 503)
   v3_fresh_window_ms: 30000
   # ── RPC ──
   rpc_read_timeout_ms: 5000
-  # rpc_simulate_timeout_ms: 1000        # block-relative: ½ block
+  # rpc_simulate_timeout_ms: 800         # block-relative: ½ block, at least 800 ms
   rpc_send_timeout_ms: 5000
   multicall_chunk_size: 10
   multicall_chunk_timeout_ms: 3000
   discover_chunk_size: 20
   discover_call_timeout_ms: 15000
-  # quote_cache_max_age_ms: 6000         # block-relative: 3 blocks
+  # quote_cache_max_age_ms: 1000         # block-relative: 3 blocks, at least 1 s
   quote_cache_max_pools: 1024
-  quote_cache_settle_ms: 500             # no caching while the pool moved < this ago (Flashblocks pending lag)
+  quote_cache_settle_ms: 500             # no caching while the pool moved < this ago (quote RPC lagging the WS logs)
   health_hold_base_ms: 10000             # execution off after an RPC outage, at least
   health_hold_max_ms: 80000              # repeated relapses double up to this
   health_relapse_window_ms: 60000
-  # health_monitor_every_ms: 2000        # block-relative: 1 block
+  # health_monitor_every_ms: 1000        # block-relative: 1 block, at least 1 s
   quoter_never_ok_warn_after_ms: 30000
   quoter_broken_warn_after_ms: 300000
   quoter_warn_min_batches: 5
   rate_limit_log_every_ms: 30000
   rpc_latency_sample_ms: 60000          # dashboard latency ping on ws_rpc (eth_blockNumber); 1,440/day
   # ── Scan loop ──
-  cooldown_secs: 15
-  send_cooldown_secs: 15
+  # 4 s (was 15) = 20 blocks at 200 ms: gaps on busy routes reopen within seconds; pending_pairs
+  # still blocks a second send while one is in flight. Lower it once live sends show how often
+  # a route that just reverted is profitable again.
+  cooldown_secs: 4
+  send_cooldown_secs: 4
   gas_reject_cooldown_secs: 60
   max_consecutive_failures: 20           # circuit breaker (RPC outages don't count)
   slow_scan_warn_ms: 10000

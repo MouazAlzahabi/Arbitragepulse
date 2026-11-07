@@ -1,5 +1,8 @@
 /var/log/arbitragepulse/*.log {
     daily
+    # Also rotate mid-day once the file passes 200 MB (setup.sh runs logrotate hourly).
+    # A noisy fault wrote 1.7 GB in one day (2026-11-06).
+    maxsize 200M
     missingok
     rotate 14
     compress

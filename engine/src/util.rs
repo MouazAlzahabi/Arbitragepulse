@@ -30,27 +30,24 @@ pub fn addr_key(addr: Address) -> String {
 }
 
 
-// ─── Block time for `pending` calls ──────────────────────────────────────────
-// A `pending` eth_call runs on flashblock state, but every Base node (Alchemy, Infura,
-// mainnet.base.org, …) executes it with the block number/timestamp of a block 1–4 back.
-// Aero's swap hook charges its floor fee when `block.timestamp` is earlier than its last
-// update, so Aero CL quotes and simulations came out up to ~800 ppm too cheap and sent
-// trades that could only revert. Every `pending` call therefore overrides the block time
-// with the latest the pending block can carry: the next slot after now, plus one.
+// ─── Chain head and block position ──────────────────────────────────────────
+// Base builds a canonical block every 200 ms (Denim upgrade, 2026-11-05; Flashblocks and
+// the `pending` preview were retired with it). Block timestamps are whole seconds, so
+// ~5 blocks share one: positions are counted from when the head arrived, not from its
+// timestamp.
 
-/// Latest head: its number, timestamp and the wall-clock ms it arrived at (0 = none yet).
+/// Latest head: its number and the wall-clock ms it arrived at (0 = none yet).
 static HEAD_NUM: AtomicU64 = AtomicU64::new(0);
-static HEAD_TS: AtomicU64 = AtomicU64::new(0);
 static HEAD_SEEN_MS: AtomicU64 = AtomicU64::new(0);
-/// Block time in seconds (Base: 2).
-static SLOT_SECS: AtomicU64 = AtomicU64::new(2);
+/// Block time in ms (Base: 200).
+static SLOT_MS: AtomicU64 = AtomicU64::new(200);
 
 fn wall_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-pub fn set_slot_secs(block_time_ms: u64) {
-    SLOT_SECS.store((block_time_ms / 1000).max(1), Ordering::Relaxed);
+pub fn set_slot_ms(block_time_ms: u64) {
+    SLOT_MS.store(block_time_ms.max(1), Ordering::Relaxed);
 }
 
 /// Record a new head. Returns the server clock's lead over the chain in seconds (wall
@@ -58,49 +55,29 @@ pub fn set_slot_secs(block_time_ms: u64) {
 pub fn note_head(number: u64, timestamp: u64) -> i64 {
     let now = wall_ms();
     HEAD_NUM.store(number, Ordering::Relaxed);
-    HEAD_TS.store(timestamp, Ordering::Relaxed);
     HEAD_SEEN_MS.store(now, Ordering::Relaxed);
     (now / 1000) as i64 - timestamp as i64
 }
 
-/// Block time for a `pending` call at wall-clock `now_ms`. Chain time is the later of the
-/// wall clock and the last head advanced by the time since it arrived, so a server clock
-/// running behind can't pull the override before the hook's last update.
-fn pending_time_at(now_ms: u64, head_ts: u64, head_seen_ms: u64, slot: u64) -> u64 {
-    let since_head = if head_seen_ms == 0 { 0 } else { now_ms.saturating_sub(head_seen_ms) };
-    let chain_ms = now_ms.max(head_ts * 1000 + since_head);
-    if head_ts == 0 {
-        // No head yet: round up to a whole second, then add a slot.
-        return chain_ms.div_ceil(1000) + slot;
-    }
-    // Slots are aligned on the head's timestamp: first slot at/after chain time, plus one.
-    let ahead = chain_ms.saturating_sub(head_ts * 1000).div_ceil(slot * 1000);
-    head_ts + slot * (ahead + 1)
-}
-
-/// The block being built at wall-clock `now_ms` and how many ms into its slot that is. A
-/// block with timestamp T is built during the slot before T, so a tx sent now can land in
-/// it at the earliest. Chain time as in [`pending_time_at`]. None before the first head.
-fn block_position_at(now_ms: u64, head_num: u64, head_ts: u64, head_seen_ms: u64, slot: u64) -> Option<(u64, u64)> {
-    if head_ts == 0 {
+/// The block being built at wall-clock `now_ms` and how many ms into its slot that is:
+/// the head's successor while the head is younger than a slot, then one block per slot.
+/// None before the first head.
+fn block_position_at(now_ms: u64, head_num: u64, head_seen_ms: u64, slot_ms: u64) -> Option<(u64, u64)> {
+    if head_seen_ms == 0 {
         return None;
     }
-    let since_head = if head_seen_ms == 0 { 0 } else { now_ms.saturating_sub(head_seen_ms) };
-    let chain_ms = now_ms.max(head_ts * 1000 + since_head);
-    let into_head = chain_ms.saturating_sub(head_ts * 1000);
-    let k = into_head / (slot * 1000) + 1;
-    Some((head_num + k, into_head % (slot * 1000)))
+    let since_head = now_ms.saturating_sub(head_seen_ms);
+    Some((head_num + 1 + since_head / slot_ms, since_head % slot_ms))
 }
 
-/// [`block_position_at`] now: `(block being built, ms into its slot)`, for the send and
-/// receipt logs (with ~10 flashblocks per slot, ms / 200 is roughly the flashblock index).
+/// [`block_position_at`] now: `(block being built, ms into its slot)`, for the swap-event,
+/// send and receipt logs.
 pub fn block_position_now() -> Option<(u64, u64)> {
     block_position_at(
         wall_ms(),
         HEAD_NUM.load(Ordering::Relaxed),
-        HEAD_TS.load(Ordering::Relaxed),
         HEAD_SEEN_MS.load(Ordering::Relaxed),
-        SLOT_SECS.load(Ordering::Relaxed),
+        SLOT_MS.load(Ordering::Relaxed),
     )
 }
 
@@ -153,14 +130,14 @@ fn percentiles(samples: &mut [u64]) -> Option<(u64, u64, u64)> {
     Some((rank(50), rank(95), samples[samples.len() - 1]))
 }
 
-/// ms into the slot of the block being built when a pool log arrived, for logs of that
-/// block (flashblock preconf). A proxy for feed lag: preconf logs carry no flashblock index.
-pub static LAT_SEEN: LatencyWindow = LatencyWindow::new();
-/// Flashblocks pool logs that arrived after their block's slot ended (by our clock).
-pub static LAT_SEEN_LATE: AtomicU64 = AtomicU64::new(0);
+/// Pool logs received on the sealed-block feed (heartbeat `logs=`).
+pub static LOGS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+/// Swap scans that answered events from more than one block, because the previous scan
+/// was still running when the next block's logs came in (heartbeat `merged=`).
+pub static SCANS_MERGED: AtomicU64 = AtomicU64::new(0);
 /// How long a swap event waited in the scan queue while the chain loop was busy.
 pub static LAT_QUEUE: LatencyWindow = LatencyWindow::new();
-/// Scan duration (the chain loop is busy for it): full (block / poll) and targeted (swap / pending).
+/// Scan duration (the chain loop is busy for it): full (periodic) and targeted (swap).
 pub static LAT_SCAN_FULL: LatencyWindow = LatencyWindow::new();
 pub static LAT_SCAN_TARGETED: LatencyWindow = LatencyWindow::new();
 /// Swap events dropped because the scan queue was full.
@@ -168,24 +145,14 @@ pub static SWAP_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Last endpoint round trips (`host=Xms …`) from the background RTT sampler.
 pub static ENDPOINT_RTT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-/// Record a pool log's arrival against `pos` (`block_position_now()` at arrival).
-pub fn note_log_seen(log_block: u64, pos: Option<(u64, u64)>) {
-    let Some((building, ms)) = pos else { return };
-    if log_block >= building {
-        LAT_SEEN.record(ms);
-    } else if log_block > 0 {
-        LAT_SEEN_LATE.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// The heartbeat's `lat` field; clears the windows.
 pub fn take_latency_summary() -> String {
     let rtt = ENDPOINT_RTT.lock().map(|s| s.clone()).unwrap_or_default();
     format!(
-        "seen={} late={} queue={} scan_full={} scan_targeted={} drops={} rtt=[{}]",
-        LAT_SEEN.take_summary(),
-        LAT_SEEN_LATE.swap(0, Ordering::Relaxed),
+        "logs={} queue={} merged={} scan_full={} scan_targeted={} drops={} rtt=[{}]",
+        LOGS_RECEIVED.swap(0, Ordering::Relaxed),
         LAT_QUEUE.take_summary(),
+        SCANS_MERGED.swap(0, Ordering::Relaxed),
         LAT_SCAN_FULL.take_summary(),
         LAT_SCAN_TARGETED.take_summary(),
         SWAP_DROPS.swap(0, Ordering::Relaxed),
@@ -193,26 +160,48 @@ pub fn take_latency_summary() -> String {
     )
 }
 
-/// False when the quote endpoint ignores block overrides (startup probe): its `pending`
-/// block time can't be fixed, so hooked (Aero CL) quotes are switched off.
-static PENDING_TIME_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+// ─── Repeated warnings ───────────────────────────────────────────────────────
+// A broken pool or a refusing endpoint repeats the same warning every scan (2.35M lines
+// in 5 h on 2026-11-05): log each key at most once per window, with how many were held.
 
-pub fn set_pending_time_ok(ok: bool) {
-    PENDING_TIME_OK.store(ok, Ordering::Relaxed);
+static THROTTLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Window for [`throttle`]d warnings.
+pub const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// `Some(held)` when the warning keyed `key` should be logged now (`held` = repeats
+/// suppressed since it was last logged), `None` while it is inside `every`.
+pub fn throttle(key: &str, every: std::time::Duration) -> Option<u64> {
+    throttle_at(&THROTTLED, key, every, std::time::Instant::now())
 }
 
-pub fn pending_time_ok() -> bool {
-    PENDING_TIME_OK.load(Ordering::Relaxed)
-}
-
-/// Block overrides for a call at `block`: the pending block's time for `pending`, none
-/// otherwise (a mined block's environment is already consistent with its state).
-pub fn pending_block_overrides(block: alloy::eips::BlockId) -> Option<alloy::rpc::types::BlockOverrides> {
-    if block != alloy::eips::BlockId::pending() {
-        return None;
+fn throttle_at(
+    map: &std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>,
+    key: &str,
+    every: std::time::Duration,
+    now: std::time::Instant,
+) -> Option<u64> {
+    let Ok(mut m) = map.lock() else { return Some(0) };
+    match m.get_mut(key) {
+        Some((last, held)) if now.duration_since(*last) < every => {
+            *held += 1;
+            None
+        }
+        Some((last, held)) => {
+            *last = now;
+            Some(std::mem::take(held))
+        }
+        None => {
+            m.insert(key.to_string(), (now, 0));
+            Some(0)
+        }
     }
-    let time = pending_time_at(wall_ms(), HEAD_TS.load(Ordering::Relaxed), HEAD_SEEN_MS.load(Ordering::Relaxed), SLOT_SECS.load(Ordering::Relaxed));
-    Some(alloy::rpc::types::BlockOverrides { time: Some(time), ..Default::default() })
+}
+
+/// " (N more since the last report)" for a throttled warning, empty when nothing was held.
+pub fn held_suffix(held: u64) -> String {
+    if held == 0 { String::new() } else { format!(" ({} more since the last report)", held) }
 }
 
 // ─── RPC timeouts ─────────────────────────────────────────────────────────────
@@ -592,36 +581,26 @@ mod tests {
     }
 
     #[test]
-    fn pending_time_is_the_slot_after_next() {
-        // Head at t=100 seen at 100.4 s: next slot at/after now is 102, override 104.
-        assert_eq!(pending_time_at(100_400, 100, 100_400, 2), 104);
-        // Exactly on a slot boundary: that slot, plus one.
-        assert_eq!(pending_time_at(102_000, 100, 100_000, 2), 104);
-        // Server clock 5 s behind the chain: head time + elapsed wins, never earlier.
-        assert_eq!(pending_time_at(95_000, 100, 95_000, 2), 102);
-        assert_eq!(pending_time_at(98_500, 100, 95_000, 2), 106);
-        // No head yet: wall clock rounded up, plus a slot.
-        assert_eq!(pending_time_at(100_400, 0, 0, 2), 103);
-    }
-
-    #[test]
     fn block_position_is_the_block_being_built() {
-        // Head 50 (t=100) seen at 100.3 s: block 51 (t=102) is being built, 300 ms in.
-        assert_eq!(block_position_at(100_300, 50, 100, 100_300, 2), Some((51, 300)));
-        // 1.9 s after the head: still block 51, near the end of its slot.
-        assert_eq!(block_position_at(101_900, 50, 100, 100_000, 2), Some((51, 1_900)));
-        // On the next slot boundary: block 52 starts.
-        assert_eq!(block_position_at(102_000, 50, 100, 100_000, 2), Some((52, 0)));
-        // Server clock 5 s behind: head time + elapsed wins.
-        assert_eq!(block_position_at(95_500, 50, 100, 95_000, 2), Some((51, 500)));
+        // Head 50 seen at t=100.0 s, 200 ms slots: block 51 is being built.
+        assert_eq!(block_position_at(100_000, 50, 100_000, 200), Some((51, 0)));
+        assert_eq!(block_position_at(100_150, 50, 100_000, 200), Some((51, 150)));
+        // A slot later with no new head: block 52, then 53.
+        assert_eq!(block_position_at(100_200, 50, 100_000, 200), Some((52, 0)));
+        assert_eq!(block_position_at(100_430, 50, 100_000, 200), Some((53, 30)));
         // No head yet.
-        assert_eq!(block_position_at(100_000, 0, 0, 0, 2), None);
+        assert_eq!(block_position_at(100_000, 0, 0, 200), None);
     }
 
     #[test]
-    fn only_pending_gets_block_overrides() {
-        assert!(pending_block_overrides(alloy::eips::BlockId::latest()).is_none());
-        let o = pending_block_overrides(alloy::eips::BlockId::pending()).expect("pending overrides");
-        assert!(o.time.is_some() && o.number.is_none());
+    fn throttle_logs_once_per_window_with_the_held_count() {
+        let map = std::sync::Mutex::new(std::collections::HashMap::new());
+        let (t0, w) = (std::time::Instant::now(), std::time::Duration::from_secs(600));
+        assert_eq!(throttle_at(&map, "a", w, t0), Some(0));
+        assert_eq!(throttle_at(&map, "a", w, t0 + std::time::Duration::from_secs(1)), None);
+        assert_eq!(throttle_at(&map, "a", w, t0 + std::time::Duration::from_secs(2)), None);
+        assert_eq!(throttle_at(&map, "b", w, t0 + std::time::Duration::from_secs(2)), Some(0), "keys are independent");
+        assert_eq!(throttle_at(&map, "a", w, t0 + w), Some(2));
+        assert_eq!(throttle_at(&map, "a", w, t0 + w + std::time::Duration::from_secs(1)), None);
     }
 }

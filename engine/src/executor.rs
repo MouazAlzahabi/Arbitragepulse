@@ -40,8 +40,7 @@ fn gas_limit_triangular() -> u64 { crate::config::tuning().gas_limit_triangular 
 /// check remains the economic guard.
 fn onchain_min_profit_bps() -> u64 { crate::config::tuning().onchain_min_profit_bps }
 
-/// Priority fee (wei per gas) for a trade: `base` (the fixed `chain.priority_fee_wei`, or
-/// the pending-path override), raised to `share_bps` of the expected gross profit spread
+/// Priority fee (wei per gas) for a trade: `base` (the fixed `chain.priority_fee_wei`), raised to `share_bps` of the expected gross profit spread
 /// over the gas limit, capped at `cap`. `share_bps == 0` → `base`. Spreading over the gas
 /// LIMIT (actual use is lower) keeps the tip paid at or under the share.
 pub(crate) fn profit_share_tip(
@@ -112,24 +111,22 @@ pub struct TxPrep {
     /// True when secondary broadcast is needed and signing hasn't happened yet.
     /// Set by prepare_*(); cleared (and raw_tx filled) by sign_if_needed().
     pub needs_sign: bool,
-    /// Preconf endpoint for pre-flight simulation at `pending` (see [`simulate_call`]).
+    /// Quote endpoint for pre-flight simulation (see [`simulate_call`]).
     pub sim_provider: Option<DynProvider>,
 }
 
-/// eth_call a trade: on the preconf endpoint at `pending` when set (the state the quotes
-/// priced), else on `provider` at `latest`. `overrides` (dry-run only) patches state for
+/// eth_call a trade at `latest`: on the quote endpoint when set (the endpoint the quotes
+/// priced on), else on `provider`. `overrides` (dry-run only) patches state for
 /// this call, e.g. an assumed start-token balance — see [`balance_override`].
 pub(crate) async fn simulate_call<P: Provider>(
     provider: &P,
-    preconf: Option<&DynProvider>,
+    quote_endpoint: Option<&DynProvider>,
     tx: TransactionRequest,
     overrides: Option<StateOverride>,
 ) -> alloy::transports::TransportResult<alloy::primitives::Bytes> {
-    // `pending` runs with a stale block time; see [`crate::util::pending_block_overrides`].
-    let pending_at = crate::util::pending_block_overrides(alloy::eips::BlockId::pending());
-    match (preconf, overrides) {
-        (Some(pc), Some(o)) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending()).overrides(o).with_block_overrides_opt(pending_at)).await,
-        (Some(pc), None) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).block(alloy::eips::BlockId::pending()).with_block_overrides_opt(pending_at)).await,
+    match (quote_endpoint, overrides) {
+        (Some(pc), Some(o)) => transport_timeout(rpc_simulate_timeout(), pc.call(tx).overrides(o)).await,
+        (Some(pc), None) => transport_timeout(rpc_simulate_timeout(), pc.call(tx)).await,
         (None, Some(o)) => transport_timeout(rpc_simulate_timeout(), provider.call(tx).overrides(o)).await,
         (None, None) => transport_timeout(rpc_simulate_timeout(), provider.call(tx)).await,
     }
@@ -204,9 +201,9 @@ pub struct Executor {
     /// receipt arrives.
     nonce: Option<u64>,
     db: Option<Arc<Database>>,
-    /// Gas price cache: (price_wei, timestamp). TTL = 2× block_time.
+    /// Gas price cache: (price_wei, timestamp). TTL = 2× block_time, at least 2 s.
     gas_price_cache: Option<(u128, Instant)>,
-    /// Gas price cache TTL (2× block_time for the chain).
+    /// Gas price cache TTL (2× block_time for the chain, at least 2 s).
     gas_price_cache_ttl: Duration,
     /// Atomics updated from receipt background tasks — safe to clone into spawns.
     pub confirmed_success: Arc<AtomicU64>,
@@ -236,8 +233,8 @@ pub struct Executor {
     deadline_secs: u64,
     /// Cached unix second + deadline (now + deadline_secs) — avoids syscall per prepare.
     deadline_cache: StdMutex<(u64, U256)>,
-    /// `chain.preconf_http_rpc` provider: simulations run on it at `pending`. Set by
-    /// chain/mod.rs after construction; None = the caller's provider at `latest`.
+    /// `chain.quote_http_rpc` provider: simulations run on it (at `latest`, like the
+    /// quotes). Set by chain/mod.rs after construction; None = the caller's provider.
     pub sim_provider: Option<DynProvider>,
     /// Dry-run only: balance-mapping slot per start token (found at startup by
     /// `state::discover_balance_slots`). An unfunded trade is then simulated with an assumed
@@ -318,8 +315,10 @@ impl Executor {
         deadline_secs: u64,
         db: Option<Arc<Database>>,
     ) -> Self {
-        // Gas price cache TTL = 2× block time (cache valid for 2 blocks)
-        let gas_price_cache_ttl = Duration::from_millis(block_time_ms * 2);
+        // Gas price cache TTL = 2× block time, at least 2 s. Each header refreshes it; at 200 ms
+        // blocks a bare 2× (400 ms) would put an eth_gasPrice round trip on the send path
+        // whenever a header is a little late. max_fee = 2×base + tip absorbs the drift.
+        let gas_price_cache_ttl = Duration::from_millis((block_time_ms * 2).max(2_000));
 
         Self {
             chain_id,
@@ -468,17 +467,15 @@ impl Executor {
         &mut self,
         provider: &P,
         opp: &ArbOpportunity,
-        tip_override: Option<u128>,
     ) -> Result<TxPrep> {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.gas_price_for_prepare(provider).await?;
-        // priority_fee (tip): pending-monitor override or the chain value, raised to the
-        // profit share when enabled. Part of gas_cost_usd, so the net-profit gate and the
+        // priority_fee (tip): the chain value, raised to the profit share when enabled. Part of gas_cost_usd, so the net-profit gate and the
         // on-chain minProfit floor both account for it.
         let priority_fee = trade_tip(
-            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_2hop(opp),
+            self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_2hop(opp),
         );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {
@@ -550,14 +547,13 @@ impl Executor {
         &mut self,
         provider: &P,
         opp: &TriangularOpportunity,
-        tip_override: Option<u128>,
     ) -> Result<TxPrep> {
         if self.paused {
             return Err(anyhow!("Executor paused"));
         }
         let gas_price = self.gas_price_for_prepare(provider).await?;
         let priority_fee = trade_tip(
-            tip_override.unwrap_or(self.priority_fee_wei), opp.profit_usd, self.native_price_usd, self.gas_triangular(opp),
+            self.priority_fee_wei, opp.profit_usd, self.native_price_usd, self.gas_triangular(opp),
         );
         let effective_gas_price = gas_price + priority_fee;
         let gas_cost_usd = {

@@ -6,7 +6,7 @@ use crate::util::{transport_timeout, RpcFailure, rpc_send_timeout};
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// After a simulation reverted `K()` on a V2/Aerodrome leg: in the background, read each of
-/// the route's V2/Aerodrome pools at the quote state (`pending` on the preconf endpoint) —
+/// the route's V2/Aerodrome pools at the quote state (`latest` on the quote endpoint) —
 /// reserves plus both token balances, one Multicall3 — and log whether they agree. A router
 /// swap on a consistent pool can't fail K, so `reserves==balances:no` confirms the simulation
 /// caught a pool mid-block; `yes` everywhere means the state had settled by the read (or
@@ -375,13 +375,10 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     // Pre-read from shared_state by the caller (alongside the paused check) to avoid
     // an extra shared_state.read().await here on every scan.
     disabled_set: std::sync::Arc<std::collections::HashSet<String>>,
-    // When Some, override the executor's priority_fee_wei for this submission.
-    // Used by pending TX monitor to match the trigger TX's tip for same-block landing.
-    tip_override: Option<u128>,
-    // Scan source: block | poll | swap | pending — execution telemetry (see chain/mod.rs call sites).
+    // Scan source: poll | swap — execution telemetry (see chain/mod.rs call sites).
     trigger: &'static str,
     // Arrival time and slot position of the event that triggered this scan (swap scans);
-    // None = the scan's own start (block / poll / pending). For the exec_lat line.
+    // None = the scan's own start (poll). For the exec_lat line.
     trigger_at: Option<(Instant, Option<(u64, u64)>)>,
 ) {
     // Detection phase timer (evaluate + triangular) — shared across all candidates this scan.
@@ -422,7 +419,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         };
 
         let is_full_scan = targeted.is_none();
-        // Targeted scans: 2-hop on pair mask; triangular only on swap/pending tokens (not full O(N³)).
+        // Targeted scans: 2-hop on pair mask; triangular only on the swapped pools' tokens (not full O(N³)).
         let token_filter = targeted.as_ref().map(|(_, tokens)| tokens.as_slice());
         let ((opps_2hop, best_2hop, verified_spread_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) =
             if is_full_scan {
@@ -608,31 +605,6 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         continue 'candidates;
     }
 
-    // ── Pending-only submission gate ──────────────────────────────────────────
-    // When pending_only_submission is enabled, block-scan / poll-tick / swap-event
-    // triggered calls have tip_override=None. Skip TX for those — log the opportunity
-    // so detection is visible, but don't submit (they land at position 500+ on Base).
-    // Pending-monitor triggered calls carry Some(tip_override) and always proceed.
-    if cfg.pending_only_submission && tip_override.is_none() {
-        let msg = format!(
-            "[{}] OPP! (pending-only mode, no submit) {} | profit=${:.4}",
-            cfg.name, display_id, best_opp.profit_usd(),
-        );
-        info!("{}", msg);
-        broadcast_log(
-            log_tx,
-            "opportunity",
-            &msg,
-            Some(serde_json::json!({
-                "chain":      cfg.name,
-                "pair_id":    display_id,
-                "profit_usd": best_opp.profit_usd(),
-                "detect_only": true,
-            })),
-        );
-        continue 'candidates;
-    }
-
     // ── Dispatch based on opportunity type ────────────────────────────────────
     // Per-candidate timer — excludes time spent on prior failed attempts this scan.
     let candidate_start = Instant::now();
@@ -658,7 +630,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 opp.clone()
             } else {
                 let strat = strategy.read().await;
-                match strat.preconf_quote_provider() {
+                match strat.quote_provider() {
                     Some(pc) => strat.optimize(opp, &pc, max_bal).await,
                     None => strat.optimize(opp, provider.as_ref(), max_bal).await,
                 }
@@ -760,7 +732,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     lat.lock_ms = lock_start.elapsed().as_millis() as u64;
                     let prep_start = Instant::now();
                     exec.dry_run = false;
-                    let r = exec.prepare_2hop(provider.as_ref(), &optimized, tip_override).await;
+                    let r = exec.prepare_2hop(provider.as_ref(), &optimized).await;
                     lat.prep_ms = prep_start.elapsed().as_millis() as u64;
                     r
                     // lock drops here — secp256k1 signing happens below, outside the lock
@@ -1248,7 +1220,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                     lat.lock_ms = lock_start.elapsed().as_millis() as u64;
                     let prep_start = Instant::now();
                     exec.dry_run = false;
-                    let r = exec.prepare_triangular(provider.as_ref(), opp, tip_override).await;
+                    let r = exec.prepare_triangular(provider.as_ref(), opp).await;
                     lat.prep_ms = prep_start.elapsed().as_millis() as u64;
                     r
                     // lock drops here — secp256k1 signing happens below, outside the lock

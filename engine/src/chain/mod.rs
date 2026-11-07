@@ -27,7 +27,6 @@ use crate::strategy::{Opportunity, Strategy};
 pub mod scan;
 pub mod state;
 pub mod discover;
-pub mod pending;
 pub mod maintain;
 
 /// Cooldown after a dry-run failure or balance-guard skip (cheap check, no RPC spent).
@@ -206,16 +205,16 @@ pub async fn run_chain(
 
     // Dedicated HTTP provider for QuoterV2 reads — HTTP/2 connection pooling is
     // faster than WS for single request-response calls (~20-40ms improvement).
-    // With `preconf_http_rpc` it is the Flashblocks endpoint instead, read at `pending`.
+    // With `quote_http_rpc`, quotes and simulations use that endpoint (at `latest`).
     // (URL validated at config load.)
-    let preconf_http: Option<alloy::providers::DynProvider> = cfg.preconf_http_rpc.as_deref()
+    let quote_http: Option<alloy::providers::DynProvider> = cfg.quote_http_rpc.as_deref()
         .and_then(|raw| {
             let url = raw.parse::<url::Url>().ok()?;
-            info!("[{}] Quotes and simulations at `pending` on {}", cfg.name, crate::util::redact_url(raw));
+            info!("[{}] Quotes and simulations on {}", cfg.name, crate::util::redact_url(raw));
             Some(ProviderBuilder::new().connect_http(url).erased())
         });
-    let http_provider: Option<alloy::providers::DynProvider> = preconf_http.clone().or(http_rpc_provider);
-    executor.lock().await.sim_provider = preconf_http.clone();
+    let http_provider: Option<alloy::providers::DynProvider> = quote_http.clone().or(http_rpc_provider);
+    executor.lock().await.sim_provider = quote_http.clone();
     // Background reads (contract/signer balances, ETH price) don't need the main provider's
     // speed or subscriptions: they go to the HTTP endpoint, keeping the main (paid) RPC for
     // subscriptions, sends, receipts and nonces. Falls back to the main provider without one.
@@ -239,10 +238,6 @@ pub async fn run_chain(
         cfg.optimistic_submission,
         http_provider,
     )));
-    if let Some(pc) = &preconf_http {
-        strategy.write().await.quote_block = alloy::eips::BlockId::pending();
-        probe_pending_time(pc, &cfg.name).await;
-    }
     maintain::spawn_depth_refresh(strategy.clone(), pool_cache.clone(), chain_pairs.clone(), cfg.name.clone());
 
     // ── Contract balance cache ─────────────────────────────────────────────────
@@ -273,7 +268,7 @@ pub async fn run_chain(
     // Balance slots for dry-run's assumed balance (simulate unfunded trades instead of
     // skipping them). On the simulation endpoint, which must accept eth_call state overrides.
     {
-        let sim: &alloy::providers::DynProvider = preconf_http.as_ref().unwrap_or(reads.as_ref());
+        let sim: &alloy::providers::DynProvider = quote_http.as_ref().unwrap_or(reads.as_ref());
         let tokens: Vec<Address> = contract_balances.read().await.keys().copied().collect();
         let slots = state::discover_balance_slots(sim, &tokens, contract_addr).await;
         let found: Vec<String> = chain_pairs.iter()
@@ -329,6 +324,7 @@ pub async fn run_chain(
                 dry_run: true,
                 paused: start_paused,
                 rpc_ok: true,   // we just connected successfully
+                blind: None,
                 last_block: 0,
                 last_block_at: 0,
                 rpc_latency_ms: 0.0,
@@ -336,6 +332,7 @@ pub async fn run_chain(
             });
         } else if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
             chain.rpc_ok = true;
+            chain.blind = None; // a previous run's verdict; the next heartbeat re-judges
             if start_paused {
                 chain.paused = true;
             }
@@ -362,13 +359,13 @@ pub async fn run_chain(
         ).await?;
     }
 
-    // ── Block-header subscription (drives immediate scanning on each new block) ──
+    // ── Block-header subscription (gas price, head position, stall watchdog) ──
     let (block_tx, mut block_rx) = mpsc::channel::<(u64, u128)>(64);
     {
         let provider_for_blocks = (*provider).clone();
         let chain_name_b = cfg.name.clone();
         let block_tx_b = block_tx.clone();
-        crate::util::set_slot_secs(cfg.block_time_ms);
+        crate::util::set_slot_ms(cfg.block_time_ms);
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             let mut clock_warned: Option<Instant> = None;
@@ -380,12 +377,11 @@ pub async fn run_chain(
                         while let Some(header) = stream.next().await {
                             let num = header.number;
                             let base_fee = header.base_fee_per_gas.unwrap_or(1_000_000_000) as u128;
-                            // Feeds the block time of `pending` calls. A server clock behind the
-                            // chain is corrected there; one far ahead quotes a later (cheaper)
-                            // hooked-pool fee, so say so.
+                            // Block positions in the logs count from the head's arrival. A server
+                            // clock far off the chain also skews trade deadlines, so say so.
                             let lead = crate::util::note_head(header.number, header.timestamp);
-                            if !(-1..=4).contains(&lead) && clock_warned.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
-                                warn!("[{}] Server clock is {}s {} the chain head — sync it (NTP): pending quotes use the chain's block time", chain_name_b, lead.abs(), if lead < 0 { "behind" } else { "ahead of" });
+                            if !(-2..=4).contains(&lead) && clock_warned.is_none_or(|t| t.elapsed() > Duration::from_secs(600)) {
+                                warn!("[{}] Server clock is {}s {} the chain head — sync it (NTP): trade deadlines use the host clock", chain_name_b, lead.abs(), if lead < 0 { "behind" } else { "ahead of" });
                                 clock_warned = Some(Instant::now());
                             }
                             debug!("[{}] New block #{}", chain_name_b, num);
@@ -404,27 +400,10 @@ pub async fn run_chain(
     }
 
     // ── Real-time log subscriptions for instant pool state updates ──────────
-    // Sealed-block logs (primary RPC) are the source of truth. With `preconf_ws_rpc`, the
-    // same filter is also subscribed as `pendingLogs` on a Flashblocks-aware endpoint:
-    // events from 200 ms pre-confirmed sub-blocks, ~1.2 s earlier. Both feed the same
-    // cache + scan trigger; PoolCache's log-position guard keeps them ordered and stops a
-    // log's sealed copy from triggering a second scan.
-    // Pools of `preconf_only_tokens` are left out of the sealed filter and watched on the
-    // preconf feed only. A missed preconf log can't cause a bad trade: quiet V2 pools are
-    // re-read before trading (recheck_quiet_pools) and V3 legs are QuoterV2-verified.
+    // Canonical-block logs on the primary RPC: every pool, one batch per 200 ms block. They
+    // update the cache and trigger the targeted scan. (Base retired Flashblocks and their
+    // `pendingLogs` feed with the Denim upgrade; a sealed block is now as early as it gets.)
     let solidly_sync_hash_sub = alloy::primitives::keccak256(b"Sync(uint256,uint256)");
-    let preconf_logs = Arc::new(AtomicU64::new(0));
-    let preconf_only: HashSet<Address> = if cfg.preconf_ws_rpc.is_some() {
-        cfg.preconf_only_tokens.iter().filter_map(|t| match t.parse::<Address>() {
-            Ok(a) => Some(a),
-            Err(_) => { warn!("[{}] preconf_only_tokens: invalid address {}", cfg.name, t); None }
-        }).collect()
-    } else {
-        if !cfg.preconf_only_tokens.is_empty() {
-            warn!("[{}] preconf_only_tokens set without preconf_ws_rpc — watching those pools on ws_rpc", cfg.name);
-        }
-        HashSet::new()
-    };
     let log_feed = LogFeed {
         cache: pool_cache.clone(),
         swap_tx: swap_tx_for_sub.clone(),
@@ -434,7 +413,7 @@ pub async fn run_chain(
         large_swap_bps: cfg.large_swap_threshold_bps,
         large_v3_bps: cfg.large_v3_threshold_bps,
     };
-    // Starts both log feeds for the cache's current pools. Re-run by pool rediscovery
+    // Starts the log feeds for the cache's current pools. Re-run by pool rediscovery
     // (maintain.rs) when new pools appear: the new feeds start before the old ones are
     // aborted, so no log is missed; the overlap's duplicates are dropped by the cache's
     // log-position guard.
@@ -442,43 +421,26 @@ pub async fn run_chain(
     let v4_managers: Vec<Address> = chain_routers.iter().filter(|r| r.v4)
         .filter_map(|r| r.address.parse().ok()).collect();
     let start_log_feeds: Arc<dyn Fn() -> Vec<tokio::task::JoinHandle<()>> + Send + Sync> = {
-        let (cache, provider, preconf_url) = (pool_cache.clone(), provider.clone(), cfg.preconf_ws_rpc.clone());
-        let (feed, counter, chain_name) = (log_feed.clone(), preconf_logs.clone(), cfg.name.clone());
+        let (cache, provider, feed) = (pool_cache.clone(), provider.clone(), log_feed.clone());
         Arc::new(move || {
-            let all_addrs = cache.watch_addresses();
-            let (sealed_addrs, preconf_only_n) = split_preconf_only(&all_addrs, &preconf_only, |p| cache.get_pool_tokens(p));
-            if preconf_only_n > 0 {
-                info!("[{}] {} of {} pools watched on the preconf feed only (preconf_only_tokens)",
-                      chain_name, preconf_only_n, all_addrs.len());
-            }
-            let topics = crate::listener::pool_log_topics(solidly_sync_hash_sub);
+            let addrs = cache.watch_addresses();
             let mut handles = Vec::new();
             // An address-less filter would match every log on the chain: skip it instead.
-            if !sealed_addrs.is_empty() {
-                let sealed_filter = alloy::rpc::types::Filter::new()
-                    .address(sealed_addrs)
-                    .event_signature(topics.clone());
-                handles.push(spawn_log_subscription((*provider).clone(), sealed_filter, feed.clone(), None, None));
-            }
-            if let Some(url) = preconf_url.clone() {
-                // Connected in the background: an optional feed must never hold up startup.
-                let log_filter = alloy::rpc::types::Filter::new()
-                    .address(all_addrs)
-                    .event_signature(topics);
-                handles.push(spawn_preconf_subscription(url, log_filter, feed.clone(), counter.clone()));
+            if !addrs.is_empty() {
+                let filter = alloy::rpc::types::Filter::new()
+                    .address(addrs)
+                    .event_signature(crate::listener::pool_log_topics(solidly_sync_hash_sub));
+                handles.push(spawn_log_subscription((*provider).clone(), filter, feed.clone()));
             }
             // V4: the PoolManager's Swap / ModifyLiquidity for the cached pool ids only (it
-            // logs for every V4 pool on the chain). Both feeds, like the pools above.
+            // logs for every V4 pool on the chain).
             let v4_ids = cache.v4_pool_ids();
             if !v4_managers.is_empty() && !v4_ids.is_empty() {
                 let v4_filter = alloy::rpc::types::Filter::new()
                     .address(v4_managers.clone())
                     .event_signature(crate::listener::v4_log_topics())
                     .topic1(v4_ids);
-                handles.push(spawn_log_subscription((*provider).clone(), v4_filter.clone(), feed.clone(), None, None));
-                if let Some(url) = preconf_url.clone() {
-                    handles.push(spawn_preconf_subscription(url, v4_filter, feed.clone(), counter.clone()));
-                }
+                handles.push(spawn_log_subscription((*provider).clone(), v4_filter, feed.clone()));
             }
             handles
         })
@@ -490,24 +452,6 @@ pub async fn run_chain(
         start_log_feeds.clone(), log_feed_handles, cfg.name.clone(),
         (contract_addr, dry_run_at_start, log_tx.clone()),
     );
-
-    // ── Pending TX monitor (optional, requires mempool-enabled WS endpoint) ──
-    // Fires a targeted arb scan with matching tip when a large swap is detected
-    // before it confirms — enables same-block execution on FCFS chains like Base.
-    let (pending_tx_chan, mut pending_rx) = mpsc::channel::<pending::PendingSwapEvent>(256);
-    if cfg.pending_tx_monitoring {
-        // Primary ws_rpc only (Alchemy — has mempool access). The ws_rpc_fallbacks are public
-        // endpoints that don't expose the mempool on OP Stack: cycling onto them only failed
-        // every 30 s. With one URL a dropped connection reconnects to it with backoff.
-        let pending_ws_urls: Vec<String> = vec![cfg.ws_rpc.clone()];
-        pending::spawn_pending_monitor(
-            cfg.name.clone(),
-            pending_ws_urls,
-            // 0 = no size filter: profitability is decided in evaluate_and_execute().
-            0u128,
-            pending_tx_chan,
-        );
-    }
 
     info!("[{}] Chain engine started", cfg.name);
     broadcast_log(
@@ -567,18 +511,23 @@ pub async fn run_chain(
     let scan_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // ── Main loop ──
-    // Tracks when the last full evaluate ran — used to gate the poll_tick fallback.
+    // Detection runs on pool logs: each block's swaps on our pools trigger one targeted
+    // scan of the pairs they touch (swap arm). A block with no such swap needs no scan —
+    // nothing we price moved. The full scan (every pair and triangle) runs every
+    // `scan_interval_ms` (10 s) as the safety net for state that moved without a log we saw.
+    // Tracks when the last full scan ran.
     let mut last_scan_at = Instant::now() - Duration::from_secs(60);
-    // Per-pool burst guard for targeted Swap-triggered scans (50ms cooldown per pool).
-    let mut pool_last_scan: HashMap<Address, Instant> = HashMap::new();
-    // scan_interval_ms controls how often the poll_tick can fire a scan.
-    // Decoupled from block_time_ms: set lower to scan more often between blocks.
-    // Default 1000ms gives ~60 scans/min on a 2s-block chain (alternates block/poll).
     let poll_interval = Duration::from_millis(cfg.scan_interval_ms);
     let mut poll_tick     = tokio::time::interval(poll_interval);
     let mut price_tick    = tokio::time::interval(crate::config::tuning().price_refresh());
     let mut config_tick   = tokio::time::interval(crate::config::tuning().config_reload());
     let mut balance_tick  = tokio::time::interval(crate::config::tuning().balance_refresh());
+    // After a stall (a slow scan), skip missed ticks instead of firing them back to back.
+    for t in [&mut poll_tick, &mut price_tick, &mut config_tick, &mut balance_tick] {
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    }
+    // When this run's loop started: the feed-silence clock before the first pool log.
+    let loop_started = Instant::now();
     // Native-price and balance refreshes run as background tasks so their RPC calls never
     // delay a scan. Each flag stops a slow refresh from overlapping with the next tick.
     let price_refresh_busy   = Arc::new(AtomicBool::new(false));
@@ -615,7 +564,7 @@ pub async fn run_chain(
     // undecodable tx ("0x00"): the sequencer refuses every other method (403), and any
     // JSON-RPC answer, an error included, means the send path is up.
     {
-        let endpoints: Vec<(&'static str, url::Url)> = cfg.preconf_http_rpc.iter()
+        let endpoints: Vec<(&'static str, url::Url)> = cfg.quote_http_rpc.iter()
             .filter_map(|u| u.parse().ok()).map(|u| ("quote", u))
             .chain(cfg.submission_rpcs.iter().filter_map(|u| u.parse().ok()).map(|u| ("send", u)))
             .collect();
@@ -778,27 +727,47 @@ pub async fn run_chain(
                 last_hb_opps = total_opps;
                 let (v3_fresh, v3_total) =
                     pool_cache.count_fresh_v3_pools(crate::config::tuning().v3_fresh_window());
-                let preconf_n = preconf_logs.swap(0, Ordering::Relaxed);
                 let recheck_drop_n = recheck_drops.load(Ordering::Relaxed);
                 // Pairs the executor can't fund (cached balances, no RPC): they detect but never trade.
                 let unfunded = if cfg.borrow { 0 } else { state::underfunded_pairs(&chain_pairs, &*contract_balances.read().await).len() };
                 let heartbeat_msg = format!(
-                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} spot2={} tri={} triV={} | quotes={} active={}/{} cross={} | opps={}{} | v2={} v3={}/{}{}{}",
+                    "[{}] ♥ scans={} execs={} ok={} | last_scan={}s ago | best={} bestV={} spread={} spot2={} tri={} triV={} | quotes={} active={}/{} cross={} | opps={}{} | v2={} v3={}/{}{}",
                     cfg.name, scans, attempts, success, last_scan_at.elapsed().as_secs(), best_seen_str, verified_str, spread_str, spot2_str, tri_str, tri_v_str, fwd_ok, active_pairs, total_pairs, multi_dex, opp_count,
                     if recheck_drop_n > 0 { format!(" recheck_drop={}", recheck_drop_n) } else { String::new() },
                     pool_cache.by_address.len(), v3_fresh, v3_total,
-                    if cfg.preconf_ws_rpc.is_some() { format!(" | preconf_logs={}", preconf_n) } else { String::new() },
                     if unfunded > 0 { format!(" | unfunded={}/{}", unfunded, total_pairs) } else { String::new() },
                 );
                 // Requests on the main provider since the last beat, by method; then Multicall3
                 // chunks on the quote endpoint (ok/timeout/err) since the last beat.
-                let qmc = strategy.read().await.quote_gate.take_summary();
-                let heartbeat_msg = format!("{} | rpc={} | qmc={}", heartbeat_msg, rpc_counter.take_summary(), qmc);
+                let qmc = strategy.read().await.quote_gate.take_counts();
+                let heartbeat_msg = format!("{} | rpc={} | qmc={}", heartbeat_msg, rpc_counter.take_summary(), qmc.summary());
+                // Blind = running but unable to detect: say so loudly (ERROR + /health 503)
+                // instead of a normal-looking heartbeat. Paused chains are expected to be quiet.
+                let blind = {
+                    let mut why = Vec::new();
+                    if qmc.mostly_failing() {
+                        why.push(format!("quotes failing ({} of {} chunks)", qmc.timeout + qmc.err, qmc.ok + qmc.timeout + qmc.err));
+                    }
+                    let blind_after = Duration::from_millis(crate::config::tuning().feed_blind_ms);
+                    let silent = pool_cache.since_last_log().unwrap_or_else(|| loop_started.elapsed());
+                    if !blind_after.is_zero() && silent >= blind_after {
+                        why.push(format!("no pool log for {}s", silent.as_secs()));
+                    }
+                    (!paused && !why.is_empty()).then(|| why.join(", "))
+                };
+                if let Some(why) = &blind {
+                    let msg = format!("[{}] BLIND: {} — no opportunity can be detected or verified", cfg.name, why);
+                    tracing::error!("{}", msg);
+                    broadcast_log(&log_tx, "error", &msg, None);
+                }
+                if let Some(chain) = shared_state.write().await.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
+                    chain.blind = blind;
+                }
                 // Latency since the last beat (p50/p95/max(n) ms): see util::take_latency_summary.
                 let heartbeat_msg = format!("{} | lat {}", heartbeat_msg, crate::util::take_latency_summary());
                 // Mirror to server terminal so it's visible even when WS is disconnected.
-                // A full scan normally runs every block (~2 s); a long gap means scanning has
-                // stalled (e.g. RPC outage), which the counters alone don't show.
+                // A full scan normally runs every `scan_interval_ms`; a long gap means scanning
+                // has stalled (e.g. RPC outage), which the counters alone don't show.
                 // Paused chains don't scan, so a long gap there is expected, not a stall.
                 if !paused && total_scans > 0 && last_scan_at.elapsed() > crate::config::tuning().heartbeat_stall_warn() {
                     warn!("{}", heartbeat_msg);
@@ -934,15 +903,15 @@ pub async fn run_chain(
                 }
             }
 
-            // ── New block header → immediate scan ─────────────────────────────
+            // ── New block header: gas price, head, liveness (no scan) ──────────
+            // At 200 ms blocks a full scan per block was 300/min and held the loop for most
+            // of every slot, so swap events queued for seconds. Prices move only through
+            // pool logs, which the swap arm scans; the full scan runs on poll_tick.
             Some((block_num, base_fee)) = block_rx.recv() => {
                 // Pre-populate gas price cache from block header — eliminates eth_gasPrice RPC calls.
                 executor.lock().await.update_gas_price(base_fee);
                 last_block_seen = Instant::now();
-
-                // Update RPC health + block number in shared state, count each block as a scan
                 {
-                    scan_count.fetch_add(1, Ordering::Relaxed);
                     let base_fee_gwei = base_fee as f64 / 1e9;
                     let mut state = shared_state.write().await;
                     if let Some(chain) = state.chains.iter_mut().find(|c| c.chain_id == cfg.id) {
@@ -954,42 +923,10 @@ pub async fn run_chain(
                 }
                 metrics.last_block.with_label_values(&[&cfg.name]).set(block_num as f64);
                 metrics.rpc_connected.with_label_values(&[&cfg.name]).set(1.0);
-
-                // Read paused state and disabled pairs in one lock acquisition.
-                let (global_paused, chain_paused, disabled_set) = {
-                    let state = shared_state.read().await;
-                    let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
-                    (state.paused, cp, state.disabled_pairs.clone())
-                };
-                if reset_breaker_on_resume(chain_paused, &mut consecutive_failures) {
-                    info!("[{}] Circuit breaker cleared by resume", cfg.name);
-                }
-                if global_paused || chain_paused {
-                    on_paused(&mut last_scan_at, &rpc_health);
-                    continue;
-                }
-
-                scan::evaluate_and_execute(
-                    &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
-                    &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &recheck_drops, &contract_balances, None, disabled_set, None,
-                    "block",
-                    None,
-                ).await;
-                last_scan_at = Instant::now();
             }
 
-            // ── Periodic fallback scan (safety net if block subscription is down) ──
+            // ── Periodic full scan (safety net: state that moved without a log we saw) ──
             _ = poll_tick.tick() => {
-                // True fallback: skip if the block subscription fired a scan recently.
-                // Without this guard, poll_tick fires every 4s independently, doubling
-                // the scan rate to 45/min (30 block + 15 poll) instead of the intended 30.
-                if last_scan_at.elapsed() < poll_interval {
-                    debug!("[{}] poll_tick skipped — block scan {}ms ago", cfg.name,
-                           last_scan_at.elapsed().as_millis());
-                    continue;
-                }
                 scan_count.fetch_add(1, Ordering::Relaxed);
                 let (global_paused, chain_paused, disabled_set) = {
                     let state = shared_state.read().await;
@@ -1008,45 +945,25 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &recheck_drops, &contract_balances, None, disabled_set, None,
+                    &opps_found, &recheck_drops, &contract_balances, None, disabled_set,
                     "poll",
                     None,
                 ).await;
                 last_scan_at = Instant::now();
             }
 
-            // ── Swap event → instant targeted scan ───────────────────────────────
-            // Reacts to intra-block price moves with zero rate limit.
-            // Only evaluates pairs that contain the tokens from the swapped pool,
-            // so the scan takes <0.1ms (pure local math, 0 RPC).
-            // 50ms per-pool burst guard prevents CPU saturation from event floods.
-            // last_scan_at is NOT updated — targeted scans must not suppress the
-            // block-triggered full scan or the poll_tick fallback.
+            // ── Block's swaps → one targeted scan ────────────────────────────────
+            // A block's pool logs arrive together: collect them (see collect_swap_batch) and
+            // scan only the pairs and triangles they touch. Logs that came in while the
+            // previous scan ran are merged into this one, so the loop is never more than one
+            // scan behind the chain. last_scan_at is NOT updated — it times the full scan.
             Some(event) = swap_rx.recv() => {
-                // Swaps that queued while the previous scan ran are merged into this one
-                // scan (only what is already waiting — the first event never waits). Each
-                // queued scan would otherwise run in turn on prices that are by then stale.
-                let mut batch = vec![event];
-                while batch.len() < 256 {
-                    match swap_rx.try_recv() {
-                        Ok(ev) => batch.push(ev),
-                        Err(_) => break,
-                    }
-                }
+                let batch = collect_swap_batch(event, &mut swap_rx).await;
                 for ev in &batch {
                     crate::util::LAT_QUEUE.record(ev.received_at.elapsed().as_millis() as u64);
                 }
-                // Per-pool burst protection (50 ms) — skipped for large swaps.
-                batch.retain(|ev| {
-                    ev.magnitude == SwapMagnitude::Large
-                        || !pool_last_scan.get(&ev.pool).is_some_and(|t| t.elapsed() < Duration::from_millis(50))
-                });
-                if batch.is_empty() {
-                    continue;
-                }
-                let now = Instant::now();
-                for ev in &batch {
-                    pool_last_scan.insert(ev.pool, now);
+                if batch.iter().any(|ev| ev.block_number != batch[0].block_number) {
+                    crate::util::SCANS_MERGED.fetch_add(1, Ordering::Relaxed);
                 }
                 let is_large = batch.iter().any(|ev| ev.magnitude == SwapMagnitude::Large);
                 let merged = batch.len() - 1;
@@ -1106,61 +1023,9 @@ pub async fn run_chain(
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
                     &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
-                    None,
                     "swap",
                     trigger_at,
                 ).await;
-                // NOTE: last_scan_at intentionally NOT updated here.
-            }
-
-            // ── Pending TX detected → same-block arb submission ──────────────
-            // Fires when a large pending swap is seen in the mempool before it
-            // confirms. We run a targeted scan for pairs involving the swapped
-            // tokens and override the tip to match the pending TX's tip, landing
-            // our TX in the SAME block as the triggering swap.
-            Some(pending_event) = pending_rx.recv() => {
-                let (global_paused, chain_paused, disabled_set) = {
-                    let state = shared_state.read().await;
-                    let cp = state.chains.iter().any(|c| c.chain_id == cfg.id && c.paused);
-                    (state.paused, cp, state.disabled_pairs.clone())
-                };
-                if reset_breaker_on_resume(chain_paused, &mut consecutive_failures) {
-                    info!("[{}] Circuit breaker cleared by resume", cfg.name);
-                }
-                if global_paused || chain_paused {
-                    on_paused(&mut last_scan_at, &rpc_health);
-                    continue;
-                }
-
-                // Build targeted mask for pairs involving the pending swap's tokens
-                let (pair_mask, token_filter) = {
-                    let strat = strategy.read().await;
-                    let indices = strat.pairs_for_tokens(pending_event.token_in, pending_event.token_out);
-                    (indices.into_iter().collect::<HashSet<usize>>(), vec![pending_event.token_in, pending_event.token_out])
-                };
-                if pair_mask.is_empty() { continue; }
-
-                // tip = pending TX tip (we match to land in same block).
-                // Slightly higher than the trigger so we're competitive for same-block ordering.
-                let tip_override = pending_event.tip_wei.max(cfg.priority_fee_wei);
-
-                let pair_count = pair_mask.len();
-                // Log AFTER evaluate_and_execute to avoid a format!+String alloc on the hot path
-                // before the scan fires. The log still appears immediately after return.
-                scan::evaluate_and_execute(
-                    &strategy, &executor, &provider, &shared_state, &log_tx,
-                    &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
-                    &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
-                    Some(tip_override),
-                    "pending",
-                    None,
-                ).await;
-                info!(
-                    "[{}] Pending swap processed: {:?}→{:?} amt={} tip={}wei ({} pairs)",
-                    cfg.name, pending_event.token_in, pending_event.token_out,
-                    pending_event.amount_in, pending_event.tip_wei, pair_count
-                );
                 // NOTE: last_scan_at intentionally NOT updated here.
             }
         }
@@ -1181,88 +1046,38 @@ struct LogFeed {
     large_v3_bps: u32,
 }
 
-/// Subscribe to pool logs and keep re-subscribing. `method`: `None` = standard `logs`
-/// (sealed blocks), `Some("pendingLogs")` = Flashblocks pre-confirmed logs. Each new log
-/// updates the cache and triggers a targeted scan (see `apply_log_to_cache`).
+/// Subscribe to pool logs (canonical blocks) and keep re-subscribing. Each new log updates
+/// the cache and triggers a targeted scan (see `apply_log_to_cache`).
 fn spawn_log_subscription<P: Provider + Clone + 'static>(
     provider: P,
     filter: alloy::rpc::types::Filter,
     feed: LogFeed,
-    method: Option<&'static str>,
-    counter: Option<Arc<AtomicU64>>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_log_subscription(provider, filter, feed, method, counter))
+    tokio::spawn(run_log_subscription(provider, filter, feed))
 }
 
 /// Bound on one WebSocket handshake. alloy's `connect_ws` has none, so a stalled
 /// endpoint (accepts TCP, never answers) would otherwise hang the caller forever.
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Flashblocks `pendingLogs` feed: connect to `url` in a background task, retrying
-/// with backoff (each attempt bounded by [`WS_CONNECT_TIMEOUT`]), then run the
-/// subscription. Until it connects, detection runs on sealed-block logs (~1.2 s later).
-fn spawn_preconf_subscription(
-    url: String,
-    filter: alloy::rpc::types::Filter,
-    feed: LogFeed,
-    counter: Arc<AtomicU64>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let shown = crate::util::redact_url(&url);
-        let mut backoff = Duration::from_secs(1);
-        let mut warned = false;
-        let preconf = loop {
-            let conn = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(url.clone()).with_max_retries(u32::MAX));
-            match rpc_timeout(WS_CONNECT_TIMEOUT, conn).await {
-                Ok(p) => break p,
-                Err(e) => {
-                    if !warned {
-                        warn!("[{}] Flashblocks endpoint {} unreachable ({}) — sealed-block logs only, retrying in background",
-                              feed.chain_name, shown, e);
-                        warned = true;
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
-                }
-            }
-        };
-        info!("[{}] Flashblocks pre-confirmed logs: subscribing on {}", feed.chain_name, shown);
-        run_log_subscription(preconf, filter, feed, Some("pendingLogs"), Some(counter)).await;
-    })
-}
-
 async fn run_log_subscription<P: Provider + Clone + 'static>(
     provider: P,
     filter: alloy::rpc::types::Filter,
     feed: LogFeed,
-    method: Option<&'static str>,
-    counter: Option<Arc<AtomicU64>>,
 ) {
-    let label = method.unwrap_or("logs");
     let mut backoff = Duration::from_secs(1);
     let mut last_err = String::new();
     loop {
-        let sub = match method {
-            None => provider.subscribe_logs(&filter).await,
-            Some(m) => provider.subscribe::<_, alloy::rpc::types::Log>((m, filter.clone())).await,
-        };
-        match sub {
+        match provider.subscribe_logs(&filter).await {
             Ok(sub) => {
                 backoff = Duration::from_secs(1);
                 last_err.clear();
                 let mut stream = sub.into_stream();
                 while let Some(log) = stream.next().await {
-                    if let Some(c) = &counter {
-                        c.fetch_add(1, Ordering::Relaxed);
-                    }
+                    crate::util::LOGS_RECEIVED.fetch_add(1, Ordering::Relaxed);
                     let received_at = Instant::now();
                     let seen_pos = crate::util::block_position_now();
                     let block_number = log.block_number.unwrap_or(0);
-                    // Flashblocks feed only: sealed-block logs are later copies by design.
-                    if method.is_some() {
-                        crate::util::note_log_seen(block_number, seen_pos);
-                    }
                     if let Some(magnitude) = crate::listener::apply_log_to_cache(
                         &log, &feed.cache, feed.solidly_sync_hash, feed.large_swap_bps, feed.large_v3_bps,
                     ) {
@@ -1278,19 +1093,47 @@ async fn run_log_subscription<P: Provider + Clone + 'static>(
                         }
                     }
                 }
-                debug!("[{}] {} subscription ended, reconnecting...", feed.chain_name, label);
+                debug!("[{}] logs subscription ended, reconnecting...", feed.chain_name);
             }
             Err(e) => {
-                // Once per distinct error: an endpoint without the method would
-                // otherwise log every backoff step.
+                // Once per distinct error: a failing endpoint would otherwise log every
+                // backoff step.
                 let msg = e.to_string();
                 if msg != last_err {
-                    warn!("[{}] {} subscription failed: {} — retrying with backoff", feed.chain_name, label, msg);
+                    warn!("[{}] logs subscription failed: {} — retrying with backoff", feed.chain_name, msg);
                     last_err = msg;
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(crate::config::tuning().ws_reconnect_max_backoff());
             }
+        }
+    }
+}
+
+/// How long the swap arm keeps collecting after the last log arrived, and the most it
+/// waits in all. A block's logs arrive back to back (well under a ms apart), so a short
+/// quiet gap marks the end of the block without holding the scan for the next head.
+const SWAP_BATCH_SETTLE: Duration = Duration::from_millis(2);
+const SWAP_BATCH_MAX_WAIT: Duration = Duration::from_millis(20);
+
+/// `first` plus every swap event already queued or arriving until the feed has been quiet
+/// for [`SWAP_BATCH_SETTLE`] (at most [`SWAP_BATCH_MAX_WAIT`]): one block's logs, plus any
+/// that queued while the previous scan ran.
+async fn collect_swap_batch(first: SwapEvent, rx: &mut mpsc::Receiver<SwapEvent>) -> Vec<SwapEvent> {
+    let deadline = tokio::time::Instant::now() + SWAP_BATCH_MAX_WAIT;
+    let mut batch = vec![first];
+    loop {
+        while let Ok(ev) = rx.try_recv() {
+            batch.push(ev);
+        }
+        // A zero timeout still returns a ready event, so the cap needs its own check.
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return batch;
+        }
+        match tokio::time::timeout(SWAP_BATCH_SETTLE.min(left), rx.recv()).await {
+            Ok(Some(ev)) => batch.push(ev),
+            _ => return batch,
         }
     }
 }
@@ -1466,48 +1309,6 @@ fn merge_swap_batch(
     (mask, tokens, large_ids)
 }
 
-/// Pools for the sealed (primary ws_rpc) log filter: every address except pools with a
-/// `preconf_only` token on either side. Returns those addresses and how many were left out.
-/// Pools with unknown tokens stay on the sealed filter.
-fn split_preconf_only(
-    addrs: &[Address],
-    preconf_only: &HashSet<Address>,
-    tokens_of: impl Fn(Address) -> Option<(Address, Address)>,
-) -> (Vec<Address>, usize) {
-    if preconf_only.is_empty() {
-        return (addrs.to_vec(), 0);
-    }
-    let sealed: Vec<Address> = addrs.iter().copied()
-        .filter(|&p| !matches!(tokens_of(p), Some((a, b)) if preconf_only.contains(&a) || preconf_only.contains(&b)))
-        .collect();
-    let left_out = addrs.len() - sealed.len();
-    (sealed, left_out)
-}
-
-/// Check that the quote endpoint applies the block-time override on `pending` calls
-/// (see [`crate::util::pending_block_overrides`]): Multicall3 must echo the overridden
-/// time. If it doesn't, hooked (Aero CL) quotes are switched off, since their fee would be
-/// priced at the wrong time; every other venue keeps quoting at `pending`. A probe that
-/// gets no answer changes nothing.
-async fn probe_pending_time(provider: &alloy::providers::DynProvider, chain_name: &str) {
-    let block = alloy::eips::BlockId::pending();
-    let Some(at) = crate::util::pending_block_overrides(block) else { return };
-    let want = at.time;
-    let tx = alloy::rpc::types::TransactionRequest::default()
-        .to(alloy::primitives::address!("0xcA11bde05977b3631167028862bE2a173976CA11"))
-        .input(alloy::primitives::Bytes::from_static(&[0x0f, 0x28, 0xc9, 0x7d]).into()); // getCurrentBlockTimestamp()
-    match rpc_timeout(rpc_read_timeout(), provider.call(tx).block(block).with_block_overrides(at)).await {
-        Ok(raw) if raw.len() == 32 && Some(U256::from_be_slice(&raw).to::<u64>()) == want => {
-            info!("[{}] Pending calls carry the chain's block time (override honoured)", chain_name);
-        }
-        Ok(_) => {
-            crate::util::set_pending_time_ok(false);
-            warn!("[{}] Quote endpoint ignores block-time overrides on `pending` — hooked (Aero CL) quotes disabled; use an endpoint that supports eth_call block overrides", chain_name);
-        }
-        Err(e) => warn!("[{}] Block-time override probe failed ({}) — keeping hooked quotes on", chain_name, e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,21 +1357,37 @@ mod tests {
         assert!(merge_swap_batch(&[ev(p_unknown, false)], tokens, pairs_for, id).0.is_empty());
     }
 
-    #[test]
-    fn split_preconf_only_keeps_core_pools_sealed() {
-        let (usdc, weth, vvv) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
-        let (core, vvv_weth, vvv_usdc, unknown) =
-            (Address::repeat_byte(10), Address::repeat_byte(11), Address::repeat_byte(12), Address::repeat_byte(13));
-        let tokens = |p: Address| match p {
-            p if p == core => Some((usdc, weth)),
-            p if p == vvv_weth => Some((weth, vvv)),
-            p if p == vvv_usdc => Some((vvv, usdc)),
-            _ => None,
+    #[tokio::test]
+    async fn collect_swap_batch_takes_one_burst_and_stops_when_quiet() {
+        let (tx, mut rx) = mpsc::channel::<SwapEvent>(64);
+        let ev = |block| SwapEvent {
+            chain_id: 8453, pool: Address::ZERO, block_number: block, magnitude: SwapMagnitude::Normal,
+            received_at: Instant::now(), seen_pos: None,
         };
-        let all = vec![core, vvv_weth, vvv_usdc, unknown];
-        let only: HashSet<Address> = [vvv].into_iter().collect();
-        assert_eq!(split_preconf_only(&all, &only, tokens), (vec![core, unknown], 2));
-        assert_eq!(split_preconf_only(&all, &HashSet::new(), tokens), (all.clone(), 0));
+        // Two already queued, one arriving while the batch is collected (inside the settle gap).
+        tx.send(ev(7)).await.unwrap();
+        tx.send(ev(7)).await.unwrap();
+        let late = tx.clone();
+        tokio::spawn(async move { let _ = late.send(ev(7)).await; });
+        let first = rx.recv().await.unwrap();
+        let t0 = Instant::now();
+        let batch = collect_swap_batch(first, &mut rx).await;
+        assert_eq!(batch.len(), 3);
+        assert!(t0.elapsed() < SWAP_BATCH_MAX_WAIT + Duration::from_millis(15), "{:?}", t0.elapsed());
+        // A steady stream is cut at the max wait.
+        let flood = tx.clone();
+        let feeder = tokio::spawn(async move {
+            loop {
+                if flood.send(ev(8)).await.is_err() { break; }
+                tokio::task::yield_now().await;
+            }
+        });
+        let first = rx.recv().await.unwrap();
+        let t0 = Instant::now();
+        let batch = collect_swap_batch(first, &mut rx).await;
+        assert!(batch.len() > 1);
+        assert!(t0.elapsed() < SWAP_BATCH_MAX_WAIT + Duration::from_millis(15), "{:?}", t0.elapsed());
+        feeder.abort();
     }
 
     #[test]

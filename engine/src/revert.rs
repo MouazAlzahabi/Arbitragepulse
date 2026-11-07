@@ -243,7 +243,7 @@ fn explain_router(data: &[u8]) -> Option<(&'static str, &'static str, RevertClas
         R::InsufficientLiquidity(_) =>
             ("InsufficientLiquidity()", "pool too thin for this trade size", C::InsufficientOutput),
         // A router swap on a consistent pool can't fail K (its amountOut comes from the same
-        // reserves); seen when a pending-state simulation caught a pool mid-block, its
+        // reserves); seen when a simulation caught a pool mid-block (pre-Denim `pending`), its
         // balances and reserves out of step. AERO/USDC-style tokens have no transfer fee.
         R::K(_) => ("K()", "pool reserves ≠ balances at the simulated state (pool changed mid-block)", C::InsufficientOutput),
         R::InsufficientInputAmount(_) => ("InsufficientInputAmount()", "pool received no input", C::TransferFailed),

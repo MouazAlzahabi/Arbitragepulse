@@ -98,8 +98,9 @@ Progress goes to stderr. The table goes to stdout.
    A token that takes a fee on transfer breaks every route.
 3. **Add the pair.** `--yaml` prints a ready `pairs:` block for eligible, allowed tokens not yet
    in config. Paste it under `pairs:` in `engine/config.yaml`.
-4. **Keep it off Alchemy.** Add the token address to `chain.preconf_only_tokens`. Its pools are
-   then watched on the free Flashblocks feed only, so the Alchemy event budget doesn't grow.
+4. **Mind the Alchemy event budget.** Every pool is watched on the `ws_rpc` log feed, and each
+   log event counts against the plan. (The free Flashblocks feed that kept added tokens off
+   Alchemy was retired with Base's Denim upgrade, 2026-11-05.)
 5. **Watch dust pools.** On a dry-run, look for `phantom skipped` warnings on the new pair. These
    come from near-empty pools. If a WETH-start pair triggers them, drop that pair: triangles
    through USDC still reach the WETH pools.
