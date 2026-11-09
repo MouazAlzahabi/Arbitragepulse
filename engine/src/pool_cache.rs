@@ -336,8 +336,12 @@ pub struct PoolCache {
     created: Instant,
     /// Pools below `tuning.min_pool_depth_usd`: every local quote treats them as missing.
     /// Recomputed from cached state by [`PoolCache::recompute_shallow`]; they stay
-    /// subscribed, so a pool that fills is quoted again after the next recompute.
-    shallow: Arc<dashmap::DashSet<Address>>,
+    /// subscribed, so a pool that fills is quoted again after the next recompute. Value =
+    /// its USD depth at the last recompute.
+    shallow: Arc<DashMap<Address, f64>>,
+    /// New logs per shallow pool since the last [`PoolCache::take_shallow_activity`]: what
+    /// the depth floor costs (pools that trade while we skip them).
+    shallow_activity: Arc<DashMap<Address, u64>>,
     /// Pools of direct venues the executor does not allowlist (live mode): never quoted.
     disabled: Arc<dashmap::DashSet<Address>>,
     /// Uniswap V4 pools (by their pool address, see [`V4PoolKey::pool_address`]): kept in
@@ -358,7 +362,8 @@ impl Default for PoolCache {
             log_pos: Arc::new(DashMap::new()),
             last_log_ms: Arc::new(AtomicU64::new(u64::MAX)),
             created: Instant::now(),
-            shallow: Arc::new(dashmap::DashSet::new()),
+            shallow: Arc::new(DashMap::new()),
+            shallow_activity: Arc::new(DashMap::new()),
             disabled: Arc::new(dashmap::DashSet::new()),
             v4_keys: Arc::new(DashMap::new()),
         }
@@ -424,7 +429,7 @@ impl PoolCache {
     /// True when local quotes must skip the pool: below `tuning.min_pool_depth_usd` (see
     /// `recompute_shallow`) or disabled (`disable_pool`).
     pub fn is_skipped(&self, pool: Address) -> bool {
-        (!self.shallow.is_empty() && self.shallow.contains(&pool))
+        (!self.shallow.is_empty() && self.shallow.contains_key(&pool))
             || (!self.disabled.is_empty() && self.disabled.contains(&pool))
     }
 
@@ -460,8 +465,8 @@ impl PoolCache {
                 (Some(a), None) | (None, Some(a)) => Some(2.0 * a),
                 (None, None) => None,
             };
-            if depth.is_some_and(|d| d < min_usd) {
-                self.shallow.insert(*pool);
+            if let Some(d) = depth.filter(|&d| d < min_usd) {
+                self.shallow.insert(*pool, d);
                 n += 1;
             } else {
                 self.shallow.remove(pool);
@@ -520,9 +525,33 @@ impl PoolCache {
         use std::cmp::Ordering;
         let mut entry = self.log_pos.entry(pool).or_insert((0, 0));
         match pos.cmp(&*entry) {
-            Ordering::Greater => { *entry = pos; Ordering::Greater }
+            Ordering::Greater => {
+                *entry = pos;
+                if !self.shallow.is_empty() && self.shallow.contains_key(&pool) {
+                    *self.shallow_activity.entry(pool).or_insert(0) += 1;
+                }
+                Ordering::Greater
+            }
             other => other,
         }
+    }
+
+    /// (block number, log index) of the last log applied to `pool`; None before its first.
+    /// Moves on every new log of the pool (Swap, Sync, Mint/Burn in or out of range), so
+    /// an unchanged value means nothing happened to the pool.
+    pub fn log_position(&self, pool: Address) -> Option<(u64, u64)> {
+        self.log_pos.get(&pool).map(|p| *p)
+    }
+
+    /// Shallow pools that had new logs since the last call: (pool, logs, USD depth), most
+    /// active first, and the reset. Pools that filled since are left out.
+    pub fn take_shallow_activity(&self) -> Vec<(Address, u64, f64)> {
+        let mut out: Vec<(Address, u64, f64)> = self.shallow_activity.iter()
+            .filter_map(|e| self.shallow.get(e.key()).map(|d| (*e.key(), *e.value(), *d)))
+            .collect();
+        self.shallow_activity.clear();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
     }
 
     /// Insert a pool and register both directional keys.
@@ -1131,5 +1160,32 @@ mod tests {
         // 0 turns the floor off.
         cache.update_reserves(dust_vvv, U256::from(1u64), U256::from(1u64));
         assert_eq!(cache.recompute_shallow(&known, &decimals, 0.0), (0, 4));
+    }
+
+    /// Only new logs on skipped pools are counted (a repeat isn't), with the pool's depth;
+    /// taking the report resets it. `log_position` follows the newest log of every pool.
+    #[test]
+    fn shallow_activity_counts_new_logs_on_skipped_pools() {
+        let e18 = 10u128.pow(18);
+        let (usdc, weth) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let (deep, dust) = (Address::repeat_byte(0x10), Address::repeat_byte(0x12));
+        let cache = PoolCache::new();
+        cache.insert(deep, v2(usdc, 1_000_000 * 10u128.pow(6), weth, 250 * e18));
+        cache.insert(dust, v2(usdc, 1_000 * 10u128.pow(6), weth, e18 / 4)); // $2k
+        let known: HashMap<Address, (f64, u8)> = [(usdc, (1.0, 6)), (weth, (4000.0, 18))].into_iter().collect();
+        let decimals: HashMap<Address, u8> = [(usdc, 6), (weth, 18)].into_iter().collect();
+        assert_eq!(cache.recompute_shallow(&known, &decimals, 20_000.0), (1, 2));
+
+        assert_eq!(cache.log_position(dust), None);
+        for pos in [(10, 0), (10, 0), (11, 3)] {
+            cache.advance_log_position(dust, pos);
+            cache.advance_log_position(deep, pos);
+        }
+        assert_eq!(cache.log_position(dust), Some((11, 3)));
+        let active = cache.take_shallow_activity();
+        assert_eq!(active.len(), 1);
+        assert_eq!((active[0].0, active[0].1), (dust, 2));
+        assert!((active[0].2 - 2_000.0).abs() < 1.0, "depth {}", active[0].2);
+        assert!(cache.take_shallow_activity().is_empty(), "reset after a report");
     }
 }

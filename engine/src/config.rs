@@ -527,6 +527,10 @@ pub struct Tuning {
     pub tri_verify_bracket_bps: u64,
     /// Triangular V3 verification: max gap to reuse a quoted point (bps).
     pub tri_verify_max_gap_bps: u64,
+    /// A triangle that QuoterV2 verified as unprofitable is not re-verified while none of its
+    /// pools has a new log, for up to this long (ms; time-based fees can move it without a
+    /// log). 0 = re-verify every scan.
+    pub tri_verify_memo_ms: u64,
     /// Size optimizer: coarse and fine probe counts.
     pub optimizer_coarse_steps: usize,
     pub optimizer_fine_steps: usize,
@@ -568,7 +572,9 @@ pub struct Tuning {
     /// After a rate-limited quote chunk, hold every new quote chunk this long (ms) and retry
     /// the limited one once.
     pub quote_rate_limit_backoff_ms: u64,
-    /// Max age of a cached 2-hop QuoterV2 result (ms). Block-relative: 3 blocks, at least 1 s.
+    /// Max age of a cached 2-hop QuoterV2 result (ms). Block-relative: 3 blocks, at least 6 s.
+    /// An entry is dropped as soon as its pool's state changes, so the age only bounds how long
+    /// an unchanged pool goes without a re-quote (time-based fees, out-of-range liquidity).
     pub quote_cache_max_age_ms: Option<u64>,
     pub quote_cache_max_pools: usize,
     /// Don't cache a QuoterV2 result while the pool's local state is younger than this
@@ -647,6 +653,7 @@ impl Default for Tuning {
             tri_verify_max_rounds: 3,
             tri_verify_bracket_bps: 100,
             tri_verify_max_gap_bps: 10,
+            tri_verify_memo_ms: 6_000,
             optimizer_coarse_steps: 5,
             optimizer_fine_steps: 5,
             optimizer_large_spread: 0.05,
@@ -663,7 +670,7 @@ impl Default for Tuning {
             discover_chunk_size: 20,
             discover_call_timeout_ms: 15_000,
             discover_chunk_gap_ms: 100,
-            quote_rate_limit_backoff_ms: 250,
+            quote_rate_limit_backoff_ms: 50,
             quote_cache_max_age_ms: None,
             quote_cache_max_pools: 1024,
             quote_cache_settle_ms: 500,
@@ -757,13 +764,14 @@ impl Tuning {
         ms(self.rpc_simulate_timeout_ms.unwrap_or((self.block_time_ms / 2).max(800)))
     }
     pub fn quote_cache_max_age(&self) -> std::time::Duration {
-        ms(self.quote_cache_max_age_ms.unwrap_or((self.block_time_ms * 3).max(1_000)))
+        ms(self.quote_cache_max_age_ms.unwrap_or((self.block_time_ms * 3).max(6_000)))
     }
     pub fn health_monitor_every(&self) -> std::time::Duration {
         ms(self.health_monitor_every_ms.unwrap_or(self.block_time_ms.max(1_000)))
     }
     pub fn rpc_read_timeout(&self) -> std::time::Duration { ms(self.rpc_read_timeout_ms) }
     pub fn quote_cache_settle(&self) -> std::time::Duration { ms(self.quote_cache_settle_ms) }
+    pub fn tri_verify_memo(&self) -> std::time::Duration { ms(self.tri_verify_memo_ms) }
     pub fn rpc_send_timeout(&self) -> std::time::Duration { ms(self.rpc_send_timeout_ms) }
     pub fn multicall_chunk_timeout(&self) -> std::time::Duration { ms(self.multicall_chunk_timeout_ms) }
     pub fn discover_call_timeout(&self) -> std::time::Duration { ms(self.discover_call_timeout_ms) }
@@ -871,7 +879,7 @@ routers: []
         // Base's 200 ms blocks hit the floors instead of shrinking 10×.
         let fast = Tuning::default().with_block_time(200);
         assert_eq!(fast.rpc_simulate_timeout(), std::time::Duration::from_millis(800));
-        assert_eq!(fast.quote_cache_max_age(), std::time::Duration::from_secs(1));
+        assert_eq!(fast.quote_cache_max_age(), std::time::Duration::from_secs(6));
         assert_eq!(fast.health_monitor_every(), std::time::Duration::from_secs(1));
     }
 

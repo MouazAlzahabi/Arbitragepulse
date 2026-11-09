@@ -31,6 +31,14 @@ fn verify_max_gap_bps() -> u64 { crate::config::tuning().tri_verify_max_gap_bps 
 /// V3-leg routes aren't QuoterV2-verified, this is deducted once per V3 leg.
 fn v3_spot_overestimate_bps() -> u64 { crate::config::tuning().v3_spot_overestimate_bps }
 
+/// Memo key of a triangle route: its triplet, routers and fees (fixes its pools).
+fn tri_route_key(o: &TriangularOpportunity) -> String {
+    format!(
+        "{}|{}/{}/{}|{}/{}/{}",
+        o.triplet_id, o.router_ab_id, o.router_bc_id, o.router_ca_id, o.fee_ab, o.fee_bc, o.fee_ca,
+    )
+}
+
 /// Outcome of chaining a route through its legs during V3 verification.
 enum RouteWalk {
     /// All legs resolved: final amount of token A.
@@ -616,6 +624,10 @@ impl Strategy {
         if !self.optimistic_submission && opportunities.iter().any(has_v3_leg) {
             let (mut v3_routes, mut rest): (Vec<_>, Vec<_>) =
                 opportunities.into_iter().partition(has_v3_leg);
+            // Already verified unprofitable and none of their pools has logged since: the
+            // same state gives the same quotes, so don't spend QuoterV2 calls on them again.
+            let memo_skips = self.drop_memoized_routes(&mut v3_routes);
+            self.tri_cal.note_memo_skips(memo_skips);
             // Bounded batch: ≤ 2 × max routes × 3 legs QuoterV2 calls in one multicall round.
             v3_routes.truncate(max_opportunities.saturating_mul(2));
             // The candidates' quiet V2/Aerodrome pools are read alongside the QuoterV2 round,
@@ -758,6 +770,12 @@ impl Strategy {
             ok
         }).collect();
 
+        // Pool log positions before any quote goes out: if a pool logs while the quotes are in
+        // flight, the memo entry won't match its state and the route is verified again.
+        let stamps: Vec<Vec<Option<(u64, u64)>>> = opportunities.iter().map(|o| self.tri_route_stamps(o)).collect();
+        let memo_on = !crate::config::tuning().tri_verify_memo().is_zero();
+        let mut unprofitable: Vec<(String, Vec<Option<(u64, u64)>>)> = Vec::new();
+
         // Pool key per V3 leg, built once and reused for marginal quotes and QuoterV2.
         let keys: Vec<[Option<V3PoolKey>; 3]> = opportunities.iter().map(|opp| {
             std::array::from_fn(|leg| {
@@ -844,7 +862,7 @@ impl Strategy {
         }
 
         let mut best_verified_usd: f64 = 0.0;
-        let kept: Vec<TriangularOpportunity> = opportunities.into_iter().zip(final_amounts).filter_map(|(mut opp, amt)| {
+        let kept: Vec<TriangularOpportunity> = opportunities.into_iter().zip(final_amounts).zip(stamps).filter_map(|((mut opp, amt), stamp)| {
             let final_amt = apply_exec_quote_haircut(amt?);
 
             let profit = final_amt.checked_sub(opp.amount_in).filter(|p| !p.is_zero());
@@ -859,6 +877,9 @@ impl Strategy {
             if !opp.amount_in.is_zero() {
                 let spread = crate::util::u256_to_f64(final_amt) / crate::util::u256_to_f64(opp.amount_in) - 1.0;
                 super::BeatSpreads::note(&self.beat.tri_v, spread);
+                // expected_profit is still the local (spot) estimate here.
+                let local = crate::util::u256_to_f64(opp.expected_profit) / crate::util::u256_to_f64(opp.amount_in);
+                self.tri_cal.note(local, spread);
             }
             let (sym_a, dec_a) = token_info.get(&addr_key(opp.token_a))?;
             let profit_usd = profit
@@ -870,13 +891,44 @@ impl Strategy {
                     "[{}] Triangular V3 verify dropped: {} | spot ${:.4} → verified ${:.4}",
                     self.chain_id, opp.triplet_id, opp.profit_usd, profit_usd,
                 );
+                if memo_on { unprofitable.push((tri_route_key(&opp), stamp)); }
                 return None;
             }
             opp.expected_profit = profit?;
             opp.profit_usd = profit_usd;
             Some(opp)
         }).collect();
+        if !unprofitable.is_empty() {
+            let mut memo = self.tri_memo.lock().unwrap();
+            if memo.len() > 4096 { memo.clear(); }
+            let now = std::time::Instant::now();
+            for (key, stamp) in unprofitable {
+                memo.insert(key, (stamp, now));
+            }
+        }
         (kept, best_verified_usd)
+    }
+
+    /// Last log position of each pool on the route (see `PoolCache::log_position`).
+    fn tri_route_stamps(&self, o: &TriangularOpportunity) -> Vec<Option<(u64, u64)>> {
+        crate::race::route_pools(&self.pool_cache, &[
+            (&o.router_ab_id, o.router_ab_type, o.fee_ab, o.token_a, o.token_b),
+            (&o.router_bc_id, o.router_bc_type, o.fee_bc, o.token_b, o.token_c),
+            (&o.router_ca_id, o.router_ca_type, o.fee_ca, o.token_c, o.token_a),
+        ]).into_iter().map(|p| self.pool_cache.log_position(p)).collect()
+    }
+
+    /// Drop routes verified unprofitable within `tuning.tri_verify_memo_ms` whose pools have
+    /// logged nothing since (prunes expired entries). Returns how many were dropped.
+    fn drop_memoized_routes(&self, routes: &mut Vec<TriangularOpportunity>) -> usize {
+        let max_age = crate::config::tuning().tri_verify_memo();
+        if max_age.is_zero() { return 0; }
+        let mut memo = self.tri_memo.lock().unwrap();
+        memo.retain(|_, (_, at)| at.elapsed() <= max_age);
+        if memo.is_empty() { return 0; }
+        let before = routes.len();
+        routes.retain(|o| memo.get(&tri_route_key(o)).is_none_or(|(stamp, _)| *stamp != self.tri_route_stamps(o)));
+        before - routes.len()
     }
 
     /// Chain a route's real amounts through its legs using the V3 points gathered so far.
@@ -1151,5 +1203,53 @@ mod tests {
         let (out, fee) = solidly_out(&cache, &keys, "aero", USDC, USDT, amt).unwrap();
         assert_eq!(fee, 0);
         assert_eq!(out, solidly_pool_out(&cache, &keys, "aero", false, USDC, USDT, amt).unwrap());
+    }
+
+    /// A route verified unprofitable is skipped while its pools log nothing new; a new log on
+    /// any of its pools, or the memo's age limit, makes it eligible for verification again.
+    #[test]
+    fn memo_skips_unchanged_unprofitable_routes_only() {
+        use crate::pool_cache::V3PoolState;
+        let (a, b, c) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
+        let cache = PoolCache::new();
+        let pools = [(Address::repeat_byte(0xa1), a, b), (Address::repeat_byte(0xa2), b, c), (Address::repeat_byte(0xa3), a, c)];
+        for (pool, t0, t1) in pools {
+            cache.insert_v3(pool, V3PoolState {
+                token0: t0, token1: t1, fee: 500, swap_fee: 500,
+                sqrt_price_x96: U256::from(1u64) << 96, liquidity: 1_000_000, tick: 0,
+                router_id: "r".into(), last_updated: Instant::now(),
+                vr0: U256::ZERO, vr1: U256::ZERO, fee_num_v3: U256::ZERO,
+            });
+            cache.advance_log_position(pool, (100, 1));
+        }
+        let strategy = Strategy::new(8453, vec![], vec![], 0.0, 0.0, None, std::sync::Arc::new(cache), 1, false, None);
+        let route = TriangularOpportunity {
+            chain_id: 8453, triplet_id: "A-B-C".into(), token_a: a, token_b: b, token_c: c,
+            amount_in: U256::from(1000u64), router_ab: Address::ZERO, router_bc: Address::ZERO, router_ca: Address::ZERO,
+            router_ab_type: RouterType::V3, router_bc_type: RouterType::V3, router_ca_type: RouterType::V3,
+            fee_ab: 500, fee_bc: 500, fee_ca: 500, expected_profit: U256::from(1u64), profit_usd: 1.0,
+            router_ab_id: "r".into(), router_bc_id: "r".into(), router_ca_id: "r".into(),
+        };
+        assert_eq!(strategy.tri_route_stamps(&route).len(), 3);
+        let remember = |at: Instant| {
+            strategy.tri_memo.lock().unwrap().insert(tri_route_key(&route), (strategy.tri_route_stamps(&route), at));
+        };
+        let mut routes = vec![route.clone()];
+        assert_eq!(strategy.drop_memoized_routes(&mut routes), 0, "nothing remembered yet");
+
+        remember(Instant::now());
+        assert_eq!(strategy.drop_memoized_routes(&mut routes), 1);
+        assert!(routes.is_empty());
+
+        // The B/C pool logs again: its state may have changed, so the route is verified.
+        strategy.pool_cache.advance_log_position(Address::repeat_byte(0xa2), (101, 0));
+        let mut routes = vec![route.clone()];
+        assert_eq!(strategy.drop_memoized_routes(&mut routes), 0);
+
+        // Remembered at the current state, but longer ago than tri_verify_memo_ms.
+        remember(Instant::now() - Duration::from_secs(60));
+        let mut routes = vec![route.clone()];
+        assert_eq!(strategy.drop_memoized_routes(&mut routes), 0);
+        assert!(strategy.tri_memo.lock().unwrap().is_empty(), "expired entries are pruned");
     }
 }

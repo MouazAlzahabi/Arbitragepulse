@@ -39,8 +39,13 @@ pub(crate) fn spawn_depth_refresh(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(crate::config::tuning().pool_depth_refresh());
         let mut last: Option<usize> = None;
+        let mut last_report = tokio::time::Instant::now();
         loop {
             tick.tick().await;
+            if last_report.elapsed() >= crate::util::WARN_EVERY {
+                last_report = tokio::time::Instant::now();
+                report_shallow_activity(&cache, &chain_name);
+            }
             let native = strategy.read().await.native_price_usd;
             let known: HashMap<Address, (f64, u8)> = known_tokens.iter()
                 .map(|&(a, d, is_native)| (a, (if is_native { native } else { 1.0 }, d)))
@@ -53,6 +58,23 @@ pub(crate) fn spawn_depth_refresh(
             }
         }
     });
+}
+
+/// What the depth floor costs: the skipped pools that traded since the last report (every
+/// [`crate::util::WARN_EVERY`]), most active first, with their depth.
+fn report_shallow_activity(cache: &PoolCache, chain_name: &str) {
+    let active = cache.take_shallow_activity();
+    if active.is_empty() {
+        return;
+    }
+    let logs: u64 = active.iter().map(|a| a.1).sum();
+    let top: Vec<String> = active.iter().take(10)
+        .map(|(pool, n, depth)| format!("{pool} ${depth:.0} ×{n}"))
+        .collect();
+    info!(
+        "[{}] Depth floor: {} skipped pool(s) traded ({} logs) in the last {} min — top: {}",
+        chain_name, active.len(), logs, crate::util::WARN_EVERY.as_secs() / 60, top.join(", "),
+    );
 }
 
 /// Re-run pool discovery every `tuning.pool_rediscover_ms` on the read provider (the free

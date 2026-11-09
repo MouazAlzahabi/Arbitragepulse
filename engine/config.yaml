@@ -636,7 +636,7 @@ tuning:
   discover_chunk_gap_ms: 100
   # Quote endpoint rate limited (429 / "request limit"): hold all quote chunks this long and
   # retry the limited one once. Heartbeat qmc=ok/timeout/err/limited.
-  quote_rate_limit_backoff_ms: 250
+  quote_rate_limit_backoff_ms: 50
   # Swap-fee refresh on the free http_rpc, outside the quote budget. Slipstream fees are
   # dynamic (150 → 698 ppm within 40 blocks seen): re-read fee() for pools that traded,
   # every cl_fee_refresh_ms. Aerodrome V2 fees are admin-set: re-read every v2_fee_refresh_ms.
@@ -649,6 +649,9 @@ tuning:
   tri_verify_max_rounds: 3
   tri_verify_bracket_bps: 100
   tri_verify_max_gap_bps: 10
+  # A triangle verified unprofitable isn't re-verified until one of its pools logs again,
+  # or this long passes (time-based fees). Was re-verified every scan: ~50 quote chunks each.
+  tri_verify_memo_ms: 6000
   optimizer_coarse_steps: 5
   optimizer_fine_steps: 5
   optimizer_large_spread: 0.05
@@ -668,7 +671,7 @@ tuning:
   multicall_chunk_timeout_ms: 3000
   discover_chunk_size: 20
   discover_call_timeout_ms: 15000
-  # quote_cache_max_age_ms: 1000         # block-relative: 3 blocks, at least 1 s
+  # quote_cache_max_age_ms: 6000         # block-relative: 3 blocks, at least 6 s (entries die on any pool change)
   quote_cache_max_pools: 1024
   quote_cache_settle_ms: 500             # no caching while the pool moved < this ago (quote RPC lagging the WS logs)
   health_hold_base_ms: 10000             # execution off after an RPC outage, at least

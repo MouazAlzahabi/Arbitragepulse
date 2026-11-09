@@ -739,8 +739,16 @@ pub async fn run_chain(
                 );
                 // Requests on the main provider since the last beat, by method; then Multicall3
                 // chunks on the quote endpoint (ok/timeout/err) since the last beat.
-                let qmc = strategy.read().await.quote_gate.take_counts();
+                let (qmc, tri_cal) = {
+                    let s = strategy.read().await;
+                    (s.quote_gate.take_counts(), s.tri_cal.take_summary())
+                };
                 let heartbeat_msg = format!("{} | rpc={} | qmc={}", heartbeat_msg, rpc_counter.take_summary(), qmc.summary());
+                // Triangles verified per local-spread band (verified/positive) and memo skips.
+                let heartbeat_msg = match tri_cal {
+                    Some(c) => format!("{heartbeat_msg} | tri_cal={c}"),
+                    None => heartbeat_msg,
+                };
                 // Blind = running but unable to detect: say so loudly (ERROR + /health 503)
                 // instead of a normal-looking heartbeat. Paused chains are expected to be quiet.
                 let blind = {

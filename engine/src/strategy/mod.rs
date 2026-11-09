@@ -339,6 +339,12 @@ pub struct Strategy {
     /// Quiet-pool reserves read this scan alongside a QuoterV2 round (pool → reserves, None =
     /// unreadable), consumed by `scan::recheck_quiet_pools`. Cleared at each scan's start.
     pub recheck_prefetch: Mutex<HashMap<Address, Option<(U256, U256)>>>,
+    /// Triangles QuoterV2 verified as unprofitable: route key → (its pools' last log
+    /// positions when verified, when). Skipped until a pool logs again or
+    /// `tuning.tri_verify_memo_ms` passes — see `triangular::tri_memo_skips`.
+    pub(crate) tri_memo: Mutex<HashMap<String, (Vec<Option<(u64, u64)>>, std::time::Instant)>>,
+    /// Local vs verified triangle spreads since the last heartbeat: see [`TriCalibration`].
+    pub tri_cal: TriCalibration,
 }
 
 impl Strategy {
@@ -431,6 +437,8 @@ impl Strategy {
             timings: ScanTimings::default(),
             beat: BeatSpreads::default(),
             recheck_prefetch: Mutex::new(HashMap::new()),
+            tri_memo: Mutex::new(HashMap::new()),
+            tri_cal: TriCalibration::default(),
         };
         s.rebuild_scan_cache();
         s
@@ -921,6 +929,64 @@ impl BeatSpreads {
     /// Read and reset `slot` (NEG_INFINITY = nothing noted since the last take).
     pub fn take(slot: &std::sync::atomic::AtomicU64) -> f64 {
         f64::from_bits(slot.swap(f64::NEG_INFINITY.to_bits(), std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Upper edges (bps) of the local-spread bands in [`TriCalibration`]; the last band is open.
+const TRI_CAL_BANDS_BPS: [f64; 5] = [5.0, 10.0, 20.0, 50.0, 100.0];
+
+/// Triangular QuoterV2 verification since the last heartbeat (`tri_cal=`): per band of the
+/// route's local (spot) spread, routes verified / verified with a positive spread, the
+/// lowest local spread that verified positive, and routes the unprofitable-route memo
+/// skipped. The data for choosing a local-spread gate without losing real triangles.
+#[derive(Default)]
+pub struct TriCalibration {
+    inner: Mutex<TriCalInner>,
+}
+
+#[derive(Default)]
+struct TriCalInner {
+    bands: [(u64, u64); TRI_CAL_BANDS_BPS.len() + 1],
+    min_pos_bps: Option<f64>,
+    memo_skips: u64,
+}
+
+impl TriCalibration {
+    /// One verified route: its local and verified spreads (ratios, verified post-haircut).
+    pub fn note(&self, local: f64, verified: f64) {
+        if !local.is_finite() || !verified.is_finite() { return; }
+        let bps = local * 10_000.0;
+        let band = TRI_CAL_BANDS_BPS.iter().position(|&edge| bps < edge).unwrap_or(TRI_CAL_BANDS_BPS.len());
+        let mut c = self.inner.lock().unwrap();
+        c.bands[band].0 += 1;
+        if verified > 0.0 {
+            c.bands[band].1 += 1;
+            c.min_pos_bps = Some(c.min_pos_bps.map_or(bps, |m| m.min(bps)));
+        }
+    }
+
+    pub fn note_memo_skips(&self, n: usize) {
+        if n > 0 { self.inner.lock().unwrap().memo_skips += n as u64; }
+    }
+
+    /// Heartbeat summary and reset, e.g. `<5:12/0 5-10:3/1 minpos=7.2bp memo=40`; empty bands
+    /// are left out. None when nothing was verified or skipped.
+    pub fn take_summary(&self) -> Option<String> {
+        let c = std::mem::take(&mut *self.inner.lock().unwrap());
+        if c.memo_skips == 0 && c.bands.iter().all(|b| b.0 == 0) { return None; }
+        let mut parts: Vec<String> = Vec::new();
+        for (i, (n, pos)) in c.bands.iter().enumerate() {
+            if *n == 0 { continue; }
+            let label = match i {
+                0 => format!("<{}", TRI_CAL_BANDS_BPS[0]),
+                i if i == TRI_CAL_BANDS_BPS.len() => format!("{}+", TRI_CAL_BANDS_BPS[i - 1]),
+                i => format!("{}-{}", TRI_CAL_BANDS_BPS[i - 1], TRI_CAL_BANDS_BPS[i]),
+            };
+            parts.push(format!("{label}:{n}/{pos}"));
+        }
+        parts.push(format!("minpos={}", c.min_pos_bps.map_or("n/a".to_string(), |b| format!("{b:.1}bp"))));
+        parts.push(format!("memo={}", c.memo_skips));
+        Some(parts.join(" "))
     }
 }
 
@@ -1541,5 +1607,23 @@ mod v4_quote_tests {
         let raw = IV4Quoter::quoteExactInputSingleCall::abi_encode_returns(
             &IV4Quoter::quoteExactInputSingleReturn { amountOut: U256::from(1234u64), gasEstimate: U256::from(9u64) });
         assert_eq!(decode_v3_quote(Some(&raw)), Some(U256::from(1234u64)));
+    }
+}
+
+#[cfg(test)]
+mod tri_calibration_tests {
+    use super::TriCalibration;
+
+    #[test]
+    fn bands_count_verified_and_positive_routes_and_reset() {
+        let c = TriCalibration::default();
+        assert_eq!(c.take_summary(), None);
+        c.note(0.0003, -0.0010); // 3 bp local, verified negative
+        c.note(0.0007, 0.0001);  // 7 bp local, verified positive
+        c.note(0.0008, -0.0002);
+        c.note(0.0150, 0.0040);  // 150 bp
+        c.note_memo_skips(4);
+        assert_eq!(c.take_summary().as_deref(), Some("<5:1/0 5-10:2/1 100+:1/1 minpos=7.0bp memo=4"));
+        assert_eq!(c.take_summary(), None);
     }
 }
