@@ -78,7 +78,9 @@ chain:
   # block (10 of 15 live sends priced on stale state) and the ~130–200 ms quote round trip lost the
   # rest of the races to N+1 closers. Local state comes from the triggering log itself.
   # 2-hop routes get no V3 overestimate deduction in this mode (triangles do).
-  optimistic_submission: true
+  # 2026-11-10 (evening): off again. The first live run sent 125 unverified USDC/EURC phantoms;
+  # each walked a thin pool's ticks until out of gas (~1.1M gas, ~$50 lost in 5 min).
+  optimistic_submission: false
   # preflight_eth_call: true     # eth_call before send — logs revert reason in engine (adds ~100–250ms latency)
   # Applies to EVERY triangular route. V3-leg routes are QuoterV2-verified first (revert plan 1.4),
   # so for them this is checked against verified profit and no longer absorbs the ~0.30% V3 spot
