@@ -27,9 +27,9 @@ pub(crate) mod size;
 /// This filters out uninitialized pools and ghost liquidity without needing USD valuation.
 pub(crate) fn min_v3_liquidity() -> u128 { crate::config::tuning().min_v3_liquidity }
 
-/// Max calls per Multicall3 batch.
-/// 10 keeps each batch well under ~30M gas (Alchemy eth_call limit) even with expensive
-/// V3 quoteExactInputSingle calls that can reach 5M gas/call when tracing ticks.
+/// Max calls per Multicall3 batch (`tuning.multicall_chunk_size`).
+/// Typical V3 quoteExactInputSingle calls cost ~0.1–0.3M gas, but one tracing many ticks can
+/// reach 5M; a batch over the node's eth_call gas cap falls back to sequential calls (WARN).
 pub(crate) fn multicall_chunk_size() -> usize { crate::config::tuning().multicall_chunk_size }
 
 /// QuoterV2 post-buffer (tenths of a bp): removed from `amount_back` before profit vs
@@ -345,6 +345,9 @@ pub struct Strategy {
     pub(crate) tri_memo: Mutex<HashMap<String, (Vec<Option<(u64, u64)>>, std::time::Instant)>>,
     /// Local vs verified triangle spreads since the last heartbeat: see [`TriCalibration`].
     pub tri_cal: TriCalibration,
+    /// Local vs verified 2-hop profit against the USD floor since the last heartbeat: see
+    /// [`FloorCalibration`].
+    pub p2_cal: FloorCalibration,
 }
 
 impl Strategy {
@@ -439,6 +442,7 @@ impl Strategy {
             recheck_prefetch: Mutex::new(HashMap::new()),
             tri_memo: Mutex::new(HashMap::new()),
             tri_cal: TriCalibration::default(),
+            p2_cal: FloorCalibration::default(),
         };
         s.rebuild_scan_cache();
         s
@@ -987,6 +991,52 @@ impl TriCalibration {
         parts.push(format!("minpos={}", c.min_pos_bps.map_or("n/a".to_string(), |b| format!("{b:.1}bp"))));
         parts.push(format!("memo={}", c.memo_skips));
         Some(parts.join(" "))
+    }
+}
+
+/// 2-hop QuoterV2 verification since the last heartbeat (`p2_cal=`), split by whether the
+/// route's local (spot) profit already reached the pair's USD floor: routes verified /
+/// verified at or above the floor, and the best verified profit among those local math put
+/// below it. The data for gating 2-hop quotes on local USD profit, as triangles already are:
+/// `below:N/0` over a long run means such a gate would lose nothing.
+#[derive(Default)]
+pub struct FloorCalibration {
+    inner: Mutex<FloorCalInner>,
+}
+
+#[derive(Default)]
+struct FloorCalInner {
+    below: (u64, u64),
+    above: (u64, u64),
+    below_best_usd: Option<f64>,
+}
+
+impl FloorCalibration {
+    /// One verified route: local and verified profit in USD (both post-haircut, ≤ 0 = none).
+    pub fn note(&self, local_usd: f64, verified_usd: f64, floor_usd: f64) {
+        if !local_usd.is_finite() || !verified_usd.is_finite() { return; }
+        let pass = verified_usd >= floor_usd;
+        let mut c = self.inner.lock().unwrap();
+        if local_usd < floor_usd {
+            c.below.0 += 1;
+            if pass { c.below.1 += 1; }
+            c.below_best_usd = Some(c.below_best_usd.map_or(verified_usd, |b| b.max(verified_usd)));
+        } else {
+            c.above.0 += 1;
+            if pass { c.above.1 += 1; }
+        }
+    }
+
+    /// Heartbeat summary and reset, e.g. `below:120/0 above:3/1 below_best=$0.0123`. None
+    /// when nothing was verified.
+    pub fn take_summary(&self) -> Option<String> {
+        let c = std::mem::take(&mut *self.inner.lock().unwrap());
+        if c.below.0 == 0 && c.above.0 == 0 { return None; }
+        Some(format!(
+            "below:{}/{} above:{}/{} below_best={}",
+            c.below.0, c.below.1, c.above.0, c.above.1,
+            c.below_best_usd.map_or("n/a".to_string(), |b| format!("${b:.4}")),
+        ))
     }
 }
 
@@ -1624,6 +1674,19 @@ mod tri_calibration_tests {
         c.note(0.0150, 0.0040);  // 150 bp
         c.note_memo_skips(4);
         assert_eq!(c.take_summary().as_deref(), Some("<5:1/0 5-10:2/1 100+:1/1 minpos=7.0bp memo=4"));
+        assert_eq!(c.take_summary(), None);
+    }
+
+    #[test]
+    fn floor_calibration_splits_on_local_profit_and_resets() {
+        let c = super::FloorCalibration::default();
+        assert_eq!(c.take_summary(), None);
+        c.note(0.01, 0.0, 0.05);      // below locally, verified nothing
+        c.note(0.02, 0.07, 0.05);     // below locally, verified above the floor: a gate would lose it
+        c.note(0.10, 0.04, 0.05);     // above locally, verified below
+        c.note(0.10, 0.06, 0.05);
+        c.note(f64::NEG_INFINITY, 0.1, 0.05); // not evaluated: ignored
+        assert_eq!(c.take_summary().as_deref(), Some("below:2/1 above:2/1 below_best=$0.0700"));
         assert_eq!(c.take_summary(), None);
     }
 }

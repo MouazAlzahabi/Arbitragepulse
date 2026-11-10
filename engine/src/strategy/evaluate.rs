@@ -607,6 +607,8 @@ impl Strategy {
         // Same QuoteCache rule as 1.5/1.5b: Some(v) = cache hit (ZERO = failed/skip), None = in p15c_mc.
         let mut p15c_pre: Vec<Option<U256>> = Vec::new();
         let mut p15c_sent_state: Vec<Option<(U256, u128)>> = Vec::new();
+        // Local profit of each p15c candidate (raw token_in units), for p2_cal.
+        let mut p15c_local: Vec<U256> = Vec::new();
         {
             for task in &rev_tasks {
                 let router_a_is_local = matches!(task.router_a_type, RouterType::V2 | RouterType::Aerodrome);
@@ -643,6 +645,7 @@ impl Strategy {
                     task.fee_b, task.router_b_addr, task.router_b_id.clone(),
                     task.token_out_amount,
                 ));
+                p15c_local.push(local_back.saturating_sub(full_amount));
             }
 
         }
@@ -694,6 +697,9 @@ impl Strategy {
         let mut p15b_sent_state: Vec<Option<(U256, u128)>> = Vec::new();
         // 1.5b reverse quotes answered by a speculative bracket instead of a second round trip.
         let mut p15b_spec_hits: usize = 0;
+        // p2_cal: best verified USD profit per Phase 1.5 gate entry over its reverse legs
+        // (1.5 local reverse and 1.5b), NEG_INFINITY until one is evaluated.
+        let mut p2_cal_best: std::collections::HashMap<(usize, String, u32), f64> = std::collections::HashMap::new();
         if !p15_gate.is_empty() && !self.optimistic_submission {
             let mut p15_list: Vec<(usize, String, u32, Address, Address, Address, U256)> = Vec::new();
             let mut p15_mc: Vec<(Address, Vec<u8>)> = Vec::new();
@@ -850,6 +856,7 @@ impl Strategy {
                     in p15_list.into_iter().zip(p15_quoter_outs.into_iter())
                 {
                     if quoter_out.is_zero() { continue; }
+                    p2_cal_best.insert((pi, router_a_id.clone(), fee_a), f64::NEG_INFINITY);
 
                     let pair = &self.pairs[pi];
                     // V3 reverse pools whose spot quote for quoter_out is tick-capped can't
@@ -942,6 +949,10 @@ impl Strategy {
                         // Aerodrome reverse uses local pool cache (volatile_max_age()=120s).
                         // Active pools get Sync events every few blocks; haircut covers quote→inclusion drift.
                         let amount_back = apply_exec_quote_haircut(amount_back);
+                        let v_usd = if amount_back > full_amount {
+                            token_amount_to_usd(amount_back - full_amount, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd)
+                        } else { 0.0 };
+                        if let Some(b) = p2_cal_best.get_mut(&(pi, router_a_id.clone(), fee_a)) { *b = b.max(v_usd); }
 
                         // Track verified spread for ALL non-phantom results, including losses
                         // (negative value shows QuoterV2 confirmed the spread is a loss).
@@ -1074,6 +1085,13 @@ impl Strategy {
                 }
 
                 let amount_back = apply_exec_quote_haircut(amount_back);
+                if let Some(b) = p2_cal_best.get_mut(&(pi, router_a_id.clone(), fee_a)) {
+                    let pair = &self.pairs[pi];
+                    let v_usd = if amount_back > full_amount {
+                        token_amount_to_usd(amount_back - full_amount, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd)
+                    } else { 0.0 };
+                    *b = b.max(v_usd);
+                }
 
                 // Track verified spread for ALL non-phantom results (including losses).
                 // Both legs are QuoterV2-confirmed here — most accurate signal available.
@@ -1120,13 +1138,22 @@ impl Strategy {
             }
             self.note_quoter_health(p15b_health);
         }
+        // p2_cal: each gate entry's local profit (the gate's best local reverse, haircut like
+        // the verified side) against its best verified result.
+        for (key, verified_usd) in p2_cal_best {
+            let Some(&(amount_in, local)) = p15_gate.get(&key) else { continue };
+            let pair = &self.pairs[key.0];
+            let local = apply_exec_quote_haircut(amount_in + local).saturating_sub(amount_in);
+            let local_usd = token_amount_to_usd(local, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd);
+            self.p2_cal.note(local_usd, verified_usd, pair.min_profit_usd.unwrap_or(self.min_profit_usd));
+        }
 
         // ── Process Phase 1.5c results ────────────────────────────────────────────────
         let mut p15c_health = QuoterBatchHealth::default();
         let mut p15c_mc_iter = p15c_raw.into_iter();
         let mut p15c_state_iter = p15c_sent_state.into_iter();
-        for ((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id, token_out_amount), pre)
-            in p15c_candidates.into_iter().zip(p15c_pre.into_iter())
+        for (((pi, router_a_id, fee_a, router_a_addr, router_a_type, token_in, token_out, full_amount, fee_b, router_b_addr, router_b_id, token_out_amount), pre), local)
+            in p15c_candidates.into_iter().zip(p15c_pre.into_iter()).zip(p15c_local)
         {
             let amount_back = if let Some(cached_val) = pre {
                 if cached_val.is_zero() { continue; }
@@ -1156,6 +1183,13 @@ impl Strategy {
 
             // Forward leg uses local pool cache (volatile_max_age()=120s); V3 reverse is QuoterV2-exact.
             let amount_back = apply_exec_quote_haircut(amount_back);
+            {
+                let pair = &self.pairs[pi];
+                let usd = |p: U256| token_amount_to_usd(p, pair.token_in_decimals, &pair.token_in_symbol, self.native_price_usd);
+                let local = apply_exec_quote_haircut(full_amount + local).saturating_sub(full_amount);
+                let v_usd = if amount_back > full_amount { usd(amount_back - full_amount) } else { 0.0 };
+                self.p2_cal.note(usd(local), v_usd, pair.min_profit_usd.unwrap_or(self.min_profit_usd));
+            }
 
             let v_spread = u256_to_f64(amount_back) / u256_to_f64(full_amount) - 1.0;
             if v_spread > best_verified_spread { best_verified_spread = v_spread; }

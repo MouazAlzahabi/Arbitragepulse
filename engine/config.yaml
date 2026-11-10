@@ -667,7 +667,7 @@ tuning:
   rpc_read_timeout_ms: 5000
   # rpc_simulate_timeout_ms: 800         # block-relative: ½ block, at least 800 ms
   rpc_send_timeout_ms: 5000
-  multicall_chunk_size: 10
+  multicall_chunk_size: 20             # 10 → 20 (2026-11-10): half the quote requests; watch scan_targeted and the "Multicall3 chunk failed (gas limit" WARN
   multicall_chunk_timeout_ms: 3000
   discover_chunk_size: 20
   discover_call_timeout_ms: 15000
