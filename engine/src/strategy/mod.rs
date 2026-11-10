@@ -885,6 +885,8 @@ pub struct ScanTimings {
     pub p15_ms: std::sync::atomic::AtomicU64,
     /// 2-hop Phase 1.5b / remaining 1.5c (after Phase 1.5).
     pub p15bc_ms: std::sync::atomic::AtomicU64,
+    /// Triangular local search (triplets, leg math, sizing) before verification.
+    pub tri_local_ms: std::sync::atomic::AtomicU64,
     /// Triangular QuoterV2 verification, all rounds.
     pub tri_verify_ms: std::sync::atomic::AtomicU64,
     /// Triangular verification rounds run.
@@ -892,13 +894,13 @@ pub struct ScanTimings {
 }
 
 impl ScanTimings {
-    /// `phase1=…ms p15=…ms p15bc=…ms tri_verify=…ms×N` for the execution log lines.
+    /// `phase1=…ms p15=…ms p15bc=…ms tri_local=…ms tri_verify=…ms×N` for the execution log lines.
     pub fn summary(&self) -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "phase1={}ms p15={}ms p15bc={}ms tri_verify={}ms×{}",
+            "phase1={}ms p15={}ms p15bc={}ms tri_local={}ms tri_verify={}ms×{}",
             self.phase1_ms.load(Relaxed), self.p15_ms.load(Relaxed), self.p15bc_ms.load(Relaxed),
-            self.tri_verify_ms.load(Relaxed), self.tri_verify_rounds.load(Relaxed),
+            self.tri_local_ms.load(Relaxed), self.tri_verify_ms.load(Relaxed), self.tri_verify_rounds.load(Relaxed),
         )
     }
 }
@@ -1038,6 +1040,11 @@ impl FloorCalibration {
             c.below_best_usd.map_or("n/a".to_string(), |b| format!("${b:.4}")),
         ))
     }
+}
+
+/// A token pair as an unordered key (lower address first): a pool's pair, or a route leg's.
+pub fn unordered_pair(a: Address, b: Address) -> (Address, Address) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 /// Signed spread ratio as a heartbeat percentage (`-0.123%`), or `n/a` when not finite.

@@ -986,7 +986,7 @@ pub async fn run_chain(
                 let trigger_at = oldest_event(&batch);
 
                 // Single strategy read: pool tokens + affected pair indices, merged over the batch.
-                let (pair_mask, token_filter, affected_pair_ids) = {
+                let (pair_mask, pair_filter, affected_pair_ids) = {
                     let strat = strategy.read().await;
                     merge_swap_batch(&batch, |p| strat.pool_cache.get_pool_tokens(p), |a, b| strat.pairs_for_tokens(a, b),
                                      |i| strat.pairs[i].id.clone())
@@ -1035,7 +1035,7 @@ pub async fn run_chain(
                     &strategy, &executor, &provider, &shared_state, &log_tx,
                     &cfg, &metrics, &mut pending_pairs, &mut cooldowns, &mut consecutive_failures,
                     &best_raw_profit, &best_spread_bits, &best_verified_spread_bits, &last_fwd_count, &last_multi_count, &last_active_count,
-                    &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, token_filter)), disabled_set,
+                    &opps_found, &recheck_drops, &contract_balances, Some((pair_mask, pair_filter)), disabled_set,
                     "swap",
                     trigger_at,
                 ).await;
@@ -1291,16 +1291,17 @@ async fn connect_first(
 }
 
 /// Merge a batch of swap events into one targeted scan: the union of their affected pair
-/// indices and pool tokens, plus the pair ids of large swaps (their cooldowns are cleared).
+/// indices and swapped pools' token pairs (unordered, lower address first — the triangles
+/// to rescan), plus the pair ids of large swaps (their cooldowns are cleared).
 /// Events on pools not in the cache contribute nothing.
 fn merge_swap_batch(
     batch: &[SwapEvent],
     tokens_of: impl Fn(Address) -> Option<(Address, Address)>,
     pairs_for: impl Fn(Address, Address) -> Vec<usize>,
     pair_id: impl Fn(usize) -> String,
-) -> (HashSet<usize>, Vec<Address>, Vec<String>) {
+) -> (HashSet<usize>, Vec<(Address, Address)>, Vec<String>) {
     let mut mask: HashSet<usize> = HashSet::new();
-    let mut tokens: Vec<Address> = Vec::new();
+    let mut token_pairs: Vec<(Address, Address)> = Vec::new();
     let mut large_ids: Vec<String> = Vec::new();
     for ev in batch {
         let Some((a, b)) = tokens_of(ev.pool) else { continue };
@@ -1308,9 +1309,8 @@ fn merge_swap_batch(
         if idx.is_empty() {
             continue;
         }
-        for t in [a, b] {
-            if !tokens.contains(&t) { tokens.push(t); }
-        }
+        let pair = crate::strategy::unordered_pair(a, b);
+        if !token_pairs.contains(&pair) { token_pairs.push(pair); }
         if ev.magnitude == SwapMagnitude::Large {
             for &i in &idx {
                 let id = pair_id(i);
@@ -1319,7 +1319,7 @@ fn merge_swap_batch(
         }
         mask.extend(idx);
     }
-    (mask, tokens, large_ids)
+    (mask, token_pairs, large_ids)
 }
 
 #[cfg(test)]
@@ -1362,9 +1362,9 @@ mod tests {
         };
         let id = |i: usize| format!("pair{i}");
         let batch = vec![ev(p_core, false), ev(p_vvv, true), ev(p_unknown, true), ev(p_core, false)];
-        let (mask, toks, large) = merge_swap_batch(&batch, tokens, pairs_for, id);
+        let (mask, pairs, large) = merge_swap_batch(&batch, tokens, pairs_for, id);
         assert_eq!(mask, [0usize, 1].into_iter().collect());
-        assert_eq!(toks, vec![usdc, weth, vvv]);
+        assert_eq!(pairs, vec![(usdc, weth), (weth, vvv)]);
         assert_eq!(large, vec!["pair0".to_string(), "pair1".to_string()]);
         // A batch of only unknown pools scans nothing.
         assert!(merge_swap_batch(&[ev(p_unknown, false)], tokens, pairs_for, id).0.is_empty());

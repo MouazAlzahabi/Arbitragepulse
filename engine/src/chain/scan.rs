@@ -370,8 +370,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
     opps_found: &Arc<AtomicU64>,
     recheck_drops: &Arc<AtomicU64>,
     contract_balances: &Arc<RwLock<HashMap<Address, U256>>>,
-    // None = full scan; Some((pair_mask, token_filter)) = targeted scan from a Swap event.
-    targeted: Option<(HashSet<usize>, Vec<Address>)>,
+    // None = full scan; Some((pair_mask, pair_filter)) = targeted scan from a Swap event:
+    // the swapped pools' token pairs (unordered) select the triangles to rescan.
+    targeted: Option<(HashSet<usize>, Vec<(Address, Address)>)>,
     // Pre-read from shared_state by the caller (alongside the paused check) to avoid
     // an extra shared_state.read().await here on every scan.
     disabled_set: std::sync::Arc<std::collections::HashSet<String>>,
@@ -419,8 +420,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
         };
 
         let is_full_scan = targeted.is_none();
-        // Targeted scans: 2-hop on pair mask; triangular only on the swapped pools' tokens (not full O(N³)).
-        let token_filter = targeted.as_ref().map(|(_, tokens)| tokens.as_slice());
+        // Targeted scans: 2-hop on pair mask; triangular only on triangles with a leg on a
+        // swapped pool's token pair (not full O(N³)).
+        let pair_filter = targeted.as_ref().map(|(_, pairs)| pairs.as_slice());
         let ((opps_2hop, best_2hop, verified_spread_2hop, fwd_ok, multi_dex, spread_2hop, active_pairs), (opps_tri, best_tri)) =
             if is_full_scan {
                 tokio::join!(
@@ -430,7 +432,7 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
             } else {
                 tokio::join!(
                     strat.evaluate(provider.as_ref(), final_mask.as_ref(), false),
-                    strat.detect_triangular(provider.as_ref(), 5, token_filter, &*disabled_set),
+                    strat.detect_triangular(provider.as_ref(), 5, pair_filter, &*disabled_set),
                 )
             };
 

@@ -31,6 +31,11 @@ fn verify_max_gap_bps() -> u64 { crate::config::tuning().tri_verify_max_gap_bps 
 /// V3-leg routes aren't QuoterV2-verified, this is deducted once per V3 leg.
 fn v3_spot_overestimate_bps() -> u64 { crate::config::tuning().v3_spot_overestimate_bps }
 
+/// The local search yields to the runtime every this many triplets / route entries: it is
+/// CPU-only, and runs joined with the 2-hop evaluation, whose QuoterV2 replies would
+/// otherwise wait for it to finish.
+const TRI_YIELD_EVERY: usize = 64;
+
 /// Memo key of a triangle route: its triplet, routers and fees (fixes its pools).
 fn tri_route_key(o: &TriangularOpportunity) -> String {
     format!(
@@ -91,15 +96,18 @@ impl Strategy {
     ///
     /// Returns `(opportunities, best_raw_profit_usd)` — best_raw_profit_usd tracks
     /// the highest profit seen even below `min_profit_usd` (for status logging).
-    /// `token_filter`: if Some, only consider triplets that include at least one of the
-    /// given token addresses (targeted scan). Pass None for a full sweep.
+    /// `pair_filter`: if Some, only consider triplets with a leg on one of the given token
+    /// pairs (unordered, see [`super::unordered_pair`]) — the swapped pools of a targeted
+    /// scan; other triangles' prices didn't move. Pass None for a full sweep.
     pub async fn detect_triangular<P: Provider + Clone>(
         &self,
         provider: &P,
         max_opportunities: usize,
-        token_filter: Option<&[Address]>,
+        pair_filter: Option<&[(Address, Address)]>,
         disabled_triplets: &std::collections::HashSet<String>,
     ) -> (Vec<TriangularOpportunity>, f64) {
+        let local_start = std::time::Instant::now();
+        self.timings.tri_local_ms.store(0, std::sync::atomic::Ordering::Relaxed);
         self.timings.tri_verify_ms.store(0, std::sync::atomic::Ordering::Relaxed);
         self.timings.tri_verify_rounds.store(0, std::sync::atomic::Ordering::Relaxed);
         use std::collections::HashMap;
@@ -140,7 +148,7 @@ impl Strategy {
         }
 
         // ── Build all ordered triplets ────────────────────────────────────────────
-        // For N tokens: N×(N-1)×(N-2) ordered triplets. Capped at 6 tokens → max 120.
+        // Start tokens × N × (N-1) ordered triplets (N ≤ max_tokens).
         struct Triplet {
             token_a: Address,
             key_a: String,
@@ -152,7 +160,7 @@ impl Strategy {
             triplet_id: String,
         }
 
-        let filter_set: Option<HashSet<Address>> = token_filter
+        let filter_set: Option<HashSet<(Address, Address)>> = pair_filter
             .map(|f| f.iter().copied().collect());
 
         let max_tokens = 25usize;
@@ -171,7 +179,8 @@ impl Strategy {
                 for &(token_c, ref key_c) in &tokens {
                     if token_c == token_a || token_c == token_b { continue; }
                     if let Some(ref fs) = filter_set {
-                        if !fs.contains(&token_a) && !fs.contains(&token_b) && !fs.contains(&token_c) {
+                        let touches = |x, y| fs.contains(&super::unordered_pair(x, y));
+                        if !touches(token_a, token_b) && !touches(token_b, token_c) && !touches(token_c, token_a) {
                             continue;
                         }
                     }
@@ -206,9 +215,9 @@ impl Strategy {
 
         // Only save all_displayable / disabled_triplet_ids on full scans — they're only
         // needed for tri_scan dashboard updates, which we skip on targeted swap scans.
-        // Targeted scans (token_filter is Some) evaluate only 1-2 triplets, so rebuilding
+        // Targeted scans (pair_filter is Some) evaluate only a few triplets, so rebuilding
         // the full tri_scan snapshot would mark all others as "not quoted" — corrupting data.
-        let is_full_scan = token_filter.is_none();
+        let is_full_scan = pair_filter.is_none();
         let all_displayable: Vec<(String, Address, Address, Address)> = if is_full_scan {
             triplets.iter()
                 .map(|t| (t.triplet_id.clone(), t.token_a, t.token_b, t.token_c))
@@ -279,50 +288,47 @@ impl Strategy {
             Vec::with_capacity(triplets.len().saturating_mul(self.chain_router_indices.len()));
         let mut tri_v3_spot: usize = 0;
         let default_v3_tiers: &[u32] = &[500, 3000, 10000];
+        // Per router (indexed like self.routers): its pool-key id, shared instead of
+        // allocated per lookup, and its address.
+        let router_keys: Vec<std::sync::Arc<str>> =
+            self.routers.iter().map(|r| std::sync::Arc::from(r.id.as_str())).collect();
+        let router_addrs: Vec<Address> = self.routers.iter()
+            .map(|r| self.router_addr_map.get(&r.id).copied().unwrap_or_default())
+            .collect();
+        let tiers_of = |ri: usize| -> &[u32] {
+            let router = &self.routers[ri];
+            if router.fee_tiers.is_empty() { default_v3_tiers } else { &router.fee_tiers }
+        };
 
+        // A→B depends only on (A, B) — the input is A's trade size — so each pair's legs
+        // (router, fee, output) are computed once and shared by every C.
+        let mut ab_legs: HashMap<(Address, Address), Vec<(usize, u32, U256)>> = HashMap::new();
         for (ti, trip) in triplets.iter().enumerate() {
-            for &ri in &self.chain_router_indices {
-                let router = &self.routers[ri];
-                let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
-                let tiers: &[u32] = if router.fee_tiers.is_empty() {
-                    default_v3_tiers
-                } else {
-                    &router.fee_tiers
-                };
-                let (fee, effective_amount_in, local_ab): (u32, U256, Option<U256>) = match router.router_type {
-                    RouterType::V3 => {
-                        let result = best_v3_spot(
-                            &self.pool_cache,
-                            &router.id,
-                            trip.token_a,
-                            trip.token_b,
-                            trip.amount_in,
-                            tiers,
-                        );
+            if ti % TRI_YIELD_EVERY == TRI_YIELD_EVERY - 1 { tokio::task::yield_now().await; }
+            let legs = ab_legs.entry((trip.token_a, trip.token_b)).or_insert_with(|| {
+                self.chain_router_indices.iter().filter_map(|&ri| {
+                    let router = &self.routers[ri];
+                    match router.router_type {
                         // `out` may be for a capped input (see quote_v3_spot_key); the route
                         // still trades the full amount_in, so this only under-scores it.
-                        match result {
-                            Some((out, f)) => (f, trip.amount_in, Some(out)),
-                            None => continue,
-                        }
-                    }
-                    _ => {
-                        let best = self.best_local_leg(
-                            &router.id, router.router_type, trip.token_a, trip.token_b, trip.amount_in,
-                        );
-                        (best.map_or(0, |(_, f)| f), trip.amount_in, best.map(|(out, _)| out))
-                    }
-                };
-                if local_ab.is_none() { continue; }
+                        RouterType::V3 => best_v3_spot(
+                            &self.pool_cache, &router_keys[ri], trip.token_a, trip.token_b, trip.amount_in, tiers_of(ri),
+                        ),
+                        _ => self.best_local_leg(&router.id, router.router_type, trip.token_a, trip.token_b, trip.amount_in),
+                    }.map(|(out, fee)| (ri, fee, out))
+                }).collect()
+            });
+            for &(ri, fee, out) in legs.iter() {
+                let router = &self.routers[ri];
                 if router.router_type == RouterType::V3 { tri_v3_spot += 1; }
                 p1_entries.push(P1Entry {
                     triplet_idx: ti,
                     router_id: router.id.clone(),
-                    router_addr,
+                    router_addr: router_addrs[ri],
                     router_type: router.router_type,
                     fee,
-                    local_result: local_ab,
-                    effective_amount_in,
+                    local_result: Some(out),
+                    effective_amount_in: trip.amount_in,
                 });
             }
         }
@@ -343,7 +349,8 @@ impl Strategy {
         let mut p2_entries: Vec<P2Entry> =
             Vec::with_capacity(p1_entries.len().saturating_mul(self.chain_router_indices.len()));
 
-        for p1e in p1_entries.iter() {
+        for (i, p1e) in p1_entries.iter().enumerate() {
+            if i % TRI_YIELD_EVERY == TRI_YIELD_EVERY - 1 { tokio::task::yield_now().await; }
             let amount_b: U256 = match p1e.local_result.filter(|b| !b.is_zero()) {
                 Some(b) => b,
                 None => continue,
@@ -352,17 +359,13 @@ impl Strategy {
 
             for &ri in &self.chain_router_indices {
                 let router = &self.routers[ri];
-                let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
-                let tiers: &[u32] = if router.fee_tiers.is_empty() {
-                    default_v3_tiers
-                } else {
-                    &router.fee_tiers
-                };
+                let router_addr = router_addrs[ri];
+                let tiers = tiers_of(ri);
                 let (fee, local_bc): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
                         let result = best_v3_spot(
                             &self.pool_cache,
-                            &router.id,
+                            &router_keys[ri],
                             trip.token_b,
                             trip.token_c,
                             amount_b,
@@ -416,7 +419,8 @@ impl Strategy {
         let mut p3_entries: Vec<P3Entry> =
             Vec::with_capacity(p2_entries.len().saturating_mul(self.chain_router_indices.len()));
 
-        for p2e in p2_entries.iter() {
+        for (i, p2e) in p2_entries.iter().enumerate() {
+            if i % TRI_YIELD_EVERY == TRI_YIELD_EVERY - 1 { tokio::task::yield_now().await; }
             let amount_c: U256 = match p2e.local_result.filter(|c| !c.is_zero()) {
                 Some(c) => c,
                 None => continue,
@@ -425,17 +429,13 @@ impl Strategy {
 
             for &ri in &self.chain_router_indices {
                 let router = &self.routers[ri];
-                let router_addr: Address = self.router_addr_map.get(&router.id).copied().unwrap_or_default();
-                let tiers: &[u32] = if router.fee_tiers.is_empty() {
-                    default_v3_tiers
-                } else {
-                    &router.fee_tiers
-                };
+                let router_addr = router_addrs[ri];
+                let tiers = tiers_of(ri);
                 let (fee, local_ca): (u32, Option<U256>) = match router.router_type {
                     RouterType::V3 => {
                         let result = best_v3_spot(
                             &self.pool_cache,
-                            &router.id,
+                            &router_keys[ri],
                             trip.token_c,
                             trip.token_a,
                             amount_c,
@@ -487,7 +487,8 @@ impl Strategy {
         let mut best_raw_usd: f64 = 0.0;
         let mut best_tri_spread: f64 = f64::NEG_INFINITY;
 
-        for p3e in p3_entries.iter() {
+        for (i, p3e) in p3_entries.iter().enumerate() {
+            if i % TRI_YIELD_EVERY == TRI_YIELD_EVERY - 1 { tokio::task::yield_now().await; }
             let amount_a_final: U256 = match p3e.local_result {
                 Some(a) if !a.is_zero() => a,
                 _ => continue,
@@ -614,6 +615,8 @@ impl Strategy {
         opportunities.retain(|o| seen_paths.insert((
             o.triplet_id.clone(), o.router_ab_id.clone(), o.router_bc_id.clone(), o.router_ca_id.clone(),
         )));
+
+        self.timings.tri_local_ms.store(local_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
 
         // ── Revert plan 1.4: verify routes with a V3 leg before submit ───────────
         // Cached sqrtPriceX96 ignores tick crossings, so V3 legs overstate output
@@ -1084,7 +1087,7 @@ fn leg_params(opp: &TriangularOpportunity, leg: usize) -> (&str, RouterType, u32
 
 fn best_v3_spot(
     cache: &PoolCache,
-    router_id: &str,
+    router_id: &std::sync::Arc<str>,
     token_in: Address,
     token_out: Address,
     amount_in: U256,
@@ -1093,7 +1096,7 @@ fn best_v3_spot(
     fee_tiers
         .iter()
         .filter_map(|&f| {
-            let key = V3PoolKey::new(router_id, token_in, token_out, f);
+            let key = V3PoolKey { router_id: router_id.clone(), token_in, token_out, fee: f };
             cache
                 .quote_v3_spot_key(&key, token_in, amount_in)
                 .and_then(|(out, liq, _)| {
@@ -1203,6 +1206,74 @@ mod tests {
         let (out, fee) = solidly_out(&cache, &keys, "aero", USDC, USDT, amt).unwrap();
         assert_eq!(fee, 0);
         assert_eq!(out, solidly_pool_out(&cache, &keys, "aero", false, USDC, USDT, amt).unwrap());
+    }
+
+    /// Targeted scans rescan exactly the triangles with a leg on a swapped pool's token pair:
+    /// same routes and amounts as the full sweep for those, none of the others.
+    #[tokio::test]
+    async fn pair_filter_selects_the_full_scans_routes_on_that_pair() {
+        let (b, c, d) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22), Address::repeat_byte(0x33));
+        let cache = PoolCache::new();
+        let v2 = |pool: u8, (t0, d0, r0): (Address, u8, u128), (t1, d1, r1): (Address, u8, u128)| {
+            assert!(t0 < t1);
+            cache.insert(Address::repeat_byte(pool), PoolInfo {
+                token0: t0, token1: t1, reserve0: U256::from(r0), reserve1: U256::from(r1), fee_bps: 30,
+                router_id: "uni2".into(), is_stable: false, decimals0: d0, decimals1: d1,
+                last_sync: Instant::now(), fee_num: U256::ZERO,
+            });
+        };
+        let e18 = 10u128.pow(18);
+        // $1M pools at 1 USDC = 1 B = 1 C = 1 D, except B/C: 1 B buys 1.03 C, so
+        // USDC→B→C→USDC earns ~2% (under the 5% phantom cap).
+        v2(0xb1, (b, 18, 1_000_000 * e18), (USDC, 6, 1_000_000_000_000));
+        v2(0xc1, (c, 18, 1_000_000 * e18), (USDC, 6, 1_000_000_000_000));
+        v2(0xd1, (d, 18, 1_000_000 * e18), (USDC, 6, 1_000_000_000_000));
+        v2(0xbc, (b, 18, 1_000_000 * e18), (c, 18, 1_030_000 * e18));
+        v2(0xcd, (c, 18, 1_000_000 * e18), (d, 18, 1_000_000 * e18));
+        let routers: Vec<crate::config::RouterConfig> = serde_yaml::from_str(r#"
+- { id: uni2, name: uni2, address: "0x0000000000000000000000000000000000000001", type: v2 }
+"#).unwrap();
+        let pairs: Vec<crate::config::PairConfig> = serde_yaml::from_str(&format!(r#"
+- {{ id: usdc-b, token_in: "{USDC}", token_out: "{b}", token_in_symbol: USDC, token_out_symbol: BBB, token_in_decimals: 6, token_out_decimals: 18, trade_amount: "1000" }}
+- {{ id: usdc-c, token_in: "{USDC}", token_out: "{c}", token_in_symbol: USDC, token_out_symbol: CCC, token_in_decimals: 6, token_out_decimals: 18, trade_amount: "1000" }}
+- {{ id: usdc-d, token_in: "{USDC}", token_out: "{d}", token_in_symbol: USDC, token_out_symbol: DDD, token_in_decimals: 6, token_out_decimals: 18, trade_amount: "1000" }}
+"#)).unwrap();
+        let strategy = Strategy::new(8453, pairs, routers, 0.0, 0.0, None, std::sync::Arc::new(cache), 1, false, None);
+        // V2-only routes are never QuoterV2-verified, so the provider is never called.
+        let provider = alloy::providers::ProviderBuilder::new().connect_http("http://127.0.0.1:9".parse().unwrap());
+        let none = HashSet::new();
+        let ids = |v: &[TriangularOpportunity]| -> Vec<(String, U256, U256)> {
+            let mut v: Vec<_> = v.iter().map(|o| (o.triplet_id.clone(), o.amount_in, o.expected_profit)).collect();
+            v.sort();
+            v
+        };
+
+        let (full, _) = strategy.detect_triangular(&provider, 5, None, &none).await;
+        assert!(full.iter().any(|o| o.triplet_id == "USDC→BBB→CCC"), "full scan: {:?}", ids(&full));
+        // Repeat sweeps give the same result (the per-scan A→B memo holds no state across scans).
+        assert_eq!(ids(&strategy.detect_triangular(&provider, 5, None, &none).await.0), ids(&full));
+
+        let on_pair = |x: Address, y: Address| -> Vec<(String, U256, U256)> {
+            let key = crate::strategy::unordered_pair(x, y);
+            let keep: Vec<TriangularOpportunity> = full.iter().filter(|o| {
+                [(o.token_a, o.token_b), (o.token_b, o.token_c), (o.token_c, o.token_a)]
+                    .iter().any(|&(p, q)| crate::strategy::unordered_pair(p, q) == key)
+            }).cloned().collect();
+            ids(&keep)
+        };
+        let targeted = |x: Address, y: Address| {
+            let f = [crate::strategy::unordered_pair(x, y)];
+            let strategy = &strategy;
+            let provider = &provider;
+            let none = &none;
+            async move { ids(&strategy.detect_triangular(provider, 5, Some(&f), none).await.0) }
+        };
+        assert_eq!(targeted(b, c).await, on_pair(b, c));
+        assert!(!targeted(b, c).await.is_empty());
+        assert_eq!(targeted(c, USDC).await, on_pair(c, USDC));
+        // C/D swapped: USDC→B→C has no C–D leg, so it is not rescanned.
+        assert_eq!(targeted(c, d).await, on_pair(c, d));
+        assert!(targeted(c, d).await.iter().all(|(id, ..)| id != "USDC→BBB→CCC"));
     }
 
     /// A route verified unprofitable is skipped while its pools log nothing new; a new log on
