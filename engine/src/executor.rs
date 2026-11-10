@@ -1,6 +1,6 @@
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Address, Uint, U256};
+use alloy::primitives::{Address, Bytes, Uint, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::state::StateOverride;
 use alloy::rpc::types::TransactionRequest;
@@ -246,6 +246,9 @@ pub struct Executor {
     /// `chain.borrow`: every trade borrows its amountIn from the V4 PoolManager (contract
     /// *Borrowed entry points) instead of using the contract's balance.
     pub borrow: bool,
+    /// Dry-run only: calldata of the last simulated trade, taken by the scan loop and logged
+    /// with its trigger block (`dry_tx`) so would-be sends can be replayed on-chain later.
+    pub last_dry_calldata: Option<Bytes>,
 }
 
 /// Venues traded on their pools directly (router config `direct: true`).
@@ -260,6 +263,9 @@ pub struct DirectVenues {
     pub hooked: std::collections::HashSet<String>,
     /// Uniswap V4 router ids (`v4: true`). Each leg on one adds `tuning.gas_per_v4_leg`.
     pub v4: std::collections::HashSet<String>,
+    /// `chain.executor_v2`: every leg must be direct, and its fee carries the leg type
+    /// (6 DirectCL, 7 DirectPair, 8 V4) in bits 20–23 above the DirectPair fee.
+    pub v2: bool,
 }
 
 impl DirectVenues {
@@ -271,7 +277,7 @@ impl DirectVenues {
         })).collect();
         let hooked = routers.iter().filter(|r| r.metaquoter).map(|r| r.id.clone()).collect();
         let v4 = routers.iter().filter(|r| r.v4).map(|r| r.id.clone()).collect();
-        Self { cache: Some(cache), venues, hooked, v4 }
+        Self { cache: Some(cache), venues, hooked, v4, v2: false }
     }
 
     /// Legs of a route on hooked venues (router ids may carry a "::volatile/stable" suffix).
@@ -287,17 +293,28 @@ impl DirectVenues {
     }
 
     /// The (router, fee) the executor gets for one leg: unchanged for router venues; the
-    /// leg's pool and its DirectCL / DirectPair fee for direct ones. Errs when a direct
-    /// leg's pool is not in the cache (the trade is then not sent).
+    /// leg's pool and its DirectCL / DirectPair fee for direct ones (executor v2: with the
+    /// leg type in bits 20–23). Errs when a direct leg's pool is not in the cache, or on a
+    /// router venue under v2 (the trade is then not sent).
     pub fn leg(&self, router: Address, router_id: &str, rtype: crate::config::RouterType, fee: u32, tin: Address, tout: Address)
         -> Result<(Address, u32)>
     {
         let venue = router_id.split("::").next().unwrap_or(router_id);
-        let Some(kind) = self.venues.get(venue) else { return Ok((router, fee)) };
+        let Some(kind) = self.venues.get(venue) else {
+            if self.v2 {
+                return Err(anyhow!("executor v2 trades on pools only: venue {} is not direct", venue));
+            }
+            return Ok((router, fee));
+        };
         let pool = self.cache.as_ref()
             .and_then(|c| crate::race::leg_pool(c, (router_id, rtype, fee, tin, tout)))
             .ok_or_else(|| anyhow!("direct venue {}: no cached pool for {:?}→{:?} (fee {})", venue, tin, tout, fee))?;
-        Ok((pool, kind.unwrap_or(0)))
+        let param = kind.unwrap_or(0);
+        if self.v2 {
+            let leg_type: u32 = if self.v4.contains(venue) { 8 } else if kind.is_none() { 6 } else { 7 };
+            return Ok((pool, leg_type << 20 | param));
+        }
+        Ok((pool, param))
     }
 }
 
@@ -349,6 +366,7 @@ impl Executor {
             balance_slots: Arc::new(HashMap::new()),
             direct: Arc::new(DirectVenues::default()),
             borrow: false,
+            last_dry_calldata: None,
             http_client: Arc::new(
                 reqwest::Client::builder()
                     .pool_max_idle_per_host(4)
@@ -719,6 +737,7 @@ impl Executor {
 
         // ── Dry-run: simulate only ─────────────────────────────────────────────
         if self.dry_run {
+            self.last_dry_calldata = tx_base.input.input().cloned();
             let assumed = self.assumed_balance(opp.token_in, opp.amount_in).await;
             match simulate_call(provider, self.sim_provider.as_ref(), tx_base, assumed.clone()).await {
                 Ok(_) => {
@@ -928,6 +947,7 @@ impl Executor {
         self.stats.total_attempts += 1;
 
         if self.dry_run {
+            self.last_dry_calldata = tx_base.input.input().cloned();
             let assumed = self.assumed_balance(opp.token_a, opp.amount_in).await;
             match simulate_call(provider, self.sim_provider.as_ref(), tx_base, assumed.clone()).await {
                 Ok(_) => {
@@ -1296,6 +1316,52 @@ mod tests {
         assert_eq!(d.leg(router, "uni-v3", RouterType::V3, 500, usdc, weth).unwrap(), (router, 500));
         assert!(d.leg(router, "uni-v2", RouterType::V2, 0, usdc, weth).is_err(), "uncached direct pool");
         assert_eq!(d.venues.get("uni-v2"), Some(&Some(30)));
+    }
+
+    /// Executor v2: a leg's fee carries its type in bits 20–23 (6 DirectCL, 7 DirectPair with
+    /// the pair fee below, 8 V4) and a router venue is refused, not sent as a router.
+    #[test]
+    fn v2_legs_carry_their_type_in_the_fee() {
+        use crate::pool_cache::{PoolCache, PoolInfo, V3PoolState};
+        let (usdc, weth) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let (cl_pool, pair_pool, uni_pair, router) =
+            (Address::repeat_byte(0xc1), Address::repeat_byte(0xa2), Address::repeat_byte(0xa3), Address::repeat_byte(0x99));
+        let cache = Arc::new(PoolCache::new());
+        cache.insert_v3(cl_pool, V3PoolState {
+            token0: usdc, token1: weth, fee: 50, swap_fee: 300, sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1, tick: 0, router_id: "aero-cl".into(), last_updated: std::time::Instant::now(),
+            vr0: U256::ZERO, vr1: U256::ZERO, fee_num_v3: U256::ZERO,
+        });
+        let pair = |rid: &str| PoolInfo {
+            token0: usdc, token1: weth, reserve0: U256::from(1u64), reserve1: U256::from(1u64), fee_bps: 30,
+            router_id: rid.into(), is_stable: false, decimals0: 6, decimals1: 18,
+            last_sync: std::time::Instant::now(), fee_num: U256::ZERO,
+        };
+        cache.insert(pair_pool, pair("aero-v2::volatile"));
+        cache.insert(uni_pair, pair("uni-v2"));
+        let routers = vec![
+            router_cfg("{id: aero-cl, name: a, address: '0x0000000000000000000000000000000000000001', type: v3, direct: true}"),
+            router_cfg("{id: aero-v2, name: b, address: '0x0000000000000000000000000000000000000002', type: aerodrome, direct: true}"),
+            router_cfg("{id: uni-v2, name: c, address: '0x0000000000000000000000000000000000000003', type: v2, fee_bps: 25, direct: true}"),
+            router_cfg("{id: uni-v3, name: d, address: '0x0000000000000000000000000000000000000004', type: v3}"),
+        ];
+        let d = DirectVenues { v2: true, ..DirectVenues::from_routers(&routers, cache) };
+        assert_eq!(d.leg(router, "aero-cl", RouterType::V3, 50, usdc, weth).unwrap(), (cl_pool, 6 << 20));
+        assert_eq!(d.leg(router, "aero-v2::volatile", RouterType::Aerodrome, 0, weth, usdc).unwrap(), (pair_pool, 7 << 20));
+        assert_eq!(d.leg(router, "uni-v2", RouterType::V2, 0, usdc, weth).unwrap(), (uni_pair, 7 << 20 | 25));
+        assert!(d.leg(router, "uni-v3", RouterType::V3, 500, usdc, weth).is_err(), "router venue under v2");
+        // V4 venues map to type 8 (the pool is the PoolId address, resolved like other CL legs).
+        let mut v4 = DirectVenues { v2: true, ..Default::default() };
+        v4.venues.insert("uni-v4".into(), None);
+        v4.v4.insert("uni-v4".into());
+        let c = Arc::new(PoolCache::new());
+        c.insert_v3(cl_pool, V3PoolState {
+            token0: usdc, token1: weth, fee: 500, swap_fee: 500, sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1, tick: 0, router_id: "uni-v4".into(), last_updated: std::time::Instant::now(),
+            vr0: U256::ZERO, vr1: U256::ZERO, fee_num_v3: U256::ZERO,
+        });
+        v4.cache = Some(c);
+        assert_eq!(v4.leg(router, "uni-v4", RouterType::V3, 500, usdc, weth).unwrap(), (cl_pool, 8 << 20));
     }
 
     /// Aero CL legs (metaquoter venues) add gas_per_hooked_leg each; other routes keep the

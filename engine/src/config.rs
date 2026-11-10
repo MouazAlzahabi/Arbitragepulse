@@ -37,6 +37,12 @@ pub struct ChainConfig {
     /// PoolManager (contract v4).
     #[serde(default)]
     pub borrow: bool,
+    /// Executor v2 (ArbitrageExecutorV2): borrow-only, pools only — every router must be
+    /// `direct: true` — and each leg's type travels in its `fee` (type << 20 | param) instead
+    /// of an on-chain allowlist. The startup check refuses live trading unless the contract
+    /// reports version() == 2.
+    #[serde(default)]
+    pub executor_v2: bool,
     /// Total Multicall3 chunks in flight on the quote endpoint per chain, shared by all
     /// batches joined concurrently (Phase 1.5/1.5b/1.5c, prefetch, triangular verify).
     /// Free Alchemy plan (330 CU/s): use 3. Growth plan (3000 CU/s): use 10–12.
@@ -377,6 +383,9 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
         if r.v4 && !chain.borrow {
             return Err(anyhow!("router '{}': V4 pools trade only inside a borrow — set chain.borrow: true", r.id));
         }
+        if chain.executor_v2 && !r.direct {
+            return Err(anyhow!("router '{}': chain.executor_v2 trades on pools only — set direct: true", r.id));
+        }
         if let Some(f) = r.fee_tiers.iter().find(|&&f| r.v4 && v4_tick_spacing(f).is_none()) {
             return Err(anyhow!("router '{}': V4 fee tier {} has no default tick spacing (100, 500, 3000, 10000)", r.id, f));
         }
@@ -395,6 +404,9 @@ pub fn parse_config(content: &str) -> Result<AppConfig> {
                 r.id, f
             ));
         }
+    }
+    if chain.executor_v2 && !chain.borrow {
+        return Err(anyhow!("chain.executor_v2 is borrow-only — set chain.borrow: true"));
     }
     if let Some(u) = chain.quote_http_rpc.as_deref() {
         u.parse::<url::Url>()
@@ -846,6 +858,23 @@ routers: []
         assert_eq!(t.phantom_cap_bps, 500);
         assert_eq!(t.block_stall_exit_ms, 300_000);
         assert_eq!(t.rpc_latency_sample(), std::time::Duration::from_secs(60));
+    }
+
+    /// executor_v2 is borrow-only and trades on pools only.
+    #[test]
+    fn executor_v2_needs_borrow_and_direct_routers() {
+        let v2 = MIN.replace("  deadline_seconds: 60\n", "  deadline_seconds: 60\n  executor_v2: true\n");
+        let err = parse_config(&v2).unwrap_err().to_string();
+        assert!(err.contains("borrow-only"), "{err}");
+        let v2 = v2.replace("  executor_v2: true\n", "  executor_v2: true\n  borrow: true\n");
+        assert!(parse_config(&v2).unwrap().chain.executor_v2);
+        let router = |direct: &str| v2.replace(
+            "routers: []\n",
+            &format!("routers:\n  - id: r\n    name: r\n    address: \"0x0000000000000000000000000000000000000002\"\n    type: v3\n{direct}"),
+        );
+        let err = parse_config(&router("")).unwrap_err().to_string();
+        assert!(err.contains("set direct: true"), "{err}");
+        assert!(parse_config(&router("    direct: true\n")).is_ok());
     }
 
     #[test]

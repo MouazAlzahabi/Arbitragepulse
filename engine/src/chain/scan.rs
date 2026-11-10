@@ -695,7 +695,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 // A live send would leave about here (no preflight); the simulation is dry-run only.
                 let reaction_ms = lat_origin.elapsed().as_millis() as u64;
                 let sim_start = Instant::now();
-                match exec.execute(provider.as_ref(), &optimized).await {
+                let res = exec.execute(provider.as_ref(), &optimized).await;
+                log_dry_tx(&cfg.name, "2hop", &optimized.pair_id, trigger_at, &mut exec, res.is_ok());
+                match res {
                     Ok(tx_hash) => {
                         let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
@@ -1185,7 +1187,9 @@ pub(crate) async fn evaluate_and_execute<P: Provider + Clone + 'static>(
                 // A live send would leave about here (no preflight); the simulation is dry-run only.
                 let reaction_ms = lat_origin.elapsed().as_millis() as u64;
                 let sim_start = Instant::now();
-                match exec.execute_triangular(provider.as_ref(), opp).await {
+                let res = exec.execute_triangular(provider.as_ref(), opp).await;
+                log_dry_tx(&cfg.name, "triangular", &opp.triplet_id, trigger_at, &mut exec, res.is_ok());
+                match res {
                     Ok(tx_hash) => {
                         let scan_to_submit_ms = pre_exec_ms + candidate_start.elapsed().as_millis() as u64;
                         drop(exec);
@@ -1681,6 +1685,23 @@ fn log_exec_lat(
         chain, route, if dry_run { "dry" } else { "live" }, trigger, reaction_ms,
         queue_ms.map_or("n/a".to_string(), |q| q.to_string()), seen, timing,
         lat.optimize_ms, lat.lock_ms, lat.prep_ms, lat.sign_ms, last.0, last.1, id,
+    );
+}
+
+/// Dry-run: one line per simulated would-be send, with what a replay needs (trigger block,
+/// sender, contract, calldata). The simulation runs at `latest` on the quote node, which can
+/// trail the trigger block, so `sim=` alone can't tell whether the send would have landed.
+/// Nothing is logged when no calldata was built (e.g. skipped as negative after gas).
+fn log_dry_tx(
+    chain: &str, route: &str, id: &str, trigger_at: Option<(Instant, Option<(u64, u64)>)>,
+    exec: &mut crate::executor::Executor, sim_ok: bool,
+) {
+    let Some(calldata) = exec.last_dry_calldata.take() else { return };
+    let seen = trigger_at.and_then(|(_, pos)| pos).map_or("n/a".to_string(), |(block, _)| block.to_string());
+    info!(
+        "[{}] dry_tx | route={} | id={} | seen_block={} | sim={} | from={} | to={} | data={}",
+        chain, route, id, seen, if sim_ok { "ok" } else { "fail" },
+        exec.signer_address, exec.contract_address, calldata,
     );
 }
 

@@ -382,6 +382,7 @@ pub(crate) async fn check_contract_setup<P: Provider>(
     chain: &str,
     dry_run: bool,
     borrow: bool,
+    v2: bool,
     log_tx: &LogBroadcaster,
 ) -> Result<bool> {
     use crate::abi::ArbitrageExecutor;
@@ -399,6 +400,14 @@ pub(crate) async fn check_contract_setup<P: Provider>(
         .map_err(|e| anyhow::anyhow!("[{chain}] executor {contract}: paused() failed: {e}"))?;
 
     let mut problems = Vec::new();
+    if v2 {
+        // v2 calldata (leg type in each fee) means something else to a v1 contract.
+        match rpc_timeout(rpc_read_timeout(), exec.version().call()).await {
+            Ok(2) => info!("[{chain}] Executor {contract} is v2 (pools only, leg types in calldata)"),
+            Ok(v) => problems.push(format!("chain.executor_v2 is on but the executor reports version() = {v} — deploy ArbitrageExecutorV2 or turn executor_v2 off")),
+            Err(e) => problems.push(format!("chain.executor_v2 is on but the executor has no version() (a v1 contract?): {e}")),
+        }
+    }
     // Direct venues are checked per pool after discovery (check_direct_pools).
     for r in routers.iter().filter(|r| !r.direct) {
         let addr: Address = match r.address.parse() {
@@ -461,12 +470,17 @@ pub(crate) async fn check_direct_pools<P: Provider>(
     routers: &[RouterConfig],
     cache: &PoolCache,
     dry_run: bool,
+    v2: bool,
     chain: &str,
     log_tx: &LogBroadcaster,
 ) -> usize {
     use alloy::sol_types::SolCall;
     use crate::abi::ArbitrageExecutor;
-    let want = direct_pools(routers, cache);
+    let mut want = direct_pools(routers, cache);
+    // Executor v2 needs no allowlist: only V4 pools are registered (by PoolKey).
+    if v2 {
+        want.retain(|(_, ty)| *ty == 8);
+    }
     if want.is_empty() {
         return 0;
     }

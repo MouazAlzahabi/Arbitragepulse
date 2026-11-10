@@ -91,7 +91,7 @@ pub(crate) fn spawn_rediscovery(
     mut feeds: Vec<tokio::task::JoinHandle<()>>,
     chain_name: String,
     // (executor, dry-run at start, log sink): new direct-venue pools get the allowlist check.
-    direct_check: (Address, bool, LogBroadcaster),
+    direct_check: (Address, bool, bool, LogBroadcaster),
 ) {
     let every = crate::config::tuning().pool_rediscover_ms;
     if every == 0 {
@@ -112,8 +112,8 @@ pub(crate) fn spawn_rediscovery(
             if added == 0 {
                 continue;
             }
-            let (contract, dry_run, ref log_tx) = direct_check;
-            state::check_direct_pools(&reads, contract, &routers, &cache, dry_run, &chain_name, log_tx).await;
+            let (contract, dry_run, v2, ref log_tx) = direct_check;
+            state::check_direct_pools(&reads, contract, &routers, &cache, dry_run, v2, &chain_name, log_tx).await;
             let fresh = start_log_feeds();
             tokio::time::sleep(Duration::from_secs(15)).await;
             for h in feeds.drain(..) {

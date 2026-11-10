@@ -107,7 +107,7 @@ pub async fn run_chain(
     // Runs before pool discovery so a wrong key fails within seconds. Startup only.
     let dry_run_at_start = shared_state.read().await.dry_run;
     let setup = |p| state::check_contract_setup(
-        p, contract_addr, signer_address, &routers, &cfg.name, dry_run_at_start, cfg.borrow, &log_tx,
+        p, contract_addr, signer_address, &routers, &cfg.name, dry_run_at_start, cfg.borrow, cfg.executor_v2, &log_tx,
     );
     let start_paused = match setup(startup_reads).await {
         Err(e) if has_startup_fallback => {
@@ -284,14 +284,17 @@ pub async fn run_chain(
     // Direct venues (legs sent to pools) and V4 borrowing.
     {
         let mut exec = executor.lock().await;
-        exec.direct = Arc::new(crate::executor::DirectVenues::from_routers(&chain_routers, pool_cache.clone()));
+        exec.direct = Arc::new(crate::executor::DirectVenues {
+            v2: cfg.executor_v2,
+            ..crate::executor::DirectVenues::from_routers(&chain_routers, pool_cache.clone())
+        });
         exec.borrow = cfg.borrow;
     }
     if cfg.borrow {
         info!("[{}] Borrowing: every trade takes its amountIn from the Uniswap V4 PoolManager (no fee, no interest) — contract balance not used", cfg.name);
     }
     // Direct venues trade only on pools the executor allowlists: report the missing ones.
-    state::check_direct_pools(reads.as_ref(), contract_addr, &chain_routers, &pool_cache, dry_run_at_start, &cfg.name, &log_tx).await;
+    state::check_direct_pools(reads.as_ref(), contract_addr, &chain_routers, &pool_cache, dry_run_at_start, cfg.executor_v2, &cfg.name, &log_tx).await;
     // Pre-fetch nonce at startup so first submission has zero RPC overhead.
     { executor.lock().await.prefetch_nonce(provider.as_ref()).await; }
 
@@ -450,7 +453,7 @@ pub async fn run_chain(
     maintain::spawn_rediscovery(
         rediscover_reads, chain_routers.clone(), chain_pairs.clone(), pool_cache.clone(),
         start_log_feeds.clone(), log_feed_handles, cfg.name.clone(),
-        (contract_addr, dry_run_at_start, log_tx.clone()),
+        (contract_addr, dry_run_at_start, cfg.executor_v2, log_tx.clone()),
     );
 
     info!("[{}] Chain engine started", cfg.name);

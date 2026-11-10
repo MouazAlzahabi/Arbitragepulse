@@ -27,12 +27,19 @@ chain:
   # Allowlisted: the 8 router venues, 68 DirectCL + 18 DirectPair pools, 101 V4 pools.
   # Previous executor (v4, empty): 0xfbf0267661784B6770F76873F99c4a626fc66e96
   # Older executor (v3, still holds its funds until withdrawn): 0x6dE168a6BAE5F92ffc28a07fC41D063b934B3Ff2
-  contract_address: "0x68a33770b9CD62B6589Ea54B0d62828D71E92590"
+  # Executor v2 (ArbitrageExecutorV2: borrow-only, pools only, leg types in calldata, no
+  # allowlist; immutable owner = the engine key), deployed 2026-11-10, block 55744684, deploy tx
+  # 0x25d306e70405f373b2fc3737b87637b1b050f5738c73a148046126a5f1ab3b85. The 213 V4 pools
+  # registered on v5 were registered here too (setV4Pools). Every router must be direct: true.
+  # Previous executor (v5, empty, unused): 0x68a33770b9CD62B6589Ea54B0d62828D71E92590
+  contract_address: "0x26a8b1d25636585a0adFb1905010621d06A8B7fb"
+  executor_v2: true
   min_native_balance: 0.005
   # ~$1k capital: keep USD floor low (defer revert-plan 1.2 $0.30–$0.80). Revert risk is handled
-  # off-chain only — P15 haircut + Phase 1.5 QuoterV2 + net-after-gas > 0. The on-chain minProfit is
-  # deliberately loosened (62% of gas floor, 2% router slack), so it does NOT filter thin edges.
-  min_profit_usd: 0.0001
+  # off-chain only — net-after-gas > 0 (and, with optimistic_submission off, Phase 1.5 QuoterV2).
+  # The on-chain minProfit is deliberately loosened (62% of gas floor, 2% router slack), so it does
+  # NOT filter thin edges. 0.001 (10× the old 0.0001) since optimistic submission went on, 2026-11-10.
+  min_profit_usd: 0.001
   deadline_seconds: 120
   quoter_v2_address: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"  # Uniswap V3 QuoterV2 (Base)
   # Full scan (every pair and triangle) interval. Detection itself runs on pool logs: each
@@ -67,7 +74,11 @@ chain:
   # Traced mined reverts on Base often show Phase-1 phantom edges vs actual V3 liquidity (final balance <
   # starting balance + minProfit). QuoterV2 preflight trades latency for fewer guaranteed reverts until the
   # pipeline nets its first confirmations.
-  optimistic_submission: false  # Phase 1.5 QuoterV2 (~80–160ms) — restores bestV= in heartbeat
+  # 2026-11-10: on again. With QuoterV2, Alchemy's `latest` often trailed the triggering log by a
+  # block (10 of 15 live sends priced on stale state) and the ~130–200 ms quote round trip lost the
+  # rest of the races to N+1 closers. Local state comes from the triggering log itself.
+  # 2-hop routes get no V3 overestimate deduction in this mode (triangles do).
+  optimistic_submission: true
   # preflight_eth_call: true     # eth_call before send — logs revert reason in engine (adds ~100–250ms latency)
   # Applies to EVERY triangular route. V3-leg routes are QuoterV2-verified first (revert plan 1.4),
   # so for them this is checked against verified profit and no longer absorbs the ~0.30% V3 spot
@@ -90,6 +101,7 @@ routers:
     name: "Uniswap V3 (Base)"
     address: "0x2626664c2603336E57B271c5C0b26F421741e481"  # SwapRouter02
     type: "v3"
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_tiers: [100, 500, 3000, 10000]
     fee_bps: 0
     factory_address: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"  # Uniswap V3 Factory (Base)
@@ -98,6 +110,7 @@ routers:
     name: "Aerodrome V2 (Base)"
     address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
     type: "aerodrome"    # 4-field Route{from,to,stable,factory}
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_bps: 30        # volatile pools (0.3%)
     stable_fee_bps: 5  # stable pools (0.05%, factory stableFee()): USDC/USDT, USDC/EURC, etc.
     # Both are fallbacks only: discovery reads each pool's actual fee via factory.getFee(pool, stable)
@@ -117,6 +130,7 @@ routers:
     address: "0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5"   # Slipstream SwapRouter
     type: "v3"
     slipstream: true
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_tiers: [1, 10, 50, 100, 200, 2000]                   # factory.tickSpacings()
     fee_bps: 0
     quoter_address: "0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0"   # Slipstream QuoterV2
@@ -126,6 +140,7 @@ routers:
     name: "PancakeSwap V3 (Base)"
     address: "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86"  # SmartRouter (7-field exactInputSingle, no deadline in struct)
     type: "v3"
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_tiers: [100, 500, 2500]
     fee_bps: 5
     quoter_address: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"  # PancakeSwap QuoterV2
@@ -141,6 +156,7 @@ routers:
     address: "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F"   # Slipstream 3 SwapRouter
     type: "v3"
     slipstream: true
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_tiers: [1, 10, 50, 80, 100, 150, 200, 500, 2000]     # factory.tickSpacings()
     fee_bps: 0
     quoter_address: "0x514c8B5f54112481E28028F1166Bd78501089259"
@@ -152,6 +168,7 @@ routers:
     name: "Uniswap V2 (Base)"
     address: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"   # UniswapV2Router02
     type: "v2"
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_bps: 30
     factory_address: "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
 
@@ -193,6 +210,7 @@ routers:
     name: "BaseSwap (Base)"
     address: "0x327Df1E6de05895d2ab08513aaDD9313Fe505d86"
     type: "v2"
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_bps: 25
     factory_address: "0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB"
 
@@ -202,6 +220,7 @@ routers:
     name: "Alien Base (Base)"
     address: "0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7"
     type: "v2"
+    direct: true         # executor v2 trades on pools only (2026-11-10)
     fee_bps: 16
     factory_address: "0x3E84D913803b02A4a7f027165E8cA42C14C0FdE7"
 

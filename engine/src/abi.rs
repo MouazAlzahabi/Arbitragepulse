@@ -180,6 +180,8 @@ sol! {
         );
         function owner() external view returns (address);
         function paused() external view returns (bool);
+        /// Executor v2 only (ArbitrageExecutorV2 returns 2).
+        function version() external view returns (uint8);
         function pause() external;
         function unpause() external;
         function withdrawToken(address token) external;
