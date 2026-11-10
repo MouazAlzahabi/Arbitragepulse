@@ -68,7 +68,7 @@ chain:
   # starting balance + minProfit). QuoterV2 preflight trades latency for fewer guaranteed reverts until the
   # pipeline nets its first confirmations.
   optimistic_submission: false  # Phase 1.5 QuoterV2 (~80–160ms) — restores bestV= in heartbeat
-  # preflight_eth_call: true     # eth_call before send — logs revert reason in engine (adds ~100–250ms latency)
+  preflight_eth_call: true       # eth_call before send: only sim-passing trades go out (adds ~100–250ms); on for the first live sends (2026-11-10)
   # Applies to EVERY triangular route. V3-leg routes are QuoterV2-verified first (revert plan 1.4),
   # so for them this is checked against verified profit and no longer absorbs the ~0.30% V3 spot
   # overestimate the old $0.80 covered. V2/Solidly/Aerodrome-only routes are NOT re-verified: they
